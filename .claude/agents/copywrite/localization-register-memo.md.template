@@ -1,0 +1,57 @@
+# {{PROJECT_NAME}} Localization Register Memo
+
+<!--
+This is a SKELETON. Fill in every section below with this project's actual register
+decisions, then either rename this file to `localization-register-memo.md` (dropping
+the `.template` suffix) and update the reference in `localization-editor.md` to match,
+or keep the `.template` suffix and point `localization-editor.md` at a project-specific
+filled-in copy.
+
+A focused reference for `localization-editor.md` and `consistency-checker.md`. It
+establishes this project's deliberate register choice per locale, lists the
+formality-drift anti-patterns to flag, and locks the locale-specific invariants
+(diacritics, plurals, scripts).
+-->
+
+## Register decision (formal/informal, per locale)
+
+<!-- State, per locale, whether the product addresses the user formally or informally,
+     and WHY — what peer products in this market/register did the founder benchmark
+     against? Note any carve-outs (legal/contract surfaces often keep the formal
+     register even when the product voice is informal elsewhere). -->
+
+- **Locale:** `[e.g. de-DE]` — **Register:** `[Sie / du, or this locale's equivalent axis]`
+  — **Why:** `[reasoning + peer-product benchmarks]`
+  — **Carve-outs:** `[e.g. Terms/Privacy/statutory notices keep the formal register]`
+
+## Common formality-drift pitfalls
+
+<!-- LLMs trained on formal/institutional corpora for a given language tend to drift
+     toward bureaucratic register when they see domain vocabulary (legal, financial,
+     government-adjacent terms). List the anti-patterns this project has actually
+     caught, each with why it fails and the house equivalent. Start this table empty
+     and grow it as the localization-editor catches real drift; don't invent entries
+     you haven't observed. -->
+
+| Anti-pattern | Why it fails | House equivalent |
+|---|---|---|
+| `[phrase the LLM over-formalizes]` | `[reasoning]` | `[the fix]` |
+
+## Locale-specific invariants (diacritics, plurals, scripts, etc.)
+
+<!-- Any locale this project supports with special characters, plural rules, or script
+     considerations that a transformation could silently break. State the invariant and
+     the regex/check that guards it (the consistency-checker enforces this
+     mechanically). -->
+
+- **Locale:** `[locale]` — **Invariant:** `[e.g. "writes N diacritics: list them"]` —
+  **Guard:** `[the regex or rule that detects a regression]`
+
+## Anglicisms / loanwords that stay untranslated
+
+<!-- Words borrowed from another language (often English, in SaaS copy) that are more
+natural left as-is than translated, and the ones that should NOT be borrowed even
+though an LLM might default to it. -->
+
+- Keep as-is: `[word]` — [why translating it reads worse].
+- Do NOT borrow: `[word]` — use `[native equivalent]` instead.

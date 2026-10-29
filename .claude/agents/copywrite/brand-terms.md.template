@@ -1,0 +1,50 @@
+# {{PROJECT_NAME}} Brand Terms Glossary
+
+<!--
+This is a SKELETON. Fill in every section below with this project's actual glossary,
+then either rename this file to `brand-terms.md` (dropping the `.template` suffix) and
+update the reference in `consistency-checker.md` to match, or keep the `.template`
+suffix and point `consistency-checker.md` at a project-specific filled-in copy.
+
+Single source of truth for `consistency-checker.md`. Every term should have one
+canonical spelling per locale; deviations become `required`-severity findings.
+-->
+
+## Canonical spellings
+
+<!-- One row per brand/product/domain term this project must never mis-spell,
+     mis-capitalize, or mistranslate. Include: the product name itself, feature/module
+     names, any regulatory/domain-specific acronyms, third-party service names that
+     appear in your copy, and plan/tier names. -->
+
+| Term | Locale A spelling | Locale B spelling | Notes |
+|---|---|---|---|
+| `[Product name]` | | | |
+| `[Feature/module name]` | | | |
+| `[Domain acronym, e.g. a regulatory program name]` | | | |
+| `[Plan/tier name]` | | | |
+
+## Terms to avoid
+
+<!-- Deprecated names, competitor names that shouldn't appear, or generic terms that
+     should always be replaced with the project's specific vocabulary (e.g. "document"
+     when the product always calls it an "invoice"). -->
+
+- `[deprecated or wrong term]` → always use `[correct term]` instead.
+
+## Approved product/feature names
+
+<!-- The exact, camera-ready names for named features, so copy never invents a
+     slightly-different name for the same thing. -->
+
+- `[Feature name]` — [one-line description of what it is, so writers pick the right name].
+
+## Register decree (cross-reference)
+
+<!-- One line pointing at the register decision this project made — see
+     `localization-register-memo.md.template` for the full reasoning. E.g.: "This
+     project addresses users informally in [locale]; the formal register is reserved
+     for [legal surfaces, if any]." -->
+
+[State the register decree here, or delete this section if the localization-register
+memo already owns it and this file should just cross-reference it.]

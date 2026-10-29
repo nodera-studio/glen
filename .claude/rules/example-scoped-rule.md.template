@@ -1,0 +1,21 @@
+---
+paths:
+  - '{{SOME_SOURCE_GLOB}}/**'
+---
+
+# {{RULE_TITLE}}
+
+> This is a TEMPLATE demonstrating the path-scoped rules pattern: the YAML
+> frontmatter `paths:` array is a glob list — Claude Code lazy-loads this file
+> only when a matching file is read or edited in the current session, instead
+> of loading it every turn (like the unscoped `behavioral-preamble.md`).
+> Copy this file, rename it to something like `{{your-domain}}.md`, replace
+> the glob(s) and the bullets below, and delete this note.
+
+## Conventions
+
+- [document a convention specific to files matching this path glob]
+- [document a second convention — e.g. a naming pattern, a required test
+  helper, a gotcha specific to this subsystem]
+- [document a third convention — e.g. a common mistake to avoid, or a
+  cross-reference to a related doc/rule]

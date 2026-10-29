@@ -1,0 +1,121 @@
+{
+  "env": {
+    "ENABLE_LSP_TOOL": "1",
+    "DISABLE_TELEMETRY": "1",
+    "BASH_DEFAULT_TIMEOUT_MS": "300000",
+    "BASH_MAX_TIMEOUT_MS": "600000"
+  },
+  "permissions": {
+    "allow": [
+      "mcp__memory__memory_search",
+      "mcp__memory__memory_get",
+      "mcp__memory__memory_get_recent",
+      "mcp__memory__memory_get_entity",
+      "mcp__memory__memory_list",
+      "mcp__codebase__code_search",
+      "mcp__codebase__code_get_file",
+      "mcp__codebase__code_index_status",
+      "mcp__exa__web_search_exa",
+      "mcp__exa__web_search_advanced_exa",
+      "mcp__exa__web_fetch_exa",
+      "mcp__claude_ai_Context7__resolve-library-id",
+      "mcp__claude_ai_Context7__query-docs"
+    ],
+    "deny": [
+      "WebSearch",
+      "WebFetch",
+      "mcp__secrets__secret_set",
+      "mcp__secrets__secret_delete",
+      "Bash(rm -rf:*)",
+      "Bash(sudo:*)",
+      "Bash(chmod 777:*)"
+    ]
+  },
+  "autoMode": {
+    "environment": ["$defaults"],
+    "allow": ["$defaults"]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/session-start.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/reinject-invariants.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/block-old-codex.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/steer-bash.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/capture-before-merge.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Skill",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/block-old-codex.sh"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/prettier-on-edit.sh"
+          },
+          {
+            "type": "command",
+            "command": ".claude/hooks/shellcheck-on-edit.sh"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/mnemosyne-capture.sh"
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/reinject-invariants.sh"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": ".claude/scripts/statusline.sh"
+  }
+}

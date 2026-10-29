@@ -1,0 +1,51 @@
+# Mnemosyne cron stack — box USER crontab reference artifact
+# =============================================================================
+# This is a REFERENCE FILE, NOT an installed crontab. See README.md (same dir)
+# for the install procedure. A single integration pass appends the lines you
+# actually want to the live `crontab -e` after review — do NOT pipe this whole
+# file into `crontab <file>` (it would clobber whatever else is already there).
+#
+# Pattern: box-cron-primary (this stack runs on whatever box hosts your
+# Mnemosyne MCP servers). Hygiene on every job:
+#   flock -n (no overlap) + timeout (hang ceiling) + staggered minute
+#   (no two jobs share a minute; nothing on :00 or :30).
+# Auth: if you invoke `claude -p` from a job, run it with whatever env forces
+# your subscription/OAuth auth rather than an API key, if that's your setup.
+# =============================================================================
+
+# CRON_TZ — set to your timezone. Shown here only so this artifact is
+# self-describing — check your existing crontab before re-adding it.
+CRON_TZ=UTC
+
+# --- Placeholders to replace before using any line below ---------------------
+#   /path/to/your/project        -> your project's working-tree path
+#   PROJECT_REPO_ID               -> the repo id this project is indexed under
+#                                    in the codebase MCP (env var read by
+#                                    mnemo-reindex.sh)
+#   MNEMOSYNE_COMPOSE_DIR          -> where the Mnemosyne stack's compose file
+#                                    lives (env var read by mnemo-reindex.sh)
+
+# --- Mnemosyne cron stack — APPEND the lines you want to `crontab -e` --------
+
+# Job A — codebase MCP incremental re-index (data-plane; NO claude -p).
+# Reads /repos:ro, re-embeds only files whose content_sha256 changed.
+# Run this before anything that consumes a fresh index (e.g. a distillation job).
+40 3 * * * MNEMOSYNE_COMPOSE_DIR=/opt/mnemosyne PROJECT_REPO_ID=your-repo-id flock -n /tmp/mnemo-reindex.lock -c '/path/to/your/project/.claude/scripts/cron/mnemo-reindex.sh' >> $HOME/.mnemo-reindex.log 2>&1
+
+# Job B (optional) — rule-distillation loop (claude -p; the learned-rules loop).
+# Body: .claude/scripts/mnemosyne/distill.sh. Must run AFTER the codebase reindex
+# (Job A) if the distiller ever consumes the code index, and needs DATABASE_URL
+# set to your project's own Postgres (see docs/LearnedRulesLoop.md).
+# 15 5 * * * flock -n /tmp/mnemo-distill.lock -c 'DATABASE_URL=postgres://... /path/to/your/project/.claude/scripts/mnemosyne/distill.sh' >> $HOME/.mnemo-distill.log 2>&1
+
+# Job C (optional) — weekly promotion digest for the learned-rules loop.
+# Body: .claude/scripts/mnemosyne/weekly-digest.sh.
+# 0 9 * * 1 flock -n /tmp/mnemo-digest.lock -c 'DATABASE_URL=postgres://... /path/to/your/project/.claude/scripts/mnemosyne/weekly-digest.sh' >> $HOME/.mnemo-digest.log 2>&1
+# --- end Mnemosyne cron stack ------------------------------------------------
+
+# --- Example slot map (adapt to your own schedule) ---------------------------
+#   40 3        codebase reindex           (Job A)
+#   15 5        rule-distillation          (Job B, optional)
+#   09 9 (Mon)  promotion digest           (Job C, optional)
+# No two jobs should share a minute; avoid :00/:30 if other cron on the box
+# already lands there.

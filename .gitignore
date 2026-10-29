@@ -1,0 +1,18 @@
+/target
+.DS_Store
+
+# The agent-os harness lives in .claude/ and IS tracked, so every worktree and
+# every machine gets the same agents, commands, hooks and rules. What stays
+# ignored is the working material the harness accumulates (plans, research,
+# evidence, handoffs, tech-debt, testing), the tool-managed worktrees, and any
+# local overrides. Durable outcomes go to Mnemosyne (project "glen").
+.claude/worktrees/
+.claude/plans/
+.claude/research/
+.claude/evidence/
+.claude/handoffs/
+.claude/tech-debt/
+.claude/testing/
+.claude/settings.local.json
+.claude/.orchestrator-mode
+.claude/*.local.*

@@ -1,0 +1,6 @@
+{
+  "name": "agent-os-workflow",
+  "version": "1.0.0",
+  "description": "Reusable Claude Code workflow suite — plan/implement/review/debug/audit orchestrators, project skills, slash commands, and enforcement hooks, packaged as one versioned unit.",
+  "author": { "name": "{{AUTHOR_NAME}}" }
+}

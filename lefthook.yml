@@ -1,0 +1,28 @@
+# Lefthook — git hooks. See https://lefthook.dev/configuration/.
+#
+# Bypass with `git commit --no-verify` / `git push --no-verify`, and only with a written reason.
+#
+#   - pre-commit → rustfmt check on staged Rust files + secret scan. Target: < 5 s.
+#   - pre-push   → clippy (warnings are errors) + the full test suite. Target: < 60 s.
+#
+# gitleaks is optional (`brew install gitleaks`); the hook degrades to a hint without it.
+
+pre-commit:
+  parallel: true
+  commands:
+    rustfmt:
+      glob: '*.rs'
+      run: cargo fmt --all -- --check
+    gitleaks:
+      run: |
+        if command -v gitleaks > /dev/null 2>&1; then
+          gitleaks protect --staged --verbose
+        else
+          echo "[hint] gitleaks not installed — run 'brew install gitleaks' to enable secret scanning"
+        fi
+
+pre-push:
+  commands:
+    checks:
+      # Sequential: clippy and test share target/, so running them in parallel only contends on the lock.
+      run: cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
