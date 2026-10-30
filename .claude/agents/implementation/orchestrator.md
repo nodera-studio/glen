@@ -159,6 +159,13 @@ Dispatch via Agent tool:
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {path}."
 ```
 
+**Network pre-flight.** The Codex sandbox may have no network. If the plan has network
+steps (`npm install`, CLI scaffolds, browser downloads, `cargo add` of a new crate), the
+planner lists them as a "Network pre-flight" block; if it did not, extract them yourself.
+Run that block in the wave's worktree BEFORE dispatching the Implementer, and tell the
+Implementer the steps are done: verify their results (files present, lockfile updated),
+do not re-run them.
+
 **Claude writes no product code — Codex does.** Do NOT dispatch separate coder /
 wiring / error-handling / test-writer / test-runner / verifier agents (those files
 were deleted); those concerns are fused into the Codex Implementer. The single most
@@ -222,6 +229,14 @@ plan's intended behavior, blind to how the Implementer happened to build it. If 
 fails, dispatch a fresh Implementer with the failing conformance checks (targeted),
 then re-run the suite. This is the one gate that catches "the tests pass because the
 Implementer wrote tests that match its own bug."
+
+**Spec ambiguity or a test that conflicts with the spec.** When the conformance writer
+flags an ambiguity, or a conformance test disagrees with the spec, settle it yourself:
+first clarify the design doc (`docs/design.md` or the plan's acceptance criteria), then
+resume the conformance writer (the suite's owner) to re-derive the assertion from the
+clarified text. The Implementer never edits conformance assertions. If a tracked test the
+Implementer wrote has to change to match the clarification, call that change out in the
+Report.
 
 **Optional arm 3 — wire up your own domain-rubric gate here.** If this project has a
 class of NON-NUMERIC, structural/textual artifacts whose correctness an LLM rubric can

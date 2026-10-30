@@ -219,7 +219,9 @@ multi-tenant / fiscal invariants that must not regress — not every micro-behav
 
 ## Seed the memory MCP
 
-After writing the plan, seed the **memory MCP** with what must survive into the Implementer's
+Do not write Mnemosyne memories unless the orchestrator asks; report decisions in the plan instead.
+
+When the orchestrator asks, seed the **memory MCP** with what must survive into the Implementer's
 context (and future sessions): the **EARS acceptance criteria** (the spec-drift baseline), the
 **spec checklist** (the ordered steps), the **key decisions**, and a short **ADR** (architecture
 decision record) — the chosen base approach, the alternatives rejected + why (one line each), the
