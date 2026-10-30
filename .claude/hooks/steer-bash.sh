@@ -63,9 +63,14 @@ while IFS= read -r seg || [ -n "$seg" ]; do
       # file://, pipes) is fine.
       # Add your own trusted remote hosts here if needed (e.g. your own infra
       # boxes, self-hosted services) — only loopback ships by default.
-      ALLOW_HOSTS='localhost|127\.0\.0\.1|0\.0\.0\.0|::1'
-      if printf '%s' "$seg" | grep -qiE 'https?://' \
-         && ! printf '%s' "$seg" | grep -qiE "https?://\[?($ALLOW_HOSTS)\]?([:/ ]|\$|\"|'|$)"; then
+      # glen's own deployed site (W7) is allowed so live checks of status codes and
+      # headers (`curl -sSI`) can run from the orchestrator and review agents.
+      ALLOW_HOSTS='localhost|127\.0\.0\.1|0\.0\.0\.0|::1|glen\.nodera\.workers\.dev'
+      # Every URL in the segment must be on the allow-list (one allowed URL must not
+      # smuggle a second, external one through).
+      bad_url=$(printf '%s' "$seg" | grep -oiE "https?://[^ \"']*" \
+        | grep -viE "^https?://\[?($ALLOW_HOSTS)\]?([:/?#]|\$)" | head -n 1)
+      if [ -n "$bad_url" ]; then
         deny "Don't fetch external URLs with $base — WebFetch is off by design. For web content use the Exa MCP (web_search_exa / advanced search + crawl); for a known service use its SDK/CLI. Loopback is allowed — add a host to ALLOW_HOSTS in hooks/steer-bash.sh for anything else you genuinely need."
       fi
       ;;
