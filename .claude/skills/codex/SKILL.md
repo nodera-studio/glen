@@ -149,7 +149,10 @@ nothing for that long ends with "Codex app-server produced no activity for 180s 
 stalled" and exit 1. Long, high-effort final answers (a big plan after many file reads) trip
 it. Ask for a COMPACT result (about 120 lines at most) and, when the context is already local,
 no web search; that avoided the stall. After two stalls on the same task, stop retrying:
-degrade to the Claude engine alone and say so in the report.
+degrade to the Claude engine alone and say so in the report. The Implementer stalls the same
+way when it reads a very long file in full before editing; small fixes go to it as line-range
+briefs, and it reports each failed attempt and stops after two (`coder-codex.md` → Steps 3
+and 4).
 
 ### Capacity and rate errors
 
