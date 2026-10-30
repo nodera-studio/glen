@@ -20,7 +20,7 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | --- | --- |
 | `{{PROJECT_NAME}}` | glen |
 | `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. A small TypeScript omp extension may come later. |
-| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs. No web framework. |
+| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; rustix (lease probe, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix). No web framework. |
 | `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked` |
 | `{{MONOREPO}}` | no: a single crate, no Cargo workspace |
 | `{{FRONTEND_DIR}}` | none |

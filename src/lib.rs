@@ -30,6 +30,11 @@ pub fn run() -> ExitCode {
     if let Err(e) = glen_home::resolve(&env) {
         return output::emit_error(&ctx, e);
     }
+    if let cli::Command::Tail(a) = &cli.command
+        && a.follow
+    {
+        return commands::tail::follow(&cli, a, &env, &ctx);
+    }
     match commands::dispatch(&cli, &env, &ctx) {
         Ok(o) => output::emit(&ctx, o, cli.command.name()),
         Err(e) => output::emit_error(&ctx, e),

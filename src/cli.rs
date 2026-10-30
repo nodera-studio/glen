@@ -39,11 +39,20 @@ pub enum ColorWhen {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    #[command(hide = true, about = "List omp sessions")]
+    #[command(
+        about = "List omp sessions (current project; --all for every project)",
+        after_help = "Examples:\n  glen ls\n  glen ls --all --live\n  glen ls --since 2h --json"
+    )]
     Ls(LsArgs),
-    #[command(hide = true, about = "Read an active-branch transcript")]
+    #[command(
+        about = "Read a session transcript (active branch)",
+        after_help = "Examples:\n  glen show @latest\n  glen show e27c0de --json\n  glen show e27c0de --tools full --thinking"
+    )]
     Show(ShowArgs),
-    #[command(hide = true, about = "Read the latest transcript items")]
+    #[command(
+        about = "Print the latest transcript items (-f follows)",
+        after_help = "Examples:\n  glen tail @latest -n 5\n  glen tail e27c0de -f\n  glen tail e27c0de -n 0 -f --json"
+    )]
     Tail(TailArgs),
     #[command(hide = true, about = "Send a message to omp")]
     Send(SendArgs),
@@ -66,14 +75,21 @@ pub enum Command {
 }
 #[derive(Debug, Args)]
 pub struct LsArgs {
-    #[arg(long)]
+    #[arg(long, conflicts_with = "cwd")]
     pub all: bool,
     #[arg(long, value_name = "DIR")]
     pub cwd: Option<PathBuf>,
-    #[arg(short = 'n', long, default_value_t = 20)]
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 20,
+        help = "maximum rows (0 = no limit)"
+    )]
     pub limit: usize,
     #[arg(long)]
     pub live: bool,
+    #[arg(long,value_name="DUR",value_parser=parse_since)]
+    pub since: Option<Duration>,
 }
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Tools {
@@ -94,7 +110,12 @@ pub struct ShowArgs {
 #[derive(Debug, Args)]
 pub struct TailArgs {
     pub session: String,
-    #[arg(short = 'n', long, default_value_t = 10)]
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 10,
+        help = "items (0 = only new with -f)"
+    )]
     pub lines: usize,
     #[arg(short = 'f', long)]
     pub follow: bool,
@@ -230,6 +251,28 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         .ok_or_else(invalid)?;
     Ok(Duration::from_millis(ms))
 }
+pub fn parse_since(s: &str) -> Result<Duration, String> {
+    let (digits, mult) = match s.as_bytes().last() {
+        Some(b's') => (&s[..s.len() - 1], 1),
+        Some(b'm') => (&s[..s.len() - 1], 60),
+        Some(b'h') => (&s[..s.len() - 1], 3600),
+        Some(b'd') => (&s[..s.len() - 1], 86400),
+        Some(b'w') => (&s[..s.len() - 1], 604800),
+        _ => (s, 1),
+    };
+    let invalid =
+        || "duration must be an unsigned integer with s, m, h, d or w (at most 3650d)".to_string();
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid());
+    }
+    let seconds = digits
+        .parse::<u64>()
+        .ok()
+        .and_then(|n| n.checked_mul(mult))
+        .filter(|n| *n <= 3650 * 86400)
+        .ok_or_else(invalid)?;
+    Ok(Duration::from_secs(seconds))
+}
 pub fn public_command() -> clap::Command {
     let full = Cli::command();
     clap::Command::new("glen")
@@ -262,6 +305,26 @@ mod tests {
         }
         for s in ["abc", "-1", "25h", "+1", "", "18446744073709551615h"] {
             assert!(parse_duration(s).is_err());
+        }
+    }
+}
+
+#[cfg(test)]
+mod since_tests {
+    use super::*;
+    #[test]
+    fn durations() {
+        for (s, n) in [
+            ("90", 90),
+            ("15m", 900),
+            ("2h", 7200),
+            ("3d", 259200),
+            ("1w", 604800),
+        ] {
+            assert_eq!(parse_since(s).unwrap().as_secs(), n)
+        }
+        for s in ["1y", "-1", "3651d", "", "+1", "18446744073709551615w"] {
+            assert!(parse_since(s).is_err());
         }
     }
 }
