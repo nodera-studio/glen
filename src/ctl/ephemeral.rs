@@ -36,11 +36,30 @@ struct Process {
     reaped: bool,
 }
 impl Process {
-    fn stop(&mut self) -> io::Result<()> {
+    fn stop(&mut self, grace: Duration) -> io::Result<()> {
         if self.reaped {
             return Ok(());
         }
         let pid = self.child.id();
+        let end = Instant::now() + grace;
+        loop {
+            if self.child.try_wait()?.is_some() {
+                let group = rustix::process::Pid::from_raw(pid as i32)
+                    .ok_or_else(|| io::Error::other("invalid omp pid"))?;
+                match rustix::process::test_kill_process_group(group) {
+                    Err(rustix::io::Errno::SRCH) => {
+                        self.reaped = true;
+                        return Ok(());
+                    }
+                    Ok(()) => (),
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            if Instant::now() >= end {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         for signal in [rustix::process::Signal::TERM, rustix::process::Signal::KILL] {
             rpc::kill_group(pid, signal)?;
             let end = Instant::now() + Duration::from_secs(1);
@@ -64,9 +83,9 @@ impl Process {
         }
         Err(io::Error::other("omp process group survived SIGKILL"))
     }
-    fn finish(&mut self) -> Vec<Warning> {
+    fn finish(&mut self, grace: Duration) -> Vec<Warning> {
         let mut warnings = vec![];
-        if let Err(error) = self.stop() {
+        if let Err(error) = self.stop(grace) {
             warnings.push(Warning {
                 code: "teardown_error".into(),
                 message: error.to_string(),
@@ -97,7 +116,7 @@ impl Process {
 }
 impl Drop for Process {
     fn drop(&mut self) {
-        drop(self.finish());
+        drop(self.finish(Duration::ZERO));
     }
 }
 fn drain_stderr(mut stderr: impl Read) -> io::Result<Vec<Warning>> {
@@ -346,8 +365,8 @@ impl Ephemeral {
         }
     }
     fn terminate(&mut self) {
-        self.warnings.extend(self.process.finish());
         let Some(client) = self.client.take() else {
+            self.warnings.extend(self.process.finish(Duration::ZERO));
             return;
         };
         if Arc::strong_count(&client) > 1 {
@@ -373,6 +392,10 @@ impl Ephemeral {
                 drop(client);
             }
         }
+        // from_io closes the transport; Process still owns and must reap the child.
+        // Give stdin EOF a short grace period before TERM/KILL escalation.
+        self.warnings
+            .extend(self.process.finish(Duration::from_millis(100)));
     }
     fn run(&mut self, op: Option<Op>, expect: Option<String>) -> Result<Value, OpError> {
         stopped(self.deadline, &self.stop)?;

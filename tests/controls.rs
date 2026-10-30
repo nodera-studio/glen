@@ -535,6 +535,13 @@ fn ac352_live_controls_and_ac353_old_extension() {
             }
         }
         if old {
+            assert_eq!(
+                b.ext_log()
+                    .iter()
+                    .filter(|r| r["dir"] == "in" && r["frame"]["op"] == "hello")
+                    .count(),
+                4
+            );
             assert!(
                 b.ext_log()
                     .iter()
@@ -680,6 +687,12 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
     poll(Duration::from_secs(2), || {
         (b.frames_in("get_state").len() >= 2).then_some(())
     });
+    // Worker polling can emit get_state, but only a.json asks for the model catalog.
+    // Its final get_state is delayed by the serial fake, keeping a.json in flight.
+    poll(Duration::from_secs(10), || {
+        (!b.frames_in("get_available_models").is_empty()).then_some(())
+    });
+    assert!(!dir.join("a.done.json").exists());
     let start = Instant::now();
     fs::write(dir.join("b.json"), r#"{"v":1,"op":"abort"}"#).unwrap();
     fs::write(
@@ -691,6 +704,49 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
     b.wait_terminal(id, Duration::from_secs(13));
     assert!(start.elapsed() < Duration::from_secs(13));
     b.wait_worker_gone(id);
+    let log = b.fake_log();
+    let incoming: Vec<_> = log
+        .iter()
+        .filter(|r| r["event"] == "in")
+        .map(|r| &r["frame"])
+        .collect();
+    let models = incoming
+        .iter()
+        .position(|f| f["type"] == "get_available_models")
+        .unwrap();
+    assert_eq!(b.frames_in("get_available_models").len(), 1);
+    assert_eq!(incoming[models - 1]["type"], "get_state");
+    assert_eq!(incoming[models + 1]["type"], "get_state");
+    let abort = log
+        .iter()
+        .position(|r| r["event"] == "in" && r["frame"]["type"] == "abort")
+        .unwrap();
+    // The catalog and the final state response must both precede abort dispatch.
+    for frame in &incoming[models..=models + 1] {
+        let response = log
+            .iter()
+            .position(|r| {
+                r["event"] == "out"
+                    && r["frame"]["type"] == "response"
+                    && r["frame"]["id"] == frame["id"]
+            })
+            .unwrap();
+        assert_eq!(log[response]["frame"]["success"], true);
+        assert!(
+            response < abort,
+            "abort preceded a.json's response: {log:?}"
+        );
+    }
+    let a: Value = serde_json::from_slice(&fs::read(dir.join("a.done.json")).unwrap()).unwrap();
+    assert_eq!(a["v"], 1);
+    assert_eq!(a["ok"], true);
+    assert_eq!(a["data"]["session_id"], A_ID);
+    assert_eq!(
+        a["data"]["current"],
+        json!({"provider":"fake","id":"fake-1"})
+    );
+    assert_eq!(a["data"]["thinking_level"], "high");
+    assert_eq!(a["data"]["models"].as_array().unwrap().len(), 6);
     assert!(b.frames_in("set_thinking_level").is_empty());
     let c: Value = serde_json::from_slice(&fs::read(dir.join("c.done.json")).unwrap()).unwrap();
     assert_eq!(c["error"]["code"], "job_ended");
@@ -1283,6 +1339,48 @@ fn fix3_startup_cancel_reaps_omp_before_releasing_session_lock() {
         assert!(start.elapsed() < Duration::from_secs(5));
         assert!(b.frames_in("set_model").is_empty());
         drop(lock);
+    }
+}
+
+#[test]
+fn fix3_ephemeral_teardown_closes_transport_before_escalating() {
+    for args in [
+        vec!["models", "--json"],
+        vec!["models", "e27c0de", "--json"],
+        vec!["model", "e27c0de", "fake/fake-2", "--json"],
+        vec!["thinking", "e27c0de", "low", "--json"],
+        vec!["compact", "e27c0de", "--json"],
+    ] {
+        let b = RpcBox::new();
+        // This peer ignores TERM, so killing before stdin EOF prevents its exit log.
+        let value = checked(
+            command(&b, &args)
+                .env("FAKE_OMP_SCENARIO", "wedge")
+                .output()
+                .unwrap(),
+            0,
+        );
+        assert!(!warning(&value, "teardown_error"), "{args:?}: {value}");
+        let log = b.fake_log();
+        assert!(
+            log.iter()
+                .any(|r| r["event"] == "exit" && r["reason"] == "stdin eof"),
+            "peer did not exit on EOF for {args:?}: {log:?}"
+        );
+        let pid = log.iter().find(|r| r["event"] == "start").unwrap()["pid"]
+            .as_u64()
+            .unwrap() as u32;
+        assert!(matches!(
+            glen::jobs::liveness::start_token(pid),
+            glen::jobs::liveness::Probe::Gone
+        ));
+        if args[0] != "models" {
+            assert!(
+                glen::jobs::lock::try_acquire(&home(&b), A_ID)
+                    .unwrap()
+                    .is_some()
+            );
+        }
     }
 }
 

@@ -34,7 +34,7 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 | 4 | false | `ambiguous` | use a candidate handle |
 | 5 | false | `omp_unavailable` | omp missing, broken or timed out |
 | 6 | false | `no_route` | refusal: live owner, unknown lease, or sandbox |
-| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job |
+| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation |
 | 8 | false | `not_implemented` | hidden unfinished command |
 | 10 | true | running | job continues; use wait |
 | 11 | true | forked | use forked.to_handle |
@@ -648,6 +648,8 @@ The `omp_env_files` check value is an array of absolute paths (empty when none n
 ## `glen completions`
 
 Raw script by default; JSON only when explicitly requested.
+`completions --json` may spill under the same `GLEN_MAX_OUTPUT` rule as other document output.
+This is an accepted consequence of W0's spill design, not a defect.
 
 | Field | Meaning |
 |---|---|
@@ -966,6 +968,8 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `not_yet_persisted` | show, tail | live session has not written a transcript yet |
 | `extension_version_mismatch` | send | live extension version differs from glen |
 | `batched` | send, wait | omp answered this request together with other queued requests |
+| `holder_unavailable` | model, thinking, compact | could not mark the session lock with the control holder identity |
+| `teardown_error` | models, model, thinking, compact | RPC process, client or reader cleanup did not finish cleanly |
 | `live_turn_continues` | send, wait | live job cancelled; the omp turn keeps running |
 | `delivery_unknown` | send, wait | live endpoint never acknowledged the message |
 | `socket_path_too_long` | install-extension | GLEN_HOME is too long for a unix socket; live delivery is off |
@@ -981,6 +985,50 @@ New visible commands and visible aliases must add a section and contract runner 
 
 `glen abort <session> [--timeout DUR]` stops the active run. Data fields are `session:{id,handle,path}`, `route:live|job|none`, `was:busy|idle`, `aborted`, `idle_after`, `queued`, `queued_jobs` (job handles). The job route adds `job` and `job_status`; `aborted` means that job ended aborted. An idle abort starts nothing. `abort_pending` means omp has not become idle; `jobs_queued` means waiting glen jobs start next. Queued omp messages remain queued.
 
+<!-- contract: abort.idle -->
+```json
+{
+  "data": {
+    "aborted": false,
+    "idle_after": true,
+    "queued": false,
+    "queued_jobs": [],
+    "route": "none",
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "was": "idle"
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: abort.aborted -->
+```json
+{
+  "data": {
+    "aborted": true,
+    "idle_after": true,
+    "job": "jb3c1037",
+    "job_status": "aborted",
+    "queued": false,
+    "queued_jobs": [],
+    "route": "job",
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "was": "busy"
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
 ## `glen stop`
 
 Visible alias of `glen abort`, with exactly the same arguments and envelope.
@@ -991,18 +1039,345 @@ Visible alias of `glen abort`, with exactly the same arguments and envelope.
 
 Without a target omp starts with `--no-session`; `default_model` is that in-memory selection and current is null. Disk fallback never resumes the target. No thinking entry means null; configured thinking (including auto) is retained when recorded. Endpoint-only fallback has null selection and `not_yet_persisted`. Other fallbacks can warn `session_unreachable` or `extension_outdated`. No GLEN_HOME is created except for oversized output spill.
 
+<!-- contract: models -->
+```json
+{
+  "data": {
+    "current": null,
+    "current_source": null,
+    "default_model": {
+      "id": "fake-1",
+      "provider": "fake"
+    },
+    "models": [
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "fake-1",
+        "max_tokens": 8192,
+        "name": "fake fake-1",
+        "provider": "fake",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "fake-2",
+        "max_tokens": 8192,
+        "name": "fake fake-2",
+        "provider": "fake",
+        "reasoning": false,
+        "thinking_levels": [
+          "off"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "locked-1",
+        "max_tokens": 8192,
+        "name": "nokey locked-1",
+        "provider": "nokey",
+        "reasoning": false,
+        "thinking_levels": [
+          "off"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "fake-2",
+        "max_tokens": 8192,
+        "name": "other fake-2",
+        "provider": "other",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "vendor/m-3",
+        "max_tokens": 8192,
+        "name": "router vendor/m-3",
+        "provider": "router",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "low",
+          "high"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "m-3",
+        "max_tokens": 8192,
+        "name": "vendor m-3",
+        "provider": "vendor",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "low",
+          "high"
+        ]
+      }
+    ],
+    "route": "rpc",
+    "session": null,
+    "thinking_configured": null,
+    "thinking_level": null,
+    "total": 6
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: models.session -->
+```json
+{
+  "data": {
+    "current": {
+      "id": "claude-sonnet-4-5",
+      "provider": "anthropic"
+    },
+    "current_source": "disk",
+    "default_model": null,
+    "models": [
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "fake-1",
+        "max_tokens": 8192,
+        "name": "fake fake-1",
+        "provider": "fake",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "low",
+          "medium",
+          "high"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "fake-2",
+        "max_tokens": 8192,
+        "name": "fake fake-2",
+        "provider": "fake",
+        "reasoning": false,
+        "thinking_levels": [
+          "off"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "locked-1",
+        "max_tokens": 8192,
+        "name": "nokey locked-1",
+        "provider": "nokey",
+        "reasoning": false,
+        "thinking_levels": [
+          "off"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "fake-2",
+        "max_tokens": 8192,
+        "name": "other fake-2",
+        "provider": "other",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "minimal",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "vendor/m-3",
+        "max_tokens": 8192,
+        "name": "router vendor/m-3",
+        "provider": "router",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "low",
+          "high"
+        ]
+      },
+      {
+        "context_window": 200000,
+        "current": false,
+        "id": "m-3",
+        "max_tokens": 8192,
+        "name": "vendor m-3",
+        "provider": "vendor",
+        "reasoning": true,
+        "thinking_levels": [
+          "off",
+          "low",
+          "high"
+        ]
+      }
+    ],
+    "route": "rpc",
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "thinking_configured": "high",
+    "thinking_level": "high",
+    "total": 6
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
 ## `glen model`
 
 `glen model <session> <spec> [--timeout DUR]` returns `{session,route,model:{provider,id,name},previous:{provider,id}|null,changed,thinking_level,thinking_levels,busy,scope:"session",forked}`. Exact provider/id wins; otherwise a case-insensitive full pair or bare id must be unique. Ambiguity exits 4 with `details.candidates:[{provider,id,name}]`; not found exits 3. omp records even an unchanged model selection. `thinking_changed` reports a changed effective level. Busy changes apply to the next model request.
+
+<!-- contract: model -->
+```json
+{
+  "data": {
+    "busy": false,
+    "changed": true,
+    "forked": null,
+    "model": {
+      "id": "fake-2",
+      "name": "fake fake-2",
+      "provider": "fake"
+    },
+    "previous": {
+      "id": "fake-1",
+      "provider": "fake"
+    },
+    "route": "rpc",
+    "scope": "session",
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "thinking_level": "off",
+    "thinking_levels": [
+      "off"
+    ]
+  },
+  "ok": true,
+  "v": 1,
+  "warnings": [
+    {
+      "code": "thinking_changed",
+      "message": "omp changed thinking from high to off for the new model"
+    }
+  ]
+}
+```
 
 ## `glen thinking`
 
 `glen thinking <session> <level> [--timeout DUR]` returns `{session,route,thinking_level,requested,previous,changed,model:{provider,id}|null,available,busy,scope:"session",forked}`. Levels are off|minimal|low|medium|high|xhigh|max, validated against the current model before a set call. Invalid model levels exit 2 usage with `details.reason:"invalid_level"`, available and model. `thinking_clamped` reports an effective level differing from requested. auto/inherit are not offered.
 
+<!-- contract: thinking -->
+```json
+{
+  "data": {
+    "available": [
+      "off",
+      "low",
+      "medium",
+      "high"
+    ],
+    "busy": false,
+    "changed": false,
+    "forked": null,
+    "model": {
+      "id": "fake-1",
+      "provider": "fake"
+    },
+    "previous": "high",
+    "requested": "high",
+    "route": "rpc",
+    "scope": "session",
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "thinking_level": "high"
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
 ## `glen compact`
 
 `glen compact <session> [--instructions TEXT] [--timeout DUR]` returns `{session,route,compacted:true,tokens_before,tokens_after,forked}`. Instructions are at most 524288 bytes. Streaming, compacting, queued messages or an active job refuse with control_failed/busy. Token fields are null when not reported.
 
+<!-- contract: compact -->
+```json
+{
+  "data": {
+    "compacted": true,
+    "forked": null,
+    "route": "rpc",
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "tokens_after": 123,
+    "tokens_before": 1234
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
 All controls use one 90s default command deadline, accept a positive `--timeout DUR`, and route live → owning job → unowned RPC. JSON emits one envelope and empty stderr. Mutations never persist global settings. A changed post-op session id exits 11 with `forked:{from,to,to_handle}`; otherwise forked is null. Model/thinking changes on endpoint-only sessions warn `not_yet_persisted` until omp's first answer writes the file.
 
 `control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol. Missing credentials include an omp-login hint. RPC deadlines and SIGINT stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT exits 130 with `{status:"interrupted",session,route,interrupted:true,hint}`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
+
+<!-- contract: error.control_failed -->
+```json
+{
+  "error": {
+    "code": "control_failed",
+    "details": {
+      "reason": "omp_error"
+    },
+    "message": "cannot control session e27c0de: Nothing to compact"
+  },
+  "ok": false,
+  "v": 1
+}
+```
