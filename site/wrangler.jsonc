@@ -2,6 +2,7 @@
 // (W7 plan D8). `npm run deploy` link-checks dist/ first; `npm run deploy:dry` needs no login.
 {
   "name": "glen",
+  "account_id": "859b4a03642ac2a45e7157bfd9024c21",
   "compatibility_date": "2026-10-15",
   "workers_dev": true,
   "preview_urls": false,

@@ -5,7 +5,7 @@ on:
     tags: ['v*']
   workflow_dispatch:
   pull_request:
-    paths: ['.github/workflows/release.yml', 'install.sh', 'scripts/package-release.sh']
+    paths: ['.github/workflows/release.yml', 'install.sh', 'scripts/package-release.sh', 'Cargo.toml', 'Cargo.lock']
 
 permissions:
   contents: read
@@ -66,11 +66,16 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.rust_targets }}
-      - uses: Swatinem/rust-cache@v2
+      # GitHub Actions has a ~10 GB per-repo cache budget. Share the source-only
+      # checkout across platforms; main CI alone saves it, avoiding per-tag
+      # and per-platform copies (and large target/ caches) that thrash the budget.
+      - uses: actions/cache/restore@v4
         with:
-          cache-on-failure: true
-          shared-key: release-${{ matrix.os }}
-          cache-targets: false
+          path: ~/.cargo/git
+          key: omp-git-v1-${{ hashFiles('Cargo.lock') }}
+          # Tag runs can fall back to the latest cache on the default branch.
+          restore-keys: |
+            omp-git-v1-
       - shell: bash
         env:
           TARGETS: ${{ matrix.targets }}

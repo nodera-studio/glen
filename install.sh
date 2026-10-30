@@ -50,7 +50,7 @@ hash_file() {
 
 download() {
     printf 'glen-install: downloading %s\n' "$1" >&2
-    if ! curl -fsSL --retry 3 --connect-timeout 15 "$@"; then
+    if ! curl -fsSL --retry 3 --connect-timeout 15 --max-time 300 "$@"; then
         fail "could not download $1; is a glen release published for $target? Build from source: cargo install --git https://github.com/nodera-studio/glen --locked"
     fi
 }
@@ -143,6 +143,15 @@ main() {
             *) fail "unexpected archive entry $entry" ;;
         esac
     done < "$tmp/entries"
+    # GNU and BSD tar both start verbose entries with the file type. Reject
+    # links (including hardlinks) and special files before extraction.
+    tar -tvzf "$tmp/$asset" > "$tmp/types" || fail "could not list types in $asset"
+    while IFS= read -r entry; do
+        case "$entry" in
+            -*|d*) ;;
+            *) fail "unexpected archive entry type: $entry" ;;
+        esac
+    done < "$tmp/types"
     tar -xzf "$tmp/$asset" -C "$tmp" || fail "could not extract $asset"
     [ -f "$tmp/glen-$target/glen" ] || fail "archive is missing glen-$target/glen"
     if [ -d "$dir" ] && [ ! -w "$dir" ]; then
@@ -150,12 +159,15 @@ main() {
     fi
     mkdir -p "$dir" || fail "cannot create $dir; choose another directory with --prefix (glen never uses sudo)"
     [ -w "$dir" ] || fail "$dir is not writable; choose another directory with --prefix (glen never uses sudo)"
-    install_tmp=$dir/.glen.tmp.$$
+    [ ! -L "$dir/glen" ] && [ ! -d "$dir/glen" ] || fail "destination is a symlink or directory: $dir/glen"
+    install_tmp=$(mktemp "$dir/.glen.tmp.XXXXXXXXXX") || fail "cannot create staging file in $dir"
     cp "$tmp/glen-$target/glen" "$install_tmp" || fail "cannot copy glen to $dir"
     chmod 0755 "$install_tmp" || fail "cannot set executable mode in $dir"
+    installed_version=$("$install_tmp" --version 2>/dev/null) || fail 'staged glen --version failed; leaving existing binary in place'
+    [ ! -L "$dir/glen" ] && [ ! -d "$dir/glen" ] || fail "destination is a symlink or directory: $dir/glen"
     mv -f "$install_tmp" "$dir/glen" || fail "cannot install glen in $dir"
     install_tmp=
-    installed_version=$("$dir/glen" --version 2>/dev/null) || installed_version=glen
+    [ -f "$dir/glen" ] && [ ! -L "$dir/glen" ] || fail "installed glen is not a regular file: $dir/glen"
     printf 'installed %s to %s\n' "$installed_version" "$dir/glen"
     case ":${PATH:-}:" in
         *:"$dir":*) ;;
