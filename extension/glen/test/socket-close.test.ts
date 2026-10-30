@@ -2,12 +2,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { finish } from "../index.ts";
-import { fixture, client, frame } from "./fake-pi.ts";
+import { fixture, client, frame, request } from "./fake-pi.ts";
 
 function socket() {
     const conn: any = new EventEmitter(), calls: string[] = [];
     const ctx: any = { setTimeout: (fn: () => void, ms: number) => setTimeout(fn, ms), clearTimer: (timer: any) => clearTimeout(timer) };
-    conn.destroyed = false; conn.writableEnded = false; conn.readableEnded = true;
+    conn.destroyed = false; conn.writableEnded = false; conn.readableEnded = true; conn.writableLength = 0;
     conn.write = (data: string, callback: Function) => { calls.push(`write:${data}`); conn.flushed = callback; return false; };
     conn.end = (callback: Function) => { calls.push("end"); conn.writableEnded = true; conn.finished = callback; };
     conn.destroy = () => { calls.push("destroy"); conn.destroyed = true; conn.emit("close"); };
@@ -15,11 +15,31 @@ function socket() {
 }
 test("D1 final response waits for the write callback under backpressure before ending", () => {
     for (const response of [undefined, { ok: true }]) {
-        const { conn, calls, ctx } = socket(); finish(ctx, conn, response);
+        const { conn, calls, ctx } = socket();
+        // With no final frame, the barrier protects a previously queued event.
+        if (response === undefined) conn.writableLength = 1;
+        finish(ctx, conn, response);
         assert.deepEqual(calls, [response ? 'write:{"ok":true}\n' : "write:"]);
         conn.flushed(); assert.equal(calls.at(-1), "end");
         conn.finished(); assert.equal(calls.at(-1), "destroy");
     }
+});
+test("C2-8 idle finish ends exactly once without an empty flush write", () => {
+    const { conn, calls, ctx } = socket();
+    finish(ctx, conn);
+    assert.deepEqual(calls, ["end"]);
+    finish(ctx, conn);
+    assert.deepEqual(calls, ["end"]);
+    conn.finished();
+    assert.deepEqual(calls, ["end", "destroy"]);
+});
+test("C2-8 idle finish preserves the close deadline while waiting for peer EOF", t => {
+    t.mock.timers.enable({ apis: ["setTimeout"] });
+    const { conn, calls, ctx } = socket(); conn.readableEnded = false;
+    finish(ctx, conn); conn.finished();
+    assert.deepEqual(calls, ["end"]);
+    t.mock.timers.tick(2999); assert.equal(conn.destroyed, false);
+    t.mock.timers.tick(1); assert.deepEqual(calls, ["end", "destroy"]);
 });
 test("D1 stalled writes and stalled end callbacks are destroyed within three seconds", t => {
     t.mock.timers.enable({ apis: ["setTimeout"] });
@@ -77,4 +97,37 @@ test("D1 hello, state, controls and errors send exactly one frame then EOF with 
             }));
         }
     } finally { await f.close(); }
+});
+
+test("C2-6 compact without instructions reports omp's no-entry callback message", async () => {
+    for (const compactOnError of [new Error("Nothing to compact (session too small)"), "Nothing to compact (session too small)"]) {
+        const f = await fixture({ compactNoEntry: true, compactOnError });
+        try {
+            const e = await f.start(); assert.ok(e, f.notes.join("\n"));
+            const [result] = await request(e.socket, frame("compact"));
+            assert.equal(result.ok, false);
+            assert.equal(result.error.code, "omp_error");
+            assert.equal(result.error.message, "Nothing to compact (session too small)");
+            assert.equal(f.calls.compact.length, 1);
+            assert.deepEqual(Object.keys(f.calls.compact[0]), ["onError"]);
+            assert.equal(typeof f.calls.compact[0].onError, "function");
+        } finally { await f.close(); }
+    }
+});
+
+test("C2-6 compact instructions require the string API and retain generic no-entry errors", async () => {
+    for (const instructions of ["keep facts", ""]) {
+        for (const compactResult of [undefined, "cancelled"]) {
+            const f = await fixture({ compactNoEntry: true, compactResult, compactOnError: new Error("Nothing to compact (session too small)") });
+            try {
+                const e = await f.start(); assert.ok(e, f.notes.join("\n"));
+                const [result] = await request(e.socket, frame("compact", { instructions }));
+                assert.equal(result.ok, false);
+                assert.equal(result.error.code, "omp_error");
+                assert.equal(result.error.message, compactResult === "cancelled" ? "compaction cancelled" : "compaction did not run");
+                // CompactOptions has no customInstructions field: this must be one string argument.
+                assert.deepEqual(f.calls.compact, [instructions]);
+            } finally { await f.close(); }
+        }
+    }
 });

@@ -137,6 +137,9 @@ fn run() -> io::Result<u8> {
         stderr.write_all(message.as_bytes())?;
         stderr.flush()?;
     }
+    if scenario == "startup_exit" {
+        return Ok(1);
+    }
     let mut id = if let Some(path) = &resume {
         fs::read_to_string(path)?
             .lines()

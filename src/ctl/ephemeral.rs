@@ -295,7 +295,7 @@ impl Ephemeral {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|error| OpenError::Failed(start_error(error)))?;
+            .map_err(|error| OpenError::Failed(start_error(error, vec![])))?;
         let mut process = Process {
             child,
             stderr: None,
@@ -306,7 +306,8 @@ impl Ephemeral {
             process.child.stdout.take(),
             process.child.stderr.take(),
         ) else {
-            return Err(OpenError::Failed(start_error("missing omp pipe")));
+            let warnings = process.finish(Duration::from_millis(100));
+            return Err(OpenError::Failed(start_error("missing omp pipe", warnings)));
         };
         process.stderr = Some(std::thread::spawn(move || drain_stderr(stderr)));
         let (tx, rx) = mpsc::channel();
@@ -330,7 +331,10 @@ impl Ephemeral {
             }
         });
         loop {
-            stopped(deadline, &stop).map_err(OpenError::Stopped)?;
+            if let Err(error) = stopped(deadline, &stop) {
+                let warnings = process.finish(Duration::from_millis(100));
+                return Err(startup_stopped(error, warnings));
+            }
             match rx.recv_timeout(
                 Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
             ) {
@@ -348,20 +352,23 @@ impl Ephemeral {
                     });
                 }
                 Ok(Err(error)) => {
-                    if Instant::now() >= deadline {
-                        return Err(OpenError::Stopped(OpError::new(
-                            ops::TIMEOUT,
-                            "omp startup exceeded the command deadline",
-                        )));
+                    let timed_out = Instant::now() >= deadline;
+                    let warnings = process.finish(Duration::from_millis(100));
+                    if timed_out {
+                        return Err(startup_stopped(
+                            OpError::new(ops::TIMEOUT, "omp startup exceeded the command deadline"),
+                            warnings,
+                        ));
                     }
-                    return Err(OpenError::Failed(start_error(error)));
+                    return Err(OpenError::Failed(start_error(error, warnings)));
                 }
                 Err(RecvTimeoutError::Timeout) => (),
                 Err(RecvTimeoutError::Disconnected) => {
-                    return Err(OpenError::Stopped(OpError::new(
-                        ops::INTERNAL,
-                        "omp startup thread ended",
-                    )));
+                    let warnings = process.finish(Duration::from_millis(100));
+                    return Err(startup_stopped(
+                        OpError::new(ops::INTERNAL, "omp startup thread ended"),
+                        warnings,
+                    ));
                 }
             }
         }
@@ -511,12 +518,28 @@ impl Ephemeral {
         Ok((forked, std::mem::take(&mut self.warnings)))
     }
 }
-fn start_error(error: impl std::fmt::Display) -> GlenError {
-    GlenError::new(
-        ErrorCode::OmpUnavailable,
-        format!("cannot start omp for session control: {error}"),
-    )
-    .with_hint("check omp or set GLEN_OMP_BIN")
+fn startup_details(message: &mut String, warnings: Vec<Warning>) -> Value {
+    let stderr: Vec<_> = warnings
+        .into_iter()
+        .filter(|warning| warning.code == "omp_stderr")
+        .map(|warning| warning.message)
+        .collect();
+    if let Some(last) = stderr.last() {
+        message.push_str(": ");
+        message.push_str(last);
+    }
+    serde_json::json!({"stderr": stderr})
+}
+fn startup_stopped(mut error: OpError, warnings: Vec<Warning>) -> OpenError {
+    let details = startup_details(&mut error.message, warnings);
+    OpenError::Stopped(error.with_details(details))
+}
+fn start_error(error: impl std::fmt::Display, warnings: Vec<Warning>) -> GlenError {
+    let mut message = format!("cannot start omp for session control: {error}");
+    let details = startup_details(&mut message, warnings);
+    GlenError::new(ErrorCode::OmpUnavailable, message)
+        .with_details(details)
+        .with_hint("check omp or set GLEN_OMP_BIN")
 }
 impl Drop for Ephemeral {
     fn drop(&mut self) {
@@ -536,6 +559,51 @@ fn moved(from: &str, to: &str) -> GlenError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn c2_3_startup_errors_keep_only_stderr_and_append_the_last_line() {
+        let warnings = || {
+            vec![
+                Warning {
+                    code: "omp_stderr".into(),
+                    message: "first diagnostic".into(),
+                },
+                Warning {
+                    code: "omp_stderr".into(),
+                    message: "fatal startup error".into(),
+                },
+                Warning {
+                    code: "teardown_error".into(),
+                    message: "cleanup diagnostic".into(),
+                },
+            ]
+        };
+        let error = start_error("handshake failed", warnings());
+        assert_eq!(
+            error.message,
+            "cannot start omp for session control: handshake failed: fatal startup error"
+        );
+        assert_eq!(
+            error.details.unwrap()["stderr"],
+            serde_json::json!(["first diagnostic", "fatal startup error"])
+        );
+        let OpenError::Stopped(error) =
+            startup_stopped(OpError::new(ops::TIMEOUT, "startup timed out"), warnings())
+        else {
+            panic!("startup timeout changed error kind");
+        };
+        assert_eq!(error.code, ops::TIMEOUT);
+        assert_eq!(error.message, "startup timed out: fatal startup error");
+        assert_eq!(
+            error.details.unwrap()["stderr"],
+            serde_json::json!(["first diagnostic", "fatal startup error"])
+        );
+        let error = start_error("handshake failed", vec![]);
+        assert_eq!(
+            error.message,
+            "cannot start omp for session control: handshake failed"
+        );
+        assert_eq!(error.details.unwrap()["stderr"], serde_json::json!([]));
+    }
     #[test]
     fn stderr_capture_bounds_lines_and_handles_invalid_utf8() {
         let mut input = b"first\n\xfftail".to_vec();

@@ -71,15 +71,17 @@ export function finish(ctx: ExtensionContext, conn: net.Socket, frame?: object) 
     if (conn.destroyed || conn.writableEnded) return;
     const timer = ctx.setTimeout(() => quietly(() => conn.destroy()), 3000);
     conn.once("close", () => quietly(() => ctx.clearTimer(timer)));
+    const end = () => conn.end(() => {
+        // Keep draining ignored input until peer EOF. Destroying with
+        // unread input can reset the socket and discard the response.
+        if (conn.readableEnded) quietly(() => conn.destroy());
+    });
     try {
+        if (frame === undefined && conn.writableLength === 0) { end(); return; }
         // An empty write is a flush barrier for already queued stream events.
         conn.write(frame === undefined ? "" : JSON.stringify(frame) + "\n", err => {
             if (err) { quietly(() => conn.destroy()); return; }
-            quietly(() => conn.end(() => {
-                // Keep draining ignored input until peer EOF. Destroying with
-                // unread input can reset the socket and discard the response.
-                if (conn.readableEnded) quietly(() => conn.destroy());
-            }));
+            quietly(end);
         });
     } catch { quietly(() => conn.destroy()); }
 }
@@ -208,10 +210,13 @@ async function control(e: Endpoint, conn: net.Socket, frame: any) {
                 const compactions = () => e.ctx.sessionManager.getEntries().filter((entry: any) => entry.type === "compaction");
                 const before = compactions(), lastId = before.at(-1)?.id;
                 notify(e.ctx, "glen: compacting the session");
-                const result = await e.ctx.compact(a.instructions ?? undefined); identity(e);
+                let capturedMessage: string | undefined;
+                const result = await e.ctx.compact(a.instructions != null ? a.instructions : {
+                    onError: (err: unknown) => { capturedMessage = err instanceof Error ? err.message : String(err); },
+                }); identity(e);
                 const after = compactions();
                 if (result === "cancelled" || result === "failed" || (after.length <= before.length && after.at(-1)?.id === lastId)) {
-                    error("omp_error", result === "cancelled" ? "compaction cancelled" : "compaction did not run"); return;
+                    error("omp_error", capturedMessage ?? (result === "cancelled" ? "compaction cancelled" : "compaction did not run")); return;
                 }
                 success({ tokens_before, tokens_after: e.ctx.getContextUsage()?.tokens ?? null });
             } finally { e.compacting = false; }

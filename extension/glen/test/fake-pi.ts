@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
+import type { CompactOptions } from "@oh-my-pi/pi-coding-agent";
 import { createGlen } from "../index.ts";
 const models = JSON.parse(fs.readFileSync(new URL("../../../tests/support/fake_models.json", import.meta.url), "utf8"));
 let pid = 4000000;
@@ -23,14 +24,17 @@ export function createFakeHost(options: any = {}) {
         compactReject?.(new Error("compaction aborted"));
         if (!fields.abortStuck) ctx.setTimeout(() => { fields.idle = true; }, fields.abortDelay ?? 0);
     };
-    ctx.compact = async (instructions?: string) => {
-        calls.compact.push(instructions);
+    ctx.compact = async (instructionsOrOptions?: string | CompactOptions) => {
+        calls.compact.push(instructionsOrOptions);
         if (fields.compactError) throw new Error(fields.compactError);
         try {
             await new Promise<void>((resolve, reject) => { compactReject = reject; ctx.setTimeout(resolve, fields.compactDelay ?? 0); });
         } catch (err) { if (fields.compactAbortReturns) return "cancelled"; throw err; }
         finally { compactReject = undefined; }
-        if (fields.compactNoEntry) return fields.compactResult;
+        if (fields.compactNoEntry) {
+            if (fields.compactOnError !== undefined && typeof instructionsOrOptions === "object") instructionsOrOptions.onError?.(fields.compactOnError);
+            return fields.compactResult;
+        }
         entries.push({ type: "compaction", id: `compact-${entries.length}` });
         fields.tokens = 123;
         return fields.compactResult;

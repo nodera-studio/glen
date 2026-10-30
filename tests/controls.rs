@@ -1418,6 +1418,82 @@ fn fix4_startup_stderr_is_drained_into_json_warnings() {
 }
 
 #[test]
+fn c2_3_startup_failure_surfaces_stderr_in_details_and_message() {
+    for args in [
+        vec!["model", "e27c0de", "fake/fake-2", "--json"],
+        vec!["models", "--json"],
+    ] {
+        for lines in [
+            vec!["fatal startup error".to_owned()],
+            (0..20).map(|i| format!("fatal {i}")).collect(),
+        ] {
+            let b = RpcBox::new();
+            let value = checked(
+                command(&b, &args)
+                    .env("FAKE_OMP_STARTUP_STDERR", lines.join("\n"))
+                    .env("FAKE_OMP_SCENARIO", "startup_exit")
+                    .output()
+                    .unwrap(),
+                5,
+            );
+            let captured = &lines[..lines.len().min(16)];
+            assert_eq!(value["error"]["code"], "omp_unavailable");
+            assert_eq!(value["error"]["details"]["stderr"], json!(captured));
+            let message = value["error"]["message"].as_str().unwrap();
+            assert!(
+                message.starts_with("cannot start omp for session control: "),
+                "{value}"
+            );
+            assert!(
+                message.ends_with(&format!(": {}", captured.last().unwrap())),
+                "{value}"
+            );
+        }
+    }
+    let b = RpcBox::new();
+    let out = command(&b, &["models", "--human"])
+        .env("FAKE_OMP_STARTUP_STDERR", "fatal startup error\n")
+        .env("FAKE_OMP_SCENARIO", "startup_exit")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(5));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("fatal startup error"));
+}
+
+#[test]
+fn c2_3_startup_deadline_keeps_stderr_and_timeout_reason() {
+    for baseline in [false, true] {
+        let b = RpcBox::new();
+        let value = checked(
+            command(&b, &["models", "--timeout", "1s", "--json"])
+                .env("FAKE_OMP_STARTUP_STDERR", "startup diagnostic\n")
+                .env(
+                    "FAKE_OMP_READY_DELAY_MS",
+                    if baseline { "0" } else { "60000" },
+                )
+                .env(
+                    "FAKE_OMP_BASELINE_DELAY_MS",
+                    if baseline { "60000" } else { "0" },
+                )
+                .output()
+                .unwrap(),
+            7,
+        );
+        assert_eq!(value["error"]["details"]["reason"], "timeout");
+        assert_eq!(
+            value["error"]["details"]["stderr"],
+            json!(["startup diagnostic"])
+        );
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .ends_with(": startup diagnostic")
+        );
+    }
+}
+
+#[test]
 fn c2_1_disconnect_after_submission_reports_unknown_without_retry() {
     for drop_at in ["before_reply", "after_reply"] {
         let b = RpcBox::new();

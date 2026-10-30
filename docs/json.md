@@ -957,7 +957,7 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `invalid_env` | any document, send | invalid output limit or job timeout uses fallback |
 | `settle_timeout` | send, wait | persistence settlement timed out |
 | `settle_cancelled` | send, wait | settlement cancelled during worker shutdown |
-| `persistence_error` | send, wait | omp reported persistence failure |
+| `persistence_error` | send, wait, models, model, thinking, compact | omp reported persistence failure |
 | `event_filter_rejected` | send, wait | omp rejected optional event filter |
 | `skill_newer` | install-skill | newer installed version skipped |
 | `skill_modified` | install-skill | digest mismatch skipped |
@@ -970,6 +970,7 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `batched` | send, wait | omp answered this request together with other queued requests |
 | `holder_unavailable` | model, thinking, compact | could not mark the session lock with the control holder identity |
 | `teardown_error` | models, model, thinking, compact | RPC process, client or reader cleanup did not finish cleanly |
+| `omp_stderr` | models, model, thinking, compact | captured omp child stderr (up to 16 lines, 1024 bytes per line) |
 | `live_turn_continues` | send, wait | live job cancelled; the omp turn keeps running |
 | `delivery_unknown` | send, wait | live endpoint never acknowledged the message |
 | `socket_path_too_long` | install-extension | GLEN_HOME is too long for a unix socket; live delivery is off |
