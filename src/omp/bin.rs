@@ -27,11 +27,14 @@ fn executable(path: &Path) -> bool {
 pub fn find_omp(env: &Env) -> Result<PathBuf, String> {
     let name = env.non_empty("GLEN_OMP_BIN").unwrap_or("omp");
     if Path::new(name).is_absolute() {
-        return if executable(Path::new(name)) {
-            Ok(PathBuf::from(name))
-        } else {
-            Err(format!("omp binary not found: {name}"))
-        };
+        let meta = fs::metadata(name).map_err(|_| format!("omp binary not found: {name}"))?;
+        if !meta.is_file() {
+            return Err(format!("GLEN_OMP_BIN is not a regular file: {name}"));
+        }
+        if !executable(Path::new(name)) {
+            return Err(format!("GLEN_OMP_BIN is not executable: {name}"));
+        }
+        return Ok(PathBuf::from(name));
     }
     if name.contains('/') {
         return Err("GLEN_OMP_BIN must be an absolute path or a bare executable name".into());
@@ -203,13 +206,35 @@ mod tests {
         }
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&bin, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(find_omp(&env).is_err());
+        assert_eq!(find_omp(&env).unwrap_err(), "omp not found on PATH");
         let env = Env::for_test(
             Some(t.path()),
             t.path(),
             &[("GLEN_OMP_BIN", bin.to_str().unwrap())],
         );
-        assert!(find_omp(&env).is_err());
+        assert_eq!(
+            find_omp(&env).unwrap_err(),
+            format!("GLEN_OMP_BIN is not executable: {}", bin.display())
+        );
+    }
+    #[cfg(unix)]
+    #[test]
+    fn absolute_override_requires_a_regular_file() {
+        let t = tempfile::tempdir().unwrap();
+        for (path, message) in [
+            (t.path().to_path_buf(), "GLEN_OMP_BIN is not a regular file"),
+            (t.path().join("missing"), "omp binary not found"),
+        ] {
+            let env = Env::for_test(
+                Some(t.path()),
+                t.path(),
+                &[("GLEN_OMP_BIN", path.to_str().unwrap())],
+            );
+            assert_eq!(
+                find_omp(&env).unwrap_err(),
+                format!("{message}: {}", path.display())
+            );
+        }
     }
     #[cfg(unix)]
     #[test]
@@ -265,31 +290,43 @@ mod tests {
     #[test]
     fn version_timeout_kills_descendants_and_inherited_pipes() {
         let t = tempfile::tempdir().unwrap();
-        for (name, redirect, ending, message) in [
-            ("waiting", "", "wait", "omp --version timed out"),
-            ("stdout", "", "echo omp/18.14.0; exit 0", "output timed out"),
-            (
-                "stderr",
-                ">/dev/null",
-                "echo omp/18.14.0; exit 0",
-                "output timed out",
-            ),
-        ] {
-            let bin = script(
-                t.path(),
-                name,
-                &format!("( /bin/sleep 3; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"),
-            );
-            let start = Instant::now();
-            let result = omp_version(&bin, Duration::from_secs(1), None);
-            let error = result.unwrap_err();
-            assert!(error.contains(message), "{name}: {error}");
-            assert!(start.elapsed() < Duration::from_secs(2));
-            thread::sleep(Duration::from_millis(3100));
-            assert!(
-                !bin.with_extension("marker").exists(),
-                "surviving descendant of {name}"
-            );
-        }
+        let start = Instant::now();
+        thread::scope(|scope| {
+            let mut cases = Vec::new();
+            for (name, redirect, ending, message) in [
+                ("waiting", "", "wait", "omp --version timed out"),
+                ("stdout", "", "echo omp/18.14.0; exit 0", "output timed out"),
+                (
+                    "stderr",
+                    ">/dev/null",
+                    "echo omp/18.14.0; exit 0",
+                    "output timed out",
+                ),
+            ] {
+                let bin = script(
+                    t.path(),
+                    name,
+                    &format!(
+                        "( /bin/sleep 1; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"
+                    ),
+                );
+                cases.push(scope.spawn(move || {
+                    let start = Instant::now();
+                    let result = omp_version(&bin, Duration::from_millis(300), None);
+                    let error = result.unwrap_err();
+                    assert!(error.contains(message), "{name}: {error}");
+                    assert!(start.elapsed() < Duration::from_secs(2));
+                    thread::sleep(Duration::from_millis(1100));
+                    assert!(
+                        !bin.with_extension("marker").exists(),
+                        "surviving descendant of {name}"
+                    );
+                }));
+            }
+            for case in cases {
+                case.join().unwrap();
+            }
+        });
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

@@ -51,7 +51,7 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
 
 ## Conventions
 
-- Rust stable, edition 2024. Errors: `anyhow` in the binary, `thiserror` in library modules.
+- Rust stable, edition 2024. Errors: `GlenError` (`thiserror`) throughout, binary and library; no `anyhow`.
 - Parse omp's formats leniently: unknown entry types and fields must be skipped, not fatal.
   omp adds entry types between releases.
 - Tests that need omp data use fixtures under `tests/fixtures/`, never a live `~/.omp`.

@@ -14,6 +14,7 @@ use std::{path::Path, time::Duration};
 struct Check {
     name: &'static str,
     status: &'static str,
+    value: String,
     detail: String,
 }
 pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
@@ -26,11 +27,8 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         checks.push(Check {
             name,
             status,
-            detail: if status == "fail" && !detail.is_empty() {
-                detail.clone()
-            } else {
-                value.clone()
-            },
+            value: value.clone(),
+            detail: detail.clone(),
         });
         let value = if matches!(
             name,
@@ -149,12 +147,16 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             String::new()
         },
     );
-    let json_paths = serde_json::to_value(&paths).map_err(|e| {
-        GlenError::new(
-            ErrorCode::InvalidEnv,
-            format!("cannot serialize omp paths: {e}"),
-        )
-    })?;
+    let json_paths = if ctx.mode == Mode::Json {
+        serde_json::to_value(&paths).map_err(|e| {
+            GlenError::new(
+                ErrorCode::InvalidEnv,
+                format!("cannot serialize omp paths: {e}"),
+            )
+        })?
+    } else {
+        serde_json::Value::Null
+    };
     let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":json_paths,"checks":checks});
     let p = &ctx.painter;
     let mut table = render::Table::new(p, ctx.width);

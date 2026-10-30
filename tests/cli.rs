@@ -105,6 +105,11 @@ fn untested_version() {
             .iter()
             .any(|w| w["code"] == "omp_version_untested")
     );
+    let v = json(&o);
+    let check = &v["data"]["checks"][1];
+    assert_eq!(check["status"], "warn");
+    assert_eq!(check["value"], "18.0.9");
+    assert_eq!(check["detail"], "untested");
 }
 #[test]
 fn doctor_unavailable() {
@@ -114,6 +119,10 @@ fn doctor_unavailable() {
         let v = json(&o);
         assert_eq!(v["error"]["code"], "omp_unavailable");
         assert!(v["error"]["details"]["report"]["checks"].is_array());
+        let skipped = &v["error"]["details"]["report"]["checks"][1];
+        assert_eq!(skipped["status"], "info");
+        assert_eq!(skipped["value"], "skipped");
+        assert_eq!(skipped["detail"], "omp binary is missing");
         assert!(
             v["error"]["details"]["report"]["checks"][0]["detail"]
                 .as_str()
@@ -370,12 +379,21 @@ fn bare_glen_is_a_json_usage_error() {
     assert!(o.stderr.is_empty());
     let v = json(&o);
     assert_eq!(v["error"]["code"], "usage");
-    assert!(
-        v["error"]["details"]["text"]
-            .as_str()
-            .unwrap()
-            .contains("Usage:")
+    assert_eq!(v["error"]["message"], "a subcommand is required");
+    let help = v["error"]["details"]["text"].as_str().unwrap();
+    assert!(help.contains("See and talk to omp sessions"));
+    assert!(help.contains("Usage:"));
+    assert!(help.contains("Commands:"));
+
+    let o = glen(&["--json"], &[]);
+    assert_eq!(o.status.code(), Some(2));
+    let v = json(&o);
+    assert_eq!(v["error"]["code"], "usage");
+    assert_eq!(
+        v["error"]["message"],
+        "'glen' requires a subcommand but one was not provided"
     );
+    assert!(o.stderr.is_empty());
 }
 
 #[test]
@@ -404,8 +422,13 @@ fn raw_errors_are_human_and_completions_do_not_resolve_glen_home() {
 }
 
 #[test]
-fn doctor_json_details_keep_raw_paths() {
+fn doctor_json_values_keep_raw_paths_and_details_keep_reasons() {
     let t = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let home = t.path().to_str().unwrap();
     let bin = t.path().join("omp\x1b\u{202e}");
     fs::copy(fake(), &bin).unwrap();
@@ -419,11 +442,19 @@ fn doctor_json_details_keep_raw_paths() {
     );
     assert!(o.status.success());
     let v = json(&o);
-    for (name, expected) in [
-        ("omp_binary", bin),
-        ("agent_dir", t.path().join(".omp/agent")),
-        ("sessions_dir", t.path().join(".omp/agent/sessions")),
-        ("glen_home", t.path().to_path_buf()),
+    for (name, expected, reason) in [
+        ("omp_binary", bin, ""),
+        (
+            "agent_dir",
+            t.path().join(".omp/agent"),
+            "omp has not run with this profile yet",
+        ),
+        (
+            "sessions_dir",
+            t.path().join(".omp/agent/sessions"),
+            "no sessions directory yet",
+        ),
+        ("glen_home", t.path().to_path_buf(), ""),
     ] {
         let check = v["data"]["checks"]
             .as_array()
@@ -431,7 +462,8 @@ fn doctor_json_details_keep_raw_paths() {
             .iter()
             .find(|c| c["name"] == name)
             .unwrap();
-        assert_eq!(check["detail"], expected.to_str().unwrap());
+        assert_eq!(check["value"], expected.to_str().unwrap());
+        assert_eq!(check["detail"], reason);
     }
     let o = glen(
         &["doctor", "--human"],
@@ -509,4 +541,107 @@ fn non_utf8_home_is_an_error_envelope_without_panic() {
     assert_eq!(o.status.code(), Some(2), "{o:?}");
     assert_eq!(json(&o)["error"]["code"], "invalid_env");
     assert!(o.stderr.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_profile_keeps_original_clap_diagnostic() {
+    use std::os::unix::ffi::OsStringExt;
+    let t = tempfile::tempdir().unwrap();
+    for mode in ["--human", "--json"] {
+        let o = Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args([mode, "--profile"])
+            .arg(std::ffi::OsString::from_vec(b"bad\xff\x1b\r".to_vec()))
+            .arg("doctor")
+            .env_clear()
+            .env("HOME", t.path())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(2), "{o:?}");
+        if mode == "--human" {
+            assert!(o.stdout.is_empty());
+            let text = String::from_utf8(o.stderr).unwrap();
+            assert!(text.contains("invalid UTF-8"), "{text:?}");
+            assert!(text.contains("Usage:"), "{text:?}");
+            assert!(text.ends_with('\n'), "{text:?}");
+            assert!(!text.contains(['\x1b', '\r']), "{text:?}");
+        } else {
+            assert!(o.stderr.is_empty());
+            let v = json(&o);
+            assert_eq!(v["error"]["code"], "usage");
+            assert!(
+                v["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("invalid UTF-8")
+            );
+            assert!(
+                v["error"]["details"]["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Usage:")
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_home_allows_a_full_human_doctor_report() {
+    use std::os::unix::ffi::OsStringExt;
+    let t = tempfile::tempdir().unwrap();
+    let home = t
+        .path()
+        .join(std::ffi::OsString::from_vec(b"home\xff".to_vec()));
+    for (bin, code) in [(fake(), 0), ("/nonexistent".into(), 5)] {
+        let o = Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args(["doctor", "--human"])
+            .env_clear()
+            .env("HOME", &home)
+            .env("GLEN_OMP_BIN", bin)
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(code), "{o:?}");
+        let text = String::from_utf8(o.stdout).unwrap();
+        for row in [
+            "glen doctor",
+            "omp binary",
+            "omp version",
+            "profile",
+            "agent dir",
+            "sessions dir",
+            "glen home",
+            "tested against omp",
+        ] {
+            assert!(text.contains(row), "{text:?}");
+        }
+        assert!(text.contains(home.to_string_lossy().as_ref()), "{text:?}");
+        assert!(!String::from_utf8_lossy(&o.stderr).contains("cannot serialize"));
+    }
+    assert!(!home.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn doctor_json_explains_glen_home_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    fs::set_permissions(t.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    let o = glen(
+        &["doctor"],
+        &[
+            ("GLEN_OMP_BIN", &fake()),
+            ("GLEN_HOME", t.path().to_str().unwrap()),
+        ],
+    );
+    assert!(o.status.success());
+    let v = json(&o);
+    let check = &v["data"]["checks"][5];
+    assert_eq!(check["status"], "warn");
+    assert_eq!(check["value"], t.path().to_str().unwrap());
+    assert_eq!(check["detail"], "group/other permission bits are set");
+    assert_eq!(
+        fs::metadata(t.path()).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }

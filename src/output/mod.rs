@@ -256,10 +256,22 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
                     .into()
             })
             .collect();
-        e = match crate::cli::Cli::try_parse_from(safe_args) {
-            Err(safe) => safe,
-            Ok(_) => clap::Error::raw(e.kind(), "invalid arguments"),
+        let mut rendered = match crate::cli::Cli::try_parse_from(safe_args) {
+            Err(safe) => {
+                e = safe;
+                e.render().ansi().to_string()
+            }
+            Ok(_) => e
+                .render()
+                .to_string()
+                .split('\n')
+                .map(|line| crate::render::sanitize(line).into_owned())
+                .collect::<Vec<_>>()
+                .join("\n"),
         };
+        if !rendered.ends_with('\n') {
+            rendered.push('\n');
+        }
         let (_, _, color, _) = pre_options(argv);
         let tty = if e.use_stderr() {
             term.stderr_tty
@@ -279,7 +291,6 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
             },
             choice,
         );
-        let rendered = e.render().ansi().to_string();
         return ExitCode::from(
             if stream
                 .write_all(rendered.as_bytes())
@@ -295,12 +306,16 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
     {
         let rendered = e.render().to_string();
         let plain = anstream::adapter::strip_str(&rendered).to_string();
-        let message = plain
-            .lines()
-            .next()
-            .unwrap_or("invalid arguments")
-            .strip_prefix("error: ")
-            .unwrap_or_else(|| plain.lines().next().unwrap_or("invalid arguments"));
+        let message = if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
+            "a subcommand is required"
+        } else {
+            plain
+                .lines()
+                .next()
+                .unwrap_or("invalid arguments")
+                .strip_prefix("error: ")
+                .unwrap_or_else(|| plain.lines().next().unwrap_or("invalid arguments"))
+        };
         let value = serde_json::json!({"v":1,"ok":false,"error":{"code":"usage","message":message,"details":{"text":plain}}});
         let mut out = anstream::AutoStream::new(io::stdout().lock(), anstream::ColorChoice::Never);
         let result = serde_json::to_vec(&value)
