@@ -78,7 +78,7 @@ $m[0] as $manifest | $calls as $all |
          (["&&","||",";","\n","$(","`","|"] | all(.[];. as $token|$c|contains($token)|not))) else true end); "only plain scratch-wrapper calls; orchestrator also audits transcript")]
     elif $mode=="b3" then
      uses($discovered) as $tools | results($discovered) as $results |
-     [check("AC-420-loaded"; any($tools[];(.name=="Skill" and ((.input.skill // .input.name // "")|test("(^|:)glen$"))) or (.name=="Read" and (.input.file_path|endswith("/skills/glen/SKILL.md")))); "discovered skill must load"),
+     [check("AC-420-loaded"; any($tools[];(.name=="Skill" and ((.input.skill // .input.name // "")|test("(^|:)glen$")) and (.id as $id | any($results[];.tool_use_id==$id and (.is_error|not) and (denied|not)))) or (.name=="Read" and (.input.file_path|endswith("/skills/glen/SKILL.md")))); "discovered skill must load"),
       check("AC-420-permission"; all($tools[];if .name=="Bash" and (.input.command|test("(^|[ /])glen ")) then .id as $id | all($results[];if .tool_use_id==$id then denied|not else true end) else true end); "any denied glen call, before or after load, fails")]
     else [] end)
  end) as $checks |

@@ -41,7 +41,15 @@ printf '{"t":"start","id":"killed","argv":["ls"],"ts":100}\n{"t":"guard_refused"
 if "$A/acc.sh" check b "$S"; then echo 'bad recording passed' >&2; exit 1; fi
 jq -e 'all(["nonce_R","paired_calls","guard_refused"][]; . as $id | any($ARGS.named.v.checks[];.id==$id and (.pass|not)))' --argjson v "$(cat "$S/verdict.json")" <<< null >/dev/null
 cp "$S/good.ndjson" "$S/calls.ndjson"
-printf '%s\n' '{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"glen"}}' '{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"glen ls"}}' '{"type":"tool_result","tool_use_id":"bash","content":"Permission denied"}' > "$S/b3.jsonl"
+printf '%s\n' '{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"glen"}}' '{"type":"tool_result","tool_use_id":"skill","content":"Skill loaded"}' '{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"glen ls"}}' '{"type":"tool_result","tool_use_id":"bash","content":"sessions listed"}' > "$S/b3.jsonl"
+"$A/acc.sh" check b3 "$S"
+jq -e '.pass and (.checks|all(.pass))' "$S/verdict.json" >/dev/null
+cp "$S/b3.jsonl" "$S/b3-good.jsonl"
+# A denied Skill loader must not count as a discovered skill load, even without is_error.
+jq -c 'if .tool_use_id?=="skill" then .content="Permission denied" else . end' "$S/b3-good.jsonl" > "$S/b3.jsonl"
+if "$A/acc.sh" check b3 "$S"; then echo 'denied Skill recording passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-420-loaded" and (.pass|not))' "$S/verdict.json" >/dev/null
+jq -c 'if .tool_use_id?=="bash" then .content="Permission denied" else . end' "$S/b3-good.jsonl" > "$S/b3.jsonl"
 if "$A/acc.sh" check b3 "$S"; then echo 'denied b3 recording passed' >&2; exit 1; fi
 jq -e '.checks|any(.id=="AC-420-permission" and (.pass|not))' "$S/verdict.json" >/dev/null
 jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
