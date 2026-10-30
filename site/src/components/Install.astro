@@ -2,10 +2,12 @@
 import SectionHead from './SectionHead.astro';
 import InstallTabs from './islands/InstallTabs';
 import {site} from '../data/site';
-const steps=[['glen doctor','Check omp, its version and the paths glen will use.'],['glen install-extension','Reach open sessions; restart omp after installing.'],['glen install-skill','Teach Claude Code or Codex the glen commands.']];
+const steps=[[site.commands.doctor,'Checks omp, its version and the paths glen will use.'],[site.commands.extension,'Lets glen reach sessions that are open in omp. Restart omp afterwards.'],['glen install-skill','Teaches Claude Code or Codex the glen commands.']];
 ---
 <section id="install" aria-labelledby="install-h" class="section"><div class="wrap">
- <SectionHead id="install-h" eyebrow="02 / Install" strong="One command." rest="Then check your setup." lead="macOS and Linux. Needs omp 18.14.0 or newer." />
- <div class="install-layout"><div class="tabs-card reveal"><InstallTabs client:visible commands={site.commands} releasesUrl={site.releasesUrl} releaseAvailable={site.releaseAvailable} /></div>
- <div class="next-steps reveal"><h3 class="text-title-sm">Next steps</h3><ol>{steps.map(([command,body],i)=><li><span class="step-disc">{i+1}</span><div><code>{command}</code><p>{body}</p></div></li>)}</ol></div></div>
+ <SectionHead id="install-h" eyebrow="02 / Install" strong="One command." rest="Then check your setup." lead={`macOS and Linux. Needs omp ${site.testedOmp} or newer.`} />
+ <div class="install-layout">
+  <div class="tabs-card reveal"><InstallTabs client:visible commands={site.commands} releasesUrl={site.releasesUrl} releaseAvailable={site.releaseAvailable} /></div>
+  <div class="next-steps reveal"><h3>Next steps</h3><ol>{steps.map(([command,body],i)=><li><span class="step-disc" aria-hidden="true">{i+1}</span><div><code>{command}</code><p>{body}</p></div></li>)}</ol></div>
+ </div>
 </div></section>

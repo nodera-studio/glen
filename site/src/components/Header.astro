@@ -1,15 +1,16 @@
 ---
-// Adapted from Morphin animated-navbar-menu-with-morphing-hover-state (CSS port).
+// Nav hover adapted from Morphin animated-navbar-menu-with-morphing-hover-state (CSS port, no JS).
 import ThemeSwitch from './ThemeSwitch.astro';
 import {site} from '../data/site';
 const links=[['how','How it works'],['install','Install'],['agents','Agents'],['faq','FAQ']];
 ---
 <header class="header-glass" data-tone="shell">
- <div class="header-bar"><a class="wordmark focus-ring" href="/">glen</a><span class="version-chip">v0.1.0</span>
-  <nav class="desktop-nav" aria-label="Sections">{links.map(([id,label])=><a class="nav-item focus-ring" href={`#${id}`}><i aria-hidden="true"></i><i aria-hidden="true"></i><span>{label}</span><span aria-hidden="true">{label}</span></a>)}</nav>
+ <div class="header-bar">
+  <a class="wordmark focus-ring" href="/" aria-label="glen home">glen</a><span class="version-chip">v0.1.0</span>
+  <nav class="desktop-nav" aria-label="Sections">{links.map(([id,label])=><a class="nav-item focus-ring" href={`#${id}`}><span class="nav-fill" aria-hidden="true"></span><span class="nav-label">{label}</span><span class="nav-label" aria-hidden="true">{label}</span></a>)}</nav>
   <span class="nav-divider" aria-hidden="true"></span>
   <a class="github-pill focus-ring" href={site.repoUrl} aria-label="glen on GitHub"><svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-4 1-4-2-6-2m12 5v-4c0-1-.5-2-1-2.5 4-.5 7-2 7-6.5 0-1.5-.5-3-1.5-4 .4-1 .4-2.5 0-3-1.5-.5-3 0-4.5 1a15 15 0 0 0-6 0C7.5 2 6 1.5 4.5 2c-.4.5-.4 2 0 3C3.5 6 3 7.5 3 9c0 4.5 3 6 7 6.5-.5.5-1 1.5-1 2.5v4"/></svg></a>
   <ThemeSwitch /><a class="header-install focus-ring" href="#install">Install</a>
  </div>
- <nav class="mobile-nav" aria-label="Mobile sections">{links.map(([id,label])=><a class="nav-item focus-ring" href={`#${id}`}><i aria-hidden="true"></i><i aria-hidden="true"></i><span>{label}</span><span aria-hidden="true">{label}</span></a>)}</nav>
+ <nav class="mobile-nav" aria-label="Sections (mobile)">{links.map(([id,label])=><a class="nav-item focus-ring" href={`#${id}`}><span class="nav-fill" aria-hidden="true"></span><span class="nav-label">{label}</span><span class="nav-label" aria-hidden="true">{label}</span></a>)}</nav>
 </header>

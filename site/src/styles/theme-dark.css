@@ -32,4 +32,4 @@
 :root[data-theme] [data-tone='content'] { color-scheme: dark }
 
 :root[data-theme] .exit-badge {background:color-mix(in oklch,var(--content) 80%,black)}
-:root[data-theme] .t-window {border-color:color-mix(in oklch,var(--line-strong) 60%,white)}
+:root[data-theme] .term-win {border-color:color-mix(in oklch,var(--line-strong) 60%,white)}

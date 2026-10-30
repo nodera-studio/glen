@@ -54,8 +54,9 @@
         "Snapshot files use the registry manifest target paths."
       ],
       "changes": [
-        "motion/react with LazyMotion strict; redesign tokens; reduced motion",
-        "Accessible controlled tabs"
+        "Labels always show; tabs h-8 rounded-full in an inline-flex pill tablist",
+        "The selected ink pill glides between tabs with a FLIP animation (spring 400/32 sampled into linear()), replacing motion layoutId, which needs the larger domMax feature set",
+        "Accessible controlled tabs with automatic activation (arrows, Home, End)"
       ]
     },
     {
@@ -93,8 +94,8 @@
         "Snapshot files use the registry manifest target paths; duplicate fallback demo removed."
       ],
       "changes": [
-        "motion/react with LazyMotion strict; redesign tokens; reduced motion",
-        "Mount-only clipboard button with success and error states"
+        "A solid --line-strong hairline at rest (rx 8); on copy the border marches as 8 8 dashes, then settles solid in --success",
+        "Mount-only clipboard button with success and error states, announced through a live region"
       ]
     },
     {
@@ -126,8 +127,203 @@
         "usehooks-ts"
       ],
       "changes": [
-        "motion/react with LazyMotion strict; redesign tokens; reduced motion",
-        "Static routes and one in-view trace; removed interval and resize provider"
+        "Redrawn as two hand-laid layouts (wide 640x204, tall 360x392) so labels stay at reading size; source boxes 136-160 wide",
+        "Framed in an r16 layer-1 card with an inner dot grid and a caption footer, full width under the How cards",
+        "One in-view trace (agent to glen to live session, then the glen_reply path), no interval or resize provider"
+      ]
+    },
+    {
+      "slug": "animated-feature-cards-for-react-tailwind-framer-motion",
+      "method": "cli",
+      "vendor": "vendor/morphin/animated-feature-cards-for-react-tailwind-framer-motion",
+      "files": [
+        "components/card-animation-01.tsx",
+        "components/card-animation-02.tsx",
+        "components/card-animation-03.tsx",
+        "components/card-animation-04.tsx",
+        "components/card.tsx",
+        "components/grid-animated-cards.tsx",
+        "components/ui/icons/ai-send-message.tsx",
+        "components/ui/icons/index.tsx",
+        "components/ui/icons/message-question.tsx",
+        "components/ui/icons/receipt-item.tsx",
+        "components/ui/icons/tick-circle.tsx",
+        "components/ui/icons/user-square.tsx",
+        "lib/utils.ts"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/WhatItDoes.astro",
+        "src/components/islands/HowCards.tsx"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "changes": [
+        "2x2 card grid (stacked below md) on NX tiles: r16 card, r12 stage with shadow-1 and a dot grid, caption with title, command chips and body",
+        "Stages rebuilt on real glen output: Find (glen ls, card-animation-01 rise), Read (glen show, 04 line reveal), Send (03 chip travel with the settle spring), Hear back (glen wait with the text-shimmer-wave pick)",
+        "Markup is static Astro passed as island children; the island only plays each stage once at 40% in view, serially, via WAAPI. Upstream setTimeout loops removed",
+        "SSR, no-JS and reduced motion show the finished stage; upstream icons dropped"
+      ]
+    },
+    {
+      "slug": "animated-navbar-menu-with-morphing-hover-state",
+      "method": "cli",
+      "vendor": "vendor/morphin/animated-navbar-menu-with-morphing-hover-state",
+      "files": [
+        "components/animated-navbar-menu-with-morphing-hover-state/nav-menu.tsx"
+      ],
+      "upstreamDependencies": [
+        "framer-motion"
+      ],
+      "adaptedTo": [
+        "src/components/Header.astro",
+        "src/styles/global.css (.nav-item, .nav-fill, .nav-label)"
+      ],
+      "droppedDependencies": [
+        "framer-motion"
+      ],
+      "changes": [
+        "Ported to CSS with zero JS: fill rises from 100px with -40deg rotation (drawer easing, 500 ms), a brand-tinted second fill follows 40 ms later, the two label copies swap",
+        "Runs on :hover and :focus-visible; pill shape h-8 rounded-full; reduced motion is a colour change only"
+      ]
+    },
+    {
+      "slug": "animated-status-badge-with-table-for-dashboards",
+      "method": "github-fallback",
+      "vendor": "vendor/morphin/animated-status-badge-with-table-for-dashboards",
+      "files": [
+        "components/index-demo.tsx",
+        "components/status-badge.tsx",
+        "lib/utils.ts"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "lucide-react",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/ExitBadge.astro",
+        "src/components/Agents.astro",
+        "src/styles/global.css (.exit-badge)"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "lucide-react",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+      "notes": [
+        "The registry manifest lists components/lib/utils.ts but the file lives at files/lib/utils.ts, so the CLI 404s; files were fetched from the GitHub tree at the pinned commit (W6 polish spec section 5)."
+      ],
+      "changes": [
+        "Static Astro component: pill with a three-strip top glow (blur 7/3.5/0, clipped to the pill) in the state colour, hand-drawn 14px icons instead of lucide",
+        "States map exit codes 0/10/6/7/11 to success/warning/warning/danger/focus; icon pop uses animation-timeline: view() under @supports"
+      ]
+    },
+    {
+      "slug": "smooth-expand-accordion",
+      "method": "github-fallback",
+      "vendor": "vendor/morphin/smooth-expand-accordion",
+      "files": [
+        "components/interactive-accordion-demo.tsx",
+        "components/interactive-accordion.tsx",
+        "lib/utils.ts"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/FAQ.astro",
+        "src/styles/global.css (.faq-list)"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+      "notes": [
+        "The registry manifest lists components/lib/utils.ts but the file lives at files/lib/utils.ts, so the CLI 404s; files were fetched from the GitHub tree at the pinned commit (W6 polish spec section 5)."
+      ],
+      "changes": [
+        "Native <details name=\"faq\"> with zero JS: numbered 40px disc fills when open, a CSS-drawn plus rotates 45deg on the spring easing, an ink rule grows to .3 on hover and 1 when open",
+        "Height animates with ::details-content and interpolate-size where supported; it snaps open elsewhere and works without JS"
+      ]
+    },
+    {
+      "slug": "text-shimmer-wave",
+      "method": "github-fallback",
+      "vendor": "vendor/morphin/text-shimmer-wave",
+      "files": [
+        "components/demo.tsx",
+        "components/ui/text-shimmer-wave.tsx",
+        "lib/utils.ts"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/WhatItDoes.astro",
+        "src/components/islands/HowCards.tsx"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+      "notes": [
+        "The registry manifest lists components/lib/utils.ts but the file lives at files/lib/utils.ts, so the CLI 404s; files were fetched from the GitHub tree at the pinned commit (W6 polish spec section 5)."
+      ],
+      "changes": [
+        "Per-character WAAPI wave on \"omp is working\" in the Hear back stage: zDistance 6, scaleDistance 1.06, two cycles, base colour --glen-muted to --term-fg",
+        "Reduced motion and SSR show the finished reply instead"
+      ]
+    },
+    {
+      "slug": "infinite-grid-with-framer-motion",
+      "method": "github-fallback",
+      "vendor": "vendor/morphin/infinite-grid-with-framer-motion",
+      "files": [
+        "components/ui/infinite-grid-integration.tsx",
+        "lib/utils.ts"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "lucide-react",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/ClosingCTA.astro",
+        "src/styles/global.css (.cta-ground)"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "lucide-react",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+      "notes": [
+        "The registry manifest lists components/lib/utils.ts but the file lives at files/lib/utils.ts, so the CLI 404s; files were fetched from the GitHub tree at the pinned commit (W6 polish spec section 5)."
+      ],
+      "changes": [
+        "CSS port: a 40px line grid at .55 opacity, a brand spotlight copy masked to the pointer through --mx/--my from a rAF-throttled pointermove handler in the existing inline script (hover devices only)",
+        "Drifts 40px per 8 s only while hovered; static under reduced motion and on touch"
       ]
     }
   ]

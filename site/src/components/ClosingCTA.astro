@@ -3,7 +3,7 @@
 import Actions from './Actions.astro';
 import {site} from '../data/site';
 ---
-<section class="cta-section" aria-labelledby="cta-h"><div class="cta-ground" aria-hidden="true"><div></div><div class="grid-spotlight"></div></div><div class="cta-inner"><h2 id="cta-h">Let your agent into omp.</h2><p>Free and open source. One binary, no server.</p><Actions /><div class="cta-command"><code>{site.commands.cargo}</code><button class="focus-ring inline-copy" type="button" data-copy={site.commands.cargo}>Copy</button><span class="sr-only" role="status"></span></div></div></section>
+<section class="cta-section" aria-labelledby="cta-h"><div class="cta-ground" aria-hidden="true"><div></div><div class="grid-spotlight"></div></div><div class="cta-inner"><h2 id="cta-h">Let your agent into omp.</h2><p>Free and open source. One binary, no server.</p><Actions /><div class="cta-command"><code class="bare">{site.commands.cargo}</code><button class="focus-ring inline-copy" type="button" data-copy={site.commands.cargo}>Copy</button><span class="sr-only" role="status"></span></div></div></section>
 <script is:inline>
 (() => {
  const ground=document.querySelector('.cta-section');
@@ -11,6 +11,6 @@ import {site} from '../data/site';
   if(frame)return;frame=requestAnimationFrame(()=>{const r=ground.getBoundingClientRect();
    ground.style.setProperty('--mx',`${e.clientX-r.left}px`);ground.style.setProperty('--my',`${e.clientY-r.top}px`);frame=0;});
  });}
- document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{const status=b.nextElementSibling;status.textContent='';try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Copied';status.textContent='Copied';}catch{b.textContent='Copy failed';status.textContent="Couldn't copy. Select the command and copy it yourself.";}}));
+ document.querySelectorAll('[data-copy]').forEach(b=>b.addEventListener('click',async()=>{const status=b.nextElementSibling;status.textContent='';try{await navigator.clipboard.writeText(b.dataset.copy);b.textContent='Copied';b.dataset.state='copied';status.textContent='Copied';}catch{b.textContent='Copy failed';status.textContent="Couldn't copy. Select the command and copy it yourself.";}}));
 })();
 </script>

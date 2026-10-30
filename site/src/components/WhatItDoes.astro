@@ -1,10 +1,54 @@
 ---
+// Cards adapted from Morphin animated-feature-cards-for-react-tailwind-framer-motion; the "Hear back"
+// wait adapted from Morphin text-shimmer-wave. The markup is static; HowCards (client:visible)
+// only plays each stage once. SSR, no-JS and reduced motion show the finished stage.
 import SectionHead from './SectionHead.astro';
 import HowCards from './islands/HowCards';
 import Topology from './islands/Topology';
+import palette from '../../../src/render/palette.json';
+import { lsTable, prompt, role, body, tool, s, cwd, reply, answer } from '../data/demo.mjs';
+import { spans, esc } from './terminal/lines';
+
+const W = 76;
+const line = (l: any, attr = '') => `<div${attr}>${spans(l)}</div>`;
+const cmd = (text: string) => line([...prompt, s(text)]);
+const bar = (title: string) => `<div class="peek-bar"><i></i><i></i><i></i><span>${esc(title)}</span></div>`;
+const peek = (title: string, rows: string) => `<div class="peek">${bar(title)}<div class="peek-body">${rows}</div></div>`;
+
+const find = peek(`${cwd} — glen`, cmd('glen ls') + lsTable(W).map((l, i) => line(l, i >= 1 && i <= 3 ? ' data-row' : '')).join(''));
+const read = peek(`${cwd} — glen`, cmd('glen show e27c0de') + [
+ [s('Fix migration 0012', undefined, true)],
+ [s('e27c0de · ', 'muted'), s(cwd), s(' · '), s('claude-sonnet-4-5', 'muted'), s(' · '), s('●', 'success'), s(' '), s('live', 'success'), s(' · updated 2s ago', 'muted')],
+ [], role('user', '12:04'), ...body('Fix 0012 and tell me when it passes.', W), [], role('assistant', '12:04'), ...tool('bash', 'cargo test migration_0012', '14 lines')(W),
+].map(l => line(l, ' data-row')).join(''));
+const shimmer = [...'omp is working'].map(c => `<span>${esc(c)}</span>`).join('');
+const hear = peek(`${cwd} — glen`, cmd('glen wait j3c9f41')
+ + `<div data-before><i class="g">⠙</i> <span class="shimmer" style="--base-color:var(--glen-muted);--base-gradient-color:var(--term-fg)">${shimmer}</span></div>`
+ + [[s('✓ completed · j3c9f41 · e27c0de · 41207ms', 'success')], [], [s(`  ${answer}`)], [s(`↩ ${reply} ✓`, 'muted')]].map(l => line(l, ' data-after')).join(''));
+const send = `<div class="route">
+ <svg class="route-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="M22 40C22 72 38 74 59 74" vector-effect="non-scaling-stroke"/></svg>
+ <div class="route-node source"><b>Claude Code</b><span>your agent</span></div>
+ <div class="route-node target" data-target><b><i class="on"></i>e27c0de</b><span>omp · live</span></div>
+ <div class="route-chip" data-chip>“Fix 0012 and tell me when it passes.”</div>
+</div>`;
+
+const cards = [
+ { title: 'Find', commands: ['glen ls'], body: 'Lists the omp sessions in this folder, live or idle, each with a short handle.', stage: find },
+ { title: 'Read', commands: ['glen show', 'glen tail -f'], body: 'Prints a session’s transcript, or follows it while it grows.', stage: read },
+ { title: 'Send', commands: ['glen send'], body: 'Messages a live or idle session, or starts a new one with @new.', stage: send },
+ { title: 'Hear back', commands: ['glen_reply', 'glen wait'], body: 'The omp model answers with glen_reply and glen hands it to your agent. Late replies wait in glen inbox.', stage: hear },
+];
+const vars = palette.tokens.map(t => `--glen-${t.name}:${t.dark.hex}`).join(';');
 ---
 <section id="how" aria-labelledby="how-h" class="section band"><div class="wrap">
  <SectionHead id="how-h" eyebrow="01 / How it works" strong="Four verbs." rest="One reply comes back." lead="glen finds, reads and messages omp sessions, then hands the answer to the agent that asked." />
- <HowCards client:visible />
- <figure class="topology-card reveal"><div class="topology-grid"><Topology client:visible /></div><figcaption>Live sessions use the glen extension; idle sessions use omp RPC; <code>@new</code> starts a session.</figcaption></figure>
+ <HowCards client:visible>
+  <div class="how-grid" style={vars}>
+   {cards.map((card, i) => <article class="how-card reveal">
+    <div class="how-stage" data-stage={['find', 'read', 'send', 'hear'][i]} aria-hidden="true" set:html={card.stage} />
+    <div class="how-caption"><h3>{card.title}</h3><p class="how-cmds">{card.commands.map(c => <code>{c}</code>)}</p><p>{card.body}</p></div>
+   </article>)}
+  </div>
+ </HowCards>
+ <figure class="topology-card reveal"><div class="topology-grid"><Topology client:visible /></div><figcaption>Live sessions take the message through the glen extension, idle ones through omp RPC, and <code>@new</code> starts a fresh session. The reply comes back the same way.</figcaption></figure>
 </div></section>

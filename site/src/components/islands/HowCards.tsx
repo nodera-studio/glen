@@ -1,50 +1,60 @@
-// Adapted from Morphin animated-feature-cards-for-react-tailwind-framer-motion.
-// Stages 01/04/03: finite, serialized in-view playback; SSR is the finished stage.
-// Adapted from Morphin text-shimmer-wave: zDistance 6, scaleDistance 1.06, two cycles.
-import { useEffect, useRef } from 'react';
-import { m } from 'motion/react';
-import { IslandRoot } from './IslandRoot';
-import palette from '../../../../src/render/palette.json';
-import type { CSSProperties } from 'react';
-const steps=[
- ['Find','glen ls','Lists the omp sessions for this folder, live or idle, with short handles.'],
- ['Read','glen show / glen tail -f',"Prints a session’s transcript, or follows it as it grows."],
- ['Send','glen send','Messages an open or idle session, or starts a new one with @new.'],
- ['Hear back','glen_reply, then glen inbox','Returns the answer to your agent. Later replies stay in glen inbox.'],
-];
-const vars=Object.fromEntries(palette.tokens.map(t=>[`--glen-${t.name}`,t.dark.hex])) as CSSProperties;
-export default function HowCards() {
- const ref=useRef<HTMLDivElement>(null);
- useEffect(()=>{
-  if(matchMedia('(prefers-reduced-motion: reduce)').matches)return;
-  const pending:HTMLElement[]=[];const seen=new Set<Element>();const animations:Animation[]=[];let running=false,disposed=false;
-  const play=async()=>{
-   if(running)return;running=true;
-   while(pending.length && !disposed){
-    const card=pending.shift()!;
-    const run=(el:Element,frames:Keyframe[],options:KeyframeAnimationOptions)=>{const a=el.animate(frames,{easing:'cubic-bezier(.25,1,.5,1)',...options});animations.push(a);return a.finished.catch(()=>{});};
-    const items=card.querySelectorAll('[data-stage-row]');
-    if(card.dataset.stage==='2') {
-     // NX settle spring: duration .4, bounce .1, sampled as a settling path.
-     await Promise.all(Array.from(items,el=>run(el,[{transform:'translate(-40px,-35px)',opacity:0},{transform:'translate(2px,1px)',opacity:1,offset:.8},{transform:'translate(0,0)',opacity:1}],{duration:400})));
-    } else if(card.dataset.stage==='3') {
-     const reply=card.querySelector('.mini-reply')!;const wait=card.querySelector('.shimmer')!;
-     await Promise.all([run(reply,[{opacity:0},{opacity:0}],{duration:2000}),run(wait,[{opacity:1},{opacity:1}],{duration:2000}),...Array.from(wait.children,(el,i)=>run(el,[{transform:'translateZ(0) scale(1)',color:'var(--base-color)'},{transform:'translateZ(6px) scale(1.06)',color:'var(--base-gradient-color)'},{transform:'translateZ(0) scale(1)',color:'var(--base-color)'}],{duration:800,iterations:2,delay:i*24,fill:'backwards'}))]);
-    } else await Promise.all(Array.from(items,(el,i)=>run(el,[{transform:'translateY(8px)',opacity:0},{transform:'translateY(0)',opacity:1}],{duration:400,delay:i*80,fill:'backwards'})));
-    card.dataset.played='true';
+// Adapted from Morphin animated-feature-cards-for-react-tailwind-framer-motion (stages 01, 03, 04)
+// and text-shimmer-wave (zDistance 6, scaleDistance 1.06, two cycles). The upstream setTimeout
+// loops are gone: each stage plays once, one at a time, when 40% of it is in view. The markup
+// arrives as static children already showing the finished stage.
+import { useEffect, useRef, type ReactNode } from 'react';
+
+const OUT = 'cubic-bezier(.25,1,.5,1)';
+const SPRING = 'cubic-bezier(.34,1.56,.64,1)';
+
+async function play(stage: HTMLElement): Promise<unknown> {
+ const all = (els: Iterable<Element>, frames: Keyframe[], opts: (i: number) => KeyframeAnimationOptions) =>
+  Promise.all(Array.from(els, (el, i) => el.animate(frames, { easing: OUT, fill: 'backwards', ...opts(i) }).finished));
+ const kind = stage.dataset.stage;
+ if (kind === 'find') return all(stage.querySelectorAll('[data-row]'), [{ opacity: 0, transform: 'translateY(8px)' }, { opacity: 1, transform: 'none' }], i => ({ duration: 400, delay: i * 80 }));
+ if (kind === 'read') return all(stage.querySelectorAll('[data-row]'), [{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], i => ({ duration: 300, delay: i * 90 }));
+ if (kind === 'send') {
+  const chip = stage.querySelector<HTMLElement>('[data-chip]')!, from = stage.querySelector('.source')!.getBoundingClientRect(), to = chip.getBoundingClientRect();
+  const dx = from.left + 12 - to.left, dy = from.bottom + 8 - to.top;
+  return chip.animate([{ opacity: 0, transform: `translate(${dx}px, ${dy}px) scale(.92)` }, { opacity: 1, offset: .2 }, { opacity: 1, transform: 'none' }], { duration: 640, easing: SPRING, fill: 'backwards' }).finished
+   .then(() => stage.querySelector('[data-target]')!.animate([{ boxShadow: '0 0 0 0 color-mix(in oklch, var(--brand) 40%, transparent)' }, { boxShadow: '0 0 0 8px transparent' }], { duration: 500, easing: OUT }).finished);
+ }
+ const chars = stage.querySelectorAll('.shimmer > span');
+ return all(chars, [
+  { transform: 'translateZ(0) scale(1)', color: 'var(--base-color)' },
+  { transform: 'translateZ(6px) scale(1.06)', color: 'var(--base-gradient-color)' },
+  { transform: 'translateZ(0) scale(1)', color: 'var(--base-color)' },
+ ], i => ({ duration: 900, delay: i * 40, iterations: 2, easing: 'ease-in-out' })).then(() => {
+  stage.dataset.state = 'done';
+  return all(stage.querySelectorAll('[data-after]'), [{ opacity: 0, transform: 'translateY(4px)' }, { opacity: 1, transform: 'none' }], i => ({ duration: 300, delay: i * 70 }));
+ });
+}
+
+export default function HowCards({ children }: { children?: ReactNode }) {
+ const ref = useRef<HTMLDivElement>(null);
+ useEffect(() => {
+  if (matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  const stages = Array.from(ref.current?.querySelectorAll<HTMLElement>('[data-stage]') ?? []);
+  const queue: HTMLElement[] = [];
+  let busy = false, gone = false;
+  const next = async () => {
+   if (busy) return;
+   busy = true;
+   while (queue.length && !gone) {
+    const stage = queue.shift()!;
+    if (stage.dataset.stage !== 'hear') stage.dataset.state = 'done';
+    await play(stage).catch(() => {});
+    stage.dataset.state = 'done';
    }
-   running=false;
+   busy = false;
   };
-  const observer=new IntersectionObserver(entries=>{for(const e of entries)if(e.isIntersecting && !seen.has(e.target)){seen.add(e.target);pending.push(e.target as HTMLElement);observer.unobserve(e.target);}void play();},{threshold:.4});
-  ref.current?.querySelectorAll<HTMLElement>('[data-stage]').forEach(el=>observer.observe(el));
-  return()=>{disposed=true;observer.disconnect();animations.forEach(a=>a.cancel());};
- },[]);
- return <IslandRoot><div className="how-grid" ref={ref} style={vars}>{steps.map(([title,command,body],i)=><m.article key={title} className="how-card reveal" data-stage={i}>
-  <div className="how-stage"><div className="mini-terminal" aria-label={`${title} example`}>
-   {i===0 && <><div className="t-muted">handle   state   title</div>{['e27c0de  ● live  Fix migration 0012','b7e2d81  ○ idle  Review routes','b8e4a07  ○ idle  Add fixtures'].map(text=><div data-stage-row key={text}>{text}</div>)}<div className="t-muted">3 sessions · 1 live</div></>}
-   {i===1 && <><div data-stage-row className="t-accent">❯ user · 12:04</div><div data-stage-row className="t-accent_2">◆ assistant · 12:04</div><div data-stage-row>↳ bash cargo test …</div></>}
-   {i===2 && <div className="message-route"><span className="mini-you">you</span><span data-stage-row className="message-chip">Fix 0012 and tell me.</span><span className="mini-target">e27c0de <span className="t-success">● live</span></span></div>}
-   {i===3 && <div style={{position:'relative'}}><span className="shimmer" style={{position:'absolute',inset:0,opacity:0}} aria-hidden="true">{Array.from('omp is working',(c,j)=><span key={j}>{c}</span>)}</span><span className="mini-reply t-success">↩ All 12 tests pass. ✓</span></div>}
-  </div></div><div className="how-caption"><h3 className="text-title-sm">{title}</h3><code>{command}</code><p>{body}</p></div>
- </m.article>)}</div></IslandRoot>;
+  stages.forEach(stage => { stage.dataset.state = 'armed'; });
+  const io = new IntersectionObserver(entries => {
+   for (const e of entries) if (e.isIntersecting) { io.unobserve(e.target); queue.push(e.target as HTMLElement); }
+   void next();
+  }, { threshold: .4 });
+  stages.forEach(stage => io.observe(stage));
+  return () => { gone = true; io.disconnect(); stages.forEach(stage => { stage.dataset.state = 'done'; }); };
+ }, []);
+ return <div ref={ref}>{children}</div>;
 }
