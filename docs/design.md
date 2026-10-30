@@ -385,7 +385,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **W4** agent surface: SKILL.md (two variants), install-skill, extended doctor, completions polish, acceptance runs with Claude Code and Codex.
 - **W5** `glen watch` TUI.
 - **W6** site: `site/`, static Astro in the Nodex-redesign look; a CSS-compiled terminal demo; morphin islands; palette from `src/render/palette.json`; CI job `site`.
-- **W7** deploy + release workflow.
+- **W7** deploy + release workflow: §A18.
 - **W8** audits + release v0.1.0.
 - Every wave leaves `main` green and usable. Unfinished subcommands stay hidden.
 
@@ -407,3 +407,31 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - [ ] Re-verify Claude Code skill frontmatter/allowed-tools and Codex skill paths, limits, shell timeout and sandbox variables on each Claude Code or Codex upgrade.
 
 - [ ] W4 tech debt: verify Linux network-on CODEX_SANDBOX live delivery and EROFS behaviour under bubblewrap.
+
+### §A18 Distribution
+<!-- Level 3 for now: tests/conformance/repo_contracts.rs (AC-024) pins exactly 17 level-2 sections. Promote to ## when that test learns §A18. -->
+- **Targets** (W7 plan D1, D2). Four, each built on a native GitHub runner with `cargo build --release --locked`:
+
+| Target | Runner | Smoke test |
+|---|---|---|
+| `aarch64-apple-darwin` | `macos-15` | runs `--version`, `ls --all`, `show` |
+| `x86_64-apple-darwin` | `macos-15`, cross-arch with Apple's toolchain | under Rosetta when present, else `lipo -archs` prints `x86_64` |
+| `x86_64-unknown-linux-musl` | `ubuntu-24.04` | runs; `file` reports a static binary |
+| `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | runs; `file` reports a static binary |
+
+  - Linux binaries are static musl, so they run on any glibc (Debian 12, Ubuntu 22.04, RHEL 9). This holds while the lockfile has no C dependency; reassess musl before adding one.
+- **Assets** (D3). Versionless names, so "latest" needs no GitHub API: `glen-<target>.tar.gz`, `glen-<target>.tar.gz.sha256` (`<64 hex>  glen-<target>.tar.gz`) and `SHA256SUMS`. Each archive holds exactly `glen-<target>/glen` (0755) and `glen-<target>/LICENSE`. `scripts/package-release.sh <target> <binary> <out-dir>` builds both files. Checksums show integrity, not authenticity; binaries are not signed or notarised.
+- **`install.sh`**, POSIX `sh`, served only from `https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh` (D4):
+  - flags `--version X.Y.Z` (an optional leading `v`), `--prefix DIR` (installs `DIR/bin/glen`; default `$HOME/.local/bin`), `--dry-run` (prints target, URLs and install path; no download, no write), `-h`/`--help`;
+  - exit 0 ok, 1 runtime failure (unsupported platform, download, checksum, archive entry, unwritable directory), 2 usage;
+  - target from `uname -s`/`uname -m`; a Rosetta shell on Apple silicon (`sysctl.proc_translated` = 1) gets the arm64 build;
+  - downloads `<base>/latest/download/<asset>` or `<base>/download/v<ver>/<asset>`, where `<base>` is `GLEN_INSTALL_BASE_URL` (mirrors and tests) or `https://github.com/nodera-studio/glen/releases`;
+  - verifies the SHA-256 and the archive's entry list before extracting, then swaps the binary in atomically. It never uses sudo.
+- **Release workflow** (`.github/workflows/release.yml`, D5):
+  - **dry run** on `workflow_dispatch` and on pull requests that change `release.yml`, `install.sh` or `scripts/package-release.sh`: build, smoke-test, package, install from a `file://` fake release on Linux and macOS, upload the archives as workflow artifacts. No tag, no release.
+  - **publish** on a pushed `v*` tag: the preflight requires an annotated tag equal to `v` + the `Cargo.toml` version on a commit of `main`; then the same jobs, an exact 8-file asset check, `SHA256SUMS`, and a GitHub Release with generated notes (a `-` in the tag makes it a pre-release). A published release is never overwritten.
+- **Site hosting** (D7, D8). One assets-only Cloudflare Worker named `glen` on workers.dev (`site/wrangler.jsonc`: no `main`, no bindings, no routes, `not_found_handling: "404-page"`). `site/public/_headers` sets `Cache-Control: public, max-age=31536000, immutable` on `/_astro/*` only; HTML keeps the platform default (`public, max-age=0, must-revalidate`), because a header set by two rules is comma-joined.
+  - `npm --prefix site run deploy` runs `verify` (including the offline link check), `check-links.mjs --online`, then `wrangler@4.124.0 deploy` on the local login.
+  - CI's `site-deploy` job runs `wrangler deploy --dry-run` on every PR and push. On a `main` push it also runs the online link check, and deploys the tested `dist/` only when the repo secret `CLOUDFLARE_API_TOKEN` exists; otherwise it prints a notice.
+  - The Install section shows no installer URL or `/releases/latest` until `site.releaseAvailable` is true; W8 flips it after v0.1.0 is published, and the link check enforces both states.
+- **Demo golden** (D6). `tests/site_demo.rs` runs the real binary on `tests/fixtures/demo` and compares its ANSI stdout with `site/src/data/demo-capture.json`; `npm --prefix site run demo:refresh` rewrites it. The site decodes the capture at build (`site/src/data/ansi.mjs`), so the demo cannot drift from glen. Only TTY-only stderr (spinner, progress, the `tail -f` diagnostic) is hand-written, and the site's unit tests check those strings against `src/`.

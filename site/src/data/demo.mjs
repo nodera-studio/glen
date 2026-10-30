@@ -1,13 +1,16 @@
 // @ts-check
-// The hero terminal script. Sessions are synthetic and time is compressed, but every line is
-// laid out the way glen prints it: ls table and column dropping (src/commands/ls.rs:181-235,
-// src/render/table.rs), transcript roles, tool rows and wrapping (src/render/transcript.rs,
-// src/render/text.rs:37), the tail -f short header and diagnostic (src/commands/tail.rs:254-268),
-// the send spinner and its progress messages (W2 send.rs:187-207, wait.rs:16-23) and the wait
-// outcome with its duration (W2 wait.rs:24-31, 118-151).
-// W7/W8: regenerate from real `glen` output against tests/fixtures (D8).
+// The hero terminal script. Every line of glen stdout comes from demo-capture.json: real glen
+// output, captured by tests/site_demo.rs from the synthetic sessions in tests/fixtures/demo and
+// decoded here (ansi.mjs). Time is compressed. The only hand-authored glen text is what glen
+// writes to a TTY's stderr, which a capture cannot see: the send spinner and its progress
+// messages (src/commands/send.rs, wait.rs) and the tail -f diagnostic (src/commands/tail.rs).
+// terminal-player.test.mjs checks each of those strings against glen's source.
+// Refresh the capture with `npm run demo:refresh`.
+import capture from './demo-capture.json' with { type: 'json' };
+import palette from '../../../src/render/palette.json' with { type: 'json' };
+import { decode } from './ansi.mjs';
 
-/** @typedef {'muted'|'accent'|'accent_2'|'success'|'warning'|'danger'|'focus'} Tone */
+/** @typedef {'muted'|'border'|'accent'|'accent_2'|'success'|'warning'|'danger'|'focus'} Tone */
 /** @typedef {{text: string, tone?: Tone, bold?: boolean}} Span */
 /** @typedef {Span[]} Line */
 /** @typedef {'a'|'b'} Pane */
@@ -32,106 +35,73 @@ export const WINDOWS = { ls: [420, 1000], send: [1600, 4700] };
 
 /** @param {string} text @param {Tone} [tone] @param {boolean} [bold] @returns {Span} */
 export const s = (text, tone, bold) => ({ text, ...(tone ? { tone } : {}), ...(bold ? { bold } : {}) });
-/** Display width; every glyph glen prints here is single-width. @param {string} t */
-const width = t => [...t].length;
-/** text::truncate @param {string} t @param {number} n */
-const truncate = (t, n) => width(t) <= n ? t : [...t].slice(0, Math.max(0, n - 1)).join('') + '…';
 /** @param {Line} line */
 export const plain = line => line.map(span => span.text).join('');
 
-/** text::wrap: word wrap that keeps the leading indent. @param {string} line @param {number} max */
-export function wrap(line, max) {
- if (width(line) <= max) return [line];
- const indent = truncate(line.match(/^\s*/)?.[0] ?? '', max - 1);
- const out = [];
- let current = indent;
- for (const word of line.split(/\s+/).filter(Boolean)) {
-  if (width(current) > width(indent) && width(current) + 1 + width(word) <= max) { current += ' ' + word; continue; }
-  if (width(current) > width(indent)) { out.push(current); current = indent; }
-  for (const c of word) {
-   if (width(current) + 1 > max) { out.push(current); current = indent; }
-   current += c;
-  }
- }
- if (width(current) > width(indent)) out.push(current);
- return out;
+/** @type {Record<string, {args: string[], columns: number, stdout: string}>} */
+const captures = capture.captures;
+/** @type {Map<string, Line[]>} */
+const decoded = new Map();
+/** The decoded capture for `key` (`<command>@<columns>`). @param {string} key @returns {Line[]} */
+export function lines(key) {
+ const raw = captures[key];
+ if (!raw) throw new Error(`no demo capture ${key}; add it to tests/site_demo.rs`);
+ if (!decoded.has(key)) decoded.set(key, decode(raw.stdout, palette));
+ return /** @type {Line[]} */ (decoded.get(key));
 }
 
-export const prompt = [s(cwd, 'accent_2'), s(' '), s('❯', 'accent'), s(' ')];
+/** Split lines on the empty lines between them (render_items joins items with a blank line). @param {Line[]} list */
+const blocks = list => list.reduce((out, line) => { if (plain(line) === '') out.push([]); else out[out.length - 1].push(line); return out; }, /** @type {Line[][]} */ ([[]]));
 
-const sessions = [
- { h: 'e27c0de', live: true, title: 'Fix migration 0012', turn: 'complete', updated: '2s ago', model: 'claude-sonnet-4-5' },
- { h: 'b7e2d81', live: false, title: 'Review routes', turn: 'complete', updated: '3m ago', model: 'claude-sonnet-4-5' },
- { h: 'b8e4a07', live: false, title: 'Add fixtures', turn: 'complete', updated: '1h ago', model: 'claude-sonnet-4-5' },
-];
+/** `glen ls`. @param {number} w */
+export const lsTable = w => lines('ls@' + w);
+/** The `glen wait` outcome; `glen send` prints the same when the reply arrives. @param {number} w */
+export const completedBlock = w => lines('wait@' + w);
+/** `glen show` header: title and meta, before the first empty line. @param {number} w */
+export const showHeader = w => blocks(lines('show@' + w))[0];
+/** `glen show` transcript items, oldest first. @param {number} w */
+export const items = w => blocks(lines('show@' + w)).slice(1);
+/** `glen tail -f` stdout before the first new item: its short header. @param {number} w */
+export const tailHeader = w => lines('tail-f@' + w);
+/**
+ * An item split so each part starts with the head (role line plus thinking or text) or with a
+ * tool row (`  ↳ `), wrapped continuation lines included.
+ * @param {Line[]} item
+ */
+export const itemParts = item => item.reduce((out, line, i) => { if (i && plain(line).startsWith('  ↳ ')) out.push([line]); else out[out.length - 1].push(line); return out; }, /** @type {Line[][]} */ ([[]]));
 
-/** `glen ls` for one project at a terminal width (ls.rs column_budget + table.rs). @param {number} w @returns {Line[]} */
-export function lsTable(w) {
- const labels = ['handle', 'state', 'project', 'title', 'turn', 'updated', 'model'];
- const cells = sessions.map(r => [r.h, r.live ? '● live' : '○ idle', cwd, r.title, r.turn, r.updated, r.model]);
- const widths = labels.map((label, i) => Math.max(label.length, ...cells.map(c => width(c[i]))));
- let cols = [0, 1, 3, 4, 5, 6];
- const other = () => cols.filter(i => i !== 3).reduce((n, i) => n + widths[i], 0) + 2 * (cols.length - 1);
- for (const drop of [6, 4, 2]) { if (w - other() >= 16) break; cols = cols.filter(i => i !== drop); }
- const budgets = widths.slice();
- budgets[3] = Math.max(1, w - other());
- const head = cols.map(i => truncate(labels[i], budgets[i]));
- const body = cells.map(c => cols.map(i => truncate(c[i], budgets[i])));
- const colWidth = cols.map((_, j) => Math.max(width(head[j]), ...body.map(r => width(r[j]))));
- /** @param {(text: string, j: number) => Span[]} paint @param {string[]} row @returns {Line} */
- const line = (row, paint) => {
-  const spans = row.flatMap((text, j) => {
-   const last = j === row.length - 1;
-   const pad = last ? '' : ' '.repeat(colWidth[j] - width(text) + 2);
-   return [...paint(text, j), ...(pad ? [s(pad)] : [])];
-  });
-  return spans.filter(span => span.text);
- };
- const lines = [line(head, text => [s(text, 'muted', true)])];
- body.forEach((row, r) => lines.push(line(row, (text, j) => {
-  const i = cols[j];
-  if (i === 0) return [s(text, 'focus')];
-  if (i === 1) return sessions[r].live ? [s('●', 'success'), s(' '), s('live', 'success')] : [s('○', 'muted'), s(' '), s('idle', 'muted')];
-  if (i >= 4) return [s(text, 'muted')];
-  return [s(text)];
- })));
- lines.push([], [s(`${sessions.length} sessions · ${sessions.filter(r => r.live).length} live`, 'muted')]);
- return lines;
-}
+const outcome = plain(completedBlock(76)[0]).match(/^✓ completed · (j[0-9a-f]+) · ([0-9a-f]+) · /);
+if (!outcome) throw new Error('wait@76 does not start with a completed outcome');
+/** The job handle and session handle glen printed. */
+export const [, job, session] = outcome;
+/** Index of the message the agent sends: the last user item in the transcript. */
+const sendAt = items(76).findLastIndex(item => plain(item[0]).startsWith('❯ user'));
+/** The message the agent sends, as the user item's body shows it. */
+export const message = items(76)[sendAt].slice(1).map(l => plain(l).trim()).join(' ');
+/** Text of the reply line the selection cue highlights: glen's `↩ <reply>` line without its tick. */
+export const selection = plain(/** @type {Line} */ (completedBlock(76).find(l => plain(l).startsWith('↩ ')))).replace(/ ✓$/, '');
 
-/** transcript.rs body(): wrap at width - 2 behind a two-space indent. @param {string} text @param {number} w @param {Tone} [tone] @returns {Line[]} */
-export const body = (text, w, tone) => wrap(text, w - 2).map(l => [s('  '), s(l, tone)]);
-/** transcript.rs role() @param {'user'|'assistant'} who @param {string} meta @returns {Line} */
-export const role = (who, meta) => who === 'user' ? [s('❯ user', 'accent', true), s(` · ${meta}`, 'muted')] : [s('◆ assistant', 'accent_2', true), s(` · ${meta}`, 'muted')];
-/** transcript.rs tool(): collapsed row, or plain wrapped body when it does not fit. @returns {(w: number) => Line[]} */
-export const tool = (/** @type {string} */ name, /** @type {string} */ summary, /** @type {string} */ result) => w => {
- const row = [s('  ↳ '), s(name, undefined, true), s(' '), s(summary, 'muted'), s(' · '), s('✓', 'success'), s(` ${result}`)];
- return width(plain(row)) <= w ? [row] : wrap(`↳ ${name} ${summary} · ✓ ${result}`, w - 2).map(l => [s('  ' + l)]);
-};
-
-/** wait.rs duration(): whole seconds, then minutes with zero-padded seconds. @param {number} ms */
-export const duration = ms => {
- const sec = Math.floor(Math.max(0, ms) / 1000);
- return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s`;
-};
-/** wait.rs progress(): the spinner message for each job state. */
+/** wait.rs progress(): the spinner message for each job state (TTY stderr, not captured). */
 export const PROGRESS = { queued: 'starting omp', locked: 'queued behind another glen job', accepted: 'waiting for the reply' };
 
-export const reply = 'Added the index. All 12 tests pass.';
-export const answer = `${reply} Migration 0012 is ready.`;
-/** wait.rs outcome(): the completed summary, painted success as one line. @type {Line} */
-export const completed = [s(`✓ completed · j3c9f41 · e27c0de · ${duration(41207)}`, 'success')];
-const sendCmd = 'glen send e27c0de "Fix 0012 and tell me when it passes."';
+export const prompt = [s(cwd, 'accent_2'), s(' '), s('❯', 'accent'), s(' ')];
+const sendCmd = `glen send ${session} "${message}"`;
+/** One transcript item as the omp pane prints it: a blank line, then the item. @param {Line[]} item */
+const item = item => [[], ...item];
+/** The transcript after the send, split into the steps the omp pane shows them in. @param {number} w */
+const turn = w => {
+ const [user, work, reply, answer] = items(w).slice(sendAt);
+ const [head, edit, bash] = itemParts(work);
+ return { user, head, edit, bash, reply, answer };
+};
 
 /** @type {Step[]} */
 export const script = [
  { k: 'static', p: 'b', lines: w => [
-  [...prompt, s('glen tail -f e27c0de')],
-  [s('e27c0de · Fix migration 0012 · '), s('●', 'success'), s(' '), s('live', 'success')],
-  [s('following e27c0de · Ctrl-C to stop', 'muted')],
-  [],
-  role('assistant', 'claude-sonnet-4-5 · 12:01'),
-  ...body('Found a missing index on users.email.', w),
+  [...prompt, s(`glen tail -f ${session}`)],
+  ...tailHeader(w),
+  [s(`following ${session} · Ctrl-C to stop`, 'muted')],
+  ...items(w).slice(0, sendAt).flatMap(item),
  ] },
  { k: 'cmd', p: 'a', id: 'ls', think: 420, text: 'glen ls' },
  { k: 'title', after: 'ls', v: 'glen' },
@@ -139,31 +109,24 @@ export const script = [
  { k: 'title', dt: 90, v: 'zsh' },
  { k: 'cmd', p: 'a', id: 'send', dt: 0, think: 350, text: sendCmd },
  { k: 'title', after: 'send', v: 'glen' },
- { k: 'spin', p: 'a', id: 'spin', after: 'send', dt: 30, v: 'sending to e27c0de · j3c9f41' },
- { k: 'event', p: 'b', after: 'send', dt: 500, lines: w => [[], role('user', '12:04'), ...body('Fix 0012 and tell me when it passes.', w)] },
+ { k: 'spin', p: 'a', id: 'spin', after: 'send', dt: 30, v: `sending to ${session} · ${job}` },
+ { k: 'event', p: 'b', after: 'send', dt: 500, lines: w => item(turn(w).user) },
  // The spinner starts on its send message, then follows the job: queued while omp starts,
  // accepted once omp takes the prompt (the user message lands in the omp pane).
  { k: 'msg', after: 'send', dt: 200, v: PROGRESS.queued },
  { k: 'msg', after: 'send', dt: 480, v: PROGRESS.accepted },
  { k: 'focus', p: 'b', after: 'send', dt: 540 },
- { k: 'event', p: 'b', after: 'send', dt: 1400, lines: w => [[], role('assistant', '12:04'), ...body('∴ thinking · 18 words', w, 'muted')] },
- { k: 'event', p: 'b', after: 'send', dt: 2300, lines: tool('edit', 'migrations/0012_add_index.sql', '3 lines') },
- { k: 'event', p: 'b', after: 'send', dt: 4200, lines: tool('bash', 'cargo test migration_0012', '14 lines') },
- { k: 'event', p: 'b', id: 'reply', after: 'send', dt: 5500, lines: tool('glen_reply', reply, 'delivered') },
+ { k: 'event', p: 'b', after: 'send', dt: 1400, lines: w => item(turn(w).head) },
+ { k: 'event', p: 'b', after: 'send', dt: 2300, lines: w => turn(w).edit },
+ { k: 'event', p: 'b', after: 'send', dt: 4200, lines: w => turn(w).bash },
+ // glen_reply is its own assistant message; its tool row lands at 5500, just before the hop.
+ { k: 'event', p: 'b', id: 'reply', after: 'send', dt: 5420, lines: w => item(turn(w).reply) },
  { k: 'hop', after: 'send', dt: 5560 },
  { k: 'focus', p: 'a', after: 'send', dt: 6080 },
- { k: 'flush', p: 'a', after: 'send', dt: 6100, ends: 'spin', lines: w => [
-  completed,
-  [],
-  ...wrap(`  ${answer}`, w).map(l => [s(l)]),
-  [s(`↩ ${reply} ✓`, 'muted')],
- ] },
+ { k: 'flush', p: 'a', after: 'send', dt: 6100, ends: 'spin', lines: completedBlock },
  { k: 'title', dt: 60, v: 'zsh' },
  { k: 'prompt', p: 'a', dt: 0 },
- { k: 'event', p: 'b', after: 'send', dt: 6240, lines: w => [[], role('assistant', '12:04'), ...body(answer, w)] },
+ { k: 'event', p: 'b', after: 'send', dt: 6240, lines: w => item(turn(w).answer) },
  { k: 'sel', p: 'a', after: 'send', dt: 7100 },
  { k: 'done', after: 'send', dt: 9300 },
 ];
-
-/** Text of the reply line the selection cue highlights. */
-export const selection = `↩ ${reply}`;
