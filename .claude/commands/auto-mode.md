@@ -11,7 +11,7 @@ Auto-mode invocation: $ARGUMENTS
 
 Procedure:
 
-1. If `$ARGUMENTS` carries an inline goal (`until /goal ...`, `/goal ...`, a board issue key, or an objective phrase), persist it to `.claude/auto-mode/state.md` as a `/goal` write first (same parsing as `.claude/commands/goal.md`), noting whether it is a release goal (explicit `release` / `tag v0.x.y` phrasing only).
+1. If `$ARGUMENTS` carries an inline goal (`until /goal ...`, `/goal ...`, a board issue (`W<n>` label or document id), or an objective phrase), persist it to `.claude/auto-mode/state.md` as a `/goal` write first (same parsing as `.claude/commands/goal.md`), noting whether it is a release goal (explicit `release` / `tag v0.x.y` phrasing only).
 2. Read `.claude/auto-mode/state.md`. If no goal is set anywhere, ask the user to declare one via `/goal` and stop — do not start a loop without a finish line.
 3. Every goal targets `main`; there is no base branch to ask about and no staging or promotion step.
 4. Otherwise begin or resume the autonomous loop against the active goal per the skill: recall Mnemosyne project `glen`, resolve waves (Glen board children first — Mnemosyne workspace project Glen, `projectId` `ff92abe1-da63-402d-a4f1-c8690e471be1` — then plan fallback), then run the wave pipeline — each wave branches off `main`, PRs into `main`, passes CI, gets a `memory_store` referencing the PR, and squash-merges — without a user gate between waves. A release goal ends with the `release` skill (version-bump PR, then an annotated `v0.x.y` tag on `main`).

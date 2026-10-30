@@ -86,7 +86,7 @@ Per wave, in order — this sequence is the spine of the mode:
 4. **Pre-push check** — `cargo fmt --all -- --check && cargo clippy --all-targets
    --locked -- -D warnings && cargo test --locked` (or `/run-ci`); fix red before
    pushing. The lefthook pre-push hook runs clippy and the tests too, when installed.
-5. **Open the PR into `main`** (`gh pr create --base main`), naming the board issue key
+5. **Open the PR into `main`** (`gh pr create --base main`), naming the board issue (`W<n>` label or document id)
    in the title or body; flip the issue → `in_review`.
 6. **Poll** — `gh pr checks <N> --watch` (blocks until CI settles), or wake ~270s apart
    with ScheduleWakeup; each cycle also fetch new PR comments and reviews since the poll

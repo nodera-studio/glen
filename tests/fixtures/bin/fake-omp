@@ -1,0 +1,7 @@
+#!/bin/sh
+if [ "$1" = "--version" ]; then
+    echo "omp/${FAKE_OMP_VERSION:-18.14.0}"
+else
+    echo "fake-omp: unsupported invocation" >&2
+    exit 64
+fi

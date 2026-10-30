@@ -134,8 +134,8 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
    (or `/run-ci`). Fix red before pushing; a red CI cycle costs a two-runner round trip.
 5. **Open the PR into `main`.** `git push -u origin <branch>`, then `gh pr create --base
-   main --title "<type>: <summary> (<issue key>)" --body <scope, tests, board issue key
-   and id>`. Flip the issue → `in_review`. Record the PR number in the ledger.
+   main --title "W<n>: <summary>" --body <scope, tests, board issue (W<n> + document id)>`.
+   Flip the issue → `in_review`. Record the PR number in the ledger.
 6. **Poll.** Either `gh pr checks <N> --watch` (blocks until every check finishes) or a
    ScheduleWakeup ~270s apart (under the 5-minute prompt-cache window). Each cycle:
    - `gh pr checks <N>` — both `check (ubuntu-latest)` and `check (macos-latest)`.
@@ -189,7 +189,7 @@ A goal without a release is **done** once its last wave is merged, `done` and ta
 `released:*` accumulates with `shipped:main`; it does not replace it. Apply a tag only
 when the merge or tag push actually happened this run — a tag tracks reality, not
 intent. To find which issues a release contains when they weren't all part of this goal:
-`git log <prev-tag>..v0.x.y --pretty=%s` and match the issue keys in the subjects.
+`git log <prev-tag>..v0.x.y --pretty=%s` and match the issues (`W<n>` label or document id) in the subjects.
 
 ## Autonomy before flagging — the escalation ladder
 
@@ -232,8 +232,8 @@ record the open question in the state file so a context refresh does not lose it
 
 ## Stop conditions
 
-- Finish line met → status `done`, final summary (waves shipped, PRs, issue keys, the
-  board prefix if it was settled this run, anything deferred to tech debt). Goal without
+- Finish line met → status `done`, final summary (waves shipped, PRs, issues (`W<n>` +
+  document id), anything deferred to tech debt). Goal without
   a release: last wave merged + `shipped:main`. Release goal: tag pushed + issues tagged
   `released:v0.x.y`.
 - A wave PR red 3+ cycles with no path forward → stop that wave, flag the user.

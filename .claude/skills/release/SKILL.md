@@ -43,7 +43,7 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
    - Pre-push: `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings
      && cargo test --locked`.
    - `gh pr create --title "chore: release v<version>"` with a body listing the shipped changes
-     and the board issue keys they implement.
+     and the board issues they implement (`W<n>` + document id).
 3. **Gate.** Wait for the `ci` checks (Linux and macOS) to go green: `gh pr checks <n> --watch`.
    Fix red on the same branch; never merge over red.
 4. **Capture before merging.** `memory_store` with `project: "glen"`, `type: "episodic"`,

@@ -39,6 +39,7 @@ Design and the omp surfaces it builds on: [`docs/design.md`](docs/design.md).
 
 ```bash
 cargo build                                         # debug build
+cargo run -- doctor                                 # check omp, paths and glen home
 cargo run -- <args>                                 # run the CLI
 cargo test                                          # all tests
 cargo clippy --all-targets -- -D warnings           # lint (warnings fail CI)
@@ -50,10 +51,11 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
 
 ## Conventions
 
-- Rust stable, edition 2024. Errors: `anyhow` in the binary, `thiserror` in library modules.
+- Rust stable, edition 2024. Errors: `GlenError` (`thiserror`) throughout, binary and library; no `anyhow`.
 - Parse omp's formats leniently: unknown entry types and fields must be skipped, not fatal.
   omp adds entry types between releases.
 - Tests that need omp data use fixtures under `tests/fixtures/`, never a live `~/.omp`.
+- Never mutate the process environment in code or tests (edition 2024 `set_var` is unsafe); read through `env::Env`.
 - Branch off `main`, PR into `main`. No direct pushes to `main`.
 
 ## Mnemosyne
