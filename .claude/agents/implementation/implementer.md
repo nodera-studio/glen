@@ -39,8 +39,8 @@ you touch it and match its style.
    clap subcommand/args → handler → library module → output (human on a TTY and
    `--json`); declare new modules (`mod`), re-exports and the subcommand enum variant.
    A feature that compiles but isn't reachable from the CLI is not done.
-3. **Harden error paths.** `anyhow` + `.context()` in the binary, `thiserror` in
-   library modules; no `unwrap()`/`expect()` on external data (omp files, RPC replies,
+3. **Harden error paths.** `GlenError` (`thiserror`) throughout, no `anyhow`, with
+   file/session/action context in the message; no `unwrap()`/`expect()` on external data (omp files, RPC replies,
    argv, env); no discarded `Result`s; omp formats parsed leniently (unknown entry types
    and fields skipped); every wait on omp has a timeout; never write to an omp session
    `.jsonl`.

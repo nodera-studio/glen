@@ -68,9 +68,9 @@ the terminal-demo code, approved it, and missed that 2 of its 4 scenes never app
 glen's conventions (from `AGENTS.md` and `.claude/CLAUDE.md`; re-read them if this block
 looks stale):
 
-- **Errors**: `anyhow` with `.context()` in the binary (`main.rs`, command handlers);
-  `thiserror` enums in library modules. A `?` without context on I/O or omp data is a
-  finding; `anyhow` in a library module is a finding.
+- **Errors**: `GlenError` (`thiserror`) throughout, binary and library. A `?` without
+  file/session context on I/O or omp data is a finding; any use of `anyhow`, and any
+  error without file/session context in its message, is a finding.
 - **Lenient omp parsing**: unknown omp entry types and fields are skipped, not fatal
   (omp adds entry types between releases). A truncated last `.jsonl` line (omp
   mid-write) is skipped. `deny_unknown_fields` on omp data is a bug.

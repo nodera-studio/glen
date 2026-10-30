@@ -49,7 +49,7 @@ Severity levels:
 <conventions>
 Project patterns to check code against (from `AGENTS.md`). Deviations are tech debt:
 
-**Errors:** `anyhow` + `.context()` in the binary; `thiserror` enums in library modules.
+**Errors:** `GlenError` (`thiserror`) throughout, binary and library; no `anyhow`.
 Scan: `src/**/*.rs`
 
 **Lenient omp parsing:** unknown entry types/fields skipped; a truncated last `.jsonl`
@@ -85,7 +85,7 @@ Dispatch via Agent tool:
 
 ```
 You are a pattern consistency auditor for glen, a single-crate Rust CLI (edition 2024,
-clap 4, serde, anyhow). You check that established patterns are followed uniformly.
+clap 4, serde, thiserror). You check that established patterns are followed uniformly.
 Deviations are tech debt.
 
 Read the conventions first: AGENTS.md (Conventions section), .claude/CLAUDE.md, and any
@@ -93,8 +93,8 @@ Read the conventions first: AGENTS.md (Conventions section), .claude/CLAUDE.md, 
 
 Then check these pattern groups across src/**/*.rs:
 
-1. ERRORS: anyhow + .context() in the binary; thiserror in library modules; no
-   anyhow::Error in library signatures; no `?` on I/O without context. Flag outliers.
+1. ERRORS: GlenError (thiserror) throughout, binary and library; any use of anyhow is a
+   finding; no `?` on I/O without file/session context in the message. Flag outliers.
 2. OMP PARSING: serde types for omp data tolerate unknown entry types and fields; one
    malformed line does not abort a transcript. Compare every parser to the most lenient
    one. Flag strict outliers.
@@ -241,7 +241,7 @@ Steps:
    - cargo build --locked 2>&1 | rg -n 'deprecated'   (compiler deprecation warnings)
    - clap 4 patterns superseded in the current 4.x (check with Context7: ctx7 library
      clap, then ctx7 docs)
-   - serde / serde_json / anyhow / dirs APIs marked deprecated in their current docs
+   - serde / serde_json / thiserror / dirs APIs marked deprecated in their current docs
    - edition 2024 changes the code has not adopted (e.g. `unsafe extern`, `gen` keyword
      collisions), if any
 

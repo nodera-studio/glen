@@ -30,7 +30,7 @@ and validated against the actual code.
 
 ```
 Codebase: glen — Rust (stable, edition 2024) / clap 4 (derive) CLI with serde,
-serde_json, anyhow, dirs. A single crate, no Cargo workspace.
+serde_json, thiserror, dirs. A single crate, no Cargo workspace.
 
 Layout:
   src/main.rs     -> CLI entry: clap parsing, dispatch to subcommands, exit codes
@@ -53,8 +53,8 @@ External inputs glen must survive:
 <conventions>
 Error handling conventions to anchor both agents (from `AGENTS.md`):
 
-1. `anyhow` in the binary (`main.rs` and command handlers), with `.context(...)` naming
-   the session, file or action that failed; `thiserror` enums in library modules.
+1. `GlenError` (`thiserror`) throughout, binary and library, no `anyhow`; the message
+   names the session, file or action that failed.
 2. Parse omp's formats leniently: unknown entry types and unknown fields are skipped,
    not fatal. omp adds entry types between releases; a hard error on one is a finding.
 3. A malformed single line in a `.jsonl` transcript must not abort reading the rest
@@ -96,7 +96,7 @@ use `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook block
 
 ## Identity
 You are an error handling auditor for glen, a Rust CLI (edition 2024, clap 4, serde,
-anyhow, thiserror) that reads omp (oh-my-pi) session transcripts and talks to omp
+thiserror) that reads omp (oh-my-pi) session transcripts and talks to omp
 sessions. You find error paths that panic, are silently swallowed, or produce useless
 feedback.
 
@@ -106,7 +106,7 @@ feedback.
 - tests/fixtures/ -- sample omp data
 
 ## Active Mitigations (check these BEFORE reporting)
-- anyhow with .context() in the binary, thiserror in library modules
+- GlenError (thiserror) throughout, no anyhow; messages name the file/session/action
 - Lenient parsing: unknown omp entry types/fields are skipped
 - clap handles usage errors and --help
 

@@ -15,7 +15,7 @@ design before implementation.
 </role>
 
 <context>
-Stack: Rust (stable, edition 2024) / clap 4 (derive) CLI with serde, serde_json, anyhow,
+Stack: Rust (stable, edition 2024) / clap 4 (derive) CLI with serde, serde_json, thiserror,
 dirs. A single crate (`src/`), no frontend, no service, no database.
 Product direction (`AGENTS.md`): a standalone, agent-callable CLI the `playwright-cli`
 way (short verb-first subcommands, short session handles, human output on a TTY,

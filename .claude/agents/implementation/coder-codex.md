@@ -66,8 +66,8 @@ Run the WHOLE fused loop in your own context, until green:
 2. Implement per the plan. WIRE every layer so the feature is reachable
    (clap subcommand/args → handler → library module → human and --json output;
    declare modules and enum variants). Compiles-but-unreachable is NOT done.
-3. Harden error paths: anyhow + .context() in the binary, thiserror in library
-   modules; no unwrap()/expect() on external data (omp files, RPC replies, argv, env);
+3. Harden error paths: GlenError (thiserror) throughout, no anyhow, with
+   file/session/action context in the message; no unwrap()/expect() on external data (omp files, RPC replies, argv, env);
    no discarded Results; parse omp formats leniently (skip unknown entry types and
    fields); a timeout on every wait for omp; NEVER write to an omp session .jsonl.
 4. Write unit + integration tests for the new behavior incl. the edges the plan
