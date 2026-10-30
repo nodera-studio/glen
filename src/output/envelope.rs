@@ -103,6 +103,22 @@ fn human_warnings(ctx: &OutputCtx, warnings: &[Warning], err: &mut dyn Write) ->
     }
     err.flush()
 }
+fn home_write_error(
+    ctx: &OutputCtx,
+    command: &str,
+    path: &std::path::Path,
+    action: &str,
+    e: io::Error,
+) -> GlenError {
+    if crate::sandbox::detect(&ctx.env).is_some() && e.kind() == io::ErrorKind::PermissionDenied {
+        crate::sandbox::map_home_write(&ctx.env, command, e)
+    } else {
+        GlenError::new(
+            ErrorCode::Io,
+            format!("cannot {action} {}: {e}", path.display()),
+        )
+    }
+}
 fn spill(
     ctx: &OutputCtx,
     bytes: &[u8],
@@ -131,21 +147,13 @@ fn spill(
     } else {
         Value::Null
     };
-    home.ensure_dir("out").map_err(|e| {
-        GlenError::new(
-            ErrorCode::Io,
-            format!("cannot create {}: {e}", dir.display()),
-        )
-    })?;
+    home.ensure_dir("out")
+        .map_err(|e| home_write_error(ctx, command, &dir, "create", e))?;
     // Human output can be explicitly forced to colour on a pipe. Spill files stay plain.
     let plain = anstream::adapter::strip_str(std::str::from_utf8(bytes).map_err(io::Error::other)?)
         .to_string();
-    write_private_atomic(&path, plain.as_bytes()).map_err(|e| {
-        GlenError::new(
-            ErrorCode::Io,
-            format!("cannot write {}: {e}", path.display()),
-        )
-    })?;
+    write_private_atomic(&path, plain.as_bytes())
+        .map_err(|e| home_write_error(ctx, command, &path, "write", e))?;
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             if entry.path() != path

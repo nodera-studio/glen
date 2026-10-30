@@ -52,3 +52,6 @@ Modes: `--version`, `--mode rpc [--no-ui] [--profile NAME] [--resume FILE]`, and
 `FAKE_OMP_LOG` appends NDJSON records with `at_ms`: `start` carries pid, pgid, argv, cwd and selected env;
 `in` / `out` carry a frame; `exit` carries the reason. Tests poll these records and status files as readiness
 signals, then wait for worker and omp teardown before releasing their temporary directories.
+
+W4 JSON contract runners reuse these reader fixtures and the `fake_omp` scenarios
+(ok, delayed, fork, error and hold-lease); no contract test reads a live omp home.

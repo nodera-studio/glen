@@ -93,6 +93,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             "message is larger than 512 KiB",
         ));
     }
+    crate::sandbox::refuse_unreachable(env, "send")?;
     let omp_bin = bin::find_omp(env).map_err(|m| {
         GlenError::new(ErrorCode::OmpUnavailable, m).with_hint("install omp or set GLEN_OMP_BIN")
     })?;
@@ -137,6 +138,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             return Err(GlenError::new(ErrorCode::NoRoute,message).with_hint("close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)"));
         }
     }
+    crate::sandbox::refuse_rpc(env, "send")?;
     let (timeout, warning) = rpc::job_timeout(env);
     let created = Instant::now();
     let now = jiff::Timestamp::now();

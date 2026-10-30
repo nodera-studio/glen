@@ -7,6 +7,7 @@ use std::{
 pub struct Env {
     vars: BTreeMap<String, String>,
     home: Option<PathBuf>,
+    home_explicit: bool,
     cwd: PathBuf,
 }
 impl Env {
@@ -16,6 +17,7 @@ impl Env {
                 .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
                 .collect(),
             home: dirs::home_dir(),
+            home_explicit: std::env::var_os("HOME").is_some_and(|v| !v.is_empty()),
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
         }
     }
@@ -26,6 +28,7 @@ impl Env {
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
             home: home.map(Path::to_path_buf),
+            home_explicit: home.is_some(),
             cwd: cwd.to_path_buf(),
         }
     }
@@ -39,6 +42,9 @@ impl Env {
     }
     pub fn non_empty(&self, k: &str) -> Option<&str> {
         self.get(k).filter(|v| !v.trim().is_empty())
+    }
+    pub fn home_is_explicit(&self) -> bool {
+        self.home_explicit
     }
     pub fn home(&self) -> Option<&Path> {
         self.home.as_deref()

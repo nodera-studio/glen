@@ -16,7 +16,7 @@ export default function AgentTabs() {
    return <div key={tab.id} role="tabpanel" id={`agent-panel-${tab.id}`} aria-labelledby={`agent-tab-${tab.id}`} tabIndex={0} hidden={selected!==tab.id} className="focus-ring">
     <h3 className="tab-heading sr-only">{tab.title}</h3>
     <div className="command-row"><pre className="command"><code className="bare">{command}</code></pre><CopyButton text={command} label={`${tab.title} skill command`} /></div>
-    <p className="panel-note">Writes <code>{tab.id==='claude' ? site.skillPaths.claude : site.skillPaths.codex}</code>.{tab.id==='claude' ? ' Claude Code picks it up in its next session.' : ' Give glen commands a timeout of at least 100 seconds, or use '}{tab.id==='codex' && <><code>glen send --no-wait</code> and then <code>glen wait &lt;job&gt;</code>.</>}</p>
+    <p className="panel-note">Writes <code>{tab.id==='claude' ? site.skillPaths.claude : site.skillPaths.codex}</code>.{tab.id==='claude' ? ' Claude Code picks it up in its next session.' : ' Give glen commands a timeout of at least 100 seconds, or use '}{tab.id==='codex' && <><code>glen send --wait 5s</code> and repeat <code>glen wait &lt;job&gt; --timeout 5s</code>.</>}</p>
    </div>;
   })}
   <p className="tabs-foot">Add <code>--project</code> to install into this repository instead.</p>
