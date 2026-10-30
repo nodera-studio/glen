@@ -148,19 +148,31 @@ pub fn map_worker_failure(env: &Env, message: &str) -> Option<GlenError> {
         "enotfound",
         "econnrefused",
         "etimeout",
+        "etimedout",
         "enetunreach",
         "eai_again",
         "eai_noname",
     ]
     .iter()
     .any(|s| lower.contains(s));
-    // Permission words alone can come from a provider. Require omp's connect/I/O
-    // framing or std's OS error suffix before treating them as sandbox failures.
+    // Permission words and OS error suffixes can come from a provider. Require
+    // connect/I/O framing or a known operation prefix together with an OS error.
     let io_framing = lower.starts_with("connect: ")
         || lower.contains(": connect: ")
         || lower.starts_with("io: ")
         || lower.contains(": io: ")
-        || lower.contains("(os error");
+        || (lower.contains("(os error")
+            && [
+                "spawn omp: ",
+                "bind omp socket: ",
+                "write omp socket: ",
+                "cannot connect ",
+                "cannot bind ",
+                "cannot spawn worker for ",
+                "cannot write ",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix)));
     let permission_failure = io_framing
         && [
             "permission denied",
@@ -232,6 +244,7 @@ mod tests {
             "Couldn't connect to 127.0.0.1:443 (connection refused). Check that the server is running and reachable.",
             "No internet connection: couldn't reach api.anthropic.com (getaddrinfo ETIMEOUT). Check your network or proxy and try again.",
             "ETIMEOUT",
+            "connect ETIMEDOUT 1.2.3.4:443",
             "connect ENETUNREACH 1.2.3.4:443",
             "connect ECONNREFUSED 127.0.0.1:443",
             "Network error: getaddrinfo ENOTFOUND api.openai.com",
@@ -265,6 +278,10 @@ mod tests {
             "spawn omp: Operation not permitted (os error 1)",
             "bind omp socket: Permission denied (os error 13)",
             "write omp socket: Read-only file system (os error 30)",
+            "cannot connect omp socket: Permission denied (os error 13)",
+            "cannot bind lease socket: Operation not permitted (os error 1)",
+            "cannot spawn worker for job j_123 at /glen/jobs/j_123: Permission denied (os error 13)",
+            "cannot write glen home for send: Read-only file system (os error 30)",
             "io: Permission denied",
             "cannot start omp: io: Operation not permitted (see worker.log)",
         ] {
@@ -284,12 +301,14 @@ mod tests {
     #[test]
     fn worker_permission_prose_is_not_a_sandbox_failure() {
         for vars in [
+            vec![],
             vec![("CODEX_SANDBOX", "seatbelt")],
             vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
         ] {
             let env = Env::for_test(None, Path::new("/"), &vars);
             for message in [
                 "403: Permission denied",
+                "403: Permission denied (os error 13)",
                 "403: Operation not permitted",
                 "provider: read-only file system",
                 "spawn omp: Operation not permitted",
