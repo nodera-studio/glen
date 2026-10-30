@@ -385,17 +385,33 @@ fn list(f: &mut Frame, app: &App, rect: Rect) {
             app.theme.style(Token::Muted),
         ));
     } else if app.list.rows.is_empty() {
-        lines.push(styled(
-            if let Some(path) = &app.list.sessions_dir_missing {
-                format!(
-                    "no sessions · {} is missing",
-                    text::single_line(&path.to_string_lossy())
-                )
-            } else {
-                "no sessions in this scope".into()
-            },
-            app.theme.style(Token::Muted),
-        ));
+        let mut messages = vec![];
+        if let Some(path) = &app.list.sessions_dir_missing {
+            messages.push("no omp sessions yet".into());
+            messages.push(format!(
+                "({} does not exist)",
+                text::single_line(&text_render::tilde(path, app.home.as_deref()))
+            ));
+        } else {
+            messages.push(match &app.scope {
+                Scope::Bucket { cwd, .. } => format!(
+                    "no omp sessions for {}",
+                    text::single_line(&text_render::tilde(cwd, app.home.as_deref()))
+                ),
+                Scope::All => "no omp sessions yet".into(),
+            });
+            if app.list.total_all > 0 {
+                messages.push(format!(
+                    "a shows {} sessions in other projects",
+                    app.list.total_all
+                ));
+            }
+        }
+        lines.extend(
+            messages
+                .into_iter()
+                .map(|message| styled(message, app.theme.style(Token::Muted))),
+        );
     }
     let offset = layout::list_offset(app, rect);
     for row in app
@@ -531,6 +547,49 @@ fn reflow(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
     }
     (lines, starts)
 }
+fn empty_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let muted = Token::Muted;
+    let messages = match &app.transcript.status {
+        TranscriptStatus::Idle => vec![
+            ("select a session".into(), muted),
+            ("↑↓ choose · enter write".into(), muted),
+        ],
+        TranscriptStatus::Opening => vec![(
+            format!("{} reading {}", theme::spinner(app.frame), handle(app)),
+            muted,
+        )],
+        TranscriptStatus::NotYetPersisted => vec![
+            (
+                format!(
+                    "{} is live but has not written a transcript yet",
+                    handle(app)
+                ),
+                muted,
+            ),
+            ("send a message to start it".into(), muted),
+        ],
+        TranscriptStatus::Ready => vec![("no messages yet".into(), muted)],
+        TranscriptStatus::Failed(error) => {
+            // Keep the follower/opener's message verbatim, including tail -f's not_found prose.
+            let mut messages = vec![(
+                format!("✗ {}", text::single_line(&error.message)),
+                Token::Danger,
+            )];
+            if let Some(hint) = &error.hint {
+                messages.push((format!("  {}", text::single_line(hint)), muted));
+            }
+            messages
+        }
+    };
+    messages
+        .into_iter()
+        .flat_map(|(message, token)| {
+            text::wrap(&message, Some(usize::from(width).max(1)))
+                .into_iter()
+                .map(move |line| styled(line, app.theme.style(token)))
+        })
+        .collect()
+}
 fn transcript(f: &mut Frame, app: &App, rect: Rect) {
     let area = layout::inner(rect);
     let scroll = &app.transcript.scroll;
@@ -557,20 +616,11 @@ fn transcript(f: &mut Frame, app: &App, rect: Rect) {
         top = anchor.and_then(|i| starts.get(i)).copied().unwrap_or(0);
     }
     if lines.is_empty() {
-        let message = match &app.transcript.status {
-            TranscriptStatus::Idle => "select a session".into(),
-            TranscriptStatus::Opening => format!("{} opening session", theme::spinner(app.frame)),
-            TranscriptStatus::NotYetPersisted => {
-                "waiting for the session to write its transcript".into()
-            }
-            TranscriptStatus::Failed(e) => format!("✗ {}", text::single_line(&e.message)),
-            TranscriptStatus::Ready => "no transcript items yet".into(),
-        };
         paint(
             f,
             app,
             Rect::new(area.x, area.y, area.width, height),
-            vec![styled(message, app.theme.style(Token::Muted))],
+            empty_transcript_lines(app, area.width),
         );
     } else {
         paint(
@@ -893,9 +943,39 @@ fn notice(f: &mut Frame, app: &App, rect: Rect) {
             .collect(),
     );
 }
-fn input(f: &mut Frame, app: &App, rect: Rect) {
+fn input(f: &mut Frame, app: &App, mut rect: Rect) {
     if rect.height == 0 || rect.width == 0 {
         return;
+    }
+    if app.prompt.text.is_empty() {
+        let placeholder = if app.list.selected.is_none() {
+            "select a session to write to it".into()
+        } else if app.focus == Focus::Prompt {
+            format!("message {} · enter send", handle(app))
+        } else {
+            format!("tab to write to {}", handle(app))
+        };
+        // Keep visual hints above the editable row, so text after the marker is only draft text.
+        paint(
+            f,
+            app,
+            Rect::new(rect.x, rect.y, rect.width, 1),
+            vec![styled(placeholder, app.theme.style(Token::Muted))],
+        );
+        if app.list.selected.is_none() {
+            if app.focus == Focus::Prompt
+                && app.overlay.is_none()
+                && f.area().contains((rect.x, rect.y).into())
+            {
+                f.set_cursor_position((rect.x, rect.y));
+            }
+            return;
+        }
+        rect.y = rect.y.saturating_add(1);
+        rect.height = rect.height.saturating_sub(1);
+        if rect.height == 0 {
+            return;
+        }
     }
     let (handle, lines, (cx, cy)) = layout::prompt_lines(app, rect.width);
     let prefix_width = text::width(&handle) + 3;
@@ -936,42 +1016,38 @@ fn input(f: &mut Frame, app: &App, rect: Rect) {
     }
 }
 
-/// One register for a whole row: Unicode chords in colour, spelled-out keys otherwise.
-pub fn key_label(binding: KeyBinding, depth: ColorDepth) -> String {
-    let unicode = depth != ColorDepth::None;
+/// Status hints and help use ASCII key spellings at every colour depth.
+pub fn key_label(binding: KeyBinding, _depth: ColorDepth) -> String {
     let base = match binding.code {
-        KeyCode::Tab => if unicode { "⇥" } else { "Tab" }.into(),
-        KeyCode::BackTab => if unicode { "⇧⇥" } else { "Shift-Tab" }.into(),
-        KeyCode::Enter => if unicode { "⏎" } else { "Enter" }.into(),
-        KeyCode::Esc => "Esc".into(),
-        KeyCode::Up => if unicode { "↑" } else { "Up" }.into(),
-        KeyCode::Down => if unicode { "↓" } else { "Down" }.into(),
-        KeyCode::Left => if unicode { "←" } else { "Left" }.into(),
-        KeyCode::Right => if unicode { "→" } else { "Right" }.into(),
-        KeyCode::Home => "Home".into(),
-        KeyCode::End => "End".into(),
-        KeyCode::PageUp => "PgUp".into(),
-        KeyCode::PageDown => "PgDn".into(),
-        KeyCode::Backspace => if unicode { "⌫" } else { "Backspace" }.into(),
-        KeyCode::Delete => "Delete".into(),
-        KeyCode::F(n) => format!("F{n}"),
-        KeyCode::Char(c) => {
-            if binding.modifiers.contains(KeyModifiers::CONTROL) {
-                c.to_uppercase().collect()
-            } else {
-                c.to_string()
-            }
+        KeyCode::Tab => "tab".into(),
+        KeyCode::BackTab => "shift-tab".into(),
+        KeyCode::Enter => "enter".into(),
+        KeyCode::Esc => "esc".into(),
+        KeyCode::Up => "up".into(),
+        KeyCode::Down => "down".into(),
+        KeyCode::Left => "left".into(),
+        KeyCode::Right => "right".into(),
+        KeyCode::Home => "home".into(),
+        KeyCode::End => "end".into(),
+        KeyCode::PageUp => "pgup".into(),
+        KeyCode::PageDown => "pgdn".into(),
+        KeyCode::Backspace => "backspace".into(),
+        KeyCode::Delete => "delete".into(),
+        KeyCode::F(n) => format!("f{n}"),
+        KeyCode::Char(c) if binding.modifiers.contains(KeyModifiers::CONTROL) => {
+            c.to_lowercase().collect()
         }
+        KeyCode::Char(c) => c.to_string(),
         _ => "key".into(),
     };
     let mut prefix = String::new();
-    for (modifier, glyph, ascii) in [
-        (KeyModifiers::CONTROL, "⌃", "Ctrl-"),
-        (KeyModifiers::ALT, "⌥", "Alt-"),
-        (KeyModifiers::SHIFT, "⇧", "Shift-"),
+    for (modifier, ascii) in [
+        (KeyModifiers::CONTROL, "^"),
+        (KeyModifiers::ALT, "alt-"),
+        (KeyModifiers::SHIFT, "shift-"),
     ] {
         if binding.modifiers.contains(modifier) && binding.code != KeyCode::BackTab {
-            prefix.push_str(if unicode { glyph } else { ascii });
+            prefix.push_str(ascii);
         }
     }
     format!("{prefix}{base}")
@@ -985,6 +1061,8 @@ pub struct Hint {
 /// Priority order is explicit. Collapsing removes only a suffix of this list.
 const PANE_HINT_PRIORITY: &[Action] = &[
     Action::NextFocus,
+    Action::Help,
+    Action::Quit,
     Action::FocusPrompt,
     Action::Down,
     Action::Up,
@@ -994,8 +1072,6 @@ const PANE_HINT_PRIORITY: &[Action] = &[
     Action::Scope,
     Action::Refresh,
     Action::Inbox,
-    Action::Help,
-    Action::Quit,
     Action::Abort,
     Action::Models,
     Action::ThinkingLevels,
@@ -1156,35 +1232,101 @@ fn overlay_area(a: &Areas) -> Option<Rect> {
         .or(a.list)
 }
 fn help_rows(app: &App) -> Vec<(String, String, bool)> {
-    let mut actions = vec![];
-    let mut rows: Vec<(String, String, bool)> = vec![];
-    // Help follows the actual focused keymap, grouping aliases for the same action.
-    for (binding, action, label) in keymap::bindings(KeymapCtx {
-        overlay: OverlayCtx::None,
-        focus: app.focus,
-    }) {
-        if let Some(index) = actions.iter().position(|a| a == action) {
-            let key = key_label(*binding, app.theme.depth);
-            let current = &mut rows[index].0;
-            if !current.split(" / ").any(|s| s == key) {
-                current.push_str(" / ");
-                current.push_str(&key);
-            }
-            continue;
-        }
-        actions.push(*action);
-        let unavailable = control_action(*action) && !app.caps.controls;
-        rows.push((
-            key_label(*binding, app.theme.depth),
-            if unavailable {
-                format!("{label} (not in this build)")
+    let mut rows = vec![];
+    for (title, bindings) in keymap::help_groups() {
+        rows.push((String::new(), title.into(), false));
+        let mut actions = vec![];
+        let mut group: Vec<(String, String, bool)> = vec![];
+        for (binding, action, label) in bindings {
+            let key = key_label(binding, app.theme.depth);
+            if let Some(index) = actions.iter().position(|a| *a == action) {
+                let current = &mut group[index].0;
+                if !current.split(" / ").any(|s| s == key) {
+                    current.push_str(" / ");
+                    current.push_str(&key);
+                }
             } else {
-                (*label).into()
-            },
-            unavailable,
-        ));
+                actions.push(action);
+                let unavailable = control_action(action) && !app.caps.controls;
+                group.push((
+                    key,
+                    if unavailable {
+                        format!("{label} (not in this build)")
+                    } else {
+                        label.into()
+                    },
+                    unavailable,
+                ));
+            }
+        }
+        rows.extend(group);
     }
     rows
+}
+fn help_lines(app: &App, width: u16) -> Vec<Line<'static>> {
+    let rows = help_rows(app);
+    let key_w = rows
+        .iter()
+        .map(|(key, _, _)| text::width(key))
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(width).saturating_sub(3))
+        .max(1);
+    let mut lines = vec![];
+    for (key, label, unavailable) in rows {
+        if key.is_empty() {
+            lines.push(styled(
+                label,
+                app.theme.style(Token::Muted).patch(app.theme.bold()),
+            ));
+            continue;
+        }
+        let key = text::truncate(&key, key_w);
+        let padding = key_w.saturating_sub(text::width(&key)) + 2;
+        let label_width = usize::from(width).saturating_sub(key_w + 2).max(1);
+        let labels = if unavailable && text::width(&label) > label_width {
+            let mut lines = text::wrap(
+                label.strip_suffix(" (not in this build)").unwrap_or(&label),
+                Some(label_width),
+            );
+            lines.push("(not in this build)".into());
+            lines
+        } else {
+            text::wrap(&label, Some(label_width))
+        };
+        for (index, label) in labels.into_iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    if index == 0 {
+                        format!("{key}{}", " ".repeat(padding))
+                    } else {
+                        " ".repeat(key_w + 2)
+                    },
+                    app.theme.style(if unavailable {
+                        Token::Muted
+                    } else {
+                        Token::Focus
+                    }),
+                ),
+                Span::styled(
+                    label,
+                    if unavailable {
+                        app.theme.style(Token::Muted)
+                    } else {
+                        Style::default()
+                    },
+                ),
+            ]));
+        }
+    }
+    lines
+}
+pub(super) fn help_scroll_bounds(app: &App) -> (usize, usize) {
+    let area = overlay_area(&layout::areas(app))
+        .map(layout::inner)
+        .unwrap_or_default();
+    let page = usize::from(area.height.saturating_sub(2)).max(1);
+    (page, help_lines(app, area.width).len().saturating_sub(page))
 }
 fn overlay(f: &mut Frame, app: &App, a: &Areas) {
     let Some(overlay) = &app.overlay else {
@@ -1231,52 +1373,26 @@ fn overlay(f: &mut Frame, app: &App, a: &Areas) {
     let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
     match overlay {
         Overlay::Help => {
-            let key_w = (usize::from(content.width) / 3).clamp(1, 22);
-            let mut lines = vec![];
-            for (key, label, unavailable) in help_rows(app) {
-                let key = text::truncate(&key, key_w);
-                let pad = key_w.saturating_sub(text::width(&key)) + 1;
-                let label = if unavailable {
-                    let suffix = " (not in this build)";
-                    let width = usize::from(content.width).saturating_sub(key_w + 1);
-                    let base = label.strip_suffix(suffix).unwrap_or(&label);
-                    if width >= text::width(suffix) {
-                        format!(
-                            "{}{}",
-                            text::truncate(base, width - text::width(suffix)),
-                            suffix
-                        )
-                    } else {
-                        text::truncate(suffix.trim_start(), width)
-                    }
-                } else {
-                    label
-                };
-                let style = if unavailable {
-                    app.theme.style(Token::Muted)
-                } else {
-                    app.theme.style(Token::Focus)
-                };
-                lines.push(Line::from(vec![
-                    Span::styled(key, style),
-                    Span::raw(" ".repeat(pad)),
-                    Span::styled(
-                        label,
-                        if unavailable {
-                            app.theme.style(Token::Muted)
-                        } else {
-                            Style::default()
-                        },
-                    ),
-                ]));
-            }
-            paint(f, app, content, lines);
+            let lines = help_lines(app, content.width);
+            let offset = app
+                .help_scroll
+                .min(lines.len().saturating_sub(usize::from(content.height)));
+            paint(
+                f,
+                app,
+                content,
+                lines
+                    .into_iter()
+                    .skip(offset)
+                    .take(usize::from(content.height))
+                    .collect(),
+            );
             paint(
                 f,
                 app,
                 footer,
                 vec![styled(
-                    "Esc closes · keys for the focused region",
+                    "up/down scroll · esc closes",
                     app.theme.style(Token::Muted),
                 )],
             );
@@ -1334,7 +1450,10 @@ fn overlay(f: &mut Frame, app: &App, a: &Areas) {
                 }
             }
             if lines.is_empty() {
-                lines.push(styled("no inbox replies", app.theme.style(Token::Muted)));
+                lines.push(styled(
+                    "no messages from omp yet",
+                    app.theme.style(Token::Muted),
+                ));
             }
             paint(f, app, content, lines);
             paint(
@@ -1427,16 +1546,15 @@ fn overlay(f: &mut Frame, app: &App, a: &Areas) {
     }
 }
 fn too_small(f: &mut Frame, app: &App) {
-    let area = Rect::new(0, 0, app.size.0, u16::from(app.size.1 > 0));
-    paint(
-        f,
-        app,
-        area,
-        vec![styled(
-            "terminal too small · need 40×10",
-            app.theme.style(Token::Muted),
-        )],
+    let message = format!(
+        "glen watch needs at least 40×10 · now {}×{}",
+        app.size.0, app.size.1
     );
+    let lines = text::wrap(&message, Some(usize::from(app.size.0).max(1)))
+        .into_iter()
+        .map(|line| styled(line, app.theme.style(Token::Muted)))
+        .collect();
+    paint(f, app, Rect::new(0, 0, app.size.0, app.size.1), lines);
 }
 
 #[cfg(test)]
@@ -1839,6 +1957,7 @@ pub(crate) mod tests {
                     if depth == ColorDepth::None {
                         assert!(!unicode, "ASCII register: {row}");
                     }
+                    assert!(row.is_ascii(), "hints must use ASCII at every depth: {row}");
                 }
             }
         }
@@ -1851,6 +1970,318 @@ pub(crate) mod tests {
                 unicode_width::UnicodeWidthChar::width(glyph.chars().next().unwrap()),
                 Some(1)
             );
+        }
+    }
+    #[test]
+    fn ascii_key_spellings_and_pane_hint_priority_are_depth_independent() {
+        for depth in [
+            ColorDepth::None,
+            ColorDepth::Ansi16,
+            ColorDepth::Ansi256,
+            ColorDepth::TrueColor,
+        ] {
+            for (code, modifiers, expected) in [
+                (KeyCode::Tab, KeyModifiers::NONE, "tab"),
+                (KeyCode::Enter, KeyModifiers::NONE, "enter"),
+                (KeyCode::Esc, KeyModifiers::NONE, "esc"),
+                (KeyCode::Enter, KeyModifiers::ALT, "alt-enter"),
+                (KeyCode::Char('t'), KeyModifiers::CONTROL, "^t"),
+                (KeyCode::Char('c'), KeyModifiers::CONTROL, "^c"),
+                (KeyCode::Char('x'), KeyModifiers::CONTROL, "^x"),
+            ] {
+                assert_eq!(
+                    key_label(
+                        KeyBinding {
+                            code,
+                            modifiers,
+                            label: "test"
+                        },
+                        depth
+                    ),
+                    expected
+                );
+            }
+            let mut app = scene(palette(depth, Theme::Dark));
+            app.toast = None;
+            for focus in [Focus::Sessions, Focus::Transcript] {
+                app.focus = focus;
+                let hints = all_status_hints(&app);
+                assert_eq!(
+                    hints[..3]
+                        .iter()
+                        .map(|hint| hint.action)
+                        .collect::<Vec<_>>(),
+                    [Action::NextFocus, Action::Help, Action::Quit]
+                );
+                let narrow = status_segments(&app, 40);
+                assert!(narrow.iter().any(|hint| hint.action == Action::Help));
+                assert!(narrow.iter().any(|hint| hint.action == Action::Quit));
+            }
+        }
+    }
+    fn region_text(buffer: &Buffer, area: Rect) -> Vec<String> {
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .into()
+            })
+            .collect()
+    }
+    #[test]
+    fn empty_states_use_the_table_text_and_the_owned_home_path() {
+        let mut app = App::new(
+            palette(ColorDepth::TrueColor, Theme::Dark),
+            Scope::Bucket {
+                cwd: "/home/test/work/gamma".into(),
+                label: "gamma".into(),
+            },
+            (120, 40),
+            Instant::now(),
+            SystemTime::UNIX_EPOCH,
+        );
+        app.home = Some("/home/test".into());
+        app.list.loaded = true;
+        app.list.sessions_dir_missing = Some("/home/test/ae/sessions".into());
+        let (buffer, _, _) = screenshot(&mut app);
+        let areas = layout::areas(&app);
+        let lines = region_text(&buffer, areas.list.unwrap());
+        assert_eq!(
+            &lines[..2],
+            ["no omp sessions yet", "(~/ae/sessions does not exist)"]
+        );
+        let lines = region_text(&buffer, layout::inner(areas.transcript.unwrap()));
+        assert_eq!(&lines[..2], ["select a session", "↑↓ choose · enter write"]);
+        assert!(
+            region_text(&buffer, areas.input)
+                .join("\n")
+                .contains("select a session to write to it")
+        );
+        app.list.sessions_dir_missing = None;
+        app.list.total_all = 7;
+        let (buffer, _, _) = screenshot(&mut app);
+        let lines = region_text(&buffer, layout::areas(&app).list.unwrap());
+        assert_eq!(lines[0], "no omp sessions for ~/work/gamma");
+        assert!(lines[1].starts_with("a shows 7 sessions in other"));
+        assert!(lines[1].ends_with('…'));
+        app.list.total_all = 0;
+        let (buffer, _, _) = screenshot(&mut app);
+        assert!(region_text(&buffer, layout::areas(&app).list.unwrap())[1].is_empty());
+    }
+    #[test]
+    fn transcript_interim_states_preserve_error_prose_style_and_hint() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        let strings = |lines: Vec<Line<'static>>| {
+            lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        };
+        app.transcript.status = TranscriptStatus::Ready;
+        assert_eq!(
+            strings(empty_transcript_lines(&app, 100)),
+            ["no messages yet"]
+        );
+        app.transcript.status = TranscriptStatus::Opening;
+        assert_eq!(
+            strings(empty_transcript_lines(&app, 100)),
+            [format!("{} reading e27c0de", theme::spinner(app.frame))]
+        );
+        app.transcript.status = TranscriptStatus::NotYetPersisted;
+        assert_eq!(
+            strings(empty_transcript_lines(&app, 100)),
+            [
+                "e27c0de is live but has not written a transcript yet",
+                "send a message to start it"
+            ]
+        );
+        let message = "session file disappeared or was replaced: /fixtures/A.jsonl";
+        app.transcript.status = TranscriptStatus::Failed(
+            crate::error::GlenError::new(crate::error::ErrorCode::NotFound, message)
+                .with_hint("select another session")
+                .into(),
+        );
+        let lines = empty_transcript_lines(&app, 100);
+        assert_eq!(lines[0].spans[0].style, app.theme.style(Token::Danger));
+        assert_eq!(lines[1].spans[0].style, app.theme.style(Token::Muted));
+        assert_eq!(
+            strings(lines),
+            [format!("✗ {message}"), "  select another session".into()]
+        );
+        app.transcript.dropped = 0;
+        app.transcript.blocks.clear();
+        app.transcript.lines.clear();
+        let (buffer, _, _) = screenshot(&mut app);
+        let area = layout::inner(layout::areas(&app).transcript.unwrap());
+        assert_eq!(
+            buffer[(area.x, area.y)].fg,
+            app.theme.style(Token::Danger).fg.unwrap()
+        );
+    }
+    #[test]
+    fn prompt_and_inbox_empty_placeholders_are_visible_and_muted() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.size = (60, 20);
+        app.prompt.text.clear();
+        app.prompt.cursor = 0;
+        for (focus, expected) in [
+            (Focus::Prompt, "message e27c0de · enter send"),
+            (Focus::Sessions, "tab to write to e27c0de"),
+        ] {
+            app.focus = focus;
+            let (buffer, cursor, position) = screenshot(&mut app);
+            let area = layout::areas(&app).input;
+            let lines = region_text(&buffer, area);
+            assert_eq!(area.height, 2);
+            assert_eq!(lines[0], expected);
+            assert_eq!(lines[1], "e27c0de ❯");
+            assert!(app.prompt.text.is_empty());
+            assert_eq!(app.prompt.cursor, 0);
+            assert_eq!(cursor, focus == Focus::Prompt);
+            if cursor {
+                assert_eq!(position.y, area.y + 1);
+                assert_eq!(position.x, area.x + text::width("e27c0de ❯ ") as u16);
+            }
+            assert_eq!(
+                buffer[(area.x + 10, area.y)].fg,
+                app.theme.style(Token::Muted).fg.unwrap()
+            );
+        }
+        app.inbox.records.clear();
+        app.overlay = Some(Overlay::Inbox);
+        let (buffer, _, _) = screenshot(&mut app);
+        assert!(
+            (0..buffer.area.height)
+                .any(|y| row_text(&buffer, y).contains("no messages from omp yet"))
+        );
+    }
+    #[test]
+    fn help_covers_every_context_binding_without_truncation_and_scrolls() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.size = (140, 70);
+        app.overlay = Some(Overlay::Help);
+        let mut required = vec![];
+        for overlay in [
+            OverlayCtx::None,
+            OverlayCtx::Help,
+            OverlayCtx::Inbox,
+            OverlayCtx::Confirm,
+            OverlayCtx::Picker,
+        ] {
+            for focus in [Focus::Sessions, Focus::Transcript, Focus::Prompt] {
+                for (binding, action, label) in keymap::bindings(KeymapCtx { overlay, focus }) {
+                    required.push((key_label(*binding, app.theme.depth), *action, *label));
+                }
+            }
+        }
+        for focus in [Focus::Sessions, Focus::Transcript, Focus::Prompt] {
+            app.focus = focus;
+            let rows = help_rows(&app);
+            let (buffer, _, _) = screenshot(&mut app);
+            let shown = (0..buffer.area.height)
+                .map(|y| row_text(&buffer, y))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for (key, action, label) in &required {
+                assert!(
+                    rows.iter()
+                        .any(|(keys, text, _)| keys.split(" / ").any(|k| k == key)
+                            && text.starts_with(label)),
+                    "missing {action:?}: {key} {label}"
+                );
+                assert!(shown.contains(key), "key absent from rendered help: {key}");
+                assert!(
+                    shown.contains(label),
+                    "action absent from rendered help: {action:?} {label}"
+                );
+            }
+            for (key, label, unavailable) in rows {
+                if unavailable {
+                    assert!(
+                        shown
+                            .lines()
+                            .any(|line| line.contains(&key) && line.contains(&label)),
+                        "truncated unavailable control: {key} {label}"
+                    );
+                }
+            }
+        }
+        let narrow_lines = help_lines(&app, 38)
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            narrow_lines
+                .iter()
+                .filter(|line| line.contains("(not in this build)"))
+                .count(),
+            help_rows(&app)
+                .iter()
+                .filter(|(_, _, unavailable)| *unavailable)
+                .count(),
+            "every unavailable control keeps its full suffix at narrow widths"
+        );
+        for (keys, _, unavailable) in help_rows(&app) {
+            if !keys.is_empty() {
+                assert!(
+                    narrow_lines.iter().any(|line| line.starts_with(&keys)),
+                    "truncated aliases: {keys}"
+                );
+            }
+            if unavailable {
+                assert!(
+                    narrow_lines
+                        .iter()
+                        .any(|line| line.contains("(not in this build)"))
+                );
+            }
+        }
+        app.size = (80, 24);
+        app.help_scroll = 0;
+        let (before, _, _) = screenshot(&mut app);
+        let key = |code| {
+            Msg::Key(ratatui::crossterm::event::KeyEvent::new(
+                code,
+                KeyModifiers::NONE,
+            ))
+        };
+        assert!(update::update(&mut app, key(KeyCode::PageDown)).is_empty());
+        assert!(app.help_scroll > 0);
+        let (after, _, _) = screenshot(&mut app);
+        assert_ne!(before, after);
+        update::update(&mut app, key(KeyCode::End));
+        let (_, limit) = help_scroll_bounds(&app);
+        assert_eq!(app.help_scroll, limit);
+        update::update(&mut app, key(KeyCode::Down));
+        assert_eq!(app.help_scroll, limit);
+        update::update(&mut app, key(KeyCode::Home));
+        assert_eq!(app.help_scroll, 0);
+        update::update(&mut app, key(KeyCode::Esc));
+        assert!(app.overlay.is_none());
+    }
+    #[test]
+    fn too_small_reports_the_full_current_dimensions_and_nothing_else() {
+        let mut app = scene(palette(ColorDepth::None, Theme::Dark));
+        for size in [(60, 9), (30, 8), (39, 10)] {
+            app.size = size;
+            let (buffer, cursor, _) = screenshot(&mut app);
+            let shown = (0..size.1)
+                .map(|y| row_text(&buffer, y))
+                .collect::<Vec<_>>()
+                .join(" ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                shown,
+                format!(
+                    "glen watch needs at least 40×10 · now {}×{}",
+                    size.0, size.1
+                )
+            );
+            assert!(!cursor);
         }
     }
     #[test]

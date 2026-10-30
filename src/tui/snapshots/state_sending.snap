@@ -27,7 +27,7 @@ glen watch                                   4 sessions · 2 live · ◐ 1 job �
                         │ ⠁ sending "run the tests again" · auto
 ────────────────────────────────────────────────────────────────── ⠁ sending… ──
 e27c0de ❯ run the tests again
-⏎ send  ⌥⏎ new line  ⌃T auto / steer / follow-up  Esc dismiss error / transcript
+enter send  alt-enter new line  ^t auto / steer / follow-up
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)
@@ -143,12 +143,11 @@ r22 c0-7 fg=accent_2(#12a594)
 r22 c7-8 fg=default
 r22 c8-9 fg=accent(#7170ff)
 r22 c9-80 fg=default
-r23 c0-1 fg=default
-r23 c1-6 fg=muted(#b4b5bd)
-r23 c6-10 fg=default
-r23 c10-19 fg=muted(#b4b5bd)
-r23 c19-23 fg=default
-r23 c23-48 fg=muted(#b4b5bd)
-r23 c48-53 fg=default
-r23 c53-80 fg=muted(#b4b5bd)
+r23 c0-5 fg=default
+r23 c5-10 fg=muted(#b4b5bd)
+r23 c10-21 fg=default
+r23 c21-30 fg=muted(#b4b5bd)
+r23 c30-34 fg=default
+r23 c34-59 fg=muted(#b4b5bd)
+r23 c59-80 fg=default
 bg: none

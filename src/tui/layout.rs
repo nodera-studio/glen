@@ -91,11 +91,15 @@ pub fn areas(app: &App) -> Areas {
             ..Areas::default()
         };
     }
-    let input_h = (prompt_lines(app, w)
-        .1
-        .len()
-        .min(if h >= 40 { 6 } else { 3 }) as u16)
-        .max(1);
+    let input_h = if app.prompt.text.is_empty() && app.list.selected.is_some() {
+        2 // Keep the placeholder above the empty editable row.
+    } else {
+        (prompt_lines(app, w)
+            .1
+            .len()
+            .min(if h >= 40 { 6 } else { 3 }) as u16)
+            .max(1)
+    };
     let notice_h = notice_lines(app, w).len() as u16;
     let body_h = h
         .saturating_sub(4)

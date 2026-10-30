@@ -30,6 +30,8 @@ pub struct App {
     pub focus: Focus,
     pub narrow_tab: Pane,
     pub overlay: Option<Overlay>,
+    pub help_scroll: usize,
+    pub home: Option<PathBuf>,
     pub scope: Scope,
     /// Remember the invoking project when switching to the all-projects scope.
     pub bucket_scope: Option<Scope>,
@@ -66,6 +68,8 @@ impl App {
             focus: Focus::Sessions,
             narrow_tab: Pane::Sessions,
             overlay: None,
+            help_scroll: 0,
+            home: None,
             bucket_scope: matches!(scope, Scope::Bucket { .. }).then(|| scope.clone()),
             scope,
             list: ListState::default(),

@@ -27,7 +27,7 @@ glen watch                                   4 sessions · 2 live · ◐ 1 job �
                         │ ↩ I found the flaky assertion.
 ──────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-Enter send  Alt-Enter new line  Ctrl-T auto / steer / follow-up
+enter send  alt-enter new line  ^t auto / steer / follow-up
 styles (zero-based, half-open columns):
 r0 c0-80 fg=default
 r1 c0-80 fg=default

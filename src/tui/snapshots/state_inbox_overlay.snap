@@ -27,7 +27,7 @@ glen watch                                   4 sessions · 2 live · ◐ 1 job �
                         │ peek only · glen inbox marks these read
 ──────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-Esc close overlay  F1 help  ⌃C clear prompt / quit
+esc close overlay  f1 help  ^c clear prompt / quit
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)

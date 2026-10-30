@@ -7,27 +7,27 @@ grid 80x24
 glen watch                                   4 sessions · 2 live · ◐ 1 job · ↩ 1
  sessions               │▍e27c0de · Fix the flaky parser test · ◐ busy
 ▌◐ e27c0de Fix the flak…│ ── help ─────────────────────────────────────────────
- ● f13a5b6 Continue the…│ ⌃C                clear prompt / quit
- ○ b7e2d81 Continue the…│ ⌃X                stop running t… (not in this build)
- ? 0a3f417 Compact plac…│ F1 / ?            help
-                        │ ⇥                 next focus
-                        │ ⇧⇥                previous focus
-                        │ t                 toggle thinking
-                        │ o                 cycle tool detail
-                        │ a                 project / all projects
-                        │ r                 refresh
-                        │ i                 peek inbox
-                        │ q                 quit
-                        │ m                 choose model (not in this build)
-                        │ T                 choose thinkin… (not in this build)
-                        │ C                 compact session (not in this build)
-                        │ ↑ / k             up
-                        │ ↓ / j             down
-                        │ PgUp              page up
-                        │ Esc closes · keys for the focused region
+ ● f13a5b6 Continue the…│ anywhere
+ ○ b7e2d81 Continue the…│ ^c              clear prompt / quit
+ ? 0a3f417 Compact plac…│ ^x              stop running turn (not in this build)
+                        │ f1              help
+                        │ outside overlays
+                        │ tab             next focus
+                        │ shift-tab       previous focus
+                        │ panes
+                        │ t               toggle thinking
+                        │ o               cycle tool detail
+                        │ a               project / all projects
+                        │ r               refresh
+                        │ i               peek inbox
+                        │ ?               help
+                        │ q               quit
+                        │ m               choose model (not in this build)
+                        │ T               choose thinking level
+                        │ up/down scroll · esc closes
 ──────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-Esc close overlay  F1 help  ⌃C clear prompt / quit
+esc close overlay  f1 help  ^c clear prompt / quit
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)
@@ -59,8 +59,8 @@ r3 c3-10 fg=focus(#94adff)
 r3 c10-24 fg=default
 r3 c24-25 fg=border(#45474d)
 r3 c25-26 fg=default
-r3 c26-28 fg=focus(#94adff)
-r3 c28-80 fg=default
+r3 c26-34 fg=muted(#b4b5bd) bold
+r3 c34-80 fg=default
 r4 c0-1 fg=default
 r4 c1-2 fg=muted(#b4b5bd)
 r4 c2-3 fg=default
@@ -68,10 +68,8 @@ r4 c3-10 fg=focus(#94adff)
 r4 c10-24 fg=default
 r4 c24-25 fg=border(#45474d)
 r4 c25-26 fg=default
-r4 c26-28 fg=muted(#b4b5bd)
-r4 c28-44 fg=default
-r4 c44-79 fg=muted(#b4b5bd)
-r4 c79-80 fg=default
+r4 c26-42 fg=focus(#94adff)
+r4 c42-80 fg=default
 r5 c0-1 fg=default
 r5 c1-2 fg=muted(#b4b5bd)
 r5 c2-3 fg=default
@@ -79,89 +77,83 @@ r5 c3-10 fg=focus(#94adff)
 r5 c10-24 fg=default
 r5 c24-25 fg=border(#45474d)
 r5 c25-26 fg=default
-r5 c26-32 fg=focus(#94adff)
-r5 c32-80 fg=default
+r5 c26-79 fg=muted(#b4b5bd)
+r5 c79-80 fg=default
 r6 c0-24 fg=default
 r6 c24-25 fg=border(#45474d)
 r6 c25-26 fg=default
-r6 c26-27 fg=focus(#94adff)
-r6 c27-80 fg=default
+r6 c26-42 fg=focus(#94adff)
+r6 c42-80 fg=default
 r7 c0-24 fg=default
 r7 c24-25 fg=border(#45474d)
 r7 c25-26 fg=default
-r7 c26-28 fg=focus(#94adff)
-r7 c28-80 fg=default
+r7 c26-42 fg=muted(#b4b5bd) bold
+r7 c42-80 fg=default
 r8 c0-24 fg=default
 r8 c24-25 fg=border(#45474d)
 r8 c25-26 fg=default
-r8 c26-27 fg=focus(#94adff)
-r8 c27-80 fg=default
+r8 c26-42 fg=focus(#94adff)
+r8 c42-80 fg=default
 r9 c0-24 fg=default
 r9 c24-25 fg=border(#45474d)
 r9 c25-26 fg=default
-r9 c26-27 fg=focus(#94adff)
-r9 c27-80 fg=default
+r9 c26-42 fg=focus(#94adff)
+r9 c42-80 fg=default
 r10 c0-24 fg=default
 r10 c24-25 fg=border(#45474d)
 r10 c25-26 fg=default
-r10 c26-27 fg=focus(#94adff)
-r10 c27-80 fg=default
+r10 c26-31 fg=muted(#b4b5bd) bold
+r10 c31-80 fg=default
 r11 c0-24 fg=default
 r11 c24-25 fg=border(#45474d)
 r11 c25-26 fg=default
-r11 c26-27 fg=focus(#94adff)
-r11 c27-80 fg=default
+r11 c26-42 fg=focus(#94adff)
+r11 c42-80 fg=default
 r12 c0-24 fg=default
 r12 c24-25 fg=border(#45474d)
 r12 c25-26 fg=default
-r12 c26-27 fg=focus(#94adff)
-r12 c27-80 fg=default
+r12 c26-42 fg=focus(#94adff)
+r12 c42-80 fg=default
 r13 c0-24 fg=default
 r13 c24-25 fg=border(#45474d)
 r13 c25-26 fg=default
-r13 c26-27 fg=focus(#94adff)
-r13 c27-80 fg=default
+r13 c26-42 fg=focus(#94adff)
+r13 c42-80 fg=default
 r14 c0-24 fg=default
 r14 c24-25 fg=border(#45474d)
 r14 c25-26 fg=default
-r14 c26-27 fg=muted(#b4b5bd)
-r14 c27-44 fg=default
-r14 c44-76 fg=muted(#b4b5bd)
-r14 c76-80 fg=default
+r14 c26-42 fg=focus(#94adff)
+r14 c42-80 fg=default
 r15 c0-24 fg=default
 r15 c24-25 fg=border(#45474d)
 r15 c25-26 fg=default
-r15 c26-27 fg=muted(#b4b5bd)
-r15 c27-44 fg=default
-r15 c44-79 fg=muted(#b4b5bd)
-r15 c79-80 fg=default
+r15 c26-42 fg=focus(#94adff)
+r15 c42-80 fg=default
 r16 c0-24 fg=default
 r16 c24-25 fg=border(#45474d)
 r16 c25-26 fg=default
-r16 c26-27 fg=muted(#b4b5bd)
-r16 c27-44 fg=default
-r16 c44-79 fg=muted(#b4b5bd)
-r16 c79-80 fg=default
+r16 c26-42 fg=focus(#94adff)
+r16 c42-80 fg=default
 r17 c0-24 fg=default
 r17 c24-25 fg=border(#45474d)
 r17 c25-26 fg=default
-r17 c26-31 fg=focus(#94adff)
-r17 c31-80 fg=default
+r17 c26-42 fg=focus(#94adff)
+r17 c42-80 fg=default
 r18 c0-24 fg=default
 r18 c24-25 fg=border(#45474d)
 r18 c25-26 fg=default
-r18 c26-31 fg=focus(#94adff)
-r18 c31-80 fg=default
+r18 c26-74 fg=muted(#b4b5bd)
+r18 c74-80 fg=default
 r19 c0-24 fg=default
 r19 c24-25 fg=border(#45474d)
 r19 c25-26 fg=default
-r19 c26-30 fg=focus(#94adff)
-r19 c30-80 fg=default
+r19 c26-63 fg=muted(#b4b5bd)
+r19 c63-80 fg=default
 r20 c0-24 fg=default
 r20 c24-25 fg=border(#45474d)
 r20 c25-26 fg=default
-r20 c26-66 fg=muted(#b4b5bd)
-r20 c66-80 fg=default
+r20 c26-53 fg=muted(#b4b5bd)
+r20 c53-80 fg=default
 r21 c0-72 fg=border(#45474d)
 r21 c72-78 fg=muted(#b4b5bd)
 r21 c78-80 fg=border(#45474d)

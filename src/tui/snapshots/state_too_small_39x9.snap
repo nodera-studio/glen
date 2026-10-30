@@ -4,8 +4,8 @@ description: too_small_39x9 · 39x9 · Dark TrueColor
 ---
 cursor: hidden
 grid 39x9
-terminal too small · need 40×10
-
+glen watch needs at least 40×10 · now
+39×9
 
 
 
@@ -14,9 +14,10 @@ terminal too small · need 40×10
 
 
 styles (zero-based, half-open columns):
-r0 c0-31 fg=muted(#b4b5bd)
-r0 c31-39 fg=default
-r1 c0-39 fg=default
+r0 c0-37 fg=muted(#b4b5bd)
+r0 c37-39 fg=default
+r1 c0-4 fg=muted(#b4b5bd)
+r1 c4-39 fg=default
 r2 c0-39 fg=default
 r3 c0-39 fg=default
 r4 c0-39 fg=default

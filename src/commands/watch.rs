@@ -82,6 +82,7 @@ fn prepare(
         Instant::now(),
         SystemTime::now(),
     );
+    app.home = env.home().map(std::path::Path::to_path_buf);
     app.bucket_scope = Some(bucket);
     if let Some(opened) = &opened {
         app.list.selected = Some(opened.session.header.id.clone());

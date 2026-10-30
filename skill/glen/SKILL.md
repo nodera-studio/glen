@@ -90,5 +90,5 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 - Don't send into a session someone is using unless asked; on a busy session prefer default follow-up.
 - Setup: `glen doctor`. Update: `glen install-skill`. Completions for people: `glen completions zsh`.
 <!-- glen:if watch -->
-- For people in an interactive terminal: `glen watch <handle>`; agents use `glen tail <handle> -f` and `glen inbox -f`.
+- For people in an interactive terminal: `glen watch <handle>` (exits 2 without a terminal); agents should not run it and use `glen tail <handle> -f` and `glen inbox -f` instead.
 <!-- glen:end -->

@@ -27,7 +27,7 @@ glen watch                                             4 sessions · 2 live · �
                         │ ✓ completed · j1234567 · e27c0de · 14s
 ──────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-⇥ next focus  ↓ down  ↑ up  End last / follow  t toggle thinking
+tab next focus  f1 help  q quit  down down  up up  end last / follow
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)
@@ -144,15 +144,17 @@ r22 c0-7 fg=accent_2(#12a594)
 r22 c7-8 fg=default
 r22 c8-9 fg=accent(#7170ff)
 r22 c9-80 fg=default
-r23 c0-1 fg=default
-r23 c1-12 fg=muted(#b4b5bd)
-r23 c12-15 fg=default
-r23 c15-20 fg=muted(#b4b5bd)
-r23 c20-23 fg=default
-r23 c23-26 fg=muted(#b4b5bd)
-r23 c26-31 fg=default
-r23 c31-45 fg=muted(#b4b5bd)
-r23 c45-48 fg=default
-r23 c48-64 fg=muted(#b4b5bd)
-r23 c64-80 fg=default
+r23 c0-3 fg=default
+r23 c3-14 fg=muted(#b4b5bd)
+r23 c14-18 fg=default
+r23 c18-23 fg=muted(#b4b5bd)
+r23 c23-26 fg=default
+r23 c26-31 fg=muted(#b4b5bd)
+r23 c31-37 fg=default
+r23 c37-42 fg=muted(#b4b5bd)
+r23 c42-46 fg=default
+r23 c46-49 fg=muted(#b4b5bd)
+r23 c49-54 fg=default
+r23 c54-68 fg=muted(#b4b5bd)
+r23 c68-80 fg=default
 bg: none

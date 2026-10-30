@@ -43,7 +43,7 @@ glen watch                                                                      
                                   │ ↩ I found the flaky assertion.
 ──────────────────────────────────────────────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-Enter send  Alt-Enter new line  Ctrl-T auto / steer / follow-up  Esc dismiss error / transcript  Tab next focus  F1 help
+enter send  alt-enter new line  ^t auto / steer / follow-up  esc dismiss error / transcript  tab next focus  f1 help
 styles (zero-based, half-open columns):
 r0 c0-120 fg=default
 r1 c0-120 fg=default

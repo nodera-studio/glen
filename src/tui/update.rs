@@ -287,6 +287,20 @@ fn key_update(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
     if key.kind == KeyEventKind::Release {
         return vec![];
     }
+    if matches!(app.overlay, Some(Overlay::Help)) && key.modifiers.is_empty() {
+        let (page, limit) = super::view::help_scroll_bounds(app);
+        let top = app.help_scroll.min(limit);
+        app.help_scroll = match key.code {
+            KeyCode::Up | KeyCode::Char('k') => top.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') => top.saturating_add(1).min(limit),
+            KeyCode::PageUp => top.saturating_sub(page),
+            KeyCode::PageDown => top.saturating_add(page).min(limit),
+            KeyCode::Home => 0,
+            KeyCode::End => limit,
+            _ => top,
+        };
+        return vec![];
+    }
     if let Some(overlay) = &mut app.overlay {
         if let Overlay::Picker(p) = overlay {
             if key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
@@ -396,7 +410,10 @@ fn dispatch(app: &mut App, action: Action) -> Vec<Cmd> {
         }
         Refresh => return vec![Cmd::Refresh],
         Inbox => app.overlay = Some(Overlay::Inbox),
-        Help => app.overlay = Some(Overlay::Help),
+        Help => {
+            app.help_scroll = 0;
+            app.overlay = Some(Overlay::Help);
+        }
         Quit => return quit(app, 0),
         Send => return submit(app),
         Newline => app.prompt.insert("\n"),

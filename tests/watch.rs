@@ -576,6 +576,42 @@ fn start_and_quit_restores_terminal_without_creating_home() {
     }
 }
 
+#[test]
+fn separate_placeholder_row_keeps_the_draft_empty_for_ctrl_d() {
+    let b = OmpBox::new();
+    for controlling in terminal_modes() {
+        let mut pty = Pty::open(60, 20);
+        pty.controlling = controlling;
+        pty.spawn(command(&b, &["watch", "e27c0de"]));
+        pty.wait_for("tab to write to e27c0de", START);
+        pty.assert_raw_while_running();
+        pty.send(b"\t");
+        let wait_empty_prompt = |pty: &Pty| {
+            poll(DATA, || {
+                let shown = pty.text_from(0);
+                let lines = shown.lines().map(str::trim_end).collect::<Vec<_>>();
+                lines
+                    .windows(2)
+                    .any(|rows| rows == ["message e27c0de · enter send", "e27c0de ❯"])
+                    .then_some(())
+            });
+        };
+        wait_empty_prompt(&pty);
+        pty.send(b"abc");
+        pty.wait_for("e27c0de ❯ abc", DATA);
+        pty.send(b"\x04");
+        // Queue another edit after Ctrl-D: its appearance proves the non-empty draft survived.
+        pty.send(b"d");
+        pty.wait_for("e27c0de ❯ abcd", DATA);
+        pty.send(b"\x05\x7f\x7f\x7f\x7f");
+        wait_empty_prompt(&pty);
+        pty.send(b"\x04");
+        assert_eq!(pty.wait_exit(EXIT), 0);
+        pty.assert_teardown();
+        b.clean();
+    }
+}
+
 fn terminal_modes() -> Vec<bool> {
     if cfg!(target_os = "macos") {
         vec![true, false]
@@ -632,7 +668,14 @@ fn resizing_switches_narrow_wide_and_too_small_layouts() {
     pty.wait_from(offset, "pending", DATA);
     let offset = pty.bytes().len();
     pty.resize(30, 8);
-    pty.wait_from(offset, "terminal too small · need 40×…", DATA);
+    poll(DATA, || {
+        let shown = pty
+            .text_from(offset)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        (shown == "glen watch needs at least 40×10 · now 30×8").then_some(())
+    });
     pty.quit();
     b.clean();
 }

@@ -117,7 +117,7 @@ impl KeyBinding {
     }
 }
 type Binding = (KeyBinding, Action, &'static str);
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Where {
     All,
     Base,
@@ -430,6 +430,32 @@ const TABLE: &[(Where, Binding)] = &[
         (key(Enter, M::NONE, "Enter"), A::Pick, "choose"),
     ),
 ];
+/// Help uses the same bindings and context groups as dispatch, including overlay-local keys.
+pub(crate) fn help_groups() -> Vec<(&'static str, Vec<Binding>)> {
+    [
+        ("anywhere", Where::All),
+        ("outside overlays", Where::Base),
+        ("panes", Where::Panes),
+        ("sessions", Where::Sessions),
+        ("transcript", Where::Transcript),
+        ("prompt", Where::Prompt),
+        ("overlays", Where::Overlay),
+        ("confirm", Where::Confirm),
+        ("picker", Where::Picker),
+    ]
+    .into_iter()
+    .map(|(title, context)| {
+        (
+            title,
+            TABLE
+                .iter()
+                .filter(|(where_, _)| *where_ == context)
+                .map(|(_, binding)| *binding)
+                .collect(),
+        )
+    })
+    .collect()
+}
 fn applies(w: Where, c: KeymapCtx) -> bool {
     match w {
         Where::All => true,
