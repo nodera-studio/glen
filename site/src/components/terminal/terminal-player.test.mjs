@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { plan, total, paneAt, typeDelays, mulberry32, SPINNER_TICKS, TICK_MS, ROW_KINDS, CUE_KINDS, TYPE } from './terminal-player.mjs';
-import { script, COLS, ROWS, WINDOWS, SEED, lsTable, wrap, plain, selection } from '../../data/demo.mjs';
+import { script, COLS, ROWS, WINDOWS, SEED, lsTable, wrap, plain, selection, duration, PROGRESS } from '../../data/demo.mjs';
 
 const wide = plan(script, { seed: SEED });
 const narrow = plan(script, { seed: SEED, narrow: true });
@@ -51,9 +51,15 @@ test('SPINNER_TICKS is indicatif’s default set, one frame every 80 ms', () => 
 test('the scroll offset never hides the newest row or the cursor line', () => {
  for (const [cues, rows] of [[wide, ROWS.wide], [narrowCols, ROWS.narrow]]) for (const pane of ['a', 'b']) for (const t of sample(cues)) {
   const { on, offset } = paneAt(cues, pane, t, rows);
+  const newest = on.length - 1 - offset;
   assert.ok(offset >= 0);
-  assert.ok(on.length - 1 - offset < rows, `${pane}@${t}: newest row ${on.length - 1} scrolled out (offset ${offset})`);
+  // Upper bounds: neither the newest row nor the cursor line below it falls under the pane.
+  assert.ok(newest < rows, `${pane}@${t}: newest row ${on.length - 1} below the pane (offset ${offset})`);
   assert.ok(on.length - offset <= rows, `${pane}@${t}: cursor line below the pane`);
+  // Lower bounds: the newest row never scrolls above the pane, and the pane scrolls no further
+  // than the newest row and its cursor line need, so it stays full.
+  if (on.length) assert.ok(newest >= 0, `${pane}@${t}: newest row ${on.length - 1} above the pane (offset ${offset})`);
+  assert.ok(on.length - offset >= Math.min(on.length, rows - 1), `${pane}@${t}: over-scrolled, ${on.length - offset} of ${on.length} rows showing`);
  }
  // The omp pane outgrows the wide window by the end, so the final frame scrolls.
  assert.ok(paneAt(wide, 'b', total(wide), ROWS.wide).offset > 0);
@@ -72,6 +78,30 @@ test('rows become visible in order, and the spinner is replaced by the completio
  const reply = wide.find(c => c.k === 'event' && plain(c.line).startsWith('  ↳ glen_reply'));
  const hop = wide.find(c => c.k === 'hop');
  assert.ok(hop.at >= reply.at && hop.at < spin.end, 'the reply hops across before glen prints it');
+});
+
+test('glen send and wait output is W2’s: spinner messages in job order, the completed line in seconds', () => {
+ // wait.rs duration() and the cases its tests pin.
+ for (const [ms, text] of [[41207, '41s'], [41000, '41s'], [59999, '59s'], [65000, '1m 05s'], [3600000, '60m 00s'], [0, '0s'], [-5, '0s']]) assert.equal(duration(ms), text, `${ms} ms`);
+ const spin = wide.find(c => c.k === 'spin');
+ assert.equal(spin.v, 'sending to e27c0de · j3c9f41');
+ const msgs = wide.filter(c => c.k === 'msg');
+ assert.deepEqual(msgs.map(c => c.v), ['starting omp', 'waiting for the reply']);
+ for (const m of msgs) assert.ok(m.at > spin.at && m.at < spin.end, `${m.v} shows while the spinner does`);
+ const user = wide.find(c => c.k === 'event' && plain(c.line).startsWith('❯ user'));
+ assert.ok(msgs[1].at <= user.at, 'omp accepts the prompt before its user message shows');
+ for (const cues of [wide, narrowCols]) {
+  const done = cues.find(c => c.k === 'flush' && c.at === cues.find(x => x.k === 'spin').end);
+  assert.deepEqual(done.line, [{ text: '✓ completed · j3c9f41 · e27c0de · 41s', tone: 'success' }]);
+ }
+});
+
+const w2 = fileURLToPath(new URL('../../../../src/commands/wait.rs', import.meta.url));
+test('the demo strings are the ones glen’s source prints', { skip: !existsSync(w2) && 'W2 (src/commands/wait.rs) is not on this branch yet' }, () => {
+ const wait = readFileSync(w2, 'utf8'), send = readFileSync(w2.replace(/wait\.rs$/, 'send.rs'), 'utf8');
+ for (const v of Object.values(PROGRESS)) assert.ok(wait.includes(`"${v}"`), v);
+ for (const f of ['format!("{seconds}s")', 'format!("{}m {:02}s"', '"✓ completed · {} · {}"']) assert.ok(wait.includes(f), f);
+ assert.ok(send.includes('"sending to {} · {}"'));
 });
 
 test('narrow mode turns the hop into a tab switch', () => {

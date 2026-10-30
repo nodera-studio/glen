@@ -174,7 +174,8 @@ section[id] { scroll-margin-top: 88px }
 .nav-label { transition: transform 320ms var(--ease-out-quart), opacity 320ms var(--ease-out-quart) }
 .nav-label + .nav-label { color: var(--frame-fg); transform: translateY(32px) rotate(-20deg) scale(.6); opacity: 0 }
 .nav-item:is(:hover, :focus-visible) .nav-fill, .nav-item:is(:hover, :focus-visible) .nav-fill::after { transform: none }
-.nav-item:is(:hover, :focus-visible) .nav-label:first-of-type { transform: translateY(-28px) rotate(-12deg) scale(.6); opacity: 0 }
+/* The resting label follows the fill (both are spans, so :first-of-type would pick the fill). */
+.nav-item:is(:hover, :focus-visible) .nav-fill + .nav-label { transform: translateY(-28px) rotate(-12deg) scale(.6); opacity: 0 }
 .nav-item:is(:hover, :focus-visible) .nav-label + .nav-label { transform: none; opacity: 1 }
 .header-glass .focus-ring:focus-visible { outline-color: var(--focus) }
 .github-pill { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; color: var(--frame-fg-subdued); transition: background-color 160ms var(--ease-out-quart), color 160ms var(--ease-out-quart) }
@@ -400,6 +401,6 @@ section[id] { scroll-margin-top: 88px }
  .reveal { opacity: 1; transform: none }
  .nav-fill, .nav-label + .nav-label { display: none }
  .nav-item:is(:hover, :focus-visible) { background: var(--frame-raised); color: var(--frame-fg) }
- .nav-item:is(:hover, :focus-visible) .nav-label:first-of-type { transform: none; opacity: 1 }
+ .nav-item:is(:hover, :focus-visible) .nav-fill + .nav-label { transform: none; opacity: 1 }
  .how-card:hover { transform: none }
 }

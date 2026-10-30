@@ -289,7 +289,7 @@
         "The registry manifest lists components/lib/utils.ts but the file lives at files/lib/utils.ts, so the CLI 404s; files were fetched from the GitHub tree at the pinned commit (W6 polish spec section 5)."
       ],
       "changes": [
-        "Per-character WAAPI wave on \"omp is working\" in the Hear back stage: zDistance 6, scaleDistance 1.06, two cycles, base colour --glen-muted to --term-fg",
+        "Per-character WAAPI wave on \"waiting for the reply\" (glen wait's spinner message) in the Hear back stage: zDistance 6, scaleDistance 1.06, two cycles, base colour --glen-muted to --term-fg",
         "Reduced motion and SSR show the finished reply instead"
       ]
     },

@@ -1,14 +1,23 @@
 import { test, expect, type Page } from '@playwright/test';
 const cargo = 'cargo install --git https://github.com/nodera-studio/glen --locked';
 
-// Text of the terminal rows a reader can see in the variant that is showing.
+// Rows a reader can see in the variant that is showing, pane by pane: rendered rows that sit inside
+// the pane's viewport once the scroll transition settles, so a wrong scroll offset changes the text.
 async function paneText(page: Page) {
- return page.locator('#term').evaluate(fig => {
+ return page.locator('#term').evaluate(async fig => {
+  await Promise.all(fig.getAnimations({ subtree: true }).filter(a => a instanceof CSSTransition).map(a => a.finished.catch(() => {})));
   const variant = [...fig.querySelectorAll<HTMLElement>('.term-v')].find(v => v.offsetParent)!;
-  return [...variant.querySelectorAll<HTMLElement>('.term-pane')].filter(p => getComputedStyle(p).display !== 'none').map(pane =>
-   [...pane.querySelectorAll<HTMLElement>('.tl[data-at]')].filter(r => getComputedStyle(r).display !== 'none' && getComputedStyle(r).visibility !== 'hidden').map(r => r.textContent).join('\n'));
+  return [...variant.querySelectorAll<HTMLElement>('.term-pane')].filter(p => getComputedStyle(p).display !== 'none').map(pane => {
+   const vp = pane.querySelector('.term-vp')!.getBoundingClientRect();
+   return [...pane.querySelectorAll<HTMLElement>('.tl[data-at]')].filter(r => {
+    const style = getComputedStyle(r), box = r.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && box.top >= vp.top - 1 && box.bottom <= vp.bottom + 1;
+   }).map(r => r.textContent ?? '');
+  });
  });
 }
+const termRows = (page: Page) => page.locator('#term').evaluate(fig => +getComputedStyle([...fig.querySelectorAll<HTMLElement>('.term-v')].find(v => v.offsetParent)!).getPropertyValue('--rows'));
+const doneAt = async (page: Page) => (JSON.parse((await page.locator('#term').getAttribute('data-cues'))!) as [number, string][]).find(c => c[1] === 'done')![0];
 const visibleRow = (page: Page, variant: 'w' | 'n', pane: 'a' | 'b', text: string | RegExp) => page.locator(`.term-v[data-v=${variant}] .term-pane[data-p=${pane}] .tl.on`, { hasText: text });
 async function hydrate(page: Page, section: string) {
  await page.locator(section).scrollIntoViewIfNeeded();
@@ -82,19 +91,27 @@ test.describe('without JavaScript', () => {
   const faq = page.locator('#faq details').first();
   await faq.locator('summary').click(); await expect(faq).toHaveAttribute('open', '');
  });
- for (const width of [360, 1280]) test(`${width}px: the static transcript equals the ?term=end frame`, async ({ page, browser }) => {
+ for (const width of [360, 1280]) test(`${width}px: the ?term=end frame is the tail of the static transcript`, async ({ page, browser }) => {
   await page.setViewportSize({ width, height: 900 });
   await page.goto('/');
+  // Without JS the panes grow to fit, so every row is visible.
   const withoutJs = await paneText(page);
   const js = await browser.newPage({ viewport: { width, height: 900 }, javaScriptEnabled: true });
   await js.goto('/?term=end');
   await expect(js.locator('#term')).toHaveAttribute('data-term', 'done');
   // With JS the narrow window shows one pane at a time; compare pane by pane.
-  if (width < 760) {
-   const panes: string[] = [];
-   for (const p of ['a', 'b']) { await js.locator(`.term-tab[data-p=${p}]`).click(); panes.push(...await paneText(js)); }
-   expect(panes).toEqual(withoutJs);
-  } else expect(await paneText(js)).toEqual(withoutJs);
+  let shown: string[][] = [];
+  if (width < 760) for (const p of ['a', 'b']) { await js.locator(`.term-tab[data-p=${p}]`).click(); shown.push(...await paneText(js)); }
+  else shown = await paneText(js);
+  const rows = await termRows(js);
+  expect(shown).toHaveLength(withoutJs.length);
+  withoutJs.forEach((all, i) => {
+   // The end frame shows the newest rows, the transcript's tail, and fills the pane but for the cursor line.
+   expect(shown[i]!.length).toBeGreaterThanOrEqual(Math.min(all.length, rows - 1));
+   expect(shown[i]).toEqual(all.slice(-shown[i]!.length));
+  });
+  // The omp pane outgrows the window, so this frame really scrolled.
+  expect(shown[1]!.length).toBeLessThan(withoutJs[1]!.length);
   await js.close();
  });
 });
@@ -132,10 +149,20 @@ test.describe('hero terminal player', () => {
   await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/?term=at:5300');
   await expect(visibleRow(page, 'w', 'b', '❯ user · 12:04')).toBeVisible();
   const spin = page.locator('.term-v[data-v=w] [data-p=a] .tl.on[data-k=spin]');
-  await expect(spin).toContainText('sending to e27c0de · j3c9f41');
+  await expect(spin).toContainText('waiting for the reply');
   expect('⠁⠉⠙⠚⠒⠂⠲⠴⠤⠄⠠⠦⠖⠐⠓⠋⠈').toContain(await spin.locator('.sp').textContent());
   await expect(page.locator('.term-title')).toHaveText('~/work/alpha — glen');
   await expect(page.locator('.term-tab[data-p=b]')).toHaveAttribute('aria-selected', 'true');
+ });
+ test('the spinner message follows glen send: sending, starting omp, waiting for the reply', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/?term=at:0');
+  const spinAt = Number(await page.locator('.term-v[data-v=w] [data-p=a] .tl[data-k=spin]').getAttribute('data-at'));
+  const msgs = (JSON.parse((await page.locator('#term').getAttribute('data-cues'))!) as [number, string, string][]).filter(c => c[1] === 'msg');
+  expect(msgs.map(c => c[2])).toEqual(['starting omp', 'waiting for the reply']);
+  for (const [at, text] of [[spinAt, 'sending to e27c0de · j3c9f41'], ...msgs.map(([at, , v]) => [at, v] as const)] as const) {
+   await page.goto(`/?term=at:${at + 20}`);
+   await expect(page.locator('.term-v[data-v=w] [data-p=a] .tl.on[data-k=spin] .sm')).toHaveText(text);
+  }
  });
  test('the reply hops from the omp pane to the agent pane', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
@@ -153,7 +180,7 @@ test.describe('hero terminal player', () => {
  for (const [width, variant] of [[1280, 'w'], [390, 'n']] as const) test(`${width}px end frame: real glen output`, async ({ page }) => {
   await page.setViewportSize({ width, height: 900 }); await page.goto('/?term=end');
   await expect(page.locator('#term')).toHaveAttribute('data-term', 'done');
-  await expect(visibleRow(page, variant, 'a', '✓ completed · j3c9f41 · e27c0de · 41207ms')).toBeVisible();
+  await expect(visibleRow(page, variant, 'a', /^✓ completed · j3c9f41 · e27c0de · 41s$/)).toBeVisible();
   await expect(visibleRow(page, variant, 'a', '↩ Added the index. All 12 tests pass. ✓')).toBeVisible();
   await expect(visibleRow(page, variant, 'a', /^handle\s+state\s+title\s+/)).toBeVisible();
   await expect(visibleRow(page, variant, 'a', '3 sessions · 1 live')).toBeVisible();
@@ -197,6 +224,52 @@ test.describe('hero terminal player', () => {
   await page.locator('#faq').scrollIntoViewIfNeeded();
   await expect(page.locator('#term')).toHaveAttribute('data-term', 'paused');
   await expect(page.getByRole('button', { name: 'Pause demo' })).toHaveAttribute('aria-pressed', 'false');
+ });
+ for (const [start, button] of [['end', 'Replay demo'], ['at:3000', 'Pause demo']] as const) test(`?term=${start}: playback started from a seek pauses off screen and in a hidden tab`, async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto(`/?term=${start}`);
+  const term = page.locator('#term');
+  await page.getByRole('button', { name: button }).click();
+  await expect(term).toHaveAttribute('data-term', 'playing');
+  await page.locator('#faq').scrollIntoViewIfNeeded();
+  await expect(term).toHaveAttribute('data-term', 'paused');
+  await term.scrollIntoViewIfNeeded();
+  await expect(term).toHaveAttribute('data-term', 'playing');
+  const setHidden = (hidden: boolean) => page.evaluate(hidden => { Object.defineProperty(document, 'hidden', { configurable: true, get: () => hidden }); document.dispatchEvent(new Event('visibilitychange')); }, hidden);
+  await setHidden(true); await expect(term).toHaveAttribute('data-term', 'paused');
+  await setHidden(false); await expect(term).toHaveAttribute('data-term', 'playing');
+ });
+ test('turning reduced motion on mid-run stops on the final frame', async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
+  const term = page.locator('#term');
+  await expect(term).toHaveAttribute('data-term', 'playing');
+  // Mid-command: the send line is half typed and the omp pane is still short.
+  await expect.poll(async () => Number(await term.getAttribute('data-term-t'))).toBeGreaterThan(1500);
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(term).toHaveAttribute('data-term', 'static');
+  await expect(term).toHaveAttribute('data-term-t', String(await doneAt(page)));
+  await expect(page.locator('.term-ctl')).toBeHidden();
+  await expect(page.locator('.term-v[data-v=w] [data-p=a] .tl[data-k=spin]')).toBeHidden();
+  const live = await paneText(page);
+  // A frame left in the loop would land on t=end and flip the state to done.
+  await page.waitForTimeout(400);
+  await expect(term).toHaveAttribute('data-term', 'static');
+  // Turned off again, the final frame stays and Replay is offered.
+  await page.emulateMedia({ reducedMotion: 'no-preference' });
+  await expect(term).toHaveAttribute('data-term', 'done');
+  await expect(page.getByRole('button', { name: 'Replay demo' })).toBeVisible();
+  // The frame equals the one a reduced-motion boot renders.
+  await page.emulateMedia({ reducedMotion: 'reduce' }); await page.reload();
+  await expect(term).toHaveAttribute('data-term', 'static');
+  expect(await paneText(page)).toEqual(live);
+ });
+ test('turning reduced motion on before playback starts keeps the frame static', async ({ page }) => {
+  await page.setViewportSize({ width: 390, height: 844 }); await page.goto('/', { waitUntil: 'domcontentloaded' });
+  await page.emulateMedia({ reducedMotion: 'reduce' });
+  await expect(page.locator('#term')).toHaveAttribute('data-term', 'static');
+  // Neither the 600 ms start timer nor the observers may restart it.
+  await page.waitForTimeout(1000); await page.locator('#faq').scrollIntoViewIfNeeded(); await page.locator('#term').scrollIntoViewIfNeeded();
+  await expect(page.locator('#term')).toHaveAttribute('data-term', 'static');
+  for (const row of await page.locator('.term-v[data-v=n] .tl[data-at]:not([data-k=spin])').all()) await expect(row).toBeVisible();
  });
  test('390px: keyboard reaches Pause, Replay, then the tabs, and the tabs switch panes', async ({ page }) => {
   await page.setViewportSize({ width: 390, height: 844 }); await page.goto('/');
@@ -267,6 +340,22 @@ test('header: sticky glass with the morphing hover fill and a focus ring', async
  await expect(item.locator('.nav-fill')).toHaveCSS('transform', 'none');
 });
 
+test('header: hover and keyboard focus swap the nav labels; reduced motion keeps one', async ({ page }) => {
+ await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
+ const item = page.locator('.desktop-nav .nav-item').first();
+ const [rest, swap] = [item.locator('.nav-label').first(), item.locator('.nav-label').nth(1)];
+ const swapped = async () => {
+  await expect(rest).toHaveCSS('opacity', '0'); await expect(swap).toHaveCSS('opacity', '1'); await expect(swap).toHaveCSS('transform', 'none');
+  expect(await rest.evaluate(e => getComputedStyle(e).transform)).not.toBe('none');
+ };
+ await expect(rest).toHaveCSS('opacity', '1'); await expect(swap).toHaveCSS('opacity', '0');
+ await item.hover(); await swapped();
+ await page.mouse.move(0, 400); await expect(rest).toHaveCSS('opacity', '1'); await expect(swap).toHaveCSS('opacity', '0');
+ await item.focus(); await page.keyboard.press('Shift+Tab'); await page.keyboard.press('Tab'); await swapped();
+ await page.emulateMedia({ reducedMotion: 'reduce' }); await item.hover();
+ await expect(rest).toHaveCSS('opacity', '1'); await expect(rest).toHaveCSS('transform', 'none'); await expect(swap).toBeHidden();
+});
+
 test('sections: mono eyebrow, two-tone h2 at 510, lead, no border dividers', async ({ page }) => {
  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
  for (const [id, n] of [['#how', '01'], ['#install', '02'], ['#agents', '03'], ['#faq', '04']]) {
@@ -298,6 +387,8 @@ test('how it works: four cards, 2×2 at 1280, each stage ends on its final frame
  }
  await expect(page.locator('[data-stage=hear] [data-before]')).toBeHidden();
  await expect(page.locator('[data-stage=hear]')).toContainText('↩ Added the index. All 12 tests pass. ✓');
+ await expect(page.locator('[data-stage=hear]')).toContainText('✓ completed · j3c9f41 · e27c0de · 41s');
+ expect(await page.locator('[data-stage=hear] [data-before]').textContent()).toContain('waiting for the reply');
  await expect(page.locator('[data-stage=find]')).toContainText('3 sessions · 1 live');
  await page.waitForTimeout(800);
  expect(await page.locator('[data-stage] [data-row], [data-stage] [data-chip], [data-stage] [data-after]').evaluateAll(els => els.every(e => getComputedStyle(e).opacity === '1'))).toBe(true);

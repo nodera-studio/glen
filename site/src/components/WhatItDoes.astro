@@ -6,7 +6,7 @@ import SectionHead from './SectionHead.astro';
 import HowCards from './islands/HowCards';
 import Topology from './islands/Topology';
 import palette from '../../../src/render/palette.json';
-import { lsTable, prompt, role, body, tool, s, cwd, reply, answer } from '../data/demo.mjs';
+import { lsTable, prompt, role, body, tool, s, cwd, reply, answer, completed, PROGRESS } from '../data/demo.mjs';
 import { spans, esc } from './terminal/lines';
 
 const W = 76;
@@ -21,10 +21,10 @@ const read = peek(`${cwd} — glen`, cmd('glen show e27c0de') + [
  [s('e27c0de · ', 'muted'), s(cwd), s(' · '), s('claude-sonnet-4-5', 'muted'), s(' · '), s('●', 'success'), s(' '), s('live', 'success'), s(' · updated 2s ago', 'muted')],
  [], role('user', '12:04'), ...body('Fix 0012 and tell me when it passes.', W), [], role('assistant', '12:04'), ...tool('bash', 'cargo test migration_0012', '14 lines')(W),
 ].map(l => line(l, ' data-row')).join(''));
-const shimmer = [...'omp is working'].map(c => `<span>${esc(c)}</span>`).join('');
+const shimmer = [...PROGRESS.accepted].map(c => `<span>${esc(c)}</span>`).join('');
 const hear = peek(`${cwd} — glen`, cmd('glen wait j3c9f41')
  + `<div data-before><i class="g">⠙</i> <span class="shimmer" style="--base-color:var(--glen-muted);--base-gradient-color:var(--term-fg)">${shimmer}</span></div>`
- + [[s('✓ completed · j3c9f41 · e27c0de · 41207ms', 'success')], [], [s(`  ${answer}`)], [s(`↩ ${reply} ✓`, 'muted')]].map(l => line(l, ' data-after')).join(''));
+ + [completed, [],[s(`  ${answer}`)], [s(`↩ ${reply} ✓`, 'muted')]].map(l => line(l, ' data-after')).join(''));
 const send = `<div class="route">
  <svg class="route-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="M22 40C22 72 38 74 59 74" vector-effect="non-scaling-stroke"/></svg>
  <div class="route-node source"><b>Claude Code</b><span>your agent</span></div>

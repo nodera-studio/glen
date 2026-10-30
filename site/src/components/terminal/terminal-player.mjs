@@ -126,7 +126,8 @@ export function boot(root) {
  if (!root) return;
  const win = /** @type {HTMLElement} */ (root.querySelector('.term-win'));
  const set = (/** @type {string} */ k, /** @type {string} */ v) => root.setAttribute('data-' + k, v);
- if (matchMedia('(prefers-reduced-motion: reduce)').matches) return set('term', 'static');
+ const reduce = matchMedia('(prefers-reduced-motion: reduce)');
+ if (reduce.matches) return set('term', 'static');
  /** @type {[number, string, string?][]} */
  const cues = JSON.parse(root.dataset.cues || '[]');
  const end = Math.max(...cues.filter(c => c[1] == 'done').map(c => c[0]));
@@ -141,10 +142,10 @@ export function boot(root) {
     scroll: /** @type {HTMLElement} */ (pane.querySelector('.term-scroll')),
     spare: /** @type {HTMLElement} */ (pane.querySelector('.spare')),
     rows: [...pane.querySelectorAll('.tl[data-at]')].map(el => {
-     const ty = el.querySelector('.ty');
+     const ty = el.querySelector('.ty'), sm = el.querySelector('.sm');
      return { el, at: num(el, 'at'), end: num(el, 'end'), commit: num(el, 'commit'), k: el.getAttribute('data-k'), on: false, n: -1, f: -1,
       ty, text: ty?.textContent ?? '', times: (el.getAttribute('data-ty') || '').split(',').filter(Boolean).map(Number),
-      sp: el.querySelector('.sp'), sm: el.querySelector('.sm'), mark: /** @type {HTMLElement|null} */ (el.querySelector('.sel')) };
+      sp: el.querySelector('.sp'), sm, sv: sm?.textContent ?? '', mark: /** @type {HTMLElement|null} */ (el.querySelector('.sel')) };
     }),
    };
   }),
@@ -158,6 +159,8 @@ export function boot(root) {
  const q = (new URLSearchParams(location.search).get('term') || '').split(':');
  const speed = q[0] == 'fast' ? 20 : 1;
  let t = 0, raf = 0, last = 0, mode = '', userPaused = false, seen = false, visible = false;
+ /** The 600 ms autoplay delay. @type {ReturnType<typeof setTimeout>|undefined} */
+ let start;
  /** @type {string|null} */
  let userFocus = null;
  /** @type {{x: number, y: number, a: number, d: number}|null} */
@@ -193,7 +196,8 @@ export function boot(root) {
     if (r.sp && on) {
      const f = Math.floor((t - r.at) / TICK_MS) % SPINNER_TICKS.length;
      if (f != r.f) { r.f = f; r.sp.textContent = SPINNER_TICKS[f]; }
-     if (msg && r.sm && r.sm.textContent != msg) r.sm.textContent = msg;
+     // Before the first message cue the spinner shows its start message (also after Replay).
+     if (r.sm && r.sm.textContent != (msg || r.sv)) r.sm.textContent = msg || r.sv;
     }
     if (r.mark) {
      const d = sel ? t - sel[0] : -1;
@@ -209,7 +213,9 @@ export function boot(root) {
    pane.cur.classList.toggle('hollow', pane.p != focus);
    pane.cur.classList.toggle('solid', typing && pane.p == 'a');
    pane.cur.classList.toggle('fin', t >= end);
-   const off = Math.max(0, n + (open ? 0 : 1) - pane.max);
+   // The cursor line takes a row below the newest one, except on an open command line or the
+   // spinner, which hold the cursor themselves (paneAt mirrors this).
+   const off = Math.max(0, n + (open || host === null ? 0 : 1) - pane.max);
    if (off != pane.off) { pane.off = off; pane.scroll.style.transform = off ? `translateY(${-off}lh)` : ''; }
   }
   // The reply crosses from the omp pane to the agent's spinner (wide only).
@@ -244,10 +250,21 @@ export function boot(root) {
   if (t >= end) state('done'); else raf = requestAnimationFrame(frame);
  };
  const play = () => {
-  if (mode == 'playing' || mode == 'done' || userPaused || !visible || document.hidden) return;
+  if (mode == 'playing' || mode == 'done' || mode == 'static' || userPaused || !visible || document.hidden) return;
   state('playing'); last = performance.now(); raf = requestAnimationFrame(frame);
  };
- const pause = () => { cancelAnimationFrame(raf); if (mode != 'done' && mode != 'armed') state('paused'); };
+ const pause = () => { cancelAnimationFrame(raf); if (mode == 'playing') state('paused'); };
+ // Reduced motion turned on mid-run: stop the clock and settle every variant on the final frame,
+ // the state a reduced-motion boot starts in. Turned off again, the frame stays and Replay returns.
+ const still = () => {
+  cancelAnimationFrame(raf); clearTimeout(start);
+  t = end; userPaused = false; userFocus = null;
+  const shown = active;
+  for (const v of variants) { active = v; render(); }
+  active = shown;
+  state('static');
+ };
+ reduce.addEventListener('change', () => { if (reduce.matches) still(); else if (mode == 'static') state('done'); });
  pauseBtn.addEventListener('click', () => {
   userPaused = !userPaused;
   if (userPaused) { pause(); state('paused'); } else { userFocus = null; seen = visible = true; play(); }
@@ -257,7 +274,7 @@ export function boot(root) {
   render(); state('armed'); play();
  });
  tabs.forEach((tab, i) => {
-  tab.addEventListener('click', () => { userFocus = tab.getAttribute('data-p'); if (mode != 'done') { userPaused = true; pause(); state('paused'); } render(); });
+  tab.addEventListener('click', () => { if (mode == 'static') return; userFocus = tab.getAttribute('data-p'); if (mode != 'done') { userPaused = true; pause(); state('paused'); } render(); });
   tab.addEventListener('keydown', e => {
    const k = /** @type {KeyboardEvent} */ (e).key;
    if (k != 'ArrowLeft' && k != 'ArrowRight' && k != 'Home' && k != 'End') return;
@@ -269,21 +286,20 @@ export function boot(root) {
  /** @type {ReturnType<typeof setTimeout>|undefined} */
  let resize;
  addEventListener('resize', () => { clearTimeout(resize); resize = setTimeout(() => { measure(); render(); }, 150); });
- document.addEventListener('visibilitychange', () => document.hidden ? pause() : play());
  root.querySelectorAll('.term-ctl button').forEach(b => b.removeAttribute('hidden'));
  measure();
  if (q[0] == 'end' || q[0] == 'at') {
+  // A seek starts paused (or done); Play and Replay then run under the same observers.
   t = q[0] == 'end' ? end : Math.min(end, +q[1] || 0);
   userPaused = t < end;
   render(); state(t < end ? 'paused' : 'done');
-  return;
- }
- render(); state('armed');
+ } else { render(); state('armed'); }
+ document.addEventListener('visibilitychange', () => document.hidden ? pause() : play());
  new IntersectionObserver(([entry]) => {
   visible = entry.isIntersecting;
   if (!visible) return pause();
   if (seen) return play();
   seen = true;
-  setTimeout(play, 600);
+  start = setTimeout(play, 600);
  }, { threshold: 0.15 }).observe(root);
 }

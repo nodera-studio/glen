@@ -3,7 +3,8 @@
 // laid out the way glen prints it: ls table and column dropping (src/commands/ls.rs:181-235,
 // src/render/table.rs), transcript roles, tool rows and wrapping (src/render/transcript.rs,
 // src/render/text.rs:37), the tail -f short header and diagnostic (src/commands/tail.rs:254-268),
-// the send spinner (W2 send.rs:166-191) and the wait outcome (W2 wait.rs:96-120).
+// the send spinner and its progress messages (W2 send.rs:187-207, wait.rs:16-23) and the wait
+// outcome with its duration (W2 wait.rs:24-31, 118-151).
 // W7/W8: regenerate from real `glen` output against tests/fixtures (D8).
 
 /** @typedef {'muted'|'accent'|'accent_2'|'success'|'warning'|'danger'|'focus'} Tone */
@@ -108,8 +109,18 @@ export const tool = (/** @type {string} */ name, /** @type {string} */ summary, 
  return width(plain(row)) <= w ? [row] : wrap(`↳ ${name} ${summary} · ✓ ${result}`, w - 2).map(l => [s('  ' + l)]);
 };
 
+/** wait.rs duration(): whole seconds, then minutes with zero-padded seconds. @param {number} ms */
+export const duration = ms => {
+ const sec = Math.floor(Math.max(0, ms) / 1000);
+ return sec < 60 ? `${sec}s` : `${Math.floor(sec / 60)}m ${String(sec % 60).padStart(2, '0')}s`;
+};
+/** wait.rs progress(): the spinner message for each job state. */
+export const PROGRESS = { queued: 'starting omp', locked: 'queued behind another glen job', accepted: 'waiting for the reply' };
+
 export const reply = 'Added the index. All 12 tests pass.';
 export const answer = `${reply} Migration 0012 is ready.`;
+/** wait.rs outcome(): the completed summary, painted success as one line. @type {Line} */
+export const completed = [s(`✓ completed · j3c9f41 · e27c0de · ${duration(41207)}`, 'success')];
 const sendCmd = 'glen send e27c0de "Fix 0012 and tell me when it passes."';
 
 /** @type {Step[]} */
@@ -130,8 +141,11 @@ export const script = [
  { k: 'title', after: 'send', v: 'glen' },
  { k: 'spin', p: 'a', id: 'spin', after: 'send', dt: 30, v: 'sending to e27c0de · j3c9f41' },
  { k: 'event', p: 'b', after: 'send', dt: 500, lines: w => [[], role('user', '12:04'), ...body('Fix 0012 and tell me when it passes.', w)] },
+ // The spinner starts on its send message, then follows the job: queued while omp starts,
+ // accepted once omp takes the prompt (the user message lands in the omp pane).
+ { k: 'msg', after: 'send', dt: 200, v: PROGRESS.queued },
+ { k: 'msg', after: 'send', dt: 480, v: PROGRESS.accepted },
  { k: 'focus', p: 'b', after: 'send', dt: 540 },
- { k: 'msg', after: 'send', dt: 820, v: 'omp is working' },
  { k: 'event', p: 'b', after: 'send', dt: 1400, lines: w => [[], role('assistant', '12:04'), ...body('∴ thinking · 18 words', w, 'muted')] },
  { k: 'event', p: 'b', after: 'send', dt: 2300, lines: tool('edit', 'migrations/0012_add_index.sql', '3 lines') },
  { k: 'event', p: 'b', after: 'send', dt: 4200, lines: tool('bash', 'cargo test migration_0012', '14 lines') },
@@ -139,7 +153,7 @@ export const script = [
  { k: 'hop', after: 'send', dt: 5560 },
  { k: 'focus', p: 'a', after: 'send', dt: 6080 },
  { k: 'flush', p: 'a', after: 'send', dt: 6100, ends: 'spin', lines: w => [
-  [s('✓ completed · j3c9f41 · e27c0de · 41207ms', 'success')],
+  completed,
   [],
   ...wrap(`  ${answer}`, w).map(l => [s(l)]),
   [s(`↩ ${reply} ✓`, 'muted')],
