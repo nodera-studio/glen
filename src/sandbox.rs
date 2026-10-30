@@ -128,14 +128,18 @@ pub fn map_probe_failure(
     error.message = format!("cannot probe omp session lease for {command}: {reason}");
     Some(error)
 }
-/// omp reports provider network failures as diagnostic prose rather than OS errors.
+/// Map omp's transport diagnostics and framed I/O permission failures under Codex markers.
 pub fn map_worker_failure(env: &Env, message: &str) -> Option<GlenError> {
     if detect(env).is_none() && env.get("CODEX_SANDBOX_NETWORK_DISABLED") != Some("1") {
         return None;
     }
     let lower = message.to_ascii_lowercase();
-    if ![
+    let network_failure = [
+        "failedtoopensocket",
+        "couldn't reach",
+        "unable to connect",
         "connection refused",
+        "connectionrefused",
         "dns resolution",
         "name resolution",
         "getaddrinfo",
@@ -143,18 +147,32 @@ pub fn map_worker_failure(env: &Env, message: &str) -> Option<GlenError> {
         "could not resolve",
         "enotfound",
         "econnrefused",
+        "etimeout",
+        "enetunreach",
         "eai_again",
         "eai_noname",
-        "permission denied",
-        "operation not permitted",
-        "read-only file system",
-        "eperm",
-        "eacces",
-        "erofs",
     ]
     .iter()
-    .any(|s| lower.contains(s))
-    {
+    .any(|s| lower.contains(s));
+    // Permission words alone can come from a provider. Require omp's connect/I/O
+    // framing or std's OS error suffix before treating them as sandbox failures.
+    let io_framing = lower.starts_with("connect: ")
+        || lower.contains(": connect: ")
+        || lower.starts_with("io: ")
+        || lower.contains(": io: ")
+        || lower.contains("(os error");
+    let permission_failure = io_framing
+        && [
+            "permission denied",
+            "operation not permitted",
+            "read-only file system",
+            "eperm",
+            "eacces",
+            "erofs",
+        ]
+        .iter()
+        .any(|s| lower.contains(s));
+    if !network_failure && !permission_failure {
         return None;
     }
     let s = detect(env).unwrap_or(Sandbox {
@@ -203,6 +221,101 @@ fn describe_with_extension(env: &Env, extension: bool) -> (&'static str, String,
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn worker_network_diagnostics_require_a_codex_marker() {
+        for message in [
+            "Couldn't reach foo.example.com (FailedToOpenSocket). Check the URL, your network, or proxy.",
+            "FailedToOpenSocket",
+            "Couldn't reach foo.example.com. Check the URL, your network, or proxy.",
+            "Unable to connect. Is the computer able to access the url?",
+            "ConnectionRefused",
+            "Couldn't connect to 127.0.0.1:443 (connection refused). Check that the server is running and reachable.",
+            "No internet connection: couldn't reach api.anthropic.com (getaddrinfo ETIMEOUT). Check your network or proxy and try again.",
+            "ETIMEOUT",
+            "connect ENETUNREACH 1.2.3.4:443",
+            "connect ECONNREFUSED 127.0.0.1:443",
+            "Network error: getaddrinfo ENOTFOUND api.openai.com",
+            "ENOTFOUND",
+            "getaddrinfo EAI_NONAME api.anthropic.com",
+            "EAI_NONAME",
+            "EAI_AGAIN",
+            "eai_again",
+            "connect: Connection refused",
+            "DNS resolution failed",
+            "connect: Operation not permitted",
+        ] {
+            for vars in [
+                vec![("CODEX_SANDBOX", "seatbelt")],
+                vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+            ] {
+                let env = Env::for_test(None, Path::new("/"), &vars);
+                let error = map_worker_failure(&env, message).unwrap();
+                assert_eq!(error.code.exit_code(), 6);
+                assert_eq!(error.details.unwrap()["reason"], "sandboxed");
+                assert!(error.hint.unwrap().contains("outside the sandbox"));
+            }
+            let env = Env::for_test(None, Path::new("/"), &[]);
+            assert!(map_worker_failure(&env, message).is_none());
+        }
+    }
+    #[test]
+    fn worker_io_permission_failures_require_framing_and_a_codex_marker() {
+        for message in [
+            "cannot start omp: io: Permission denied (os error 13) (see worker.log)",
+            "spawn omp: Operation not permitted (os error 1)",
+            "bind omp socket: Permission denied (os error 13)",
+            "write omp socket: Read-only file system (os error 30)",
+            "io: Permission denied",
+            "cannot start omp: io: Operation not permitted (see worker.log)",
+        ] {
+            for vars in [
+                vec![("CODEX_SANDBOX", "seatbelt")],
+                vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+            ] {
+                let env = Env::for_test(None, Path::new("/"), &vars);
+                let error = map_worker_failure(&env, message).unwrap();
+                assert_eq!(error.code.exit_code(), 6);
+                assert_eq!(error.details.unwrap()["reason"], "sandboxed");
+            }
+            let env = Env::for_test(None, Path::new("/"), &[]);
+            assert!(map_worker_failure(&env, message).is_none());
+        }
+    }
+    #[test]
+    fn worker_permission_prose_is_not_a_sandbox_failure() {
+        for vars in [
+            vec![("CODEX_SANDBOX", "seatbelt")],
+            vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        ] {
+            let env = Env::for_test(None, Path::new("/"), &vars);
+            for message in [
+                "403: Permission denied",
+                "403: Operation not permitted",
+                "provider: read-only file system",
+                "spawn omp: Operation not permitted",
+                "connect EPERM",
+                "provider EACCES",
+                "provider EROFS",
+                "provider scenario: Permission denied",
+            ] {
+                assert!(map_worker_failure(&env, message).is_none());
+            }
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn socket_connect_eperm_is_a_sandbox_failure() {
+        let env = Env::for_test(None, Path::new("/"), &[("CODEX_SANDBOX", "seatbelt")]);
+        let error = map_socket_failure(
+            &env,
+            "connect omp socket",
+            &io::Error::from_raw_os_error(libc::EPERM),
+        )
+        .unwrap();
+        assert_eq!(error.code.exit_code(), 6);
+        assert_eq!(error.details.unwrap()["reason"], "sandboxed");
+        assert!(error.hint.unwrap().contains("outside the sandbox"));
+    }
     #[test]
     fn detection_and_refusals() {
         for (vars, exists, network) in [
@@ -376,11 +489,9 @@ mod cycle2_tests {
             assert!(map_probe_failure(&env, "send", &lease).is_none());
         }
         for message in [
-            "spawn omp: Operation not permitted",
             "connect: Connection refused",
             "DNS resolution failed",
             "getaddrinfo EAI_AGAIN",
-            "connect EPERM",
         ] {
             let error = map_worker_failure(&env, message).unwrap();
             assert_eq!(error.code.exit_code(), 6);
