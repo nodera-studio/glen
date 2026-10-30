@@ -44,6 +44,8 @@ cargo run -- <args>                                 # run the CLI
 cargo test                                          # all tests
 cargo clippy --all-targets -- -D warnings           # lint (warnings fail CI)
 cargo fmt --all                                     # format
+shellcheck -s sh install.sh scripts/package-release.sh  # lint the installer and packager
+gh workflow run release.yml --ref main              # release workflow dry run: builds, publishes nothing
 ```
 
 Site:
@@ -51,9 +53,11 @@ Site:
 ```bash
 cd site && npm ci   # Node from site/.nvmrc
 npm run dev
-npm run verify      # astro check, build, timeline tests, budgets
+npm run verify      # astro check, build, unit tests, budgets, offline link check
 npm run test:e2e    # Playwright smoke; npx playwright install chromium once
 npm run lhci        # Lighthouse CI, mobile, light and dark
+npm run demo:refresh  # regenerate the demo capture from real glen output (cargo test)
+npm run deploy      # verify, online link check, wrangler deploy (local wrangler login)
 ```
 
 `lefthook install` once per clone: pre-commit checks rustfmt and scans for secrets, pre-push runs

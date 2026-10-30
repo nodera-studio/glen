@@ -1,95 +1,13 @@
 #![cfg(unix)]
 mod common;
-use common::{OmpBox, data};
-use std::{
-    fs,
-    io::{BufRead, BufReader, Read, Write},
-    path::{Path, PathBuf},
-    process::{Child, Command, Stdio},
-    sync::mpsc,
-    thread,
-    time::{Duration, Instant},
-};
+use common::{Holder, OmpBox, data};
+use std::{fs, path::PathBuf};
 #[test]
 #[ignore]
 fn lease_holder() {
-    let Some(path) = std::env::var_os("GLEN_TEST_HOLD_LOCK") else {
-        return;
-    };
-    let path = PathBuf::from(path);
-    #[cfg(not(target_os = "linux"))]
-    let _held = {
-        let f = fs::File::options()
-            .read(true)
-            .write(true)
-            .open(path)
-            .unwrap();
-        f.lock().unwrap();
-        f
-    };
-    #[cfg(target_os = "linux")]
-    let _held = {
-        use std::os::linux::net::SocketAddrExt;
-        let name = glen::omp::lease::memory_lock_name(path.to_str().unwrap());
-        let addr = std::os::unix::net::SocketAddr::from_abstract_name(name).unwrap();
-        std::os::unix::net::UnixDatagram::bind_addr(&addr).unwrap()
-    };
-    println!("held");
-    std::io::stdout().flush().unwrap();
-    std::io::stdin().read_to_end(&mut Vec::new()).unwrap();
+    common::hold_lease_from_env()
 }
-struct Holder(Child);
-impl Holder {
-    fn new(path: &Path) -> Self {
-        let mut c = Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "lease_holder", "--ignored", "--nocapture"])
-            .env_clear()
-            .env("GLEN_TEST_HOLD_LOCK", path)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let out = c.stdout.take().unwrap();
-        let (tx, rx) = mpsc::channel();
-        thread::spawn(move || {
-            let mut ready = Some(tx);
-            for l in BufReader::new(out).lines() {
-                if l.unwrap() == "held"
-                    && let Some(tx) = ready.take()
-                {
-                    tx.send(()).unwrap();
-                }
-            }
-        });
-        let holder = Self(c);
-        rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        holder
-    }
-    fn release(&mut self) {
-        drop(self.0.stdin.take());
-        let start = Instant::now();
-        loop {
-            if let Some(s) = self.0.try_wait().unwrap() {
-                assert!(s.success());
-                return;
-            }
-            assert!(start.elapsed() < Duration::from_secs(3));
-            thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
-impl Drop for Holder {
-    fn drop(&mut self) {
-        if self.0.try_wait().unwrap().is_none() {
-            self.0.kill().unwrap();
-            let start = Instant::now();
-            while self.0.try_wait().unwrap().is_none() {
-                assert!(start.elapsed() < Duration::from_secs(3));
-                thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
-}
+
 fn lock(sb: &OmpBox, key: char) -> PathBuf {
     let s = glen::omp::session::Session::load(&sb.session(key)).unwrap();
     let dir = sb.home.join(".omp/run/session-owners");

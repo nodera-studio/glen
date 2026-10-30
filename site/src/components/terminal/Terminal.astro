@@ -65,6 +65,6 @@ const player = (await transform(`${playerSource.replace(/^export /gm, '')}\nboot
   <h2>Agent terminal</h2><pre>{transcript('a')}</pre>
   <h2>omp session</h2><pre>{transcript('b')}</pre>
  </div>
- <figcaption id="term-cap">Your agent runs <code>glen send</code> on the left; the omp session works on the right and answers with <code>glen_reply</code>. Synthetic sessions, time compressed.</figcaption>
+ <figcaption id="term-cap">Your agent runs <code>glen send</code> on the left; the omp session works on the right and answers with <code>glen_reply</code>. Real glen output from synthetic sessions; time compressed.</figcaption>
 </figure>
 <script is:inline set:html={player}></script>

@@ -79,9 +79,11 @@ test.describe('without JavaScript', () => {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
   await expect(page.locator('#install-panel-cargo code')).toHaveText(cargo);
   await expect(page.locator('#install-panel-cargo code')).toBeVisible();
-  await expect(page.locator('#install-panel-script code')).toHaveText('curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh');
-  await expect(page.locator('#install-panel-script code')).toBeVisible();
-  await expect(page.getByRole('link', { name: 'Download from GitHub Releases' })).toBeVisible();
+  // Until the first release the Script panel is a note: no installer command to copy (W7 D9).
+  await expect(page.locator('#install-panel-script')).toContainText('The install script ships with the first release (v0.1.0). Use Cargo until then.');
+  await expect(page.locator('#install-panel-script code')).toHaveCount(0);
+  await expect(page.getByRole('link', { name: 'GitHub Releases', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'GitHub Releases', exact: true })).toHaveAttribute('href', 'https://github.com/nodera-studio/glen/releases');
   await expect(page.locator('.theme-switch')).toBeHidden(); await expect(page.locator('.term-ctl')).toBeHidden();
   await expect(page.locator('#install-panel-cargo button')).toHaveCount(0);
   for (const pane of await page.locator('.term-v[data-v=n] .term-vp').all()) expect(await pane.evaluate(e => e.scrollHeight <= e.clientHeight + 1)).toBe(true);
@@ -159,7 +161,7 @@ test.describe('hero terminal player', () => {
   const spinAt = Number(await page.locator('.term-v[data-v=w] [data-p=a] .tl[data-k=spin]').getAttribute('data-at'));
   const msgs = (JSON.parse((await page.locator('#term').getAttribute('data-cues'))!) as [number, string, string][]).filter(c => c[1] === 'msg');
   expect(msgs.map(c => c[2])).toEqual(['starting omp', 'waiting for the reply']);
-  for (const [at, text] of [[spinAt, 'sending to e27c0de · j3c9f41'], ...msgs.map(([at, , v]) => [at, v] as const)] as const) {
+  for (const [at, text] of [[spinAt, 'sending to e27c0de · ja3c9f41'], ...msgs.map(([at, , v]) => [at, v] as const)] as const) {
    await page.goto(`/?term=at:${at + 20}`);
    await expect(page.locator('.term-v[data-v=w] [data-p=a] .tl.on[data-k=spin] .sm')).toHaveText(text);
   }
@@ -180,7 +182,7 @@ test.describe('hero terminal player', () => {
  for (const [width, variant] of [[1280, 'w'], [390, 'n']] as const) test(`${width}px end frame: real glen output`, async ({ page }) => {
   await page.setViewportSize({ width, height: 900 }); await page.goto('/?term=end');
   await expect(page.locator('#term')).toHaveAttribute('data-term', 'done');
-  await expect(visibleRow(page, variant, 'a', /^✓ completed · j3c9f41 · e27c0de · 41s$/)).toBeVisible();
+  await expect(visibleRow(page, variant, 'a', /^✓ completed · ja3c9f41 · e27c0de · 41s$/)).toBeVisible();
   await expect(visibleRow(page, variant, 'a', '↩ Added the index. All 12 tests pass. ✓')).toBeVisible();
   await expect(visibleRow(page, variant, 'a', /^handle\s+state\s+title\s+/)).toBeVisible();
   await expect(visibleRow(page, variant, 'a', '3 sessions · 1 live')).toBeVisible();
@@ -387,7 +389,7 @@ test('how it works: four cards, 2×2 at 1280, each stage ends on its final frame
  }
  await expect(page.locator('[data-stage=hear] [data-before]')).toBeHidden();
  await expect(page.locator('[data-stage=hear]')).toContainText('↩ Added the index. All 12 tests pass. ✓');
- await expect(page.locator('[data-stage=hear]')).toContainText('✓ completed · j3c9f41 · e27c0de · 41s');
+ await expect(page.locator('[data-stage=hear]')).toContainText('✓ completed · ja3c9f41 · e27c0de · 41s');
  expect(await page.locator('[data-stage=hear] [data-before]').textContent()).toContain('waiting for the reply');
  await expect(page.locator('[data-stage=find]')).toContainText('3 sessions · 1 live');
  await page.waitForTimeout(800);
@@ -492,10 +494,21 @@ test('412px first viewport requests no JavaScript file', async ({ page }) => {
 test('Cargo defaults; unreleased downloads carry release labels', async ({ page }) => {
  await page.goto('/'); await hydrate(page, '#install');
  await expect(page.getByRole('tab', { name: 'Cargo', exact: true })).toHaveAttribute('aria-selected', 'true');
- for (const name of ['Script', 'Binary']) {
+ for (const [name, note] of [['Script', 'The install script ships with the first release (v0.1.0). Use Cargo until then.'], ['Binary', 'Binaries arrive with the v0.1.0 release.']]) {
   await page.getByRole('tab', { name, exact: true }).click();
-  await expect(page.locator('#install [role=tabpanel]:not([hidden])')).toContainText('Available with the v0.1.0 release.');
+  await expect(page.locator('#install [role=tabpanel]:not([hidden])')).toContainText(note!);
  }
  await page.getByRole('tab', { name: 'Script', exact: true }).click();
  await expect(page.locator('#install-panel-script button')).toHaveCount(0);
+ await expect(page.locator('#install-panel-script code')).toHaveCount(0);
+});
+test('before the first release the page names no installer URL and no latest release', async ({ page }) => {
+ const responses: string[] = [];
+ page.on('response', async r => { if (r.url().endsWith('.js')) responses.push(await r.text()); });
+ await page.goto('/'); await scrollThrough(page);
+ await expect(page.locator('astro-island:not([ssr])')).toHaveCount(4);
+ for (const text of [await page.content(), ...responses]) {
+  expect(text).not.toContain('raw.githubusercontent.com');
+  expect(text).not.toContain('/releases/latest');
+ }
 });

@@ -1,0 +1,5 @@
+{"type":"title","v":1,"title":"Review routes","source":"auto","updatedAt":"2026-10-29T11:30:00.000Z","pad":"                                                                                                                                                 "}
+{"type":"session","version":3,"id":"01a0fd2a-4140-7e05-a3f4-0c9a4b7e2d81","timestamp":"2026-10-29T11:30:00.000Z","cwd":"/home/fixture/work/alpha"}
+{"type":"model_change","id":"00000002","parentId":null,"timestamp":"2026-10-29T11:30:00.000Z","runtime":{"version":"18.14.0"},"model":"anthropic/claude-sonnet-4-5","role":"default"}
+{"type":"message","id":"00000003","parentId":"00000002","timestamp":"2026-10-29T11:30:00.000Z","runtime":{"version":"18.14.0"},"message":{"role":"user","content":[{"type":"text","text":"Review the API routes."}]}}
+{"type":"message","id":"00000004","parentId":"00000003","timestamp":"2026-10-29T11:30:00.000Z","runtime":{"version":"18.14.0"},"message":{"role":"assistant","content":[{"type":"text","text":"The routes look consistent."}],"stopReason":"stop","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5"}}
