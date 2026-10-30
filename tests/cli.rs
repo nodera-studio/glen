@@ -31,6 +31,11 @@ fn public_help() {
             "send",
             "wait",
             "jobs",
+            "abort",
+            "models",
+            "model",
+            "thinking",
+            "compact",
             "inbox",
             "install-extension",
             "install-skill",
@@ -240,11 +245,20 @@ fn completions() {
             "send",
             "wait",
             "jobs",
+            "abort",
+            "models",
+            "model",
+            "thinking",
+            "compact",
             "inbox",
             "install-extension",
             "install-skill",
         ] {
             assert!(s.contains(visible));
+        }
+        assert!(s.contains("stop"), "{shell} lacks stop alias");
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert!(s.contains(level), "{shell} lacks {level}");
         }
         for hidden in ["__worker", "watch"] {
             assert!(!s.contains(hidden), "{shell}: {hidden}");

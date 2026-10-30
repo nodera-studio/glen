@@ -3,7 +3,7 @@ use glen::{
     glen_home::{GlenHome, write_private_atomic},
     jobs::Reply,
     live::registry::{self, Registry},
-    ops,
+    ops::{self, Op, OpError},
 };
 use serde_json::{Value, json};
 use std::{
@@ -15,11 +15,30 @@ use std::{
     },
     path::PathBuf,
     sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
+// Retain the historical W3 capability set for compatibility tests.
+const W3_OPS: &[&str] = &["hello", "state", "send"];
+const W3_RESERVED: &[&str] = &[
+    "abort",
+    "list_models",
+    "set_model",
+    "set_thinking_level",
+    "compact",
+];
+struct Selection {
+    model: omp_rpc::ModelInfo,
+    thinking: String,
+}
+struct Active(Arc<AtomicUsize>);
+impl Drop for Active {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 #[derive(Clone)]
 struct Peer {
     home: GlenHome,
@@ -31,6 +50,12 @@ struct Peer {
     version: String,
     delay: u64,
     mode: String,
+    old_ops: bool,
+    models: Arc<Vec<omp_rpc::ModelInfo>>,
+    selection: Arc<Mutex<Selection>>,
+    active: Arc<AtomicUsize>,
+    abort_generation: Arc<AtomicU64>,
+    compacting: Arc<AtomicBool>,
 }
 impl Peer {
     fn log(&self, dir: &str, frame: &Value) {
@@ -50,8 +75,16 @@ impl Peer {
         self.log("out", &v);
         writeln!(s, "{v}")
     }
+    fn supported(&self) -> &[&str] {
+        if self.old_ops {
+            W3_OPS
+        } else {
+            ops::IMPLEMENTED
+        }
+    }
     fn data(&self, hello: bool) -> Value {
-        let busy = matches!(self.scenario.as_str(), "busy" | "queued");
+        let busy = matches!(self.scenario.as_str(), "busy" | "queued")
+            || self.active.load(Ordering::SeqCst) > 0;
         let mut d = json!({"ext_version":self.version,"omp_version":"18.14.0","pid":std::process::id(),"session_id":if self.scenario=="mismatch"{moved(&self.id)}else{self.id.clone()},"session_file":self.file,"mode":self.mode,"state":if busy{"busy"}else{"idle"},"busy":busy,"queued":self.scenario=="queued","active_requests":0});
         if hello {
             d["protocol"] = json!(1);
@@ -59,7 +92,7 @@ impl Peer {
             d["ops"] = if self.scenario == "no_send" {
                 json!(["hello", "state"])
             } else {
-                json!(ops::IMPLEMENTED)
+                json!(self.supported())
             }
         }
         d
@@ -93,13 +126,20 @@ impl Peer {
             return Ok(());
         }
         let op = v["op"].as_str().unwrap_or("");
-        if !ops::IMPLEMENTED.contains(&op) || (op == "send" && self.scenario == "no_send") {
+        if !self.supported().contains(&op) || (op == "send" && self.scenario == "no_send") {
             return bad(
                 &mut s,
                 "unsupported_op",
                 "unsupported operation",
-                json!({"op":op,"ops":ops::IMPLEMENTED,"reserved":ops::RESERVED.contains(&op)}),
+                json!({"op":op,"ops":self.supported(),"reserved":self.old_ops&&W3_RESERVED.contains(&op)}),
             );
+        }
+        if ops::CONTROL_OPS.contains(&op) {
+            let result = self.control(op, v.get("args"));
+            return match result {
+                Ok(data) => self.write(&mut s, json!({"v":1,"id":id,"ok":true,"data":data})),
+                Err(error) => self.write(&mut s, json!({"v":1,"id":id,"ok":false,"error":error})),
+            };
         }
         if op != "send" {
             return self.write(
@@ -147,6 +187,13 @@ impl Peer {
         } else {
             "follow_up"
         };
+        let generation = self.abort_generation.load(Ordering::SeqCst);
+        let _active = if self.scenario != "queued" {
+            self.active.fetch_add(1, Ordering::SeqCst);
+            Some(Active(self.active.clone()))
+        } else {
+            None
+        };
         self.write(&mut s,json!({"v":1,"id":id,"ok":true,"data":{"delivered_as":delivered,"session_id":self.id,"request_id":id}}))?;
         if self.scenario == "not_delivered" {
             return self.write(&mut s, json!({"v":1,"id":id,"event":"error","error":{"code":"not_delivered","message":"request removed before delivery"}}));
@@ -154,9 +201,24 @@ impl Peer {
         if self.scenario != "queued" {
             self.write(&mut s, json!({"v":1,"id":id,"event":"consumed"}))?;
         }
-        if matches!(self.scenario.as_str(), "queued" | "never_settles") {
-            std::thread::sleep(Duration::from_secs(30));
-            return Ok(());
+        if matches!(self.scenario.as_str(), "queued" | "never_settles" | "slow") {
+            let end = std::time::Instant::now()
+                + Duration::from_millis(if self.scenario == "slow" {
+                    self.delay
+                } else {
+                    30_000
+                });
+            while std::time::Instant::now() < end {
+                if self.scenario != "queued"
+                    && self.abort_generation.load(Ordering::SeqCst) != generation
+                {
+                    return self.write(&mut s,json!({"v":1,"id":id,"event":"settled","status":"aborted","assistant_text":null,"stop_reason":"aborted","error_message":null}));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if self.scenario != "slow" {
+                return Ok(());
+            }
         }
         if self.scenario == "malformed" {
             return writeln!(s, "not json");
@@ -169,9 +231,6 @@ impl Peer {
             if self.scenario == "switched" {
                 return self.write(&mut s,json!({"v":1,"id":id,"event":"error","error":{"code":"session_switched","message":"switched"}}));
             }
-        }
-        if self.scenario == "slow" {
-            std::thread::sleep(Duration::from_millis(self.delay));
         }
         let texts = if self.scenario == "progress" {
             vec![("working".into(), false), (format!("reply: {text}"), true)]
@@ -212,6 +271,115 @@ impl Peer {
         };
         self.write(&mut s,json!({"v":1,"id":id,"event":"settled","status":status,"assistant_text":format!("pong: {text}"),"stop_reason":if status=="completed"{"stop"}else{status},"error_message":if status=="error"{Some("model error")}else{None},"warnings":if self.scenario=="batched"{vec![json!({"code":"batched","message":"shared reply span with j7654321"})]}else{vec![]}}))
     }
+    fn control(&self, name: &str, args: Option<&Value>) -> Result<Value, OpError> {
+        let op = ops::decode(name, args)?;
+        if ops::expect_session_id(args).is_some_and(|expected| expected != self.id) {
+            return Err(OpError::new(ops::SESSION_MISMATCH, "session moved")
+                .with_details(json!({"session_id":self.id})));
+        }
+        let mut data = match op {
+            Op::Abort => {
+                let busy = self.active.load(Ordering::SeqCst) > 0
+                    || self.compacting.load(Ordering::SeqCst)
+                    || self.scenario == "busy";
+                let stuck = std::env::var("FAKE_EXT_ABORT_STUCK").as_deref() == Ok("1");
+                if busy {
+                    if stuck {
+                        std::thread::sleep(Duration::from_secs(3));
+                    } else {
+                        self.abort_generation.fetch_add(1, Ordering::SeqCst);
+                        let end = std::time::Instant::now() + Duration::from_secs(3);
+                        while (self.active.load(Ordering::SeqCst) > 0
+                            || self.compacting.load(Ordering::SeqCst))
+                            && std::time::Instant::now() < end
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                    }
+                }
+                json!({"was":if busy {"busy"}else{"idle"},"aborted":busy,"idle_after":!stuck,"queued":self.scenario=="queued"})
+            }
+            Op::ListModels => {
+                let selected = self
+                    .selection
+                    .lock()
+                    .map_err(|e| OpError::new(ops::INTERNAL, e.to_string()))?;
+                json!({"current":{"provider":selected.model.provider,"id":selected.model.id},"thinking_level":selected.thinking,"models":self.models.iter().map(glen::ctl::row_from_info).collect::<Vec<_>>()})
+            }
+            Op::SetModel(a) => {
+                let model = self
+                    .models
+                    .iter()
+                    .find(|m| m.provider == a.provider && m.id == a.model_id)
+                    .ok_or_else(|| OpError::new(ops::MODEL_NOT_FOUND, "Model not found"))?;
+                if model.provider == "nokey"
+                    || std::env::var("FAKE_EXT_NO_AUTH").ok().as_deref()
+                        == Some(model.provider.as_str())
+                {
+                    return Err(OpError::new(
+                        ops::NO_AUTH,
+                        format!("No API key for {}/{}", model.provider, model.id),
+                    ));
+                }
+                let mut selected = self
+                    .selection
+                    .lock()
+                    .map_err(|e| OpError::new(ops::INTERNAL, e.to_string()))?;
+                let previous = json!({"provider":selected.model.provider,"id":selected.model.id});
+                selected.model = model.clone();
+                if !model.reasoning {
+                    selected.thinking = "off".into();
+                }
+                json!({"model":{"provider":model.provider,"id":model.id,"name":model.name},"previous":previous,"thinking_level":selected.thinking,"thinking_levels":glen::ctl::row_from_info(model).thinking_levels,"busy":self.data(false)["busy"]})
+            }
+            Op::SetThinkingLevel(a) => {
+                let mut selected = self
+                    .selection
+                    .lock()
+                    .map_err(|e| OpError::new(ops::INTERNAL, e.to_string()))?;
+                let available = glen::ctl::row_from_info(&selected.model).thinking_levels;
+                let model = json!({"provider":selected.model.provider,"id":selected.model.id});
+                if !available.contains(&a.level) {
+                    return Err(
+                        OpError::new(ops::INVALID_LEVEL, "unsupported thinking level")
+                            .with_details(json!({"available":available,"model":model})),
+                    );
+                }
+                let previous = std::mem::replace(&mut selected.thinking, a.level);
+                json!({"thinking_level":selected.thinking,"previous":previous,"model":model,"available":available,"busy":self.data(false)["busy"]})
+            }
+            Op::Compact(_) => {
+                if self.data(false)["busy"] == true
+                    || self.scenario == "queued"
+                    || self.compacting.swap(true, Ordering::SeqCst)
+                {
+                    return Err(OpError::new(ops::BUSY, "session is busy"));
+                }
+                let generation = self.abort_generation.load(Ordering::SeqCst);
+                let delay = std::env::var("FAKE_EXT_COMPACT_DELAY_MS")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let end = std::time::Instant::now() + Duration::from_millis(delay);
+                while std::time::Instant::now() < end {
+                    if self.abort_generation.load(Ordering::SeqCst) != generation {
+                        self.compacting.store(false, Ordering::SeqCst);
+                        return Err(OpError::new(ops::OMP_ERROR, "compaction aborted"));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                self.compacting.store(false, Ordering::SeqCst);
+                json!({"tokens_before":1234,"tokens_after":123})
+            }
+            _ => return Err(OpError::new(ops::UNSUPPORTED_OP, "unsupported control")),
+        };
+        data["session_id"] = json!(if std::env::var("FAKE_EXT_POST_ID").as_deref() == Ok("1") {
+            moved(&self.id)
+        } else {
+            self.id.clone()
+        });
+        Ok(data)
+    }
 }
 fn moved(id: &str) -> String {
     let mut s = id.to_owned();
@@ -229,7 +397,21 @@ fn main() -> io::Result<()> {
     };
     let id = get("--session-id").ok_or_else(|| io::Error::other("--session-id required"))?;
     let socket = glen::live::run_dir(&home).join(format!("{}.sock", std::process::id()));
+    let models: Vec<omp_rpc::ModelInfo> = serde_json::from_str(include_str!("fake_models.json"))?;
+    let selected = models
+        .first()
+        .ok_or_else(|| io::Error::other("empty models fixture"))?
+        .clone();
     let peer = Peer {
+        old_ops: std::env::var("FAKE_EXT_OPS").as_deref() == Ok("w3"),
+        models: Arc::new(models),
+        selection: Arc::new(Mutex::new(Selection {
+            model: selected,
+            thinking: "medium".into(),
+        })),
+        active: Arc::new(AtomicUsize::new(0)),
+        abort_generation: Arc::new(AtomicU64::new(0)),
+        compacting: Arc::new(AtomicBool::new(false)),
         home,
         id,
         file: get("--session-file").map(PathBuf::from),

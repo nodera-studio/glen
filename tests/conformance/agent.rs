@@ -1118,20 +1118,11 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
         out.assert_exit(0);
         assert_eq!(
             command_names(&out.out()),
-            [
-                "completions",
-                "doctor",
-                "help",
-                "inbox",
-                "install-extension",
-                "install-skill",
-                "jobs",
-                "ls",
-                "send",
-                "show",
-                "tail",
-                "wait"
-            ],
+            {
+                let mut names = VISIBLE;
+                names.sort();
+                names
+            },
             "{}",
             out.ctx()
         );
@@ -3190,7 +3181,7 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 24] = [
+const CONTRACT_IDS: [&str; 32] = [
     "ls",
     "show",
     "show.raw",
@@ -3207,10 +3198,18 @@ const CONTRACT_IDS: [&str; 24] = [
     "inbox",
     "inbox.follow",
     "install-extension",
+    "models",
+    "models.session",
+    "model",
+    "thinking",
+    "abort.idle",
+    "abort.aborted",
+    "compact",
     "error.usage",
     "error.not_found",
     "error.ambiguous",
     "error.job_failed",
+    "error.control_failed",
     "error.no_route",
     "error.no_route.sandboxed",
     "error.omp_unavailable",

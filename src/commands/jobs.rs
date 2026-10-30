@@ -3,42 +3,21 @@ use crate::{
     env::Env,
     error::GlenError,
     glen_home,
-    jobs::{JobStore, State, liveness},
+    jobs::{JobStore, State},
     output::{Outcome, OutputCtx},
     render::{Table, palette::Token, text},
     rpc::session_handle,
 };
 use serde_json::json;
 use std::time::SystemTime;
-fn matches_session(id: Option<&str>, filter: &str) -> bool {
-    let Some(id) = id else { return false };
-    let id = id.to_ascii_lowercase();
-    let filter = filter.to_ascii_lowercase();
-    id == filter
-        || (filter.len() >= 4
-            && filter.bytes().all(|b| b.is_ascii_hexdigit())
-            && id.replace('-', "").ends_with(&filter))
-}
 pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let store = JobStore::new(glen_home::resolve(env)?);
-    let mut rows = vec![];
     let now = jiff::Timestamp::now();
-    for id in store.list() {
-        let (Ok(job), Ok(status)) = (store.read_job(&id), store.read_status(&id)) else {
-            continue;
-        };
-        let s = liveness::refresh(&store, &id, status);
-        if args.active && s.status.is_terminal() {
-            continue;
-        }
-        if let Some(filter) = &args.session
-            && !matches_session(job.session_id.as_deref(), filter)
-            && !matches_session(s.actual_session_id.as_deref(), filter)
-        {
-            continue;
-        }
-        rows.push((job, s));
-    }
+    let mut rows: Vec<_> = store
+        .for_session(args.session.as_deref(), args.active)
+        .into_iter()
+        .map(|(_, job, status)| (job, status))
+        .collect();
     let total = rows.len();
     let active = rows.iter().filter(|(_, s)| !s.status.is_terminal()).count();
     if args.limit > 0 {
@@ -204,7 +183,7 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::jobs::matches_session;
     #[test]
     fn filters() {
         for (s, want) in [

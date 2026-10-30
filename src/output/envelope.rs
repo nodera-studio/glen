@@ -211,7 +211,8 @@ pub fn emit_to(
         Ok(bytes) => bytes,
         Err(e) => return emit_error_to(ctx, e.into(), out, err),
     };
-    let bytes = if !(command == "install-skill" && outcome.data["dry_run"] == true)
+    let bytes = if !(command == "completions"
+        || command == "install-skill" && outcome.data["dry_run"] == true)
         && !ctx.stdout_tty
         && ctx.mode != Mode::Raw
         && ctx.max_output.is_some_and(|max| {

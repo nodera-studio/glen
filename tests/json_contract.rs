@@ -309,6 +309,94 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     all.insert("wait".into(), vec![json(&out)]);
     r.wait_worker_gone(v["data"]["job"]["id"].as_str().unwrap());
     all.insert("send.running".into(), vec![v]);
+    for (id, args, scenario, exit) in [
+        ("models", vec!["models", "--json"], "ok", 0),
+        (
+            "models.session",
+            vec!["models", "e27c0de", "--json"],
+            "ok",
+            0,
+        ),
+        (
+            "model",
+            vec!["model", "e27c0de", "fake/fake-2", "--json"],
+            "ok",
+            0,
+        ),
+        (
+            "thinking",
+            vec!["thinking", "e27c0de", "high", "--json"],
+            "ok",
+            0,
+        ),
+        ("abort.idle", vec!["abort", "e27c0de", "--json"], "ok", 0),
+        (
+            "compact",
+            vec![
+                "compact",
+                "e27c0de",
+                "--instructions",
+                "keep exact facts",
+                "--json",
+            ],
+            "ok",
+            0,
+        ),
+        (
+            "error.control_failed",
+            vec!["compact", "e27c0de", "--json"],
+            "compact_error",
+            7,
+        ),
+    ] {
+        let r = RpcBox::new();
+        let out = r
+            .glen(&args)
+            .env("FAKE_OMP_SERIAL", "1")
+            .env("FAKE_OMP_SCENARIO", scenario)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(exit), "{id}: {out:?}");
+        assert!(out.stderr.is_empty(), "{id}: {out:?}");
+        let v = json(&out);
+        assert_eq!(v["ok"], exit == 0, "{id}: {v}");
+        if exit == 7 {
+            assert_eq!(v["error"]["code"], "control_failed");
+            assert_eq!(v["error"]["details"]["reason"], "omp_error");
+        } else {
+            assert_eq!(
+                v["data"]["route"],
+                if id == "abort.idle" { "none" } else { "rpc" }
+            );
+        }
+        all.insert(id.into(), vec![v]);
+    }
+    let r = RpcBox::new();
+    let out = r
+        .glen(&["send", "e27c0de", "hold", "--no-wait", "--json"])
+        .env("FAKE_OMP_SERIAL", "1")
+        .env("FAKE_OMP_RUN_RELEASE", r.omp.tmp.path().join("release"))
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10), "{out:?}");
+    assert!(out.stderr.is_empty());
+    let launched = json(&out);
+    let job = launched["data"]["job"]["id"].as_str().unwrap();
+    poll(Duration::from_secs(5), || {
+        (r.job(job).1["status"] == "accepted").then_some(())
+    });
+    let out = r
+        .glen(&["abort", "e27c0de", "--timeout", "15s", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(out.stderr.is_empty());
+    let v = json(&out);
+    assert_eq!(v["data"]["route"], "job");
+    assert_eq!(v["data"]["aborted"], true);
+    assert_eq!(v["data"]["job_status"], "aborted");
+    r.wait_worker_gone(job);
+    all.insert("abort.aborted".into(), vec![v]);
     let r = RpcBox::new();
     let mut lease = r.hold_lease(A_ID);
     let out = r.glen(&["send", "e27c0de", "hi"]).output().unwrap();
@@ -349,7 +437,8 @@ fn ac412_examples_match_real_envelopes() {
                 shape_eq(doc, value, false, &format!("{id}.{event}")).unwrap();
             }
         } else {
-            shape_eq(&example.values[0], &actual[0], false, &id).unwrap();
+            shape_eq(&example.values[0], &actual[0], false, &id)
+                .unwrap_or_else(|error| panic!("{error}; actual envelope: {}", actual[0]));
         }
     }
 }

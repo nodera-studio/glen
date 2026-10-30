@@ -21,6 +21,25 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
 /// The one command still hidden after W3 and W4 (AC-301, AC-401).
+pub const VISIBLE: [&str; 17] = [
+    "ls",
+    "show",
+    "tail",
+    "send",
+    "wait",
+    "jobs",
+    "abort",
+    "models",
+    "model",
+    "thinking",
+    "compact",
+    "inbox",
+    "install-extension",
+    "install-skill",
+    "doctor",
+    "completions",
+    "help",
+];
 pub const HIDDEN: [&str; 1] = ["watch"];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.

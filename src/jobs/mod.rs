@@ -192,6 +192,15 @@ pub struct JobResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settled_at: Option<String>,
 }
+pub(crate) fn matches_session(id: Option<&str>, filter: &str) -> bool {
+    let Some(id) = id else { return false };
+    let id = id.to_ascii_lowercase();
+    let filter = filter.to_ascii_lowercase();
+    id == filter
+        || (filter.len() >= 4
+            && filter.bytes().all(|b| b.is_ascii_hexdigit())
+            && id.replace('-', "").ends_with(&filter))
+}
 #[derive(Clone, Debug)]
 pub struct JobStore {
     pub home: GlenHome,
@@ -207,6 +216,34 @@ impl JobStore {
     }
     pub fn exists(&self) -> bool {
         self.root.is_dir()
+    }
+    /// Session filtering shared by job discovery and control routing. Refresh lost
+    /// workers before deciding which jobs are active.
+    pub fn active_for_session(&self, session_id: &str) -> Vec<(JobId, Job, Status)> {
+        self.for_session(Some(session_id), true)
+    }
+    pub(crate) fn for_session(
+        &self,
+        session: Option<&str>,
+        active: bool,
+    ) -> Vec<(JobId, Job, Status)> {
+        self.list()
+            .into_iter()
+            .filter_map(|id| {
+                let job = self.read_job(&id).ok()?;
+                let status = liveness::refresh(self, &id, self.read_status(&id).ok()?);
+                if active && status.status.is_terminal() {
+                    return None;
+                }
+                if let Some(filter) = session
+                    && !matches_session(job.session_id.as_deref(), filter)
+                    && !matches_session(status.actual_session_id.as_deref(), filter)
+                {
+                    return None;
+                }
+                Some((id, job, status))
+            })
+            .collect()
     }
     pub fn create(&self, job: &Job) -> Result<(), GlenError> {
         self.create_mapped(job, |path, e| {
@@ -766,5 +803,49 @@ pub(crate) mod tests {
                 .count(),
             3
         );
+    }
+}
+
+#[cfg(test)]
+mod session_jobs_tests {
+    use super::*;
+    #[test]
+    fn active_for_session_matches_original_and_actual_ids_and_refreshes_lost() {
+        let t = tempfile::tempdir().unwrap();
+        let store = super::tests::store(t.path());
+        assert!(store.active_for_session("abcd").is_empty());
+        assert!(!store.home.root.exists());
+        let identity = liveness::current().unwrap();
+        let mut active = Vec::new();
+        for (original, actual, state, live) in [
+            ("s-abcd", None, State::Queued, true),
+            ("s-other", Some("s-abcd"), State::Accepted, true),
+            ("s-other", None, State::Accepted, true),
+            ("s-abcd", None, State::Completed, true),
+            ("s-abcd", None, State::Accepted, false),
+        ] {
+            let mut j = super::tests::job();
+            j.session_id = Some(original.into());
+            let id = JobId::parse(&j.id).unwrap();
+            store.create(&j).unwrap();
+            let mut status = store.read_status(&id).unwrap();
+            status.actual_session_id = actual.map(str::to_owned);
+            status.status = state;
+            status.worker_pid = Some(identity.pid);
+            status.worker_start = Some(if live {
+                identity.start.clone()
+            } else {
+                "reused".into()
+            });
+            store.write_status(&id, &status).unwrap();
+            if live && !state.is_terminal() && (original == "s-abcd" || actual == Some("s-abcd")) {
+                active.push(id);
+            }
+        }
+        let rows = store.active_for_session("ABCD");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|(id, _, _)| active.contains(id)));
+        assert_eq!(store.for_session(Some("s-abcd"), false).len(), 4);
+        assert_eq!(store.for_session(Some("cd"), false).len(), 0);
     }
 }

@@ -35,6 +35,8 @@ mod agent;
 mod cli_surface;
 #[path = "conformance/color.rs"]
 mod color;
+#[path = "conformance/controls.rs"]
+mod controls;
 #[path = "conformance/doctor.rs"]
 mod doctor;
 #[path = "conformance/ext_node.rs"]

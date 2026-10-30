@@ -32,7 +32,7 @@ Every command has `--help`.
 | 4 | `ambiguous` | use a handle from `error.details.candidates` |
 | 5 | `omp_unavailable` | tell the user; `glen doctor` shows why |
 | 6 | `no_route` | refused safely; see below |
-| 7 | `job_failed` | report `error.details` |
+| 7 | `job_failed`, `control_failed` | report `error.details` |
 | 8 | `not_implemented` | this version lacks the command |
 | 10 | running | `glen wait <job>`; the job keeps running |
 | 11 | forked | done; read `data`, then use `data.forked.to_handle` |
@@ -78,9 +78,16 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 
 <!-- glen:if abort stop models model thinking compact -->
 ## Session controls
-- `glen abort <handle>` stops the running turn (`glen stop` is the same).
-- `glen models <handle>` lists models; `glen model <handle> <provider/id>` switches the model;
-  `glen thinking <handle> high` sets thinking (`off` to `max`); `glen compact <handle>` compacts an idle session.
+- `glen abort <handle>` stops the running turn (`glen stop <handle>` is the same); idle abort starts nothing.
+- `glen models` lists the profile models without resuming a session. `glen models <handle>` reports its selection;
+  `--provider P` filters providers. `glen model <handle> <provider/id>` switches the model;
+  `glen thinking <handle> high` accepts off, minimal, low, medium, high, xhigh, max when supported by that model.
+  `glen compact <handle>` needs an idle session; abort the run first or wait.
+- Controls and models take `--timeout DUR` (default 90s). Changes have session scope; auto/inherit are unavailable.
+  Models may fall back to disk selection with session_unreachable or extension_outdated warnings.
+  Exit 6 extension_outdated: run `glen install-extension`, then restart that omp session.
+  Abort keeps queued omp messages; queued_jobs names glen jobs that start next.
+  A live timeout may still finish; a job timeout has unknown outcome: check the job before retrying.
 - These change the user's session: run only when asked.
 <!-- glen:end -->
 

@@ -585,3 +585,25 @@ impl Drop for Holder {
         }
     }
 }
+
+pub fn fake_models() -> Vec<serde_json::Value> {
+    serde_json::from_str(include_str!("../support/fake_models.json")).unwrap()
+}
+pub fn session_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+pub fn hold_glen_lock_as(
+    home: &glen::glen_home::GlenHome,
+    id: &str,
+    holder: Option<glen::jobs::lock::Holder>,
+) -> glen::jobs::lock::SessionLock {
+    let lock = glen::jobs::lock::try_acquire(home, id).unwrap().unwrap();
+    if let Some(holder) = holder {
+        glen::jobs::lock::mark(&lock, &holder).unwrap();
+    }
+    lock
+}
