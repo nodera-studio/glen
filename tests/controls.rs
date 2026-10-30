@@ -1204,3 +1204,117 @@ fn fix8_terminal_lock_holder_waits_or_reports_finishing() {
         }
     }
 }
+
+#[test]
+fn fix3_startup_cancel_reaps_omp_before_releasing_session_lock() {
+    for (interrupt, baseline) in [(false, false), (true, false), (false, true), (true, true)] {
+        let b = RpcBox::new();
+        let mut child = command(
+            &b,
+            &[
+                "model",
+                "e27c0de",
+                "fake/fake-2",
+                "--timeout",
+                if interrupt { "30s" } else { "1500ms" },
+                "--json",
+            ],
+        )
+        // The ready sleep requires KILL; delayed get_state observes TERM.
+        .env(
+            "FAKE_OMP_READY_DELAY_MS",
+            if baseline { "0" } else { "60000" },
+        )
+        .env(
+            "FAKE_OMP_BASELINE_DELAY_MS",
+            if baseline { "60000" } else { "0" },
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+        let pid = poll(Duration::from_secs(5), || {
+            b.fake_log().iter().find(|r| r["event"] == "start")?["pid"].as_u64()
+        });
+        let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        if baseline {
+            poll(Duration::from_secs(1), || {
+                (!b.frames_in("get_state").is_empty()).then_some(())
+            });
+        }
+        assert!(
+            glen::jobs::lock::try_acquire(&home(&b), A_ID)
+                .unwrap()
+                .is_none()
+        );
+        if interrupt {
+            rustix::process::kill_process(
+                rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+                rustix::process::Signal::INT,
+            )
+            .unwrap();
+        }
+        let start = Instant::now();
+        // Observe the actual lock continuously, including while TERM is pending.
+        let lock = poll(Duration::from_secs(5), || {
+            let lock = glen::jobs::lock::try_acquire(&home(&b), A_ID).unwrap()?;
+            assert_eq!(
+                rustix::process::test_kill_process_group(pid),
+                Err(rustix::io::Errno::SRCH),
+                "session lock became free while the omp process group survived"
+            );
+            assert!(matches!(
+                glen::jobs::liveness::start_token(pid.as_raw_nonzero().get() as u32),
+                glen::jobs::liveness::Probe::Gone
+            ));
+            Some(lock)
+        });
+        poll(Duration::from_secs(5), || child.try_wait().unwrap());
+        let value = checked(
+            child.wait_with_output().unwrap(),
+            if interrupt { 130 } else { 7 },
+        );
+        if interrupt {
+            assert_eq!(value["data"]["interrupted"], true);
+            assert_eq!(value["data"]["status"], "interrupted");
+        } else {
+            assert_eq!(value["error"]["details"]["reason"], "timeout");
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(b.frames_in("set_model").is_empty());
+        drop(lock);
+    }
+}
+
+#[test]
+fn fix4_startup_stderr_is_drained_into_json_warnings() {
+    for args in [
+        vec!["model", "e27c0de", "fake/fake-2", "--json"],
+        vec!["models", "--json"],
+    ] {
+        let b = RpcBox::new();
+        // More than a pipe buffer, with an unterminated final line, must neither
+        // block startup nor leak to stderr or produce unbounded warnings.
+        let message = format!(
+            "startup diagnostic\n{}\nlast diagnostic",
+            "x".repeat(100_000)
+        );
+        let value = checked(
+            command(&b, &args)
+                .env("FAKE_OMP_STARTUP_STDERR", &message)
+                .output()
+                .unwrap(),
+            0,
+        );
+        let warnings = value["warnings"].as_array().unwrap();
+        let stderr = warnings
+            .iter()
+            .filter(|w| w["code"] == "omp_stderr")
+            .collect::<Vec<_>>();
+        assert_eq!(stderr.len(), 3);
+        assert_eq!(stderr[0]["message"], "startup diagnostic");
+        assert_eq!(stderr[1]["message"].as_str().unwrap().len(), 1024);
+        assert_eq!(stderr[2]["message"], "last diagnostic");
+        assert!(!warning(&value, "teardown_error"));
+    }
+}

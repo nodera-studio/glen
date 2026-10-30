@@ -132,6 +132,11 @@ fn run() -> io::Result<u8> {
     log(
         json!({"event":"start","pid":std::process::id(),"pgid":rustix::process::getpgrp().as_raw_nonzero().get(),"argv":args,"cwd":std::env::current_dir()?,"env":{"GLEN_MANAGED":knob("GLEN_MANAGED"),"OMP_PROFILE":knob("OMP_PROFILE"),"PI_PROFILE":knob("PI_PROFILE")}}),
     )?;
+    if let Some(message) = knob("FAKE_OMP_STARTUP_STDERR") {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(message.as_bytes())?;
+        stderr.flush()?;
+    }
     let mut id = if let Some(path) = &resume {
         fs::read_to_string(path)?
             .lines()
@@ -261,7 +266,7 @@ fn run() -> io::Result<u8> {
                         } else if stage != 0 {
                             ms("FAKE_OMP_STATE_DELAY_MS", 0)
                         } else {
-                            Duration::ZERO
+                            ms("FAKE_OMP_BASELINE_DELAY_MS", 0)
                         };
                         let stale_reply = scenario == "stale_state" && running_queries == 1;
                         if delay.is_zero() {
