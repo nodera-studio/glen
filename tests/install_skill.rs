@@ -99,7 +99,10 @@ fn ac406_state_table() {
     assert_eq!(meta.modified().unwrap(), after.modified().unwrap());
     let visible = skill::visible_commands();
     let mut different = visible.clone();
-    different.insert("inbox".into());
+    // Another build of the same version: toggle one guarded command.
+    if !different.remove("inbox") {
+        different.insert("inbox".into());
+    }
     for text in [
         skill::render(Agent::Claude, "0.0.1", &visible).unwrap(),
         skill::render(Agent::Claude, env!("CARGO_PKG_VERSION"), &different).unwrap(),
@@ -310,15 +313,15 @@ fn ac408_doctor_skill_checks() {
     let before = tree(&b.home);
     let v = doctor();
     assert_eq!(v["skills"]["codex"]["project"], Value::Null);
-    assert_eq!(v["checks"][7]["status"], "info");
+    assert_eq!(v["checks"][9]["status"], "info");
     assert_eq!(tree(&b.home), before);
     install(&b, &["install-skill"]);
     let v = doctor();
-    assert_eq!(v["checks"][7]["status"], "ok");
+    assert_eq!(v["checks"][9]["status"], "ok");
     assert_eq!(v["skills"]["claude"]["current"], true);
     let p = user(&b, Agent::Claude);
     fs::write(&p, format!("{}edited", fs::read_to_string(&p).unwrap())).unwrap();
-    assert_eq!(doctor()["checks"][7]["status"], "warn");
+    assert_eq!(doctor()["checks"][9]["status"], "warn");
     let project = skill::project_target(&b.alpha(), Agent::Codex);
     fs::create_dir_all(project.parent().unwrap()).unwrap();
     fs::write(
@@ -327,9 +330,9 @@ fn ac408_doctor_skill_checks() {
     )
     .unwrap();
     let v = doctor();
-    assert_eq!(v["checks"][8]["status"], "warn");
+    assert_eq!(v["checks"][10]["status"], "warn");
     assert!(
-        v["checks"][8]["detail"]
+        v["checks"][10]["detail"]
             .as_str()
             .unwrap()
             .contains("--project")
@@ -353,21 +356,21 @@ fn ac409_env_files() {
         data(&c.output().unwrap())
     };
     let v = doctor(false);
-    assert_eq!(v["checks"][6]["status"], "warn");
+    assert_eq!(v["checks"][8]["status"], "warn");
     assert_eq!(
-        v["checks"][6]["value"],
+        v["checks"][8]["value"],
         serde_json::json!([b.home.join(".env")])
     );
     assert!(
-        v["checks"][6]["detail"]
+        v["checks"][8]["detail"]
             .as_str()
             .unwrap()
             .contains("XDG_STATE_HOME")
     );
-    assert_eq!(doctor(true)["checks"][6]["status"], "ok");
+    assert_eq!(doctor(true)["checks"][8]["status"], "ok");
     // PI_CODING_AGENT_DIR is already explicitly set by OmpBox. Alias maps to that key.
     fs::write(b.alpha().join(".env"), "OMP_CODING_AGENT_DIR=/x").unwrap();
-    assert_eq!(doctor(true)["checks"][6]["status"], "ok");
+    assert_eq!(doctor(true)["checks"][8]["status"], "ok");
     let out = b
         .command(&["doctor"], &b.alpha())
         .env_remove("PI_CODING_AGENT_DIR")
@@ -375,10 +378,10 @@ fn ac409_env_files() {
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
         .output()
         .unwrap();
-    assert_eq!(data(&out)["checks"][6]["status"], "warn");
+    assert_eq!(data(&out)["checks"][8]["status"], "warn");
     fs::set_permissions(b.home.join(".env"), fs::Permissions::from_mode(0o000)).unwrap();
     fs::set_permissions(b.alpha().join(".env"), fs::Permissions::from_mode(0o000)).unwrap();
-    assert_eq!(doctor(false)["checks"][6]["status"], "ok");
+    assert_eq!(doctor(false)["checks"][8]["status"], "ok");
 }
 #[test]
 fn ac410_sandbox() {
@@ -419,7 +422,7 @@ fn ac410_sandbox() {
         .env("CODEX_SANDBOX", "seatbelt")
         .output()
         .unwrap();
-    assert_eq!(data(&out)["checks"][9]["status"], "warn");
+    assert_eq!(data(&out)["checks"][11]["status"], "warn");
     fs::create_dir(&b.omp.glen_home).unwrap();
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o500)).unwrap();
     let out = b
@@ -578,7 +581,7 @@ fn cycle1_doctor_home_symlink_is_user_copy_and_project_detail_has_no_leading_sep
         .unwrap();
     let v = data(&out);
     assert_eq!(v["skills"]["claude"]["project"], Value::Null);
-    assert_eq!(v["checks"][7]["status"], "ok");
+    assert_eq!(v["checks"][9]["status"], "ok");
     let project = skill::project_target(&b.alpha(), Agent::Claude);
     fs::create_dir_all(project.parent().unwrap()).unwrap();
     fs::write(&project, "foreign").unwrap();
@@ -588,7 +591,7 @@ fn cycle1_doctor_home_symlink_is_user_copy_and_project_detail_has_no_leading_sep
         .output()
         .unwrap();
     let v = data(&out);
-    let detail = v["checks"][7]["detail"].as_str().unwrap();
+    let detail = v["checks"][9]["detail"].as_str().unwrap();
     assert!(detail.starts_with("project copy"), "{detail}");
 }
 #[test]
@@ -632,9 +635,9 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
         .output()
         .unwrap();
     let v = data(&out);
-    assert_eq!(v["checks"][9]["status"], "info");
+    assert_eq!(v["checks"][11]["status"], "info");
     assert_eq!(
-        v["checks"][9]["detail"],
+        v["checks"][11]["detail"],
         "network disabled by the host; escalated commands still work"
     );
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o500)).unwrap();
@@ -667,7 +670,7 @@ fn cycle2_doctor_absent_symlink_scopes_and_foreign_file_symlink() {
         assert_eq!(v["skills"][a.as_str()]["project"], Value::Null);
     }
     assert!(
-        !v["checks"][7]["detail"]
+        !v["checks"][9]["detail"]
             .as_str()
             .unwrap()
             .contains("foreign")
@@ -693,7 +696,7 @@ fn cycle2_doctor_absent_symlink_scopes_and_foreign_file_symlink() {
     let v = doctor();
     assert_eq!(v["skills"]["claude"]["project"]["state"], "foreign");
     assert!(
-        v["checks"][7]["detail"]
+        v["checks"][9]["detail"]
             .as_str()
             .unwrap()
             .contains("foreign")
@@ -706,7 +709,7 @@ fn cycle2_doctor_absent_symlink_scopes_and_foreign_file_symlink() {
     let v = doctor();
     assert_eq!(v["skills"]["codex"]["project"]["state"], "foreign");
     assert!(
-        v["checks"][8]["detail"]
+        v["checks"][10]["detail"]
             .as_str()
             .unwrap()
             .contains("foreign")
@@ -764,7 +767,7 @@ fn cycle2_alias_process_environment_resolves_and_suppresses_dotenv_warning() {
     let v = data(&out);
     assert_eq!(v["paths"]["agent_dir"], alias.to_str().unwrap());
     assert_eq!(v["paths"]["agent_dir_source"], "env");
-    assert_eq!(v["checks"][6]["status"], "ok");
+    assert_eq!(v["checks"][8]["status"], "ok");
 }
 #[test]
 fn cycle2_refusal_precedes_missing_omp_lookup() {

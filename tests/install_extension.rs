@@ -184,7 +184,7 @@ fn ac304_doctor_checks_and_ac321_warning() {
     assert!(!b.glen_home.exists());
     install(&b, &[]);
     let d = doctor();
-    assert_eq!(d["checks"].as_array().unwrap().len(), 8);
+    assert_eq!(d["checks"].as_array().unwrap().len(), 12);
     assert_eq!(d["extension"]["current"], true);
     fs::write(target(&b), glen::extension::render("0.0.1", &b.glen_home)).unwrap();
     assert_eq!(doctor()["checks"][6]["status"], "warn");

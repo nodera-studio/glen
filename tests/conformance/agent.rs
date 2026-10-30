@@ -1122,6 +1122,8 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
                 "completions",
                 "doctor",
                 "help",
+                "inbox",
+                "install-extension",
                 "install-skill",
                 "jobs",
                 "ls",
@@ -1136,13 +1138,13 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
     }
 }
 
-/// AC-401 + the W4 spec change: `watch` stays hidden (exit 8), and `inbox` and
-/// `install-extension` stay hidden until W3.
+/// AC-401 + the W4 spec change: `watch` stays hidden (exit 8); `inbox` and
+/// `install-extension` became visible with W3.
 #[test]
-fn ac401_watch_inbox_and_install_extension_stay_hidden_and_exit_8() {
+fn ac401_watch_stays_hidden_and_exits_8() {
     let sb = Sandbox::new();
     let listed = command_names(&sb.glen(["--help"]).run().out());
-    for name in ["watch", "inbox", "install-extension"] {
+    for name in HIDDEN {
         assert!(
             !listed.iter().any(|c| c == name),
             "{name} is listed: {listed:?}"
@@ -3188,7 +3190,7 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 21] = [
+const CONTRACT_IDS: [&str; 24] = [
     "ls",
     "show",
     "show.raw",
@@ -3202,6 +3204,9 @@ const CONTRACT_IDS: [&str; 21] = [
     "doctor",
     "completions",
     "install-skill",
+    "inbox",
+    "inbox.follow",
+    "install-extension",
     "error.usage",
     "error.not_found",
     "error.ambiguous",
@@ -3466,6 +3471,11 @@ fn ac412_contract_tail_follow_ndjson() {
     let mut st = bx.follow(&["tail", A.handle, "-n", "1", "-f", "--json"]);
     st.expect_event("session", reader::T);
     st.expect_event("item", reader::T);
+    assert_stream_contract("tail.follow", st);
+}
+
+/// Interrupt a follow stream, then check its single terminal line and every event's shape.
+fn assert_stream_contract(id: &str, mut st: reader::Stream) {
     st.interrupt();
     let status = st.wait(reader::T);
     assert_eq!(status.code(), Some(130), "{}", st.ctx());
@@ -3486,7 +3496,7 @@ fn ac412_contract_tail_follow_ndjson() {
         "exactly one terminal line, last\n{}",
         st.ctx()
     );
-    let (_, examples) = &contract_blocks()["tail.follow"];
+    let (_, examples) = &contract_blocks()[id];
     for real in &lines {
         let ex = examples
             .iter()
@@ -3496,11 +3506,35 @@ fn ac412_contract_tail_follow_ndjson() {
         shape_diff(ex, real, "$", &mut diffs);
         assert!(
             diffs.is_empty(),
-            "tail.follow {}:\n{}",
+            "{id} {}:\n{}",
             real["event"],
             diffs.join("\n")
         );
     }
+}
+
+#[test]
+fn ac412_contract_inbox_and_inbox_follow() {
+    let bx = OmpBox::new();
+    let dir = bx.glen_home.join("inbox");
+    fs::create_dir_all(&dir).unwrap();
+    let record = serde_json::json!({"v":1,"id":"r1","session_id":A.id,"job_id":"01a18bcc-6970-7685-8f03-0ecc16977273","request_id":null,"tool_call_id":"call_1","text":"reply: hi","final":true,"at":"2026-10-30T07:53:12.332571Z"});
+    fs::write(dir.join(format!("{}.ndjson", A.id)), format!("{record}\n")).unwrap();
+    let out = bx.glen(["inbox", "--peek", "--json"]).run();
+    out.ok_data();
+    assert_contract("inbox", &out.json());
+    let mut st = bx.follow(&["inbox", "-f", "--peek", "--json"]);
+    st.expect_event("message", reader::T);
+    assert_stream_contract("inbox.follow", st);
+}
+
+#[test]
+fn ac412_contract_install_extension() {
+    let ws = Ws::new();
+    let out = ws.glen(["install-extension", "--dry-run", "--json"]).run();
+    out.ok_data();
+    assert_contract("install-extension", &out.json());
+    ws.assert_no_side_effects("install-extension --dry-run");
 }
 
 #[test]
