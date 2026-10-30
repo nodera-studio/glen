@@ -123,7 +123,8 @@ decides what (if anything) to persist to the memory MCP.
 - **Inside `/implement` (Role 2):** if the fix plan has must-fix items, dispatch a
   **fresh** Implementer — "Fix ONLY these review findings: {fix plan}. Do not
   re-implement the plan." — then re-run this review scoped to the fixed files. Max 2
-  cycles; if must-fix items remain, stop and report to the user.
+  cycles; if must-fix items remain, stop and report to the user. Give each finding its
+  exact line range (`implementation/orchestrator.md` → Role 2 → "Line-range fix briefs").
 
 <rules>
 - Three engines for recall, synthesizer for precision. Never feed an engine another

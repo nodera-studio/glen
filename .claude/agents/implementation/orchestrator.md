@@ -157,8 +157,13 @@ below.
 
 ```
 Dispatch via Agent tool:
+  subagent_type: "impl-coder-codex"
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {absolute path in the main checkout}. The plan is git-ignored, so it is not in the worktree; that is expected."
 ```
+
+Subagents run in the background; continue other work and act on the completion notification,
+never on a guess. That is also what lets the Implementer reach `main` by SendMessage to report
+failed attempts and answer status requests.
 
 **Plan paths in briefs.** `.claude/plans/` is git-ignored, so a wave worktree never contains
 the plan. Every brief that needs a plan (Implementer, fix, conformance writer, docs updater,
@@ -192,12 +197,54 @@ UI Implementer, not Codex. If the plan has no catalogue survey for a named compo
 (see the plan orchestrator's UI-wave rule), the UI Implementer does that survey first and
 reports it before choosing components.
 
+**Failed Implementer attempts.** The Implementer reports each failed Codex attempt to you by
+SendMessage, with the error text, before it retries; it makes at most 2 attempts, then stops
+with a suggested smaller delta (`coder-codex.md` → Step 4 → "Failed attempts"). Act on those
+messages; do not rely on polling `codex-companion status` (W4 lost about 2 h to two silent
+stalled attempts). If SendMessage failed, the reports lead its final message instead. After
+the second failure, confirm the worktree has stopped changing (`git -C "$WT" status --short`
+unchanged 30 s apart; if not, run `coder-codex.md` → "Cancelling a run"), then dispatch one
+fresh Implementer with the smaller delta, as a line-range brief when it is a targeted fix
+(Role 2 → "Line-range fix briefs"). Allow at most one such smaller-delta re-dispatch: if it
+also fails twice, stop and report to the user.
+
+**Check before stopping an Implementer.** An Implementer that looks stuck may be done: W3's
+cycle 2 was finished with only the commit left when its host was stopped, and its edits sat
+in tagged git stashes that had to be restored by SHA. Before you stop one:
+
+1. Look at the worktree (`WT` = its absolute path, `COMPANION` as in `coder-codex.md` Step 2):
+
+   ```bash
+   git -C "$WT" status --short
+   git -C "$WT" stash list --format='%H %gs'      # stashes are repo-wide: match the wave's tags
+   node "$COMPANION" status --cwd "$WT" --json
+   ```
+
+2. SendMessage the agent asking for its status (step, attempt, Codex job state, uncommitted
+   files, stashes) and wait one reply cycle. A foreground Codex call blocks it, so it reads
+   and answers (by SendMessage) only when its current tool call returns: wait up to 5 min. If
+   no reply comes, decide from step 1's evidence, re-run about 60 s later: if the worktree is
+   still changing or the companion job is still running, it is working, so leave it; stop it
+   only when the job is gone and the worktree is static.
+3. Only then stop it (TaskStop), run the cancel path below, and recover every stash tagged for
+   the wave by SHA: `git -C "$WT" stash apply <sha>` (never by a `stash@{n}` index you noted
+   earlier, which shifts as other worktrees stash) and check the result. Drop that entry only
+   after its work is committed, looking up its current index by SHA at that moment:
+
+   ```bash
+   git -C "$WT" stash list --format='%gd %H %gs' | grep -- "<sha>"   # -> stash@{n}
+   git -C "$WT" stash drop "stash@{n}"
+   ```
+
+   Say in the Report what was recovered.
+
 **Stopping a Codex-backed agent.** TaskStop on `impl-coder-codex` (or any agent that ran
 `codex-companion.mjs`) does NOT stop Codex: the companion job, its broker, the app-server and
-the sandbox keep running and keep editing the worktree. Whenever you stop such an agent, run
-the cancel path in `coder-codex.md` → "Cancelling a run" (companion `cancel`, then kill the
-worktree's `app-server-broker.mjs serve --cwd <worktree>` tree if anything survives) and
-confirm the worktree has stopped changing before dispatching anything else into it.
+the sandbox keep running and keep editing the worktree. Whenever you stop such an agent (after
+the check above), run the cancel path in `coder-codex.md` → "Cancelling a run" (companion
+`cancel`, then kill the worktree's `app-server-broker.mjs serve --cwd <worktree>` tree if
+anything survives) and confirm the worktree has stopped changing before dispatching anything
+else into it.
 
 **Removing a worktree (stop its Codex broker first).** The companion broker
 (`app-server-broker.mjs serve --cwd <worktree>`) and its app-server outlive a run that ended
@@ -292,8 +339,11 @@ important property of this pipeline is that the context which reads a test/gate
 failure is the same one that wrote the code — that context is Codex's; splitting the
 loop is what we deliberately removed. `implementer.md` remains as the canonical
 envelope `coder-codex.md` forwards to Codex. If Codex is unavailable, Role 1 stops
-and reports — there is no Claude-inline coder fallback. The only Claude-written product code
-is design-heavy UI under "UI implementation routing" above.
+and reports — there is no Claude-inline coder fallback. Claude-written product code has two
+exceptions only: design-heavy UI under "UI implementation routing" above, and integrating two
+already-reviewed parallel waves (merging one wave's branch into the other), which may go to a
+Claude agent, recorded as a routing deviation and followed by the gate, tests and a scoped
+Claude ‖ Codex review of the resolved files (`loop-procedures.md` → "Shared seams").
 
 **Slices, waves, and the budget guard.** A feature too large for one context is
 split at *slice boundaries*, never mid-loop. If the Implementer returns
@@ -360,6 +410,13 @@ path). If the report has must-fix items, dispatch a **fresh**
 Implementer ("Fix ONLY these review findings: {fix plan}. Do not re-implement the
 plan."), then re-run the review scoped to the fixed files. Maximum 2 cycles; if
 must-fix items remain, stop and report to the user.
+
+**Line-range fix briefs.** For a small or targeted fix (review, conformance or visual
+findings), give each finding its exact `path:start-end` range, and say: "Read only these
+ranges (plus ~30 lines of context); do not read any file in full beyond them; skip Mnemosyne
+recall." The Codex Implementer stalls on the 180 s watchdog when it reads a very long file in
+full before editing (`worker.rs`, about 1600 lines); `coder-codex.md` → Step 3 carries the
+ranges into Codex's prompt.
 
 ### Role 3 — Parallel tail (docs ‖ conformance ‖ optional domain-rubric gate)
 
@@ -494,8 +551,15 @@ Plans are **kept after implementation** — they accumulate as project history. 
   `coder-codex.md`) → Review (fresh) → tail (docs ‖ conformance ‖ optional
   project-specific domain-rubric gate) → re-index. Codex owns write+wire+harden+test+gate;
   Claude writes no product code (except design-heavy UI, routed to the Claude Opus
-  UI Implementer `coder-ui.md`) and does not re-introduce separate
+  UI Implementer `coder-ui.md`, and integrating two already-reviewed parallel waves, a
+  recorded routing deviation followed by gate + tests + a scoped Claude ‖ Codex review) and
+  does not re-introduce separate
   coder/wiring/error-handling/test/verifier dispatches.
+- Before stopping an Implementer, check its worktree, stashes and Codex job, ask it for a
+  status and wait one reply cycle (up to 5 min); after stopping, recover its tagged stashes by
+  SHA. Act on an Implementer's completion notification, never on a guess; failed Codex attempts reach you by
+  SendMessage (at most 2, then at most one smaller-delta re-dispatch). Small or targeted fix briefs carry
+  exact line ranges, forbid full-file reads beyond them and skip Mnemosyne recall.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
   alone leaves Codex editing the worktree. Removing a worktree stops its broker first and
   sweeps orphaned brokers under `.claude/worktrees/` (Role 1 → "Removing a worktree").
