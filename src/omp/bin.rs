@@ -81,6 +81,9 @@ fn terminate(child: &mut Child) -> Result<(), String> {
         }
     }
 }
+fn retryable_spawn_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::ExecutableFileBusy
+}
 pub fn omp_version(
     bin: &Path,
     timeout: Duration,
@@ -100,7 +103,18 @@ pub fn omp_version(
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    // Parallel forks can briefly inherit a script's open write fd and cause ETXTBSY.
+    let mut retries = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(e) if retries < 4 && retryable_spawn_error(&e) => {
+                thread::sleep(Duration::from_millis(10 << retries));
+                retries += 1;
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    };
     // Drain both pipes while polling so a noisy child cannot fill a pipe and block exit.
     // Readers retain at most 64 KiB and have the same deadline as the child.
     let stdout = child
@@ -179,6 +193,20 @@ pub fn omp_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn spawn_retry_only_for_executable_file_busy() {
+        assert!(retryable_spawn_error(&io::Error::from(
+            io::ErrorKind::ExecutableFileBusy
+        )));
+        for kind in [
+            io::ErrorKind::NotFound,
+            io::ErrorKind::PermissionDenied,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::Other,
+        ] {
+            assert!(!retryable_spawn_error(&io::Error::from(kind)), "{kind:?}");
+        }
+    }
     #[cfg(unix)]
     fn script(dir: &Path, name: &str, text: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
