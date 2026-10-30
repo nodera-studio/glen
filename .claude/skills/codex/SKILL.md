@@ -85,6 +85,24 @@ literal `--resume` quoted from omp's CLI made it look for an earlier Codex threa
 other CLI flag, write it in prose ("the resume flag") or inside a fenced code block the
 forwarder won't parse, and put `--effort high` (or any routing flag) only where you mean it.
 
+The codex-companion app-server has an inactivity watchdog of about 180 s: a run that streams
+nothing for that long ends with "Codex app-server produced no activity for 180s … Treating as
+stalled" and exit 1. Long, high-effort final answers (a big plan after many file reads) trip
+it. Ask for a COMPACT result (about 120 lines at most) and, when the context is already local,
+no web search; that avoided the stall. After two stalls on the same task, stop retrying:
+degrade to the Claude engine alone and say so in the report.
+
+### Capacity and rate errors
+
+A call can fail with "Selected model is at capacity", a 429 or another rate-limit error. That
+is transient: retry the same call once after a short wait (about 60 s; `sleep 60` in Bash).
+If the retry fails too, record Codex as unavailable for that step and go on with the
+single-engine (Claude) verdict, saying in the report that Codex was unavailable and why.
+Never drop the engine silently, and never report a dual-engine result when only one ran.
+This applies to every Codex path: `codex:codex-rescue`, `codex review` and the Implementer's
+`codex-companion.mjs` (where "go on" means STOP and report the blocker, since only Codex
+writes product code).
+
 ### Example — single dispatch
 
 ```

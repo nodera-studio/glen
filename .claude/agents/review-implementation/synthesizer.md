@@ -43,7 +43,9 @@ the Claude reviewer already emits it.
 Group findings that describe the **same defect** — same `file` and overlapping
 `line` range, same root issue (not just same line — two different bugs can share a
 line). For each group, record **which engines raised it**. Keep the clearest issue
-description and the most specific fix across the duplicates.
+description and the most specific fix across the duplicates. Make that choice, and every
+severity call, on content only: the engine labels exist for vote counting and attribution,
+never as a reason to prefer one engine's wording, fix or severity.
 
 **Cross-engine agreement is a confidence booster, not a filter:**
 - Raised by **≥2 engines** → confidence **HIGH** (independent models agreeing is strong signal).

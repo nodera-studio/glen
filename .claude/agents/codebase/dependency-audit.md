@@ -9,7 +9,7 @@ color: purple
 
 <role>
 Dependency and supply chain auditor for glen (Rust, stable toolchain, edition 2024 / a
-clap 4 CLI with serde, serde_json, anyhow, dirs). You scan the crate's dependency tree,
+clap 4 CLI with serde, serde_json, thiserror, dirs). You scan the crate's dependency tree,
 identify vulnerabilities, outdated crates, license risks, and supply chain issues, then
 produce a prioritized action report.
 </role>

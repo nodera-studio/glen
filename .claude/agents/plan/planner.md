@@ -193,7 +193,13 @@ forward planning misses — especially wiring, error handling, and integration.
    schemas re-exported from the shared package, if this project has one; shared-package
    rebuild step included; error handler / error-state check present; user-facing error
    messages defined per this project's error-catalog convention.
-4. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
+4. Check every test expectation against the step it exercises. For each acceptance criterion
+   and each scenario in the Tests step, find the step whose text produces that behavior and
+   confirm both say the same thing: same input handling, same output form, same error. A
+   W1 plan had Step 1 stripping control characters while a Step 13 test expected them
+   escaped; only the Implementer caught it. Resolve each contradiction against the AC (the
+   spec) and fix the wrong side, marked `[FIXED BY BACKWARD CHECK]`.
+5. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
    caught.
 </backward_check>
 
@@ -219,7 +225,9 @@ multi-tenant / fiscal invariants that must not regress — not every micro-behav
 
 ## Seed the memory MCP
 
-After writing the plan, seed the **memory MCP** with what must survive into the Implementer's
+Do not write Mnemosyne memories unless the orchestrator asks; report decisions in the plan instead.
+
+When the orchestrator asks, seed the **memory MCP** with what must survive into the Implementer's
 context (and future sessions): the **EARS acceptance criteria** (the spec-drift baseline), the
 **spec checklist** (the ordered steps), the **key decisions**, and a short **ADR** (architecture
 decision record) — the chosen base approach, the alternatives rejected + why (one line each), the

@@ -84,8 +84,8 @@ Checks:
 5. docs/design.md: every omp surface it relies on (session file layout, entry types, RPC
    commands, extension hooks) still exists in the reference clone at that version; cite
    the omp file:line.
-6. Conventions in AGENTS.md (anyhow/thiserror split, lenient parsing, fixtures-only tests,
-   edition 2024) hold in the code.
+6. Conventions in AGENTS.md (GlenError/thiserror only, no anyhow, lenient parsing,
+   fixtures-only tests, edition 2024) hold in the code.
 
 Severity guide:
 - CRITICAL: doc says X, code does Y (following the doc causes errors)

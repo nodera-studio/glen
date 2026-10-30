@@ -17,7 +17,7 @@ documented, and re-indexed:
 2. **Review** — a fresh, independent context that judges the diff (never the
    Implementer's transcript).
 3. **Parallel tail** — docs-updater ‖ conformance-test-writer ‖ an optional project-specific domain-rubric gate (conditional, if this project wires one up), once the code lands.
-4. **Re-index** — fold the new/changed files back into the codebase MCP.
+4. **Re-index** — fold the merged code back into the codebase MCP, after the merge.
 
 The doctrine: keep the generative loop in ONE context — that context is **Codex's**
 (Claude writes no product code) — isolate every discriminative check in a fresh one,
@@ -27,8 +27,8 @@ work and return results to you.
 </role>
 
 **Done when:** the feature is implemented per the approved plan, the review and
-conformance gates pass, tests and docs are updated, the codebase MCP is re-indexed,
-and a completion summary is handed to the user (committed and pushed by default).
+conformance gates pass, tests and docs are updated, the post-merge re-index is noted
+as due (Role 4), and a completion summary is handed to the user (committed and pushed by default).
 
 Ground decisions in `.claude/CLAUDE.md` and the relevant area doc from its
 reference table (QueueProcessing.md for queue work, DataModel.md for schema
@@ -159,6 +159,40 @@ Dispatch via Agent tool:
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {path}."
 ```
 
+**Network pre-flight.** The Codex sandbox may have no network. If the plan has network
+steps (`npm install`, CLI scaffolds, browser downloads, `cargo add` of a new crate), the
+planner lists them as a "Network pre-flight" block; if it did not, extract them yourself.
+Run that block in the wave's worktree BEFORE dispatching the Implementer, and tell the
+Implementer the steps are done: verify their results (files present, lockfile updated),
+do not re-run them.
+
+**File snapshot (pre-existing files survive the Implementer).** The envelope forbids the
+Implementer to delete, move or revert files it did not create, but `touchedFiles` cannot show
+a deletion (it lists paths with no change type, a shell `rm` never appears in it, and git
+cannot see a deleted untracked file). So check it yourself. Before each Implementer dispatch,
+in the checkout it will write to:
+
+```bash
+SNAP="${TMPDIR:-/tmp}/glen-impl-snap-$(date +%s)"; mkdir -p "$SNAP"
+EXCL='^(target|site/node_modules|site/dist)/'        # build output may legitimately vanish
+{ git ls-files; git ls-files --others; } | grep -vE "$EXCL" | sort -u \
+  | while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done > "$SNAP/before.txt"
+git ls-files --others | grep -vE "$EXCL" | grep -v '/$' \
+  | tar -czf "$SNAP/untracked.tgz" -T -              # untracked incl. ignored, for restore
+```
+
+(`--others` without `--exclude-standard` includes ignored files such as `.claude/launch.json`.)
+After it returns:
+
+```bash
+while IFS= read -r f; do [ -e "$f" ] || printf '%s\n' "$f"; done < "$SNAP/before.txt"
+```
+
+Every path printed that the plan did not tell it to delete or move goes in the Report as a
+deviation, and is restored: tracked with `git restore --source=HEAD --staged --worktree -- <f>`,
+untracked with `tar -xzf "$SNAP/untracked.tgz" <f>`. Say in the Report what was restored and
+what could not be.
+
 **Claude writes no product code — Codex does.** Do NOT dispatch separate coder /
 wiring / error-handling / test-writer / test-runner / verifier agents (those files
 were deleted); those concerns are fused into the Codex Implementer. The single most
@@ -184,6 +218,25 @@ transcript. By default run the lean **`/code-review` dual-engine gate** (see
 one must-fix / recommended / notes report. No lint/type/style re-check — the
 deterministic gate already enforced that inside the Implementer; the engines hunt
 real bugs.
+
+**UI diffs are reviewed by running them.** When the diff touches rendered output
+(`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
+at the output (a browser screenshot, or real CLI/TUI output under a pty) before calling
+it correct; a code trace alone is not enough. In W6 both engines traced the terminal
+demo, approved it, and missed 2 of its 4 scenes never appearing. This is in addition to
+the Visual verification step below, not a substitute for it.
+
+**Codex capacity.** If the Codex pass fails on capacity or rate ("Selected model is at
+capacity", 429, rate limit), retry it once after a short wait (about 60 s). If the retry
+fails too, record Codex as unavailable, proceed with the Claude pass as a single-engine
+verdict, and say so in the Report. Never drop the engine silently.
+
+**Review file names.** If you save the passes to disk, name them `claude-review.md` and
+`codex-review.md` (plan files `<engine>-plan.md`), never `claude.md`: on macOS's
+case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
+`CLAUDE.md`, which injects the review as project instructions. This holds for every way
+of creating a file, including shell redirects and `mv`. The `guard-claude-md-name.sh`
+hook refuses such a name on the Write tool only.
 
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer
@@ -223,6 +276,14 @@ fails, dispatch a fresh Implementer with the failing conformance checks (targete
 then re-run the suite. This is the one gate that catches "the tests pass because the
 Implementer wrote tests that match its own bug."
 
+**Spec ambiguity or a test that conflicts with the spec.** When the conformance writer
+flags an ambiguity, or a conformance test disagrees with the spec, settle it yourself:
+first clarify the design doc (`docs/design.md` or the plan's acceptance criteria), then
+resume the conformance writer (the suite's owner) to re-derive the assertion from the
+clarified text. The Implementer never edits conformance assertions. If a tracked test the
+Implementer wrote has to change to match the clarification, call that change out in the
+Report.
+
 **Optional arm 3 — wire up your own domain-rubric gate here.** If this project has a
 class of NON-NUMERIC, structural/textual artifacts whose correctness an LLM rubric can
 grade better than a property test (e.g. a regulated document format, a legal-copy
@@ -237,13 +298,34 @@ own domain-specific gate" pattern applied to the security audit; this is the
 `/implement`-pipeline analog. If no such artifact class exists in this project, skip
 this arm entirely — it is optional, not a stub to fill mechanically.
 
-### Role 4 — Re-index (before merge)
+### Visual verification (rendered UI — required before the PR)
 
-When everything is green (tests + gate + review + conformance), incrementally
-re-index the new/changed files into the **codebase MCP** (the Mnemosyne codebase
-engine's indexer) so semantic search reflects the merged code rather than the
-pre-edit snapshot. A lefthook pre-push hook backstops this so it cannot be silently
-skipped; run it here as the pipeline tail as well.
+Any change with a rendered result — site pages, the TUI, human (TTY) CLI output — gets a
+human-style look at the real rendered output before the PR, by you or a dispatched agent with a
+browser. Tests, smoke suites and Lighthouse scores do not substitute: a W6 terminal demo shipped
+with two of its four scenes never appearing, past 12 unit tests, a 16-test Playwright smoke and
+Lighthouse 1.00; only a visual check caught it.
+
+- **Web pages:** open the built page in the built-in browser (`mcp__Claude_Browser__*`) or
+  chrome-devtools. Check mobile (~375px) and desktop widths, light and dark themes. Let
+  animations and timed sequences run to completion (wait out the full duration, then screenshot)
+  and confirm every scene and state appears.
+- **CLI / TUI:** run the binary under a pseudo-TTY so the TTY code path runs, e.g.
+  `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'` (macOS), at a narrow and a
+  wide width, with and without `NO_COLOR`. Let a live view run through its states. Compare with
+  the plan's intended output.
+- Save what you looked at (screenshots or captured output) under `.claude/evidence/` and name it
+  in the Report. A defect found here goes to a fresh Implementer like a must-fix review finding.
+
+Skip only when the diff changes no rendered output, and say so in the Report.
+
+### Role 4 — Re-index (after the merge, at wave close)
+
+glen's code index reads a clean clone of `main`, so re-indexing before the merge would
+index the old code. Re-index after the squash-merge, at wave close: pull the index clone,
+run `code_reindex {project: "glen", repo: "glen"}`, and confirm with `code_index_status`
+(exact commands in the `mnemosyne` skill → Code index; `/auto-mode` runs this in
+`loop-procedures.md` step 9). No git hook does this, so it must not be skipped.
 
 ### Manual-test entry point
 
@@ -291,7 +373,8 @@ Plans are **kept after implementation** — they accumulate as project history. 
   spec. Split large work at slice boundaries (fresh Codex Implementer via
   `--fresh`), never mid write→test→fix loop; rework resumes Codex via `--resume-last`.
 - The user-approval gate (Step 4; announced instead under `/auto-mode`), the Review
-  gate (Role 2), and the conformance gate (Role 3) are mandatory — do not skip them. Any optional domain-rubric gate this
+  gate (Role 2), the conformance gate (Role 3) and, for any change with rendered output, the
+  visual verification are mandatory — do not skip them. Any optional domain-rubric gate this
   project wires up (Role 3 arm 3) is mandatory *when its trigger predicate fires*; on
   persistent FAIL it BLOCKS the pipeline. Code is written only after the plan is
   approved.

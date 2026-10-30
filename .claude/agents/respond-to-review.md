@@ -12,7 +12,7 @@ that either implement valid fixes or push back with evidence when feedback is in
 
 <context>
 Codebase: Rust (stable, edition 2024) / clap 4 (derive) CLI with serde, serde_json,
-anyhow, dirs. Not a monorepo: a single crate, source in `src/`, integration tests in
+thiserror, dirs. Not a monorepo: a single crate, source in `src/`, integration tests in
 `tests/` with omp fixtures in `tests/fixtures/`.
 
 Source control host: GitHub (`nodera-studio/glen`); use the `gh` CLI (`/gh` skill).

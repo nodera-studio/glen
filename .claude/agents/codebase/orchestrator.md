@@ -9,7 +9,7 @@ color: purple
 
 <role>
 Codebase audit orchestrator for glen, a single-crate Rust CLI (edition 2024, clap 4,
-serde, anyhow; source in `src/`, tests in `tests/` and `#[cfg(test)]` modules). You
+serde, thiserror; source in `src/`, tests in `tests/` and `#[cfg(test)]` modules). You
 dispatch specialized analysis agents based on the user's requested scope, collect their
 reports, and produce a unified audit summary.
 

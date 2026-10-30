@@ -35,12 +35,23 @@ never stage it.
 - Release: <none | v0.x.y (the goal asked for a release)>
 - Wave source: <board-children | plan-doc | fresh-plan>
 - Shipping tags: shipped:main at each wave close; released:v0.x.y only after the tag is pushed
+- Run ledger queue: <queue id> (one item per wave; mirrors the table below)
 
 ## Wave ledger
 
 | Wave | Board issue (key / id) | Branch                       | PR → main | State                                                  |
 | ---- | ---------------------- | ---------------------------- | --------- | ------------------------------------------------------ |
 | 1    | <key> / <uuid>         | feat/<goal>-wave-1-<slug>    | #NN       | merged \| in-progress \| polling \| blocked \| pending |
+
+## Harness friction log
+
+- <date> <wave> <what in .claude/ slowed or misled the run> — <fixed in PR #NN | open>
+
+## Harness self-improvement
+
+| Batch | Branch                        | Worktree                              | PR → main | State |
+| ----- | ----------------------------- | ------------------------------------- | --------- | ----- |
+| 1     | chore/harness-selfimprove-1   | .claude/worktrees/harness-1           | #NN       | <...> |
 
 ## Release (release goals only)
 
@@ -99,6 +110,17 @@ ToolSearch (`+plugin_mnemosyne_workspace board document`) before the first call.
   record it as a blocker. HTTP 401 means the Mnemosyne token is missing or expired: a
   human-required blocker.
 
+## The run ledger queue
+
+A Mnemosyne queue is the run's visible ledger; the state file's wave ledger mirrors it and
+stays the source of truth across compaction. Create one queue per goal
+(`queue_create`), record its id under **Resolved goal**, and add one item per wave with
+`queue_item_add {queueId, title: "W<n> — <summary> (<issue id>)", runState: "planned"}`.
+**Never pass the issue id as `documentId`** (the `mnemosyne` skill → Queues: the server
+persists a broken row that breaks `queue_get`); the id goes in the title. Move the item with
+`queue_item_update` as the wave moves: `in_progress` at bootstrap, `blocked` when flagged,
+`done` at wave close. Wave-end Notes may be referenced by `documentId`.
+
 ## Resolving the goal into waves
 
 1. **Goal names a board item** (a module, or an issue, by key, title or id) → read it
@@ -114,7 +136,8 @@ ToolSearch (`+plugin_mnemosyne_workspace board document`) before the first call.
    the wave's scope and acceptance criteria), and nest each under the module with
    `board_place`. Record `fresh-plan`.
 
-Write the full wave ledger (with each issue's key and id) before starting Wave 1.
+Write the full wave ledger (with each issue's key and id) and the run ledger queue before
+starting Wave 1.
 
 ## The per-wave loop — step expansions
 
@@ -129,7 +152,12 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    Implementer's cargo loop and `.claude/scripts/quality-gate.sh`, the local
    `/code-review` gate (1 Claude ‖ 1 Codex pass, 2-vote), the conformance tail
    (`cargo test --test conformance`) and the docs updater. This local gate is the code
-   review; nothing on GitHub reviews the PR.
+   review; nothing on GitHub reviews the PR. Saved review or plan files per engine are
+   named `<engine>-review.md` / `<engine>-plan.md` (e.g.
+   `.claude/plans/reviews/<wave>/claude-review.md`), never `claude.md`: Claude Code loads
+   any `claude.md` as a nested `CLAUDE.md` on macOS's case-insensitive filesystem. If the
+   Codex review pass hits a capacity or rate error, the gate retries once and then runs
+   single-engine (see `.claude/commands/code-review.md`); record that in the wave-end note.
 4. **Pre-push check.**
    `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
    (or `/run-ci`). Fix red before pushing; a red CI cycle costs a two-runner round trip.
@@ -162,8 +190,12 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    `gh pr merge <N> --squash` (prompt-gated; no `--delete-branch`).
 9. **Close the wave.** Flip the issue → `done`; `document_tags_update` add
    `shipped:main`; `document_comment` the wave-end note (files changed, squash commit SHA,
-   PR link, tests added). Update the ledger. Then `git push origin --delete <branch>` and
-   `git switch main && git pull --ff-only`.
+   PR link, tests added). Write a wave-end Note (`document_create {projectId, kind:
+   "notes"}`: what shipped, decisions, open follow-ups, what the next wave needs) and mark
+   the wave's queue item `done`. Refresh the code index:
+   `git -C ~/Developer/.mnemosyne-index/glen pull --ff-only`, then `code_reindex {project:
+   "glen", repo: "glen"}`, confirmed with `code_index_status`. Update the ledger. Then
+   `git push origin --delete <branch>` and `git switch main && git pull --ff-only`.
 10. **Advance** to the next wave without asking. 2–3 line status at wave boundaries only;
     silent during polling.
 
@@ -176,6 +208,33 @@ A goal without a release is **done** once its last wave is merged, `done` and ta
     `git tag -a v0.x.y -m "glen v0.x.y"` on that `main` commit → `git push origin v0.x.y`.
     Then `document_tags_update` add `released:v0.x.y` to every goal issue (and the goal
     module). Set status `done`.
+
+## Parallel work
+
+### Harness self-improvement loop
+
+The run fixes its own harness as it goes. Whenever something in `.claude/` slows or misleads
+a wave, add a line to the state file's **Harness friction log** (and log a gap in
+`.claude/orchestrator/gaps.jsonl` when no agent fits). With each wave PR, run one batch:
+
+1. `git worktree add .claude/worktrees/harness-<n> -b chore/harness-selfimprove-<n>
+   origin/main` — an isolated worktree, so the wave checkout is untouched.
+2. Fix the logged frictions and the open gaps, editing only harness files (`.claude/`) that
+   the open wave branch does not touch (`git diff --name-only origin/main...<wave branch>`).
+   A friction in a file the wave touches waits for the next batch.
+3. External bugs (Mnemosyne, plugins, Codex runtime) are not fixed here: document the
+   workaround in the skill or agent prompt that hits them.
+4. Commit, push, PR into `main`, then poll, capture a memory and squash-merge exactly like a
+   wave. Mark the fixed friction lines `fixed in PR #NN`, close the gaps, and record the batch
+   in **Harness self-improvement**. Remove the worktree after the merge.
+
+### Independent waves in parallel
+
+An independent wave (one sharing no files with the current wave, e.g. the `site/`) can be
+planned and built in its own worktree while the main checkout carries the current CLI wave:
+`git worktree add .claude/worktrees/<slug> -b <branch> origin/main`, then run the per-wave
+loop there. Each wave still PRs into `main` separately and is squash-merged on its own bar;
+rebase the later one if the first merge conflicts with it.
 
 ## Shipping tags (`shipped:main` / `released:v0.x.y`)
 

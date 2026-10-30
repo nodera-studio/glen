@@ -44,7 +44,7 @@ glen's key libraries (check `Cargo.toml` for the current set and versions):
 - **clap 4** (derive) — subcommands, args, value parsers, help output, shell completions
 - **serde / serde_json** — lenient deserialization of omp's `.jsonl` (unknown entry types
   and fields must be skipped: `#[serde(other)]`, untagged fallbacks, `Value`), `--json` output
-- **anyhow / thiserror** — error context in the binary, typed errors in library modules
+- **thiserror** — the `GlenError` type, used throughout (no `anyhow`); context goes in the message
 - **dirs** — locating `~/.omp` and platform directories on Linux and macOS
 - **Terminal UI crates, if the task adds them** (e.g. a TUI or styling crate for the live
   session view) — rendering model, terminal compatibility, testability
