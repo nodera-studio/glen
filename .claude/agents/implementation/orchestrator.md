@@ -252,6 +252,27 @@ own domain-specific gate" pattern applied to the security audit; this is the
 `/implement`-pipeline analog. If no such artifact class exists in this project, skip
 this arm entirely — it is optional, not a stub to fill mechanically.
 
+### Visual verification (rendered UI — required before the PR)
+
+Any change with a rendered result — site pages, the TUI, human (TTY) CLI output — gets a
+human-style look at the real rendered output before the PR, by you or a dispatched agent with a
+browser. Tests, smoke suites and Lighthouse scores do not substitute: a W6 terminal demo shipped
+with two of its four scenes never appearing, past 12 unit tests, a 16-test Playwright smoke and
+Lighthouse 1.00; only a visual check caught it.
+
+- **Web pages:** open the built page in the built-in browser (`mcp__Claude_Browser__*`) or
+  chrome-devtools. Check mobile (~375px) and desktop widths, light and dark themes. Let
+  animations and timed sequences run to completion (wait out the full duration, then screenshot)
+  and confirm every scene and state appears.
+- **CLI / TUI:** run the binary under a pseudo-TTY so the TTY code path runs, e.g.
+  `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'` (macOS), at a narrow and a
+  wide width, with and without `NO_COLOR`. Let a live view run through its states. Compare with
+  the plan's intended output.
+- Save what you looked at (screenshots or captured output) under `.claude/evidence/` and name it
+  in the Report. A defect found here goes to a fresh Implementer like a must-fix review finding.
+
+Skip only when the diff changes no rendered output, and say so in the Report.
+
 ### Role 4 — Re-index (after the merge, at wave close)
 
 glen's code index reads a clean clone of `main`, so re-indexing before the merge would
@@ -306,7 +327,8 @@ Plans are **kept after implementation** — they accumulate as project history. 
   spec. Split large work at slice boundaries (fresh Codex Implementer via
   `--fresh`), never mid write→test→fix loop; rework resumes Codex via `--resume-last`.
 - The user-approval gate (Step 4; announced instead under `/auto-mode`), the Review
-  gate (Role 2), and the conformance gate (Role 3) are mandatory — do not skip them. Any optional domain-rubric gate this
+  gate (Role 2), the conformance gate (Role 3) and, for any change with rendered output, the
+  visual verification are mandatory — do not skip them. Any optional domain-rubric gate this
   project wires up (Role 3 arm 3) is mandatory *when its trigger predicate fires*; on
   persistent FAIL it BLOCKS the pipeline. Code is written only after the plan is
   approved.
