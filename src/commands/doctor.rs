@@ -148,28 +148,56 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         },
     );
     let extension_path = paths.extensions_dir.join("glen/index.ts");
-    let (extension_state, extension_version) =
-        crate::extension::inspect(&extension_path, env!("CARGO_PKG_VERSION"), &glen_home.root)
-            .unwrap_or((crate::extension::State::Modified, None));
-    let current = extension_state == crate::extension::State::Current;
+    let inspection =
+        crate::extension::inspect(&extension_path, env!("CARGO_PKG_VERSION"), &glen_home.root);
+    let (extension_state, extension_version, extension_error) = match inspection {
+        Ok((state, version)) => (state, version, None),
+        Err(e) => (
+            crate::extension::State::Foreign,
+            None,
+            Some(format!(
+                "cannot inspect extension {}: {e}",
+                extension_path.display()
+            )),
+        ),
+    };
+    let extension_state_name = if extension_error.is_some() {
+        "unreadable"
+    } else {
+        extension_state.name()
+    };
+    let current = extension_error.is_none() && extension_state == crate::extension::State::Current;
     add(
         "extension",
         if current {
             "ok"
+        } else if extension_error.is_some() {
+            "warn"
         } else if extension_state == crate::extension::State::NotInstalled {
             "info"
         } else {
             "warn"
         },
-        extension_state.name().into(),
-        format!(
-            "{}{}; run `glen install-extension` to reach running omp sessions",
-            extension_path.display(),
-            extension_version
-                .as_deref()
-                .map(|v| format!(" (installed {v})"))
-                .unwrap_or_default()
-        ),
+        if extension_error.is_some() {
+            "unreadable".into()
+        } else {
+            extension_state.name().into()
+        },
+        extension_error.unwrap_or_else(|| {
+            format!(
+                "{}{}{}",
+                extension_path.display(),
+                extension_version
+                    .as_deref()
+                    .map(|v| format!(" (installed {v})"))
+                    .unwrap_or_default(),
+                if current {
+                    ""
+                } else {
+                    "; run `glen install-extension` to reach running omp sessions"
+                }
+            )
+        }),
     );
     let registries = crate::live::registry::index(&glen_home);
     let stale = registries
@@ -204,7 +232,7 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
     } else {
         serde_json::Value::Null
     };
-    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":json_paths,"extension":{"path":path_value(&extension_path),"state":extension_state.name(),"version":extension_version,"current":current},"checks":checks});
+    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":json_paths,"extension":{"path":path_value(&extension_path),"state":extension_state_name,"version":extension_version,"current":current},"checks":checks});
     let p = &ctx.painter;
     let mut table = render::Table::new(p, ctx.width);
     for (name, status, value, detail) in rows {

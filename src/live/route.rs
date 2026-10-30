@@ -24,6 +24,24 @@ pub enum Unhealthy {
     Unresponsive,
     Incompatible,
 }
+fn cleanup(home: &GlenHome, reg: &Registry, socket_too: bool) -> Option<Endpoint> {
+    let reason = match registry::remove_if_unchanged(home, reg, socket_too) {
+        Ok(true)
+            if matches!(
+                registry::read(home, &reg.session_id),
+                registry::Read::Missing
+            ) =>
+        {
+            return None;
+        }
+        Ok(_) => "live registry changed during stale cleanup; retry delivery".into(),
+        Err(e) => e.to_string(),
+    };
+    Some(Endpoint::Unhealthy {
+        reason,
+        kind: Unhealthy::Unreadable,
+    })
+}
 pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
     let reg = match registry::read(home, id) {
         registry::Read::Missing => return Endpoint::None,
@@ -36,7 +54,9 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
         registry::Read::Ok(r) => r,
     };
     if registry::pid_dead(reg.pid) {
-        registry::remove_if_unchanged(home, &reg, true);
+        if let Some(e) = cleanup(home, &reg, true) {
+            return e;
+        }
         return Endpoint::Stale(format!("pid {} is gone", reg.pid));
     }
     if !super::socket_path_ok(&reg.socket) {
@@ -47,7 +67,9 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
     }
     match client::hello(&reg.socket, timeout) {
         Ok(hello) if hello.session_id != id => {
-            registry::remove_if_unchanged(home, &reg, false);
+            if let Some(e) = cleanup(home, &reg, false) {
+                return e;
+            }
             Endpoint::Stale(format!("now on {}", hello.session_id))
         }
         Ok(hello) if hello.protocol == 1 && hello.ops.iter().any(|s| s == "send") => {
@@ -61,7 +83,9 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
             kind: Unhealthy::Incompatible,
         },
         Err(ClientError::Connect(ConnectError::Missing | ConnectError::Refused)) => {
-            registry::remove_if_unchanged(home, &reg, false);
+            if let Some(e) = cleanup(home, &reg, false) {
+                return e;
+            }
             Endpoint::Stale("socket went away".into())
         }
         Err(e) => Endpoint::Unhealthy {

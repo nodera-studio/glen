@@ -513,6 +513,9 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
             let d = data(&o);
             assert!(d["items"].as_array().unwrap().is_empty());
             assert_eq!(d["session"]["id"], id);
+            assert!(d["session"]["path"].is_null());
+            assert_eq!(d["session"]["state_source"], "extension");
+            assert_eq!(d["session"]["state"], "live");
             assert_eq!(json(&o)["warnings"][0]["code"], "not_yet_persisted");
         }
     }
@@ -547,6 +550,9 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
             let o = b.rpc.glen(&[command, arg, "--json"]).output().unwrap();
             let d = data(&o);
             assert_eq!(d["session"]["id"], id);
+            assert!(d["session"]["path"].is_null());
+            assert_eq!(d["session"]["state_source"], "extension");
+            assert_eq!(d["session"]["state"], "live");
             assert!(d["items"].as_array().unwrap().is_empty());
             assert_eq!(json(&o)["warnings"][0]["code"], "not_yet_persisted");
         }
@@ -647,4 +653,185 @@ fn ac315_worker_refuses_an_unhealthy_endpoint_at_submission() {
     assert_eq!(error_code(&out), "no_route");
     assert!(b.rpc.frames_in("prompt").is_empty());
     b.rpc.wait_worker_gone(id);
+}
+
+#[test]
+fn not_delivered_from_extension_is_preserved_in_live_job_result() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "not_delivered", &[]);
+    let o = send(&b, &[]);
+    assert_eq!(o.status.code(), Some(7));
+    assert_eq!(error_code(&o), "not_delivered");
+    wait_failed(&b, &o);
+}
+
+#[test]
+fn endpoint_only_tail_ends_not_found_after_disappearance_grace() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let b = LiveBox::new();
+    let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";
+    fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
+    fs::write(b.registry(id), serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":null,"socket":live::run_dir(&home(&b)).join("unbound.sock"),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
+    let mut child = b
+        .rpc
+        .glen(&["tail", id, "-f", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let stdout = child.stdout.take().unwrap();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx
+                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(first["event"], "session");
+    assert!(first["session"]["path"].is_null());
+    assert_eq!(first["session"]["state_source"], "extension");
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap()["code"],
+        "not_yet_persisted"
+    );
+    fs::remove_file(b.registry(id)).unwrap();
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "disappearance grace must be observed"
+    );
+    let error = rx.recv_timeout(Duration::from_secs(7)).unwrap();
+    assert_eq!(error["ok"], false);
+    assert_eq!(error["error"]["code"], "not_found");
+    assert_eq!(child.wait().unwrap().code(), Some(3));
+    reader.join().unwrap();
+}
+
+#[test]
+fn show_and_tail_use_extension_state_for_persisted_sessions() {
+    for scenario in ["ok", "busy"] {
+        let mut b = LiveBox::new();
+        b.start_ext(A_ID, scenario, &[]);
+        for command in ["show", "tail"] {
+            let o = b.rpc.glen(&[command, A_ID, "--json"]).output().unwrap();
+            let row = &data(&o)["session"];
+            assert_eq!(row["state_source"], "extension");
+            assert_eq!(row["state_detail"], "tui");
+            assert_eq!(
+                row["state"],
+                if scenario == "busy" { "busy" } else { "live" }
+            );
+            assert!(!row["path"].is_null());
+        }
+    }
+}
+
+#[test]
+fn endpoint_only_tail_waits_for_persistence_then_streams_fixture_items() {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    let b = LiveBox::new();
+    let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";
+    let path = b
+        .rpc
+        .omp
+        .session('A')
+        .parent()
+        .unwrap()
+        .join(format!("2026-10-30T09-00-00-000Z_{id}.jsonl"));
+    fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
+    fs::write(b.registry(id), serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":path,"socket":live::run_dir(&home(&b)).join("unbound.sock"),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
+    let mut child = b
+        .rpc
+        .glen(&["tail", id, "-f", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            if tx
+                .send(serde_json::from_str::<Value>(&line.unwrap()).unwrap())
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let initial = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(initial["event"], "session");
+    assert_eq!(initial["session"]["state_source"], "extension");
+    assert!(initial["session"]["path"].is_null());
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap()["code"],
+        "not_yet_persisted"
+    );
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(rx.recv_timeout(Duration::from_millis(350)).is_err());
+    let fixture = fs::read_to_string(b.rpc.omp.session('A'))
+        .unwrap()
+        .replace(A_ID, id);
+    fs::write(path, fixture).unwrap();
+    let mut received = Vec::new();
+    let mut saw_user = false;
+    for _ in 0..10 {
+        let item = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(item["event"], "item");
+        saw_user = item["item"]
+            .to_string()
+            .contains("Why does parser_test flake?");
+        received.push(item);
+        if saw_user {
+            break;
+        }
+    }
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let mut ended = false;
+    for _ in 0..30 {
+        match rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(frame) if frame["event"] == "end" => {
+                ended = true;
+                break;
+            }
+            Ok(_) => (),
+            Err(_) => break,
+        }
+    }
+    assert!(ended);
+    assert_eq!(child.wait().unwrap().code(), Some(130));
+    reader.join().unwrap();
+    assert!(
+        saw_user,
+        "expected fixture user message after persistence, got {received:?}"
+    );
+}
+
+#[test]
+fn live_batch_warning_is_returned_to_the_calling_agent() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "batched", &[]);
+    let o = send(&b, &[]);
+    assert!(o.status.success(), "{o:?}");
+    let value = json(&o);
+    assert!(
+        value["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "batched" && w["message"].as_str().unwrap().contains("j7654321"))
+    );
+    assert_eq!(data(&o)["assistant_text"], "pong: hi");
+    b.rpc.wait_worker_gone(job_id(&value["data"]));
 }

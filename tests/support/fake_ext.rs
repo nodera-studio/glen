@@ -148,6 +148,9 @@ impl Peer {
             "follow_up"
         };
         self.write(&mut s,json!({"v":1,"id":id,"ok":true,"data":{"delivered_as":delivered,"session_id":self.id,"request_id":id}}))?;
+        if self.scenario == "not_delivered" {
+            return self.write(&mut s, json!({"v":1,"id":id,"event":"error","error":{"code":"not_delivered","message":"request removed before delivery"}}));
+        }
         if self.scenario != "queued" {
             self.write(&mut s, json!({"v":1,"id":id,"event":"consumed"}))?;
         }
@@ -207,7 +210,7 @@ impl Peer {
             "error" => "error",
             _ => "completed",
         };
-        self.write(&mut s,json!({"v":1,"id":id,"event":"settled","status":status,"assistant_text":format!("pong: {text}"),"stop_reason":if status=="completed"{"stop"}else{status},"error_message":if status=="error"{Some("model error")}else{None}}))
+        self.write(&mut s,json!({"v":1,"id":id,"event":"settled","status":status,"assistant_text":format!("pong: {text}"),"stop_reason":if status=="completed"{"stop"}else{status},"error_message":if status=="error"{Some("model error")}else{None},"warnings":if self.scenario=="batched"{vec![json!({"code":"batched","message":"shared reply span with j7654321"})]}else{vec![]}}))
     }
 }
 fn moved(id: &str) -> String {
@@ -287,7 +290,9 @@ fn main() -> io::Result<()> {
         }
     }
     if std::env::var("FAKE_EXT_KEEP_FILES").as_deref() != Ok("1") {
-        registry::remove_if_unchanged(&peer.home, &reg, false);
+        if let Err(e) = registry::remove_if_unchanged(&peer.home, &reg, false) {
+            eprintln!("{e}");
+        }
         fs::remove_file(&peer.socket)?;
     }
     Ok(())

@@ -81,7 +81,18 @@ pub enum ClientError {
 }
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{self:?}")
+        match self {
+            Self::Connect(ConnectError::PathTooLong) => {
+                f.write_str("endpoint socket path is too long")
+            }
+            Self::Connect(ConnectError::Missing) => f.write_str("endpoint socket is missing"),
+            Self::Connect(ConnectError::Refused) => f.write_str("endpoint refused the connection"),
+            Self::Connect(ConnectError::Io(e)) => write!(f, "cannot connect to endpoint: {e}"),
+            Self::Timeout => f.write_str("endpoint request timed out"),
+            Self::Protocol(message) => write!(f, "invalid endpoint response: {message}"),
+            Self::Refused(e) => write!(f, "endpoint refused: {} ({})", e.code, e.message),
+            Self::Cancelled => f.write_str("endpoint request cancelled"),
+        }
     }
 }
 impl std::error::Error for ClientError {}
@@ -309,6 +320,39 @@ pub fn open_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn client_errors_display_actionable_text_without_debug_payloads() {
+        for (error, expected) in [
+            (ClientError::Timeout, "endpoint request timed out"),
+            (
+                ClientError::Connect(ConnectError::Missing),
+                "endpoint socket is missing",
+            ),
+            (
+                ClientError::Connect(ConnectError::Refused),
+                "endpoint refused the connection",
+            ),
+            (
+                ClientError::Connect(ConnectError::PathTooLong),
+                "endpoint socket path is too long",
+            ),
+            (
+                ClientError::Protocol("malformed JSON".into()),
+                "invalid endpoint response: malformed JSON",
+            ),
+            (ClientError::Cancelled, "endpoint request cancelled"),
+            (
+                ClientError::Refused(WireError {
+                    code: "unsupported_version".into(),
+                    message: "unsupported protocol".into(),
+                    details: Some(serde_json::json!({"supported":[1]})),
+                }),
+                "endpoint refused: unsupported_version (unsupported protocol)",
+            ),
+        ] {
+            assert_eq!(error.to_string(), expected);
+        }
+    }
     #[test]
     fn frames_and_path_bytes() {
         for v in [

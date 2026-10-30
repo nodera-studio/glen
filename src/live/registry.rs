@@ -7,7 +7,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use std::{fs, path::PathBuf};
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct Registry {
     pub v: u32,
     pub pid: u32,
@@ -79,22 +79,54 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
 pub fn pid_dead(pid: u32) -> bool {
     matches!(liveness::start_token(pid), Probe::Gone)
 }
-pub fn remove_if_unchanged(home: &GlenHome, reg: &Registry, socket_too: bool) {
-    if let Read::Ok(now) = read(home, &reg.session_id)
-        && now.pid == reg.pid
-        && now.socket == reg.socket
-        && now.started_at == reg.started_at
-    {
-        if let Err(e) = fs::remove_file(path(home, &reg.session_id)) {
-            let _ = e;
+pub fn remove_if_unchanged(
+    home: &GlenHome,
+    reg: &Registry,
+    socket_too: bool,
+) -> Result<bool, crate::error::GlenError> {
+    let target = path(home, &reg.session_id);
+    let tombstone = super::run_dir(home).join(format!(
+        ".{}.{}.stale",
+        lock_key(&reg.session_id),
+        uuid::Uuid::now_v7()
+    ));
+    let io = |e| {
+        crate::error::GlenError::new(
+            crate::error::ErrorCode::Io,
+            format!(
+                "cannot clean live registry {} for session {}: {e}",
+                target.display(),
+                reg.session_id
+            ),
+        )
+    };
+    match fs::rename(&target, &tombstone) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(io(e)),
+    }
+    let bytes = fs::read(&tombstone).map_err(io)?;
+    let unchanged = serde_json::from_slice::<Registry>(&bytes).is_ok_and(|now| now == *reg);
+    if !unchanged {
+        // Restore without clobbering a concurrent atomic publisher. Keep an
+        // unexpected tombstone when the target is occupied by an even newer one.
+        match fs::hard_link(&tombstone, &target) {
+            Ok(()) => fs::remove_file(&tombstone).map_err(io)?,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(e) => return Err(io(e)),
         }
-        // A corrupt registry must never turn stale cleanup into deletion of an
-        // arbitrary file (in particular an omp transcript).
-        let owned_socket = super::run_dir(home).join(format!("{}.sock", reg.pid));
-        if socket_too && reg.socket == owned_socket && pid_dead(reg.pid) {
-            let _ = fs::remove_file(&reg.socket);
+        return Ok(false);
+    }
+    fs::remove_file(&tombstone).map_err(io)?;
+    let owned_socket = super::run_dir(home).join(format!("{}.sock", reg.pid));
+    if socket_too && reg.socket == owned_socket && pid_dead(reg.pid) {
+        match fs::remove_file(&owned_socket) {
+            Ok(()) => (),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+            Err(e) => return Err(io(e)),
         }
     }
+    Ok(true)
 }
 /// Add unpublished TUI sessions to the same handle namespace as disk sessions.
 /// No session bytes are invented on disk; the synthetic header is read-only.
@@ -198,8 +230,12 @@ mod tests {
         let mut changed = (*reg).clone();
         changed.started_at = Some("new".into());
         std::fs::write(path(&home, id), serde_json::to_vec(&changed).unwrap()).unwrap();
-        remove_if_unchanged(&home, &reg, false);
-        assert!(path(&home, id).exists());
+        assert!(!remove_if_unchanged(&home, &reg, false).unwrap());
+        let Read::Ok(restored) = read(&home, id) else {
+            panic!("fresh registry must be restored")
+        };
+        assert_eq!(*restored, changed);
+        assert_eq!(files(&home).len(), 1);
         let env = crate::env::Env::for_test(Some(t.path()), t.path(), &[]);
         let mut catalog = crate::omp::listing::Catalog::scan(&t.path().join("sessions")).unwrap();
         union(&mut catalog, &home, &env, &[(*reg).clone()]);
@@ -210,7 +246,7 @@ mod tests {
             catalog.sessions[0].file.path
         );
         assert!(!catalog.sessions[0].file.path.exists());
-        remove_if_unchanged(&home, &changed, false);
+        remove_if_unchanged(&home, &changed, false).unwrap();
         assert!(!path(&home, id).exists());
         std::fs::write(dir.join(format!("{id}.json")), "bad").unwrap();
         assert!(matches!(read(&home, id), Read::Unreadable(_)));
@@ -251,13 +287,13 @@ mod cleanup_tests {
             title: None,
         };
         std::fs::write(path(&home, "stale"), serde_json::to_vec(&registry).unwrap()).unwrap();
-        remove_if_unchanged(&home, &registry, true);
+        remove_if_unchanged(&home, &registry, true).unwrap();
         assert_eq!(std::fs::read_to_string(&protected).unwrap(), "protected");
         assert!(!path(&home, "stale").exists());
         registry.socket = super::super::run_dir(&home).join(format!("{pid}.sock"));
         std::fs::write(&registry.socket, "leftover").unwrap();
         std::fs::write(path(&home, "stale"), serde_json::to_vec(&registry).unwrap()).unwrap();
-        remove_if_unchanged(&home, &registry, true);
+        remove_if_unchanged(&home, &registry, true).unwrap();
         assert!(!registry.socket.exists());
     }
 }

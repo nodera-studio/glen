@@ -111,7 +111,7 @@ fn ac319_missing_home_is_lazy_and_human_is_sanitized() {
     assert!(!o.stdout.contains(&27));
     let h = String::from_utf8(o.stdout).unwrap();
     assert!(h.contains("↩ e27c0de"));
-    assert!(h.contains("1 messages · 1 sessions · peek"));
+    assert!(h.contains("1 message · 1 session · peek"));
 }
 #[test]
 fn ac319_output_failure_keeps_cursor() {
@@ -201,4 +201,87 @@ fn ac325_rpc_reply_nulls() {
     let lines = fs::read_to_string(path(&b.omp, A)).unwrap();
     let r: Value = serde_json::from_str(lines.lines().next().unwrap()).unwrap();
     assert!(r.get("request_id").unwrap().is_null());
+}
+
+#[test]
+fn mark_read_failure_is_reported_on_stderr_and_leaves_messages_unread() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+    fs::write(b.glen_home.join("inbox/.read"), "blocked").unwrap();
+    let o = inbox(&b, &[]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("cannot mark inbox {A} read")));
+    assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 1);
+}
+
+#[test]
+fn footer_counts_only_sessions_with_displayed_messages() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "one", "2026-10-30T00:00:00Z"));
+    append(&b, B, &record(B, "read", "2026-10-30T00:00:00Z"));
+    inbox(&b, &["--session", B]);
+    let o = b
+        .command(&["inbox", "--human", "--peek"], &b.alpha())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(o.stdout)
+            .unwrap()
+            .contains("1 message · 1 session · peek")
+    );
+    append(&b, B, &record(B, "two", "2026-10-30T00:00:01Z"));
+    let o = b
+        .command(&["inbox", "--human", "--peek"], &b.alpha())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8(o.stdout)
+            .unwrap()
+            .contains("2 messages · 2 sessions · peek")
+    );
+}
+
+#[test]
+fn closed_stdout_does_not_mark_inbox_read() {
+    use std::os::unix::process::CommandExt;
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+    let mut command = b.command(&["inbox", "--json"], &b.alpha());
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let mut pipe = [-1; 2];
+    // SAFETY: pipe points to two valid descriptor slots. Each returned fd gets
+    // exactly one owner; dropping the read end guarantees EPIPE on the writer.
+    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
+    let read_end = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
+    let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
+    drop(read_end);
+    // SAFETY: dup2 is async-signal-safe. fd 1 stays open across exec, so Rust's
+    // startup sanitizer cannot replace it with /dev/null.
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(write_end.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let o = command.output().unwrap();
+    assert_eq!(o.status.code(), Some(1));
+    assert!(!b.glen_home.join("inbox/.read").exists());
+    assert!(String::from_utf8_lossy(&o.stderr).contains("messages remain unread"));
+}
+
+#[test]
+fn inbox_rejects_hex_suffixes_shorter_than_four_digits() {
+    let b = OmpBox::new();
+    for suffix in ["a", "AB", "abc"] {
+        for mode in ["--peek", "--follow"] {
+            let o = inbox(&b, &["--session", suffix, mode]);
+            assert_eq!(o.status.code(), Some(2), "{o:?}");
+            assert_eq!(common::json(&o)["error"]["code"], "usage");
+            assert!(o.stderr.is_empty());
+        }
+    }
+    assert_eq!(data(&inbox(&b, &["--session", "abcd"]))["total"], 0);
+    assert!(!b.glen_home.exists());
 }

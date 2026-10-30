@@ -219,14 +219,30 @@ pub fn emit_to(
         bytes
     };
     if !write_output(ctx, &bytes, out, err) {
+        if after_output.is_some()
+            && writeln!(
+                err,
+                "glen: cannot write inbox output; messages remain unread"
+            )
+            .and_then(|()| err.flush())
+            .is_err()
+        {
+            return ExitCode::from(1);
+        }
         return ExitCode::from(1);
     }
     if ctx.mode != Mode::Json && human_warnings(ctx, &warnings, err).is_err() {
         return ExitCode::from(1);
     }
     if let Some(commit) = after_output
-        && commit().is_err()
+        && let Err(e) = commit()
     {
+        if writeln!(err, "glen: {}", sanitize(&e.to_string()))
+            .and_then(|()| err.flush())
+            .is_err()
+        {
+            return ExitCode::from(1);
+        }
         return ExitCode::from(1);
     }
     ExitCode::from(outcome.exit.exit_code())
