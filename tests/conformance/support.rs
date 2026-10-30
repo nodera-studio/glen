@@ -185,6 +185,16 @@ pub struct Run {
 }
 
 impl Run {
+    /// Wrap a prepared `Command` whose environment the caller has already set (W1 `OmpBox`).
+    pub fn from_command(cmd: Command, desc: String) -> Self {
+        Run {
+            cmd,
+            desc,
+            env_desc: Vec::new(),
+            stdout: None,
+        }
+    }
+
     pub fn env(mut self, k: impl AsRef<OsStr>, v: impl AsRef<OsStr>) -> Self {
         self.env_desc.push(format!(
             "{}={:?}",
