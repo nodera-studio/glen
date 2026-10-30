@@ -49,14 +49,30 @@ cp "$S/transcript.jsonl" "$S/good-transcript.jsonl"
 jq -c 'select(.argv[0]!="send" or .argv[1]!="ccccccc")' "$S/good.ndjson" > "$S/calls.ndjson"
 jq -cn '{t:"start",id:"x-usage",argv:["send","ccccccc","hi","--cwd","."],ts:40},
   {t:"end",id:"x-usage",argv:["send","ccccccc","hi","--cwd","."],exit:2,ms:20,stdout:{error:{code:"usage"}}}' >> "$S/calls.ndjson"
+# With only usage-rejected X sends, neither a refusal nor its report hint exists.
+if "$A/acc.sh" check b "$S"; then echo 'usage-only X recording passed' >&2; exit 1; fi
+jq -e '(.pass|not) and (.checks|all(.[]; if .id=="AC-415-X" or .id=="AC-415-report" then (.pass|not) else .pass end))' "$S/verdict.json" >/dev/null
 jq -c 'select(.argv[0]=="send" and .argv[1]=="ccccccc")' "$S/good.ndjson" >> "$S/calls.ndjson"
 "$A/acc.sh" check b "$S"
 jq -e '.pass and (.checks|any(.id=="AC-415-X" and .pass))' "$S/verdict.json" >/dev/null
+cp "$S/good.ndjson" "$S/calls.ndjson"
+# A successful X send breaks the requirement that every counted X send is refused.
+jq -cn --slurpfile m "$S/manifest.json" '
+  {t:"start",id:"x-success",argv:["send","ccccccc","hi"],ts:100},
+  {t:"end",id:"x-success",argv:["send","ccccccc","hi"],exit:0,ms:20,
+   stdout:{v:1,ok:true,data:{job:{session_id:$m[0].X.id,route:"rpc"},assistant_text:"delivered"}}}' >> "$S/calls.ndjson"
+if "$A/acc.sh" check b "$S"; then echo 'successful X send recording passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-415-X" and (.pass|not)) and all(.[];.pass or .id=="AC-415-X")' "$S/verdict.json" >/dev/null
 cp "$S/good.ndjson" "$S/calls.ndjson"
 # Raw inbox NDJSON strings still supply the talk-back nonce.
 jq -c 'if .t=="end" and .argv[0]=="inbox" then .stdout="{\"text\":\"T-nonce\"}\n{\"text\":\"another reply\"}\n" else . end' "$S/good.ndjson" > "$S/calls.ndjson"
 "$A/acc.sh" check b "$S"
 jq -e '.pass and (.checks|any(.id=="nonce_T" and .pass))' "$S/verdict.json" >/dev/null
+cp "$S/good.ndjson" "$S/calls.ndjson"
+# Plain inbox strings without the nonce must fail the string-stdout fallback.
+jq -c 'if .t=="end" and .argv[0]=="inbox" then .stdout="another reply without the nonce" else . end' "$S/good.ndjson" > "$S/calls.ndjson"
+if "$A/acc.sh" check b "$S"; then echo 'inbox string without nonce passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="nonce_T" and (.pass|not)) and all(.[];.pass or .id=="nonce_T")' "$S/verdict.json" >/dev/null
 cp "$S/good.ndjson" "$S/calls.ndjson"
 # Unknown line types must never hide tools, even otherwise permitted wrapper calls.
 jq -cn --arg s "$S" '{type:"unknown",message:{content:[{type:"tool_use",id:"hidden",name:"Bash",input:{command:($s+"/bin/glen ls")}}]}}' >> "$S/transcript.jsonl"
@@ -142,6 +158,11 @@ jq -c '.message.content[1].content |= [{type:"text",text:.}]' "$S/b2-probe.jsonl
 cp "$S/probe-array.jsonl" "$S/b2-probe.jsonl"
 "$A/acc.sh" check b2 "$S"
 jq -e '.pass and (.checks|any(.id=="AC-416-probe" and .pass))' "$S/verdict.json" >/dev/null
+# Text that resembles a success object must actually parse as JSON.
+jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
+  {type:"tool_result",tool_use_id:"probe",content:"not-json \"ok\": true"}]}}' > "$S/b2-probe.jsonl"
+if "$A/acc.sh" check b2 "$S"; then echo 'unparseable b2 success text passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-416-probe" and (.pass|not)) and all(.[];.pass or .id=="AC-416-probe")' "$S/verdict.json" >/dev/null
 jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
   {type:"tool_result",tool_use_id:"probe",is_error:true,content:"{\"ok\":true}"}]}}' > "$S/b2-probe.jsonl"
 if "$A/acc.sh" check b2 "$S"; then echo 'error b2 result with ok:true passed' >&2; exit 1; fi
@@ -216,6 +237,13 @@ jq -c 'if .t=="end" and .argv[0]=="send" and .argv[1]=="aaaaaaa" then .exit=2 | 
 cp "$S/c2-usage.ndjson" "$S/calls.ndjson"
 if HOME="$S/c2-home" "$A/acc.sh" check c2 "$S"; then echo 'usage-only R refusal passed' >&2; exit 1; fi
 jq -e '.checks|any(.id=="AC-418-rpc-refused" and (.pass|not)) and all(.[];.pass or .id=="AC-418-rpc-refused")' "$S/verdict.json" >/dev/null
+# A genuine R refusal still satisfies c2 alongside the excluded usage rejection.
+cp "$S/c2-usage.ndjson" "$S/calls.ndjson"
+jq -cn '{t:"start",id:"r-refused",argv:["send","aaaaaaa","hi"],ts:100},
+  {t:"end",id:"r-refused",argv:["send","aaaaaaa","hi"],exit:6,ms:20,
+   stdout:{error:{details:{reason:"sandboxed",network:true}}}}' >> "$S/calls.ndjson"
+HOME="$S/c2-home" "$A/acc.sh" check c2 "$S"
+jq -e '.mode=="c2" and .pass and (.checks|any(.id=="AC-418-rpc-refused" and .pass) and all(.pass))' "$S/verdict.json" >/dev/null
 cp "$S/good.ndjson" "$S/calls.ndjson"
 # Exercise the guard with a fake binary, including --as before target and escaped cwd.
 printf '#!/usr/bin/env bash\nprintf '\''{"v":1,"ok":true,"data":{}}\\n'\''\n' > "$S/glen-bin/glen"
