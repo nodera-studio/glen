@@ -31,3 +31,58 @@ test('send beam and spinner run for the wait and settle at completion',()=>{
  assert.equal(timeline.beam.startMs,spinner.startMs);
  assert.equal(timeline.settleMs,spinner.endMs);
 });
+
+for (const replacesRow of [0,scenes[2].wide.length,scenes[2].wide.length+1]) test(`rejects transient replacesRow ${replacesRow}`,()=>{
+ assert.throws(()=>compileTimeline([{...scenes[2],transient:{...scenes[2].transient,replacesRow}}]),/Scene 1: transient replacesRow/);
+});
+test('no transient means no beam or settle flash',()=>{
+ const t=compileTimeline([scenes[0],scenes[1]]);
+ assert.equal(t.beam,undefined);
+ assert.equal(t.settleMs,undefined);
+ assert.ok(t.rows.every(row=>row.endMs===undefined));
+});
+test('every output reveals after its command has finished typing',()=>{
+ for (const row of timeline.rows.filter(row=>row.index>=0)) {
+  const command=timeline.rows.find(command=>command.scene===row.scene && command.index===-1);
+  assert.ok(row.startMs>=command.startMs+(command.type?.durationMs ?? 0));
+  if (row.scene>0) assert.ok(row.startMs>command.startMs);
+  assert.ok(timeline.revealCss.includes(`@keyframes ${row.name}{`));
+  assert.ok(timeline.revealCss.includes(`${row.startMs/timeline.totalMs*100}%{visibility:visible;opacity:1}`));
+ }
+});
+test('each reveal and scroll keyframe keeps the newest revealed rows in a contiguous window',()=>{
+ const frames=[...timeline.css.matchAll(/([\d.]+)%\{transform:translateY\((?:calc\(-(\d+) \* var\(--t-row\)\)|0)\)\}/g)].map(match=>({time:Number(match[1])/100*timeline.totalMs,offset:Number(match[2] ?? 0)}));
+ assert.equal(frames.length,timeline.scroll.length+2);
+ const times=[...new Set([0,...timeline.rows.flatMap(row=>[row.startMs,...(row.endMs===undefined ? [] : [row.endMs])]),...timeline.scroll.map(step=>step.time),timeline.totalMs])];
+ for (const time of times) {
+  const revealed=timeline.rows.filter(row=>row.startMs<=time && row.units>0);
+  const units=revealed.reduce((sum,row)=>sum+row.units,0);
+  const offset=frames.findLast(frame=>frame.time<=time+.000001)?.offset ?? 0;
+  assert.equal(offset,Math.max(0,units-WINDOW_ROWS));
+  // Older history scrolls out; every retained row fits, with no hidden gaps in the tail.
+  let position=0;
+  for (const row of revealed) {
+   const bottom=position+row.units;
+   if (bottom>offset) {
+    assert.ok(position-offset>=0);
+    assert.ok(bottom-offset<=WINDOW_ROWS);
+    if (row.endMs!==undefined && time>=row.endMs) {
+     const replacement=timeline.rows.find(next=>next.scene===row.scene && next.index===row.index+1);
+     assert.equal(replacement.startMs,row.endMs);
+    }
+   }
+   position=bottom;
+  }
+ }
+});
+test('scroll ends at units minus the window and percentages strictly increase, including simultaneous reveals',()=>{
+ for (const [t,windowRows] of [[timeline,WINDOW_ROWS],[compileTimeline([scenes[0]],{windowRows:2}),2]]) {
+  const units=t.rows.reduce((sum,row)=>sum+row.units,0);
+  assert.equal(t.finalOffset,units-windowRows);
+  const percentages=[...t.css.matchAll(/([\d.]+)%\{/g)].map(match=>Number(match[1]));
+  assert.equal(percentages[0],0);
+  assert.equal(percentages.at(-1),100);
+  percentages.forEach((percent,index)=>assert.ok(index===0 || percent>percentages[index-1]));
+  assert.match(t.css,new RegExp(`100%\\{transform:translateY\\(calc\\(-${t.finalOffset} \\* var\\(--t-row\\)\\)\\)`));
+ }
+});

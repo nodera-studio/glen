@@ -57,7 +57,8 @@ npm run lhci        # Lighthouse CI, mobile, light and dark
 ```
 
 `lefthook install` once per clone: pre-commit checks rustfmt and scans for secrets, pre-push runs
-clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS.
+clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS (the
+`site` job runs on Linux only).
 
 ## Conventions
 

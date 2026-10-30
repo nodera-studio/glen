@@ -26,6 +26,9 @@ for (const file of walk('src').filter(f=>/\.(?:ts|tsx|astro|mjs)$/.test(f))) {
  const content = readFileSync(file,'utf8');
  if (forbidden.test(content)) { check(`forbidden motion source: ${file}`,1,0); }
 }
+for (const file of files.filter(f=>f.endsWith('.js'))) {
+ if (forbidden.test(readFileSync(file,'utf8'))) check(`forbidden motion bundle: ${file}`,1,0);
+}
 for (const file of walk('src/components/terminal')) {
  if (cliHex.test(readFileSync(file,'utf8'))) check(`literal CLI token: ${relative('.',file)}`,1,0);
 }

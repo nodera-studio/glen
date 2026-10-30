@@ -31,5 +31,5 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 </script>
 <noscript><style>.theme-switch, .t-controls { display: none !important } [data-tabs] [role=tablist] { display: none } @layer base { [data-tabs] [role=tabpanel][hidden] { display: block !important } } [data-tabs] .tab-heading { position: static; width: auto; height: auto; clip: auto; margin: 0 0 .5rem } .terminal *, .t-window::before, .t-window::after { animation: none !important } .terminal .t-window { height: auto } .terminal .t-scroll { transform: none }</style></noscript>
 </head>
-<body><a class="sr-only focus:not-sr-only focus-ring" href="#main">Skip to content</a><slot /></body>
+<body><a class="sr-only focus:not-sr-only focus-ring text-frame-fg" href="#main">Skip to content</a><slot /></body>
 </html>

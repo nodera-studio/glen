@@ -14,7 +14,7 @@ export default function InstallTabs({commands,releasesUrl,releaseAvailable}:Pick
   <ExpandableTabs tabs={tabs} selectedId={selected} onSelect={setSelected} label="Install method" idPrefix="install" />
   {tabs.map(tab=><div key={tab.id} role="tabpanel" id={`install-panel-${tab.id}`} aria-labelledby={`install-tab-${tab.id}`} tabIndex={0} hidden={selected!==tab.id} className="focus-ring rounded-lg border border-line bg-layer-1 p-5">
    <h3 className="tab-heading sr-only">{tab.title}</h3>
-   {tab.id==='binary' ? <a className="focus-ring text-ink underline" href={releasesUrl}>Download from GitHub Releases</a> : <div className="flex flex-wrap items-start justify-between gap-4"><pre className="command min-w-0 flex-1"><code>{tab.id==='script' ? commands.script : commands.cargo}</code></pre><CopyButton text={tab.id==='script' ? commands.script : commands.cargo} label={`${tab.title} command`} /></div>}
+   {tab.id==='binary' ? <a className="focus-ring text-ink underline" href={releasesUrl}>Download from GitHub Releases</a> : <div className="flex flex-wrap items-start justify-between gap-4"><pre className="command min-w-0 flex-1"><code>{tab.id==='script' ? commands.script : commands.cargo}</code></pre>{(tab.id!=='script' || releaseAvailable) && <CopyButton text={tab.id==='script' ? commands.script : commands.cargo} label={`${tab.title} command`} />}</div>}
    <p className="mt-3 text-body-sm text-ink-subdued">{tab.id==='script' ? 'Installs the latest release binary.' : tab.id==='cargo' ? 'Builds from source with a Rust toolchain.' : 'Pick the archive for your platform.'}</p>
    {!releaseAvailable && tab.id!=='cargo' && <p className="mt-2 text-body-sm text-ink-subdued">Available with the v0.1.0 release.</p>}
   </div>)}

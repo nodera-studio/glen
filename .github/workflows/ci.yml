@@ -43,6 +43,10 @@ jobs:
       - run: npm run build
       - run: npm run test:unit
       - run: npm run budgets
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('site/package-lock.json') }}
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - run: npm run lhci
@@ -54,4 +58,6 @@ jobs:
             site/dist/
             site/.lighthouseci/
             site/playwright-report/
+            site/test-results/
+          include-hidden-files: true
           if-no-files-found: ignore

@@ -29,8 +29,8 @@
       "method": "github-fallback",
       "vendor": "vendor/morphin/morphing-navigation-tabs-compact-expanded",
       "files": [
-        "demo.tsx",
-        "expandable-tabs.tsx",
+        "components/demo.tsx",
+        "components/ui/expandable-tabs.tsx",
         "lib/utils.ts"
       ],
       "upstreamDependencies": [
@@ -51,7 +51,7 @@
       "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
       "notes": [
         "Fallback lib/utils.ts also returned 404 on GitHub; copied verbatim from vendor/morphin/animated-svg-branch-connector/lib/utils.ts (CLI-written).",
-        "Preflight fallback paths are retained exactly as supplied; files lists the actual snapshot paths."
+        "Snapshot files use the registry manifest target paths."
       ],
       "changes": [
         "motion/react with LazyMotion strict; redesign tokens; reduced motion",
@@ -64,11 +64,10 @@
       "vendor": "vendor/morphin/animated-border-button",
       "files": [
         "components/demo.tsx",
-        "demo.tsx",
         "lib/utils.ts",
-        "ui/button.tsx",
-        "ui/icons/success.tsx",
-        "ui/icons/trash.tsx"
+        "components/ui/button.tsx",
+        "components/ui/icons/success.tsx",
+        "components/ui/icons/trash.tsx"
       ],
       "upstreamDependencies": [
         "framer-motion",
@@ -90,8 +89,8 @@
       "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
       "notes": [
         "Fallback lib/utils.ts also returned 404 on GitHub; copied verbatim from vendor/morphin/animated-svg-branch-connector/lib/utils.ts (CLI-written).",
-        "Preflight fallback paths are retained exactly as supplied; files lists the actual snapshot paths.",
-        "components/demo.tsx was CLI-written before the registry 404; remaining files were supplied by the GitHub fallback."
+        "components/demo.tsx was CLI-written before the registry 404; remaining files were supplied by the GitHub fallback.",
+        "Snapshot files use the registry manifest target paths; duplicate fallback demo removed."
       ],
       "changes": [
         "motion/react with LazyMotion strict; redesign tokens; reduced motion",

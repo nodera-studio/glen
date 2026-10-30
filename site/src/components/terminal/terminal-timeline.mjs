@@ -32,9 +32,11 @@ export function compileTimeline(scenes, opts = {}) {
  /** @type {TimedRow[]} */
  const rows = [];
  let time = 0;
- let beam = { startMs: 0, durationMs: 0, laps: 2 };
+ /** @type {{startMs: number, durationMs: number, laps: number} | undefined} */
+ let beam;
  for (const [scene, data] of scenes.entries()) {
   if (data.wide.length !== data.narrow.length) throw new Error(`Scene ${scene + 1}: wide/narrow row-count mismatch`);
+  if (data.transient && (data.transient.replacesRow < 1 || data.transient.replacesRow >= data.wide.length)) throw new Error(`Scene ${scene + 1}: transient replacesRow must be between 1 and ${data.wide.length - 1}`);
   for (const variant of /** @type {const} */ (['wide','narrow'])) {
    data[variant].forEach((row, index) => {
     if ([...row.map(s => s.text).join('')].length > (variant === 'wide' ? 76 : 38)) throw new Error(`Scene ${scene + 1} ${variant} row ${index + 1} exceeds columns`);
@@ -57,26 +59,39 @@ export function compileTimeline(scenes, opts = {}) {
   }
   time = output + SCENE_GAP_MS;
  }
- const settleMs = beam.startMs + beam.durationMs;
+ const settleMs = beam ? beam.startMs + beam.durationMs : undefined;
  rows.push({ scene: scenes.length, index: -2, startMs: time - SCENE_GAP_MS + LINE_STAGGER_MS, units: 1 });
- const totalMs = Math.max(time, settleMs + 1300);
+ const totalMs = Math.max(time, settleMs === undefined ? 0 : settleMs + 1300);
+ // Reveal, replacement and scroll all use the same clock, with steps at row boundaries.
+ const timedRows = rows.map((row, index) => ({ ...row, name: `t-row-${index}` }));
+ const revealCss = timedRows.map(row => {
+  const frames = row.startMs ? ['0%{visibility:hidden;opacity:0}'] : [];
+  frames.push(`${row.startMs / totalMs * 100}%{visibility:visible;opacity:1}`);
+  if (row.endMs !== undefined) frames.push(`${row.endMs / totalMs * 100}%{visibility:hidden;opacity:0}`);
+  frames.push(`100%{visibility:${row.endMs === undefined ? 'visible' : 'hidden'};opacity:${row.endMs === undefined ? 1 : 0}}`);
+  return `@keyframes ${row.name}{${frames.join('')}}`;
+ }).join('');
  let count = 0;
- const scroll = rows.flatMap(row => {
+ /** @type {{time: number, offset: number}[]} */
+ const scroll = [];
+ for (const row of rows) {
   count += row.units;
-  return count > windowRows && row.units ? [{ time: row.startMs, offset: count - windowRows }] : [];
- });
+  if (count > windowRows && row.units) {
+   const previous = scroll[scroll.length - 1];
+   if (previous?.time === row.startMs) previous.offset = count - windowRows;
+   else scroll.push({ time: row.startMs, offset: count - windowRows });
+  }
+ }
  const finalOffset = Math.max(0, count - windowRows);
  let css = '';
  if (scroll.length) {
-  let previous = 0;
-  const frames = ['0%{transform:translateY(0)}'];
+  const frames = scroll[0].time ? ['0%{transform:translateY(0)}'] : [];
   for (const step of scroll) {
    const percent = step.time / totalMs * 100;
-   frames.push(`${Math.max(0,percent - .001).toFixed(4)}%{transform:translateY(calc(-${previous} * var(--t-row)))}`, `${percent.toFixed(4)}%{transform:translateY(calc(-${step.offset} * var(--t-row)))}`);
-   previous = step.offset;
+   frames.push(`${percent}%{transform:translateY(calc(-${step.offset} * var(--t-row)))}`);
   }
   frames.push(`100%{transform:translateY(calc(-${finalOffset} * var(--t-row)))}`);
   css = `@keyframes t-scroll{${frames.join('')}}`;
  }
- return { rows, beam, settleMs, totalMs, finalOffset, css };
+ return { rows: timedRows, beam, settleMs, totalMs, finalOffset, scroll, revealCss, css };
 }

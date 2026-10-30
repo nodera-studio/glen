@@ -1,5 +1,5 @@
 // Adapted from Morphin morphing-navigation-tabs-compact-expanded (MIT, see ../LICENSE and site/morphin.json).
-// Verbatim source: site/vendor/morphin/morphing-navigation-tabs-compact-expanded/expandable-tabs.tsx.
+// Verbatim source: site/vendor/morphin/morphing-navigation-tabs-compact-expanded/components/ui/expandable-tabs.tsx.
 import { AnimatePresence, m, useReducedMotion } from 'motion/react';
 import { useRef, type ReactNode, type KeyboardEvent } from 'react';
 interface Props {
