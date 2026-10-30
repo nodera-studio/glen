@@ -892,3 +892,96 @@ fn ac410_sandbox_and_the_live_route() {
         assert!(!root.join("jobs").exists());
     }
 }
+
+/// MEDIUM-001: an EACCES on the live-endpoint socket connect maps to `sandboxed`
+/// under a Codex sandbox marker, and stays the plain `no_route` hint otherwise.
+#[test]
+fn ac410b_connect_denied_maps_to_sandboxed() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "skipping ac410b_connect_denied_maps_to_sandboxed: running as root, chmod 000 is not enforced"
+        );
+        return;
+    }
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    for (vars, exit) in [
+        (&[("CODEX_SANDBOX_NETWORK_DISABLED", "1")][..], 6),
+        (&[][..], 1),
+    ] {
+        let b = LiveBox::new();
+        let dir = home(&b).root.join("denied");
+        fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("x.sock");
+        b.write_registry(A_ID, std::process::id(), &socket);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        let _restore = Restore(dir.clone());
+        let o = b
+            .rpc
+            .glen(&["send", "e27c0de", "hi", "--json"])
+            .env("GLEN_OMP_BIN", "/nonexistent")
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if exit == 6 {
+            assert_eq!(o.status.code(), Some(6), "{o:?}");
+            let e = &json(&o)["error"];
+            assert_eq!(e["details"]["reason"], "sandboxed");
+        } else {
+            assert_eq!(o.status.code(), Some(6), "{o:?}");
+            let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
+            assert!(hint.contains("glen install-extension"), "{hint}");
+        }
+    }
+}
+
+/// LOW-001: a stale-registry cleanup that cannot write GLEN_HOME (EACCES on rename) maps
+/// to `sandboxed` under a Codex marker, and to the plain stale-cleanup failure otherwise.
+#[test]
+fn ac410c_registry_cleanup_denied_maps_to_sandboxed() {
+    use std::os::unix::fs::PermissionsExt;
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "skipping ac410c_registry_cleanup_denied_maps_to_sandboxed: running as root, chmod 000 is not enforced"
+        );
+        return;
+    }
+    struct Restore(std::path::PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
+        }
+    }
+    for (vars, exit) in [(&[("CODEX_SANDBOX", "seatbelt")][..], 6), (&[][..], 1)] {
+        let b = LiveBox::new();
+        let pid = common::dead_pid();
+        let socket = live::run_dir(&home(&b)).join(format!("{pid}.sock"));
+        b.write_registry(A_ID, pid, &socket);
+        let reg_dir = b.registry(A_ID).parent().unwrap().to_path_buf();
+        fs::set_permissions(&reg_dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let _restore = Restore(reg_dir.clone());
+        let o = b
+            .rpc
+            .glen(&["send", "e27c0de", "hi", "--json"])
+            .env("GLEN_OMP_BIN", "/nonexistent")
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap();
+        fs::set_permissions(&reg_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        if exit == 6 {
+            assert_eq!(o.status.code(), Some(6), "{o:?}");
+            let e = &json(&o)["error"];
+            assert_eq!(e["details"]["reason"], "sandboxed");
+        } else {
+            assert_eq!(o.status.code(), Some(6), "{o:?}");
+            let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
+            assert!(hint.contains("glen install-extension"), "{hint}");
+        }
+    }
+}

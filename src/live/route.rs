@@ -3,7 +3,7 @@ use super::{
     registry::{self, Registry},
 };
 use crate::glen_home::GlenHome;
-use std::time::Duration;
+use std::{io, time::Duration};
 #[derive(Debug)]
 pub enum Endpoint {
     None,
@@ -15,6 +15,10 @@ pub enum Endpoint {
     Unhealthy {
         reason: String,
         kind: Unhealthy,
+        /// The underlying I/O error, when this came from a socket connect or a
+        /// registry-cleanup write; lets the caller distinguish a sandbox
+        /// permission denial from a genuine endpoint problem.
+        io: Option<io::Error>,
     },
 }
 #[derive(Clone, Copy, Debug)]
@@ -25,7 +29,7 @@ pub enum Unhealthy {
     Incompatible,
 }
 fn cleanup(home: &GlenHome, reg: &Registry, socket_too: bool) -> Option<Endpoint> {
-    let reason = match registry::remove_if_unchanged(home, reg, socket_too) {
+    let (reason, io_err) = match registry::remove_if_unchanged(home, reg, socket_too) {
         Ok(true)
             if matches!(
                 registry::read(home, &reg.session_id),
@@ -34,12 +38,16 @@ fn cleanup(home: &GlenHome, reg: &Registry, socket_too: bool) -> Option<Endpoint
         {
             return None;
         }
-        Ok(_) => "live registry changed during stale cleanup; retry delivery".into(),
-        Err(e) => e.to_string(),
+        Ok(_) => (
+            "live registry changed during stale cleanup; retry delivery".into(),
+            None,
+        ),
+        Err(e) => (e.message.clone(), Some(e.io)),
     };
     Some(Endpoint::Unhealthy {
         reason,
         kind: Unhealthy::Unreadable,
+        io: io_err,
     })
 }
 pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
@@ -49,6 +57,7 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
             return Endpoint::Unhealthy {
                 reason,
                 kind: Unhealthy::Unreadable,
+                io: None,
             };
         }
         registry::Read::Ok(r) => r,
@@ -63,6 +72,7 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
         return Endpoint::Unhealthy {
             reason: "socket path too long".into(),
             kind: Unhealthy::PathTooLong,
+            io: None,
         };
     }
     match client::hello(&reg.socket, timeout) {
@@ -81,6 +91,7 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
         Ok(_) => Endpoint::Unhealthy {
             reason: "endpoint does not support protocol 1 send".into(),
             kind: Unhealthy::Incompatible,
+            io: None,
         },
         Err(ClientError::Connect(ConnectError::Missing | ConnectError::Refused)) => {
             if let Some(e) = cleanup(home, &reg, false) {
@@ -88,14 +99,19 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
             }
             Endpoint::Stale("socket went away".into())
         }
-        Err(e) => Endpoint::Unhealthy {
-            kind: if matches!(e, ClientError::Refused(_)) {
+        Err(e) => {
+            let reason = e.to_string();
+            let kind = if matches!(e, ClientError::Refused(_)) {
                 Unhealthy::Incompatible
             } else {
                 Unhealthy::Unresponsive
-            },
-            reason: e.to_string(),
-        },
+            };
+            let io = match e {
+                ClientError::Connect(ConnectError::Io(io_err)) => Some(io_err),
+                _ => None,
+            };
+            Endpoint::Unhealthy { reason, kind, io }
+        }
     }
 }
 pub fn hint(kind: Unhealthy) -> String {

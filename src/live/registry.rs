@@ -79,26 +79,38 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
 pub fn pid_dead(pid: u32) -> bool {
     matches!(liveness::start_token(pid), Probe::Gone)
 }
+/// A failed stale-registry cleanup, carrying the raw I/O error alongside the
+/// formatted message so callers can tell a sandbox permission denial from any
+/// other cleanup failure.
+#[derive(Debug)]
+pub struct CleanupError {
+    pub message: String,
+    pub io: std::io::Error,
+}
+impl std::fmt::Display for CleanupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+impl std::error::Error for CleanupError {}
 pub fn remove_if_unchanged(
     home: &GlenHome,
     reg: &Registry,
     socket_too: bool,
-) -> Result<bool, crate::error::GlenError> {
+) -> Result<bool, CleanupError> {
     let target = path(home, &reg.session_id);
     let tombstone = super::run_dir(home).join(format!(
         ".{}.{}.stale",
         lock_key(&reg.session_id),
         uuid::Uuid::now_v7()
     ));
-    let io = |e| {
-        crate::error::GlenError::new(
-            crate::error::ErrorCode::Io,
-            format!(
-                "cannot clean live registry {} for session {}: {e}",
-                target.display(),
-                reg.session_id
-            ),
-        )
+    let io = |e: std::io::Error| CleanupError {
+        message: format!(
+            "cannot clean live registry {} for session {}: {e}",
+            target.display(),
+            reg.session_id
+        ),
+        io: e,
     };
     match fs::rename(&target, &tombstone) {
         Ok(()) => (),

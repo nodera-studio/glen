@@ -113,7 +113,23 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
                 }
                 live = Some(reg);
             }
-            crate::live::route::Endpoint::Unhealthy { reason, kind } => {
+            crate::live::route::Endpoint::Unhealthy { reason, kind, io } => {
+                if let Some(e) = io {
+                    let mapped = match kind {
+                        crate::live::route::Unhealthy::Unresponsive => {
+                            crate::sandbox::map_socket_failure(env, "connect omp socket", &e)
+                        }
+                        crate::live::route::Unhealthy::Unreadable
+                            if crate::sandbox::restricted(env, &e) =>
+                        {
+                            Some(crate::sandbox::map_home_write(env, "send", e))
+                        }
+                        _ => None,
+                    };
+                    if let Some(err) = mapped {
+                        return Err(err);
+                    }
+                }
                 return Err(GlenError::new(
                     ErrorCode::NoRoute,
                     format!(

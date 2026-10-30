@@ -825,13 +825,10 @@ fn endpoint_check(
     id: Option<&str>,
     handle: Option<&str>,
 ) -> Result<(), Failure> {
-    if let Some(id) = id
-        && matches!(
-            crate::live::route::find(home, id, crate::live::HELLO_PROBE),
-            crate::live::route::Endpoint::Live { .. }
-                | crate::live::route::Endpoint::Unhealthy { .. }
-        )
-    {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let fallback = || -> Failure {
         let mut failure = Failure::new(
             "no_route",
             format!(
@@ -840,9 +837,38 @@ fn endpoint_check(
             ),
         );
         failure.hint = Some("send again; glen will deliver through the live session".into());
-        return Err(failure);
+        failure
+    };
+    match crate::live::route::find(home, id, crate::live::HELLO_PROBE) {
+        crate::live::route::Endpoint::Unhealthy {
+            kind, io: Some(e), ..
+        } => {
+            let env = Env::from_process();
+            let mapped = match kind {
+                crate::live::route::Unhealthy::Unresponsive => {
+                    crate::sandbox::map_socket_failure(&env, "connect omp socket", &e)
+                }
+                crate::live::route::Unhealthy::Unreadable
+                    if crate::sandbox::restricted(&env, &e) =>
+                {
+                    Some(crate::sandbox::map_home_write(&env, "send", e))
+                }
+                _ => None,
+            };
+            match mapped {
+                Some(err) => {
+                    let mut failure = Failure::new("no_route", err.message);
+                    failure.hint = err.hint;
+                    failure.details = err.details.map(|d| *d);
+                    Err(failure)
+                }
+                None => Err(fallback()),
+            }
+        }
+        crate::live::route::Endpoint::Unhealthy { .. }
+        | crate::live::route::Endpoint::Live { .. } => Err(fallback()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
     let message = match lease {
