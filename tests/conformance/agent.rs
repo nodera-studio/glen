@@ -401,6 +401,8 @@ enum Pre {
     Older,
     /// Older version, different body, intact digest.
     OlderBody,
+    /// Older version, body edited, digest left stale (cycle 1: `modified`).
+    OlderEdited,
     /// Same version, different body, intact digest (another build).
     OtherBuild,
     /// Newer version, intact digest.
@@ -422,6 +424,9 @@ fn bytes_for(pre: Pre, agent: &str) -> Vec<u8> {
         Pre::Current | Pre::LinkedFile => r.as_bytes().to_vec(),
         Pre::Older => sealed(r, OLDER),
         Pre::OlderBody => sealed(&with_extra_body(r), OLDER),
+        Pre::OlderEdited => {
+            with_extra_body(std::str::from_utf8(&sealed(r, OLDER)).unwrap()).into_bytes()
+        }
         Pre::OtherBuild => sealed(&with_extra_body(r), PKG_VERSION),
         Pre::Newer => sealed(r, NEWER),
         Pre::Modified => with_extra_body(r).into_bytes(),
@@ -1606,17 +1611,19 @@ fn ac405_ac406_every_flag_combination_over_current_installs() {
 
 #[test]
 fn ac405_claude_config_dir_moves_the_user_claude_target_only() {
-    // Absolute, relative (to the cwd) and empty (= unset) values.
-    let cases: [(&str, PathOf); 3] = [
+    // Absolute, relative (to the cwd), empty and whitespace-only (both unset, cycle 1) values.
+    let cases: [(&str, PathOf); 4] = [
         ("abs", |ws| ws.root.join("cfg/claude/skills/glen/SKILL.md")),
         ("rel", |ws| ws.cwd.join("rel/claude/skills/glen/SKILL.md")),
         ("empty", |ws| ws.user("claude")),
+        ("blank", |ws| ws.user("claude")),
     ];
     for (kind, want) in cases {
         let ws = Ws::new();
         let value = match kind {
             "abs" => s(&ws.root.join("cfg/claude")),
             "rel" => "rel/claude".to_owned(),
+            "blank" => "  \t ".to_owned(),
             _ => String::new(),
         };
         let out = ws
@@ -1633,7 +1640,7 @@ fn ac405_claude_config_dir_moves_the_user_claude_target_only() {
         );
         assert_eq!(fs::read(&claude).unwrap(), rendered("claude"), "{kind}");
         assert_eq!(fs::read(ws.user("codex")).unwrap(), rendered("codex"));
-        if kind != "empty" {
+        if !matches!(kind, "empty" | "blank") {
             assert!(!ws.home.join(".claude").exists(), "{kind}: wrote ~/.claude");
         }
         // --project ignores CLAUDE_CONFIG_DIR.
@@ -1679,9 +1686,15 @@ fn ac405_codex_home_is_ignored_and_codex_skills_never_written() {
     );
 }
 
+/// Cycle 1: directories 0755 and files 0644 *before umask*; glen never chmods past the umask.
 #[test]
-fn ac405_new_directories_are_0755_and_files_0644() {
-    for mask in ["000", "022"] {
+fn ac405_new_directories_and_files_are_0755_and_0644_before_umask() {
+    for (mask, m) in [
+        ("000", 0o000_u32),
+        ("022", 0o022),
+        ("027", 0o027),
+        ("077", 0o077),
+    ] {
         for project in [false, true] {
             let ws = Ws::new();
             let args: Vec<&str> = if project {
@@ -1694,27 +1707,29 @@ fn ac405_new_directories_are_0755_and_files_0644() {
             for agent in AGENTS {
                 let c = chain(&ws, agent, project);
                 for d in &c[..3] {
-                    assert_eq!(mode(d), 0o755, "umask {mask}: {}", d.display());
+                    assert_eq!(mode(d), 0o755 & !m, "umask {mask}: {}", d.display());
                 }
-                assert_eq!(mode(&c[3]), 0o644, "umask {mask}: {}", c[3].display());
+                assert_eq!(mode(&c[3]), 0o644 & !m, "umask {mask}: {}", c[3].display());
             }
         }
     }
-    // An upgrade writes a fresh 0644 file in place of an 0600 one.
-    let ws = Ws::new();
-    ws.place(&ws.user("claude"), &bytes_for(Pre::Older, "claude"));
-    set_mode(&ws.user("claude"), 0o600);
-    let out = ws
-        .glen_umask("000", &["install-skill", "--claude", "--json"])
-        .run();
-    assert_target(
-        &skill_env(&out),
-        "claude",
-        "upgraded",
-        "outdated",
-        Some(OLDER),
-    );
-    assert_eq!(mode(&ws.user("claude")), 0o644);
+    // An upgrade writes a fresh file in place of an 0600 one, at 0644 less the umask.
+    for (mask, m) in [("000", 0o000_u32), ("027", 0o027)] {
+        let ws = Ws::new();
+        ws.place(&ws.user("claude"), &bytes_for(Pre::Older, "claude"));
+        set_mode(&ws.user("claude"), 0o600);
+        let out = ws
+            .glen_umask(mask, &["install-skill", "--claude", "--json"])
+            .run();
+        assert_target(
+            &skill_env(&out),
+            "claude",
+            "upgraded",
+            "outdated",
+            Some(OLDER),
+        );
+        assert_eq!(mode(&ws.user("claude")), 0o644 & !m, "umask {mask}");
+    }
 }
 
 #[test]
@@ -2007,6 +2022,8 @@ fn ac406_older_versions_and_other_builds_are_upgraded() {
 }
 
 /// Newer, modified and foreign files are skipped with their warning; `--force` reinstalls them.
+/// Cycle 1: an older version with a stale digest is `modified`, and a foreign marker (another
+/// agent's included) reports `installed_version: null`.
 #[test]
 fn ac406_skipped_states_warn_and_force_reinstalls_them() {
     let cases = [
@@ -2017,6 +2034,7 @@ fn ac406_skipped_states_warn_and_force_reinstalls_them() {
             "skill_modified",
             Some(PKG_VERSION),
         ),
+        (Pre::OlderEdited, "modified", "skill_modified", Some(OLDER)),
         (Pre::Foreign, "foreign", "skill_foreign", None),
         (Pre::OtherAgent, "foreign", "skill_foreign", None),
         (Pre::LinkedFile, "foreign", "skill_foreign", None),
@@ -2031,7 +2049,7 @@ fn ac406_skipped_states_warn_and_force_reinstalls_them() {
             assert_target(&env, agent, "skipped", state, None);
             assert_warning(&env, warning);
             match (pre, version) {
-                (Pre::Foreign, _) => {
+                (Pre::Foreign | Pre::OtherAgent, _) => {
                     assert!(
                         tgt(&env["data"], agent)["installed_version"].is_null(),
                         "{ctx}"
@@ -2102,13 +2120,15 @@ fn ac406_uninstall_keeps_a_non_empty_glen_dir_with_a_warning() {
     }
 }
 
+/// Cycle 1: a skipped `--uninstall` emits the same warning code as a skipped install.
 #[test]
 fn ac406_uninstall_skips_modified_and_foreign_files_unless_forced() {
-    for (pre, state) in [
-        (Pre::Modified, "modified"),
-        (Pre::Foreign, "foreign"),
-        (Pre::OtherAgent, "foreign"),
-        (Pre::LinkedFile, "foreign"),
+    for (pre, state, warning) in [
+        (Pre::Modified, "modified", "skill_modified"),
+        (Pre::OlderEdited, "modified", "skill_modified"),
+        (Pre::Foreign, "foreign", "skill_foreign"),
+        (Pre::OtherAgent, "foreign", "skill_foreign"),
+        (Pre::LinkedFile, "foreign", "skill_foreign"),
     ] {
         for agent in AGENTS {
             let ws = Ws::new();
@@ -2116,6 +2136,7 @@ fn ac406_uninstall_skips_modified_and_foreign_files_unless_forced() {
             let original = fs::read(ws.user(agent)).unwrap();
             let env = install(&ws, agent, &["--uninstall"]);
             assert_target(&env, agent, "skipped", state, None);
+            assert_warning(&env, warning);
             assert_eq!(
                 fs::read(ws.user(agent)).unwrap(),
                 original,
@@ -2143,6 +2164,7 @@ fn ac406_dry_run_reports_the_real_actions_and_changes_nothing() {
         Pre::Older,
         Pre::Newer,
         Pre::Modified,
+        Pre::OlderEdited,
         Pre::Foreign,
     ];
     let modes: [&[&str]; 4] = [
@@ -2184,8 +2206,9 @@ fn ac406_dry_run_reports_the_real_actions_and_changes_nothing() {
 // AC-407 — exits and human output.
 // ---------------------------------------------------------------------------------------------
 
+/// User scope needs HOME (`invalid_env`); project scope does not (cycle 1).
 #[test]
-fn ac407_home_unset_or_empty_is_invalid_env() {
+fn ac407_home_unset_or_empty_is_invalid_env_for_the_user_scope_only() {
     let ws = Ws::new();
     for out in [
         ws.glen(["install-skill", "--dry-run", "--json"])
@@ -2199,6 +2222,39 @@ fn ac407_home_unset_or_empty_is_invalid_env() {
         out.assert_exit(2);
     }
     ws.assert_no_side_effects("HOME unset");
+    for home in [None, Some("")] {
+        let ws = Ws::new();
+        let run = |args: &[&str]| match home {
+            None => ws.glen(args).env_remove("HOME"),
+            Some(h) => ws.glen(args).env("HOME", h),
+        };
+        // A dry run first, so a wrong scope can never reach a real home directory.
+        let out = run(&["install-skill", "--project", "--dry-run", "--json"]).run();
+        let env = skill_env(&out);
+        assert_eq!(env["data"]["scope"], "project", "{}", out.ctx());
+        for agent in AGENTS {
+            assert_path_is(
+                &tgt(&env["data"], agent)["path"],
+                &ws.project(agent),
+                &out.ctx(),
+            );
+        }
+        let out = run(&["install-skill", "--project", "--json"]).run();
+        let env = skill_env(&out);
+        for agent in AGENTS {
+            assert_target(&env, agent, "installed", "not_installed", None);
+            assert_eq!(
+                fs::read(ws.project(agent)).unwrap(),
+                rendered(agent),
+                "{agent}"
+            );
+        }
+        assert!(
+            is_empty_dir(&ws.home),
+            "HOME {home:?}: wrote under the temp HOME"
+        );
+        ws.assert_no_side_effects("project install without HOME");
+    }
 }
 
 #[test]
@@ -2319,7 +2375,7 @@ fn ac408_doctor_appends_the_four_w4_checks_after_every_earlier_check() {
 
 #[test]
 fn ac408_doctor_reports_each_user_skill_state() {
-    let cases: [(Pre, &str, &str, Option<&str>, &str); 8] = [
+    let cases: [(Pre, &str, &str, Option<&str>, &str); 9] = [
         (
             Pre::Absent,
             "not_installed",
@@ -2343,6 +2399,7 @@ fn ac408_doctor_reports_each_user_skill_state() {
             Some(PKG_VERSION),
             "--force",
         ),
+        (Pre::OlderEdited, "modified", "warn", Some(OLDER), "--force"),
         (Pre::Foreign, "foreign", "warn", None, "--force"),
         (Pre::OtherAgent, "foreign", "warn", Some("?"), "--force"),
         (Pre::LinkedFile, "foreign", "warn", Some("?"), "--force"),
@@ -2399,12 +2456,15 @@ fn ac408_doctor_skill_paths_follow_claude_config_dir() {
         &ws.cwd.join("rel/cfg/skills/glen/SKILL.md"),
         &data.to_string(),
     );
-    let data = doctor(&ws, &[("CLAUDE_CONFIG_DIR", "")]);
-    assert_path_is(
-        &skills_entry(&data, "claude")["path"],
-        &ws.user("claude"),
-        &data.to_string(),
-    );
+    // Empty and whitespace-only values are unset (cycle 1).
+    for blank in ["", "  \t "] {
+        let data = doctor(&ws, &[("CLAUDE_CONFIG_DIR", blank)]);
+        assert_path_is(
+            &skills_entry(&data, "claude")["path"],
+            &ws.user("claude"),
+            &data.to_string(),
+        );
+    }
     // A skill installed there is current.
     skill_env(
         &ws.glen(["install-skill", "--claude", "--json"])
@@ -2486,31 +2546,44 @@ fn ac408_w4_rows_never_fail_doctor_and_doctor_creates_nothing() {
 // AC-409 — `.env` files omp reads.
 // ---------------------------------------------------------------------------------------------
 
-/// The check value names `file` (`~`-relative per AC-409, or absolute per §A10).
-fn value_names(v: &Value, file: &Path, home: &Path) -> bool {
-    let text = match v {
-        Value::Array(a) => a
-            .iter()
-            .map(|x| x.as_str().unwrap_or_default().to_owned())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        other => other.as_str().unwrap_or_default().to_owned(),
-    };
-    let tilde = file.strip_prefix(home).ok().map(|r| format!("~/{}", s(r)));
-    text.contains(&s(file)) || tilde.is_some_and(|t| text.contains(&t))
+/// The `omp_env_files` check and the files it lists. Cycle 1: the value is an array of absolute
+/// paths, `[]` when no file needs attention (the §A10 rule wins over AC-409's `~` wording).
+fn env_check(data: &Value) -> (Value, BTreeSet<String>) {
+    let c = check(data, "omp_env_files").clone();
+    let listed = c["value"]
+        .as_array()
+        .unwrap_or_else(|| panic!("omp_env_files.value is an array: {c}"))
+        .iter()
+        .map(|v| {
+            let p = v
+                .as_str()
+                .unwrap_or_else(|| panic!("omp_env_files.value holds strings: {c}"));
+            assert!(Path::new(p).is_absolute(), "the paths are absolute: {c}");
+            p.to_owned()
+        })
+        .collect();
+    (c, listed)
+}
+
+fn files(paths: &[&Path]) -> BTreeSet<String> {
+    paths.iter().map(|p| s(p)).collect()
+}
+
+fn assert_env_clean(data: &Value) {
+    let (c, _) = env_check(data);
+    assert_eq!(c["status"], "ok", "{c}");
+    assert_eq!(c["value"], Value::Array(vec![]), "{c}");
 }
 
 #[test]
-fn ac409_no_env_files_is_ok_with_value_none() {
+fn ac409_no_env_files_is_ok_with_an_empty_value() {
     let ws = Ws::new();
-    let c = check(&doctor(&ws, &[]), "omp_env_files").clone();
-    assert_eq!(c["status"], "ok", "{c}");
-    assert_eq!(c["value"], "none", "{c}");
+    assert_env_clean(&doctor(&ws, &[]));
 }
 
 #[test]
 fn ac409_each_location_omp_reads_is_checked() {
-    let cases: [EnvCase; 6] = [
+    let cases: [EnvCase; 8] = [
         (
             |ws| ws.home.join(".env"),
             "XDG_DATA_HOME=/x/data\n",
@@ -2547,17 +2620,31 @@ fn ac409_each_location_omp_reads_is_checked() {
             "XDG_DATA_HOME",
             &[("PI_CODING_AGENT_DIR", "")],
         ),
+        // Cycle 1: whitespace-only §A12 path variables count as unset.
+        (
+            |ws| ws.home.join(".env"),
+            "XDG_DATA_HOME=/x/data\n",
+            "XDG_DATA_HOME",
+            &[("XDG_DATA_HOME", "  ")],
+        ),
+        (
+            |ws| ws.cwd.join(".env"),
+            "PI_CODING_AGENT_DIR=/x/agent\n",
+            "PI_CODING_AGENT_DIR",
+            &[("PI_CODING_AGENT_DIR", " \t ")],
+        ),
     ];
     for (loc, contents, key, vars) in cases {
         let ws = Ws::new();
         let file = loc(&ws);
         ws.place(&file, contents.as_bytes());
-        let c = check(&doctor(&ws, vars), "omp_env_files").clone();
-        let ctx = format!("{} = {contents:?}: {c}", file.display());
+        let (c, listed) = env_check(&doctor(&ws, vars));
+        let ctx = format!("{} = {contents:?}, env {vars:?}: {c}", file.display());
         assert_eq!(c["status"], "warn", "{ctx}");
-        assert!(
-            value_names(&c["value"], &file, &ws.home),
-            "value lists the file: {ctx}"
+        assert_eq!(
+            listed,
+            files(&[&file]),
+            "value lists exactly that file: {ctx}"
         );
         assert!(
             c["detail"].as_str().is_some_and(|d| d.contains(key)),
@@ -2576,9 +2663,9 @@ fn ac409_profile_config_root_and_agent_dir_are_checked() {
             .glen(["doctor", "--json", "--profile", "work"])
             .fake_omp()
             .run();
-        let c = check(&out.ok_data(), "omp_env_files").clone();
+        let (c, listed) = env_check(&out.ok_data());
         assert_eq!(c["status"], "warn", "{rel}: {c}");
-        assert!(value_names(&c["value"], &file, &ws.home), "{rel}: {c}");
+        assert_eq!(listed, files(&[&file]), "{rel}: {c}");
     }
 }
 
@@ -2591,13 +2678,12 @@ fn ac409_several_files_are_all_listed_with_all_their_keys() {
     ws.place(&a, b"XDG_DATA_HOME=/x/data\n");
     ws.place(&b, b"export XDG_STATE_HOME=/x/state\n");
     ws.place(&unrelated, b"FOO=1\n");
-    let c = check(&doctor(&ws, &[]), "omp_env_files").clone();
+    let (c, listed) = env_check(&doctor(&ws, &[]));
     assert_eq!(c["status"], "warn", "{c}");
-    assert!(value_names(&c["value"], &a, &ws.home), "{c}");
-    assert!(value_names(&c["value"], &b, &ws.home), "{c}");
-    assert!(
-        !value_names(&c["value"], &unrelated, &ws.home),
-        "a file assigning none of the keys is not listed: {c}"
+    assert_eq!(
+        listed,
+        files(&[&a, &b]),
+        "both files, and not the one assigning none of the keys: {c}"
     );
     let detail = c["detail"].as_str().unwrap_or_default();
     assert!(
@@ -2606,6 +2692,8 @@ fn ac409_several_files_are_all_listed_with_all_their_keys() {
     );
 }
 
+/// Keys glen already has are not a gap. `OMP_CODING_AGENT_DIR` is the alias of
+/// `PI_CODING_AGENT_DIR` (§A12, cycle 1), so glen's own PI_ value covers both.
 #[test]
 fn ac409_keys_set_in_glens_own_environment_do_not_warn() {
     let ws = Ws::new();
@@ -2615,21 +2703,15 @@ fn ac409_keys_set_in_glens_own_environment_do_not_warn() {
     fs::create_dir(&state_home).unwrap();
     ws.place(
         &ws.home.join(".env"),
-        b"XDG_DATA_HOME=/x/data\nXDG_STATE_HOME=/x/state\nPI_CODING_AGENT_DIR=/x/agent\n",
+        b"XDG_DATA_HOME=/x/data\nXDG_STATE_HOME=/x/state\nPI_CODING_AGENT_DIR=/x/agent\nOMP_CODING_AGENT_DIR=/x/agent\n",
     );
-    let c = check(
-        &doctor(
-            &ws,
-            &[
-                ("XDG_DATA_HOME", s(&data_home).as_str()),
-                ("XDG_STATE_HOME", s(&state_home).as_str()),
-            ],
-        ),
-        "omp_env_files",
-    )
-    .clone();
-    assert_eq!(c["status"], "ok", "{c}");
-    assert_eq!(c["value"], "none", "{c}");
+    assert_env_clean(&doctor(
+        &ws,
+        &[
+            ("XDG_DATA_HOME", s(&data_home).as_str()),
+            ("XDG_STATE_HOME", s(&state_home).as_str()),
+        ],
+    ));
 }
 
 #[test]
@@ -2639,9 +2721,7 @@ fn ac409_unrelated_keys_and_comments_do_not_warn() {
         &ws.home.join(".env"),
         b"FOO=1\n# XDG_DATA_HOME=/x/data\nMY_XDG_DATA_HOME=/x\nXDG_DATA_HOME_OLD=/x\n",
     );
-    let c = check(&doctor(&ws, &[]), "omp_env_files").clone();
-    assert_eq!(c["status"], "ok", "{c}");
-    assert_eq!(c["value"], "none", "{c}");
+    assert_env_clean(&doctor(&ws, &[]));
 }
 
 #[test]
@@ -2654,9 +2734,7 @@ fn ac409_unreadable_files_are_skipped() {
     ws.place(&file, b"XDG_DATA_HOME=/x/data\n");
     set_mode(&file, 0o000);
     let _restore = RestoreMode(file.clone(), 0o644);
-    let c = check(&doctor(&ws, &[]), "omp_env_files").clone();
-    assert_eq!(c["status"], "ok", "{c}");
-    assert_eq!(c["value"], "none", "{c}");
+    assert_env_clean(&doctor(&ws, &[]));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2707,17 +2785,16 @@ fn assert_nothing_started(rb: &RpcBox, ctx: &str) {
 
 #[test]
 fn ac410_an_offline_sandbox_refuses_send_with_reason_details_and_hint() {
-    for sandbox in [Some("seatbelt"), None] {
+    // Cycle 1: only a non-empty CODEX_SANDBOX marks the sandbox; details carry its value.
+    for sandbox in ["seatbelt", "landlock"] {
         for target in [A.handle, "@latest", "@new"] {
             let rb = RpcBox::new();
-            let mut run = rb
+            let out = rb
                 .glen(["send", target, "hi", "--json"])
-                .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
-            if let Some(v) = sandbox {
-                run = run.env("CODEX_SANDBOX", v);
-            }
-            let out = run.run();
-            assert_sandboxed(&out, sandbox, false);
+                .env("CODEX_SANDBOX", sandbox)
+                .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+                .run();
+            assert_sandboxed(&out, Some(sandbox), false);
             assert!(
                 !rb.bx.glen_home.exists(),
                 "GLEN_HOME was created\n{}",
@@ -2841,6 +2918,65 @@ fn ac410_empty_or_zero_sandbox_variables_send_normally() {
     rb.assert_quiet();
 }
 
+/// Cycle 1: `CODEX_SANDBOX_NETWORK_DISABLED=1` without a non-empty `CODEX_SANDBOX` is not a
+/// sandbox (Codex also sets it on approved escalated commands), so the send proceeds.
+#[test]
+fn ac410_network_disabled_without_codex_sandbox_is_not_a_sandbox() {
+    for vars in [
+        &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")][..],
+        &[
+            ("CODEX_SANDBOX", ""),
+            ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ],
+    ] {
+        let rb = RpcBox::new();
+        let out = envs(
+            rb.glen(["send", A.handle, "hi", "--wait", "20s", "--json"]),
+            vars,
+        )
+        .run();
+        let d = data_of(&out, 0);
+        assert_eq!(d["status"], "completed", "{vars:?}: {d}");
+        rb.assert_quiet();
+    }
+}
+
+/// Cycle 1: in that state a real permission failure writing the job still maps to exit 6
+/// `sandboxed` with `glen_home_writable:false`, never a raw `io` error.
+#[test]
+fn ac410_network_disabled_alone_maps_a_glen_home_permission_failure_to_sandboxed() {
+    if running_as_root() {
+        return;
+    }
+    let rb = RpcBox::new();
+    let ro = rb.bx.root.join("ro");
+    fs::create_dir(&ro).unwrap();
+    set_mode(&ro, 0o555);
+    let _restore = RestoreMode(ro.clone(), 0o755);
+    let out = rb
+        .glen(["send", A.handle, "hi", "--json"])
+        .env("GLEN_HOME", ro.join("glen"))
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        .run();
+    let err = failed(&out, "no_route");
+    let d = &err["details"];
+    assert_eq!(d["reason"], "sandboxed", "{}", out.ctx());
+    assert_eq!(d["glen_home_writable"], false, "{}", out.ctx());
+    assert!(
+        d["sandbox"].is_null(),
+        "CODEX_SANDBOX is unset\n{}",
+        out.ctx()
+    );
+    assert_eq!(d["network"], false, "{}", out.ctx());
+    let hint = err["hint"].as_str().unwrap_or_default();
+    assert!(
+        hint.contains("TMPDIR") && hint.contains("writable_roots"),
+        "{}",
+        out.ctx()
+    );
+    assert!(rb.starts().is_empty(), "omp was started\n{}", rb.diag());
+}
+
 #[test]
 fn ac410_reads_work_inside_the_sandbox() {
     let bx = OmpBox::new();
@@ -2925,6 +3061,17 @@ fn ac410_doctor_sandbox_check_is_info_outside_and_warn_inside() {
         let c = check(&doctor(&ws, vars), "sandbox").clone();
         assert_eq!(c["status"], "info", "{vars:?}: {c}");
         assert_eq!(c["value"], "none", "{vars:?}: {c}");
+    }
+    // Cycle 1: network disabled by the host without CODEX_SANDBOX (or with it empty) is info.
+    for vars in [
+        &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")][..],
+        &[
+            ("CODEX_SANDBOX", ""),
+            ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ],
+    ] {
+        let c = check(&doctor(&ws, vars), "sandbox").clone();
+        assert_eq!(c["status"], "info", "{vars:?}: {c}");
     }
     for vars in [&OFFLINE[..], &NETWORKED[..]] {
         let c = check(&doctor(&ws, vars), "sandbox").clone();
@@ -3398,7 +3545,7 @@ fn ac412_contract_reader_errors() {
 }
 
 #[test]
-fn ac412_contract_send_completed() {
+fn ac412_contract_send_completed_and_jobs() {
     let rb = RpcBox::new();
     let out = rb
         .glen(["send", A.handle, "hi", "--wait", "20s", "--json"])
@@ -3406,6 +3553,15 @@ fn ac412_contract_send_completed() {
     data_of(&out, 0);
     assert_contract("send.completed", &out.json());
     rb.assert_quiet();
+    // The `jobs` example has a row, so compare it with a real, non-empty list.
+    let out = rb.glen(["jobs", "--json"]).run();
+    let data = out.ok_data();
+    assert!(
+        data["jobs"].as_array().is_some_and(|j| !j.is_empty()),
+        "{}",
+        out.ctx()
+    );
+    assert_contract("jobs", &out.json());
 }
 
 #[test]
@@ -3474,7 +3630,7 @@ fn ac412_contract_doctor_and_omp_unavailable() {
 }
 
 #[test]
-fn ac412_contract_completions_install_skill_and_jobs() {
+fn ac412_contract_completions_and_install_skill() {
     let ws = Ws::new();
     let out = ws.glen(["completions", "zsh", "--json"]).run();
     out.ok_data();
@@ -3484,9 +3640,10 @@ fn ac412_contract_completions_install_skill_and_jobs() {
         .run();
     skill_env(&out);
     assert_contract("install-skill", &out.json());
-    let out = ws.glen(["jobs", "--json"]).run();
-    out.ok_data();
-    assert_contract("jobs", &out.json());
+    // Without a GLEN_HOME, `jobs` is an empty list and creates nothing.
+    let data = ws.glen(["jobs", "--json"]).run().ok_data();
+    assert_eq!(data["jobs"], Value::Array(vec![]), "{data}");
+    assert_eq!(data["total"], 0, "{data}");
     ws.assert_no_side_effects("contracts");
 }
 
