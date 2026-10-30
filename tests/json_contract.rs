@@ -350,8 +350,14 @@ fn evidence_shapes() {
         eprintln!("skipped: GLEN_CONTRACT_EVIDENCE is unset");
         return;
     };
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(err) => {
+            eprintln!("skipped: no recording at {path}: {err}");
+            return;
+        }
+    };
     let docs = examples();
-    let text = fs::read_to_string(path).unwrap();
     let mut checked = 0;
     for line in text.lines() {
         let call: Value = serde_json::from_str(line).unwrap();

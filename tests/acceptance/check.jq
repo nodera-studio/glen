@@ -23,6 +23,14 @@ def final($ends):
 def denied: (tostring|ascii_downcase|test("permission[^\n]*den|denied|not allowed|dontask"));
 def uses($events): [$events[] | .. | objects | select(.type? == "tool_use")];
 def results($events): [$events[] | .. | objects | select(.type? == "tool_result")];
+def probe_success:
+  . as $raw |
+  (try (.content | if type=="string" then fromjson
+    elif type=="array" then [.[] | select(.type?=="text") | .text? | strings] | join("\n") | fromjson
+    else null end) catch null) as $parsed |
+  if $parsed == null then $raw | tostring | test("\\\"?ok\\\"?\\s*:\\s*true")
+  elif ($parsed|type)=="object" then $parsed.ok == true
+  else false end;
 $m[0] as $manifest | $calls as $all |
 [$all[]|select(.t=="end")] as $ends |
 [$all[]|select(.t=="start")] as $starts |
@@ -32,9 +40,9 @@ $m[0] as $manifest | $calls as $all |
 [$sends[]|select(is_target($manifest;"X"))] as $x |
 (if $mode == "b2" then
   uses($probe) as $pu | results($probe) as $pr | uses($control) as $cu | results($control) as $cr |
-  [$pu[]|select(.name=="Bash" and (.input.command|startswith("glen ")))] as $pc |
+  [$pu[]|select(.name=="Bash" and ((.input.command // "")|if type=="string" then startswith("glen ") else false end))] as $pc |
   [$cu[]|select(.name=="Bash" and (.input.command|startswith("glen ")))] as $cc |
-  [check("AC-416-probe"; any($pc[]; .id as $id | any($pr[]; .tool_use_id==$id and (denied|not) and (tostring|test("\\\"?ok\\\"?\\s*:\\s*true")))); "glen Bash result must succeed"),
+  [check("AC-416-probe"; any($pc[]; .id as $id | any($pr[]; .tool_use_id==$id and (denied|not) and probe_success)); "glen Bash result must succeed"),
    check("AC-416-control-denied"; any($cc[]; .id as $id | any($cr[]; .tool_use_id==$id and denied)); "otherwise inconclusive; never pass")]
  elif $mode == "a" then
   [check("AC-414-person"; $person.pass == true; $person)]

@@ -30,6 +30,30 @@ cp "$S/good.ndjson" "$S/calls.ndjson"
 printf '%s\n' '{"type":"tool_use","id":"skill","name":"Skill","input":{"skill":"glen"}}' '{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"glen ls"}}' '{"type":"tool_result","tool_use_id":"bash","content":"Permission denied"}' > "$S/b3.jsonl"
 if "$A/acc.sh" check b3 "$S"; then echo 'denied b3 recording passed' >&2; exit 1; fi
 jq -e '.checks|any(.id=="AC-420-permission" and (.pass|not))' "$S/verdict.json" >/dev/null
+jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
+  {type:"tool_result",tool_use_id:"probe",content:({v:1,ok:true,data:{sessions:[]}}|tojson)}]}}' > "$S/b2-probe.jsonl"
+printf '%s\n' '{"type":"tool_use","id":"control","name":"Bash","input":{"command":"glen ls"}}' '{"type":"tool_result","tool_use_id":"control","content":"Permission denied"}' > "$S/b2-control.jsonl"
+"$A/acc.sh" check b2 "$S"
+jq -e '.pass and (.checks|all(.pass))' "$S/verdict.json" >/dev/null
+# Text content arrays use the same JSON parsing path.
+jq -c '.message.content[1].content |= [{type:"text",text:.}]' "$S/b2-probe.jsonl" > "$S/probe-array.jsonl"
+cp "$S/probe-array.jsonl" "$S/b2-probe.jsonl"
+"$A/acc.sh" check b2 "$S"
+jq -e '.pass and (.checks|any(.id=="AC-416-probe" and .pass))' "$S/verdict.json" >/dev/null
+jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
+  {type:"tool_result",tool_use_id:"probe",content:({v:1,ok:false,error:{message:"Permission denied"}}|tojson)}]}}' > "$S/b2-probe.jsonl"
+if "$A/acc.sh" check b2 "$S"; then echo 'denied b2 recording passed' >&2; exit 1; fi
+jq -e '(.pass|not) and (.checks|any(.id=="AC-416-probe" and (.pass|not)))' "$S/verdict.json" >/dev/null
+# Missing recordings must retain every mode's check IDs in a valid failing verdict.
+for mode in a b b2 b3 c1 c2; do
+    "$A/acc.sh" check "$mode" "$S" >/dev/null || true
+    jq '[.checks[].id]' "$S/verdict.json" > "$S/check-ids.json"
+    rm "$S/calls.ndjson"
+    if "$A/acc.sh" check "$mode" "$S"; then echo "missing $mode recording passed" >&2; exit 1; fi
+    jq -e --slurpfile ids "$S/check-ids.json" --arg path "$S/calls.ndjson" \
+      '(.pass|not) and ([.checks[].id]==$ids[0]) and (.checks|length>0) and all(.checks[]; (.pass|not) and (.evidence|contains($path) and contains("missing recording")))' "$S/verdict.json" >/dev/null
+    cp "$S/good.ndjson" "$S/calls.ndjson"
+done
 # Exercise the guard with a fake binary, including --as before target and escaped cwd.
 printf '#!/usr/bin/env bash\nprintf '\''{"v":1,"ok":true,"data":{}}\\n'\''\n' > "$S/glen-bin/glen"
 chmod +x "$S/glen-bin/glen"
