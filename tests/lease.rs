@@ -2,7 +2,7 @@
 mod common;
 use common::{OmpBox, data};
 use std::{
-    fs::{self, File},
+    fs,
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -19,7 +19,11 @@ fn lease_holder() {
     let path = PathBuf::from(path);
     #[cfg(not(target_os = "linux"))]
     let _held = {
-        let f = File::options().read(true).write(true).open(path).unwrap();
+        let f = fs::File::options()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
         f.lock().unwrap();
         f
     };
@@ -136,7 +140,7 @@ fn ac108_permission_is_unknown() {
     let p = lock(&sb, 'B');
     let dir = p.parent().unwrap();
     fs::set_permissions(dir, fs::Permissions::from_mode(0o000)).unwrap();
-    if File::open(&p).is_ok() {
+    if fs::File::open(&p).is_ok() {
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
         return;
     }
