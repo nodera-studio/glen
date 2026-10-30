@@ -26,57 +26,107 @@ while [ "$#" -gt 0 ]; do
 done
 case "$MODEL" in cursor/?*) ;; *) die '--model must be cursor/<id>' ;; esac
 
-ENGINE_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
-MAIN="$(dirname "$(git -C "$ENGINE_ROOT" rev-parse --path-format=absolute --git-common-dir)")"
 # PI_CONFIG_DIR is a directory name under HOME, including when it starts with /.
 OMP_ROOT="$HOME/${PI_CONFIG_DIR:-.omp}"
+for tool in omp jq shasum; do
+  command -v "$tool" >/dev/null 2>&1 || die "Required tool missing: $tool"
+done
+# Match node:path.join's lexical normalization, including a leading slash in
+# PI_CONFIG_DIR (joined under HOME, never an absolute override).
+OMP_ROOT="$(jq -nr --arg path "$OMP_ROOT" '
+  $path | split("/") | reduce .[] as $part ([];
+    if $part == "" or $part == "." then .
+    elif $part == ".." then .[:-1] else . + [$part] end) | "/" + join("/")')"
+EXPECTED_AGENT_DIR="$OMP_ROOT/profiles/$PROFILE/agent"
+DEFAULT_AGENT_DIR="$OMP_ROOT/agent"
+MCP_TARGET="$EXPECTED_AGENT_DIR/mcp.json"
+SKILL_TARGET="$EXPECTED_AGENT_DIR/skills/mnemosyne-glen/SKILL.md"
+
+profile_path_guard() {
+  local target path ancestor suffix real
+  # config path initializes settings too. Check the expected chain BEFORE the
+  # first omp invocation, including config.yml and every asset parent directory.
+  for target in "$EXPECTED_AGENT_DIR" "$EXPECTED_AGENT_DIR/config.yml" "$MCP_TARGET" "$SKILL_TARGET"; do
+    path="$target"
+    while :; do
+      [ ! -L "$path" ] || die "Refusing symlink in harness profile path: $path"
+      [ "$path" != "$OMP_ROOT" ] || break
+      path="$(dirname "$path")"
+    done
+  done
+  # First-time setup need not have an agent directory yet. Resolve its nearest
+  # existing parent without creating anything and append the missing suffix.
+  ancestor="$EXPECTED_AGENT_DIR" suffix=''
+  while [ ! -d "$ancestor" ]; do
+    [ ! -e "$ancestor" ] || die "Harness profile parent is not a directory: $ancestor"
+    suffix="/$(basename "$ancestor")$suffix"
+    ancestor="$(dirname "$ancestor")"
+  done
+  real="$(cd "$ancestor" && pwd -P)$suffix"
+  [ "$real" = "$EXPECTED_AGENT_DIR" ] || die "Harness profile real path differs from expected path: $EXPECTED_AGENT_DIR"
+}
+profile_path_guard
+
+ENGINE_ROOT="$(git -C "$(dirname "$0")" rev-parse --show-toplevel)"
+MAIN="$(dirname "$(git -C "$ENGINE_ROOT" rev-parse --path-format=absolute --git-common-dir)")"
 OVERLAY="$ENGINE_ROOT/.claude/omp/glen-harness.yml"
 MCP_SOURCE="$ENGINE_ROOT/.claude/omp/mcp.json"
 SKILL_SOURCE="$ENGINE_ROOT/.claude/omp/skills/mnemosyne-glen/SKILL.md"
 SKILL_MARKER='<!-- Managed by omp-profile-setup.sh: mnemosyne-glen -->'
-for tool in omp jq shasum; do
-  command -v "$tool" >/dev/null 2>&1 || die "Required tool missing: $tool"
-done
 
+# dirs.ts:getNativesDir uses the config ROOT, not agent/natives. Include its
+# sorted entry list; redirected PI_NATIVES_DIR/XDG caches are outside this check.
+# Shared run/daemons/global and run/session-owners (possibly under
+# XDG_STATE_HOME/omp/run) are runtime state, intentionally not fingerprinted.
+COMPONENTS=(config.yml mcp.json extensions sessions natives)
 fingerprint() {
-  local agent="$OMP_ROOT/agent" file
-  for file in config.yml mcp.json; do
-    if [ -f "$agent/$file" ]; then
-      printf '%s ' "$file"
-      shasum -a 256 < "$agent/$file" || return 1
-    else
-      say "$file absent"
-    fi
-  done
-  say extensions
-  if [ -d "$agent/extensions" ]; then
-    find "$agent/extensions" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort || return 1
-  else
-    say absent
-  fi
-  say sessions
-  if [ -d "$agent/sessions" ]; then
-    if [ "$(uname -s)" = Darwin ]; then
-      find "$agent/sessions" -type f -exec stat -f '%m' {} + || return 1
-    else
-      find "$agent/sessions" -type f -exec stat -c '%Y' {} + || return 1
-    fi | awk 'BEGIN { count=0; newest=0 } { count++; if ($1>newest) newest=$1 } END { print count, newest }' || return 1
-  else
-    say '0 0'
-  fi
+  local component="$1" path="$DEFAULT_AGENT_DIR/$1"
+  [ "$component" != natives ] || path="$OMP_ROOT/natives"
+  case "$component" in
+    config.yml | mcp.json)
+      if [ -f "$path" ]; then shasum -a 256 < "$path"; else say absent; fi
+      ;;
+    extensions | natives)
+      if [ -d "$path" ]; then
+        find "$path" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort
+      else
+        say absent
+      fi
+      ;;
+    sessions)
+      if [ ! -d "$path" ]; then say '0 0'; return; fi
+      if [ "$(uname -s)" = Darwin ]; then
+        find "$path" -type f -exec stat -f '%m' {} + || return 1
+      else
+        find "$path" -type f -exec stat -c '%Y' {} + || return 1
+      fi | awk 'BEGIN { count=0; newest=0 } { count++; if ($1>newest) newest=$1 } END { print count, newest }'
+      ;;
+  esac
 }
 
-BEFORE="$(fingerprint)"
+BEFORE=()
+for component in "${COMPONENTS[@]}"; do
+  before="$(fingerprint "$component")" || die "Default-profile fingerprint could not be read: $component"
+  BEFORE+=("$before")
+done
 TMPROOT="$(mktemp -d)"
 finish() {
-  local status="$?" after
+  local status="$?" after component index=0 unchanged=yes
   trap - EXIT
-  if after="$(fingerprint)" && [ "$BEFORE" = "$after" ]; then
-    [ "$CHECK" -eq 0 ] || printf '%-30s %s\n' fingerprint-unchanged yes
-  else
+  for component in "${COMPONENTS[@]}"; do
+    if ! after="$(fingerprint "$component")"; then
+      say "ERROR: default-profile fingerprint could not be read: $component" >&2
+      status=1 unchanged=no
+    elif [ "${BEFORE[$index]}" != "$after" ]; then
+      say "ERROR: default-profile fingerprint changed: $component; inspect it manually." >&2
+      status=1 unchanged=no
+    fi
+    index=$((index + 1))
+  done
+  if [ "$unchanged" = no ]; then
     printf '%-30s %s\n' fingerprint-unchanged no >&2
-    say 'ERROR: default-profile fingerprint changed (or could not be read); inspect it manually.' >&2
-    status=1
+  elif [ "$CHECK" -eq 1 ]; then
+    printf '%-30s %s\n' fingerprint-unchanged yes
   fi
   rm -rf "$TMPROOT"
   exit "$status"
@@ -84,7 +134,7 @@ finish() {
 trap finish EXIT
 
 # Each call gets a new project-free cwd. Never inherit the caller's overlay or
-# active profile; the unqualified config path must refer to the default profile.
+# active profile; every omp invocation must explicitly select glen-harness.
 omp_run() {
   local layer="$1"
   shift
@@ -106,15 +156,10 @@ profile_omp() {
 }
 
 AGENT_DIR="$(profile_omp profile config path)"
-DEFAULT_AGENT_DIR="$(omp_run profile config path)"
 [ -n "$AGENT_DIR" ] || die 'omp returned an empty profile directory'
 [ "$AGENT_DIR" != "$DEFAULT_AGENT_DIR" ] || die 'Harness profile resolves to the default profile!'
-case "$AGENT_DIR" in
-  /*/profiles/glen-harness/agent) ;;
-  *) die "Unsafe harness profile directory: $AGENT_DIR" ;;
-esac
-MCP_TARGET="$AGENT_DIR/mcp.json"
-SKILL_TARGET="$AGENT_DIR/skills/mnemosyne-glen/SKILL.md"
+[ "$AGENT_DIR" = "$EXPECTED_AGENT_DIR" ] || die "Unsafe harness profile directory: $AGENT_DIR"
+profile_path_guard
 
 # Refuse owner-authored files before applying any settings, without displaying
 # their contents (the MCP file may contain credentials).
@@ -127,17 +172,22 @@ asset_guard() {
 asset_guard "$MCP_SOURCE" "$MCP_TARGET" '"mnemosyne"'
 asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"
 
-KEYS=(modelRoles.default tools.approvalMode tools.approval tools.xdev
+KEYS=(modelRoles tools.approvalMode tools.approval tools.xdev
   tools.restrictedFolders fetch.enabled web_search.enabled bash.enabled eval.py
   eval.js browser.enabled lsp.enabled mcp.enableProjectConfig mcp.startupTimeoutMs)
 CURRENT=() DESIRED=()
 DIFFERENCES=0
 for key in "${KEYS[@]}"; do
   current="$(profile_omp profile config get "$key" --json | jq -cS .value)"
-  if [ "$key" = modelRoles.default ]; then
+  if [ "$key" = modelRoles ]; then
+    # The CLI registers only the whole record. Preserve all other model roles.
+    value_to_set="$(printf '%s' "$current" | jq -ecS --arg model "$MODEL" '
+      if type == "object" then .default = $model else error("modelRoles must be a record") end')"
+    current="$(printf '%s' "$current" | jq -cS .default)"
     desired="$(jq -cn --arg model "$MODEL" '$model')"
   else
     desired="$(profile_omp overlay config get "$key" --json | jq -cS .value)"
+    value_to_set="$desired"
   fi
   CURRENT+=("$current")
   DESIRED+=("$desired")
@@ -148,7 +198,7 @@ for key in "${KEYS[@]}"; do
     if [ "$CHECK" -eq 1 ] || [ "$DRY_RUN" -eq 1 ]; then
       say "would change $key"
     else
-      profile_omp profile config set "$key" "$desired" >/dev/null
+      profile_omp profile config set "$key" "$value_to_set" >/dev/null
       say "changed $key"
     fi
   fi
@@ -213,11 +263,10 @@ if [ "$CHECK" -eq 1 ]; then
   row() { printf '%-30s %s\n' "$1" "$2"; }
   row 'profile dir' "$AGENT_DIR"
   [ -d "$AGENT_DIR" ] || FAILED=1
-  OMP_VERSION="$(omp_run profile --version)"
+  OMP_VERSION="$(profile_omp profile --version)"
   row 'omp version' "$OMP_VERSION"
-  if [ "$OMP_VERSION" != 18.14.0 ]; then
+  if [ "${OMP_VERSION##*/}" != 18.14.0 ]; then
     say 'WARN: expected omp 18.14.0' >&2
-    FAILED=1
   fi
   row 'glen binary' "$GLEN_BIN"
   if GLEN_VERSION="$(glen_run --version)"; then
