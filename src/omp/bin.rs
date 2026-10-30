@@ -291,25 +291,36 @@ mod tests {
     fn version_timeout_kills_descendants_and_inherited_pipes() {
         let t = tempfile::tempdir().unwrap();
         let start = Instant::now();
+        // Write and close every script before spawning any thread. If a script
+        // were still written while another thread's `Command::spawn` is forking to
+        // exec a different script, the forking child would briefly inherit the
+        // open write fd (fork happens before the child's own execve, so CLOEXEC
+        // hasn't fired yet); a third thread execing the first script could then
+        // observe that still-open fd and fail with ETXTBSY ("Text file busy").
+        let bins: Vec<(PathBuf, &str)> = [
+            ("waiting", "", "wait", "omp --version timed out"),
+            ("stdout", "", "echo omp/18.14.0; exit 0", "output timed out"),
+            (
+                "stderr",
+                ">/dev/null",
+                "echo omp/18.14.0; exit 0",
+                "output timed out",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, redirect, ending, message)| {
+            let bin = script(
+                t.path(),
+                name,
+                &format!("( /bin/sleep 1; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"),
+            );
+            (bin, message)
+        })
+        .collect();
         thread::scope(|scope| {
             let mut cases = Vec::new();
-            for (name, redirect, ending, message) in [
-                ("waiting", "", "wait", "omp --version timed out"),
-                ("stdout", "", "echo omp/18.14.0; exit 0", "output timed out"),
-                (
-                    "stderr",
-                    ">/dev/null",
-                    "echo omp/18.14.0; exit 0",
-                    "output timed out",
-                ),
-            ] {
-                let bin = script(
-                    t.path(),
-                    name,
-                    &format!(
-                        "( /bin/sleep 1; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"
-                    ),
-                );
+            for (bin, message) in bins {
+                let name = bin.file_name().unwrap().to_str().unwrap().to_string();
                 cases.push(scope.spawn(move || {
                     let start = Instant::now();
                     let result = omp_version(&bin, Duration::from_millis(300), None);
