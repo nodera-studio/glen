@@ -26,8 +26,12 @@ while [ "$#" -gt 0 ]; do
 done
 case "$MODEL" in cursor/?*) ;; *) die '--model must be cursor/<id>' ;; esac
 
+# HOME's ancestry may contain system aliases such as macOS /var -> /private/var.
+# Anchor both our baseline and child directory resolution to the same physical HOME;
+# symlinks below it still go through profile_path_guard before any omp invocation.
+PROFILE_HOME="$(cd "$HOME" && pwd -P)" || die 'Could not resolve HOME directory'
 # PI_CONFIG_DIR is a directory name under HOME, including when it starts with /.
-OMP_ROOT="$HOME/${PI_CONFIG_DIR:-.omp}"
+OMP_ROOT="$PROFILE_HOME/${PI_CONFIG_DIR:-.omp}"
 for tool in omp jq shasum; do
   command -v "$tool" >/dev/null 2>&1 || die "Required tool missing: $tool"
 done
@@ -74,19 +78,18 @@ MCP_SOURCE="$ENGINE_ROOT/.claude/omp/mcp.json"
 SKILL_SOURCE="$ENGINE_ROOT/.claude/omp/skills/mnemosyne-glen/SKILL.md"
 SKILL_MARKER='<!-- Managed by omp-profile-setup.sh: mnemosyne-glen -->'
 
-# dirs.ts:getNativesDir uses the config ROOT, not agent/natives. Include its
-# sorted entry list; redirected PI_NATIVES_DIR/XDG caches are outside this check.
+# Root natives/ is a shared, cross-profile native-binary cache populated by omp
+# invocations under any profile, intentionally outside the default-profile fingerprint.
 # Shared run/daemons/global and run/session-owners (possibly under
 # XDG_STATE_HOME/omp/run) are runtime state, intentionally not fingerprinted.
-COMPONENTS=(config.yml mcp.json extensions sessions natives)
+COMPONENTS=(config.yml mcp.json extensions sessions)
 fingerprint() {
   local component="$1" path="$DEFAULT_AGENT_DIR/$1"
-  [ "$component" != natives ] || path="$OMP_ROOT/natives"
   case "$component" in
     config.yml | mcp.json)
       if [ -f "$path" ]; then shasum -a 256 < "$path"; else say absent; fi
       ;;
-    extensions | natives)
+    extensions)
       if [ -d "$path" ]; then
         find "$path" -mindepth 1 -maxdepth 1 -print | LC_ALL=C sort
       else
@@ -142,10 +145,10 @@ omp_run() {
     cd "$(mktemp -d "$TMPROOT/omp.XXXXXX")" || exit 1
     if [ "$layer" = overlay ]; then
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u OMP_PROFILE -u PI_PROFILE PI_CONFIG_FILES="$OVERLAY" omp "$@"
+        -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" PI_CONFIG_FILES="$OVERLAY" omp "$@"
     else
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u OMP_PROFILE -u PI_PROFILE omp "$@"
+        -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" omp "$@"
     fi
   )
 }
@@ -230,7 +233,7 @@ glen_run() {
   (
     cd "$(mktemp -d "$TMPROOT/glen.XXXXXX")" || exit 1
     env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-      -u OMP_PROFILE -u PI_PROFILE "$GLEN_BIN" "$@"
+      -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" "$GLEN_BIN" "$@"
   )
 }
 if [ "$CHECK" -eq 0 ]; then

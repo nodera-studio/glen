@@ -145,6 +145,37 @@ setup_run "$SETUP" --dry-run
 assert_exit 'leading-slash PI_CONFIG_DIR stays under scratch HOME' 0
 assert 'custom config directory still scopes every call' all_scoped
 
+# HOME aliases are allowed; only symlinks below its physical location are unsafe.
+# Cover both the nearest-existing-ancestor fallback and an existing agent dir.
+for existing in no yes; do
+  new_fixture
+  [ "$existing" != yes ] || ready_assets
+  physical_home="$TEST_HOME"
+  ln -s "$physical_home" "$CASE_DIR/home-alias"
+  TEST_HOME="$CASE_DIR/home-alias"
+  setup_run "$SETUP" --dry-run
+  assert_exit "symlinked HOME existing=$existing dry-run succeeds" 0
+  assert "symlinked HOME existing=$existing keeps harness scope" all_scoped
+  # shellcheck disable=SC2016 # jq expands its own --arg variable.
+  assert "symlinked HOME existing=$existing uses physical HOME for omp" jq -es \
+    --arg home "$physical_home" 'length > 0 and all(.[]; .home==$home)' "$FAKE_OMP_LOG"
+done
+
+new_fixture
+ready_assets
+physical_home="$TEST_HOME"
+cp -R "$TEST_AGENT" "$CASE_DIR/outside-agent"
+rm -r "$TEST_AGENT"
+ln -s "$CASE_DIR/outside-agent" "$TEST_AGENT"
+ln -s "$physical_home" "$CASE_DIR/home-alias"
+TEST_HOME="$CASE_DIR/home-alias"
+before="$(tree_contents "$CASE_DIR")"
+setup_run "$SETUP" --dry-run
+assert_exit 'symlinked HOME still refuses symlink at agent component' 1
+assert_contains 'symlinked HOME component refusal names physical agent path' "$TEST_AGENT" "$STDERR"
+assert 'symlinked HOME component refusal precedes omp initialization' test ! -s "$FAKE_OMP_LOG"
+assert_eq 'symlinked HOME component refusal leaves fixture unchanged' "$(tree_contents "$CASE_DIR")" "$before"
+
 for version in omp/18.14.0 18.14.0 omp/18.15.0; do
   new_fixture
   ready_assets
@@ -207,7 +238,7 @@ assert_contains 'default directory collision diagnostic' 'resolves to the defaul
 assert 'directory collision never queries default profile' all_scoped
 assert 'directory collision performs no config sets' test "$(grep -c '^config set ' "$FAKE_OMP_WRITES" || true)" -eq 0
 
-for component in config.yml mcp.json extensions sessions natives; do
+for component in config.yml mcp.json extensions sessions; do
   new_fixture
   ready_assets
   export FAKE_OMP_MUTATE="$component"
@@ -216,12 +247,17 @@ for component in config.yml mcp.json extensions sessions natives; do
   assert_contains "default fingerprint names changed $component" "default-profile fingerprint changed: $component" "$STDERR"
   assert 'fingerprint mismatch reports no unchanged claim' test "$(grep -c 'fingerprint-unchanged.*yes' "$STDOUT" || true)" -eq 0
 done
-new_fixture
-ready_assets
-export FAKE_OMP_MUTATE=run
-setup_run "$SETUP" --check
-assert_exit 'documented shared run directory remains outside fingerprint' 0
-assert 'shared runtime fixture really changed' test -f "$TEST_ROOT/run/daemons/global/added"
+for component in run natives; do
+  new_fixture
+  ready_assets
+  export FAKE_OMP_MUTATE="$component"
+  setup_run "$SETUP" --check
+  assert_exit "documented shared $component directory remains outside fingerprint" 0
+  assert_contains "shared $component mutation leaves default fingerprint unchanged" 'fingerprint-unchanged' "$STDOUT"
+  assert "shared $component mutation reports no fingerprint error" test ! -s "$STDERR"
+  if [ "$component" = run ]; then path="$TEST_ROOT/run/daemons/global/added"; else path="$TEST_ROOT/natives/added"; fi
+  assert "shared $component fixture really changed" test -f "$path"
+done
 
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]
