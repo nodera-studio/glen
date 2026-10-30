@@ -198,7 +198,38 @@ fn entry_leaf(e: &Entry) -> Option<&str> {
 /// Preserve nonblank session text exactly; human renderers collapse whitespace
 /// in single-line fields and escape controls at the presentation boundary.
 pub fn display_name(raw: &str) -> Option<String> {
-    (!raw.trim().is_empty()).then(|| raw.to_owned())
+    // ECMAScript WhiteSpace + LineTerminator (String.prototype.trim).
+    let blank = raw.chars().all(|c| {
+        matches!(
+            c,
+            '\u{0009}'..='\u{000d}'
+                | '\u{0020}'
+                | '\u{00a0}'
+                | '\u{1680}'
+                | '\u{2000}'..='\u{200a}'
+                | '\u{2028}'..='\u{2029}'
+                | '\u{202f}'
+                | '\u{205f}'
+                | '\u{3000}'
+                | '\u{feff}'
+        )
+    });
+    (!blank).then(|| raw.to_owned())
+}
+/// omp's listing preview includes only text blocks, without transcript placeholders.
+pub fn text_only(content: &Value, sep: &str) -> String {
+    if let Some(s) = content.as_str() {
+        s.into()
+    } else {
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|v| v["type"] == "text")
+            .map(|v| v["text"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join(sep)
+    }
 }
 pub fn text_of(content: &Value, sep: &str) -> String {
     if let Some(s) = content.as_str() {
@@ -276,6 +307,13 @@ mod tests {
         let raw = "  title\twith\n\x1b[31m\x00\x7f  ";
         assert_eq!(super::display_name(raw).as_deref(), Some(raw));
         assert_eq!(super::display_name(" \n\t "), None);
+    }
+    #[test]
+    fn display_names_use_javascript_trim_whitespace() {
+        assert_eq!(super::display_name(" \u{feff}\n"), None);
+        assert_eq!(super::display_name("\u{0085}").as_deref(), Some("\u{0085}"));
+        assert_eq!(super::display_name("\u{200b}").as_deref(), Some("\u{200b}"));
+        assert_eq!(super::display_name("\u{180e}").as_deref(), Some("\u{180e}"));
     }
     use super::*;
     use serde_json::json;
