@@ -247,6 +247,15 @@ fn execute(
     }
     Ok((data, warnings))
 }
+fn check_instructions_len(instructions: &str) -> Result<(), GlenError> {
+    if instructions.len() > ops::MAX_INSTRUCTIONS {
+        return Err(GlenError::new(
+            ErrorCode::Usage,
+            "compaction instructions are larger than 512 KiB",
+        ));
+    }
+    Ok(())
+}
 fn run_control(
     cli: &Cli,
     env: &Env,
@@ -258,13 +267,8 @@ fn run_control(
     let deadline = Instant::now() + timeout;
     let stop = wait::install_interrupt()?;
     let opened = open(cli, env, target)?;
-    if let Control::Compact(Some(instructions)) = &control
-        && instructions.len() > ops::MAX_INSTRUCTIONS
-    {
-        return Err(GlenError::new(
-            ErrorCode::Usage,
-            "compaction instructions are larger than 512 KiB",
-        ));
+    if let Control::Compact(Some(instructions)) = &control {
+        check_instructions_len(instructions)?;
     }
     let progress = match &control {
         Control::Abort => format!("stopping {}…", opened.handle),
@@ -741,6 +745,19 @@ fn models_table(data: &Value, ctx: &OutputCtx) -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    // Linux MAX_ARG_STRLEN (131072 bytes) prevents testing the full 512 KiB
+    // boundary through argv; the conformance test still covers that path on macOS.
+    #[test]
+    fn instructions_are_bounded_at_524288_bytes() {
+        let at = "x".repeat(524_288);
+        assert!(check_instructions_len(&at).is_ok());
+        let over = "x".repeat(524_289);
+        assert_eq!(
+            check_instructions_len(&over).unwrap_err().code,
+            ErrorCode::Usage
+        );
+    }
 
     fn human_output() -> OutputCtx {
         let cli = Cli::try_parse_from(["glen", "--human", "models"]).unwrap();

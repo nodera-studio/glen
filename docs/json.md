@@ -1467,6 +1467,8 @@ Without a target omp starts with `--no-session`; `default_model` is that in-memo
 
 `glen compact <session> [--instructions TEXT] [--timeout DUR]` returns `{session,route,compacted:true,tokens_before,tokens_after,forked}`. Instructions are at most 524288 bytes. Streaming, compacting, queued messages or an active job refuse with control_failed/busy. Token fields are null when not reported.
 
+On Linux, command-line instructions are limited by the OS to 128 KiB (`MAX_ARG_STRLEN`), well below the 512 KiB application limit, so a near-512-KiB `--instructions` argument may fail to launch glen rather than receive glen's own usage error.
+
 <!-- contract: compact -->
 ```json
 {

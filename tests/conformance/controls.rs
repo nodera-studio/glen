@@ -1481,6 +1481,9 @@ fn ac362_compact_on_an_idle_unowned_session_passes_the_instructions_and_reports_
     lb.assert_quiet();
 }
 
+// Linux MAX_ARG_STRLEN (131072 bytes) prevents this argv boundary test; see
+// commands::ctl::tests::instructions_are_bounded_at_524288_bytes for direct coverage.
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn ac362_r4_instructions_are_bounded_at_524288_bytes() {
     let lb = LiveBox::new();
