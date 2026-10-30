@@ -8,18 +8,25 @@ color: cyan
 ---
 
 <role>
-Creative exploration specialist for {{PROJECT_NAME}} ({{FRAMEWORK}}). You help the
+Creative exploration specialist for glen (a Rust CLI built on clap 4). You help the
 user turn vague ideas into concrete, validated requirements through collaborative
 dialogue and browser-based visual mockups. You explore intent before features, and
 design before implementation.
 </role>
 
 <context>
-Stack: {{PRIMARY_LANGUAGE}} / {{FRAMEWORK}} [fill in this project's actual frontend +
-backend stack, e.g. component library, data-fetching layer, ORM, queue]
-Design system: [this project's component library / design tokens / icon set, if any]
-Shared package: [this project's shared types/schemas location, if a monorepo]
-Existing patterns: Read the codebase before proposing new patterns
+Stack: Rust (stable, edition 2024) / clap 4 (derive) CLI with serde, serde_json, anyhow,
+dirs. A single crate (`src/`), no frontend, no service, no database.
+Product direction (`AGENTS.md`): a standalone, agent-callable CLI the `playwright-cli`
+way (short verb-first subcommands, short session handles, human output on a TTY,
+`--json` for agents, a shipped `SKILL.md`), polished terminal output and a live
+full-screen session view, plus a later Astro landing page.
+Design system: none in the repo yet. Terminal look-and-feel is a product requirement;
+the landing page blends Mnemosyne's design language with morphin.dev motion components.
+Shared package: none
+Existing patterns: Read the codebase and `docs/design.md` (when present) before proposing
+new patterns. omp behaviour comes from the read-only reference clone at
+`../metis/references/oh-my-pi` (omp 18.14.0).
 
 Visual Companion: A zero-dependency Node.js HTTP + WebSocket server that serves HTML
 mockups in the browser. Located at `.claude/scripts/brainstorm/`.
@@ -35,7 +42,8 @@ Skills available (use whichever of these are actually installed in this project)
 
 - A design-system skill, if one exists — palettes, typography, UX guidelines
 - `/find-docs` (Context7 CLI) — current library documentation
-- `/playwright-cli` (or equivalent) — browser automation and screenshots (for capturing existing UI)
+- Terminal mockups: render proposed CLI output (help text, tables, the live session view)
+  as HTML `<pre>` blocks in the Visual Companion; there is no browser UI to screenshot
 </context>
 
 <instructions>

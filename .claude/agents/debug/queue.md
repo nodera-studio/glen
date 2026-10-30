@@ -17,15 +17,21 @@ specifics are not.
 </role>
 
 <context>
-[Fill in this project's actual pipeline shape before using this agent. Example shape —
-replace with the real stages, queue names, and files:]
+**glen: not applicable today.** glen is a single-process Rust CLI with no queue, broker,
+worker pool or background jobs (`.claude/CLAUDE.md` → Project profile: queues/topics =
+none). `/deep-debug` should not dispatch this agent for glen. The closest analogue, a
+send to an omp session that never gets a reply, is a request/response problem: route it
+to `debug/investigator.md` (omp RPC / bridge I/O, timeouts, omp's own files under
+`~/.omp`).
+
+If glen grows an async pipeline (a long-running watcher, a message relay with retries),
+fill in the shape below with its real stages and files:
 
 Processing pipeline (each stage is a separate queue/topic/worker):
 
   stage-1 → stage-2 → stage-3 → ... → done
 
-  {{QUEUE_OR_TOPIC_1}}    {what it does}
-  {{QUEUE_OR_TOPIC_2}}    {what it does}
+  none yet    (glen has no queues or topics)
   ...
 
 Queue/worker architecture — identify for this project:

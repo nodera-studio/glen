@@ -7,14 +7,49 @@
   },
   "permissions": {
     "allow": [
-      "mcp__memory__memory_search",
-      "mcp__memory__memory_get",
-      "mcp__memory__memory_get_recent",
-      "mcp__memory__memory_get_entity",
-      "mcp__memory__memory_list",
-      "mcp__codebase__code_search",
-      "mcp__codebase__code_get_file",
-      "mcp__codebase__code_index_status",
+      "Bash(cargo build:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(cargo fmt:*)",
+      "mcp__plugin_mnemosyne_memory__memory_search",
+      "mcp__plugin_mnemosyne_memory__memory_get",
+      "mcp__plugin_mnemosyne_memory__memory_get_recent",
+      "mcp__plugin_mnemosyne_memory__memory_get_entity",
+      "mcp__plugin_mnemosyne_memory__memory_list",
+      "mcp__plugin_mnemosyne_memory__memory_decision_chain",
+      "mcp__plugin_mnemosyne_memory__memory_store",
+      "mcp__plugin_mnemosyne_memory__memory_update",
+      "mcp__plugin_mnemosyne_codebase__code_search",
+      "mcp__plugin_mnemosyne_codebase__code_get_file",
+      "mcp__plugin_mnemosyne_codebase__code_index_status",
+      "mcp__plugin_mnemosyne_secrets__secret_list",
+      "mcp__plugin_mnemosyne_workspace__board_list",
+      "mcp__plugin_mnemosyne_workspace__board_place",
+      "mcp__plugin_mnemosyne_workspace__board_promote",
+      "mcp__plugin_mnemosyne_workspace__document_get",
+      "mcp__plugin_mnemosyne_workspace__document_read",
+      "mcp__plugin_mnemosyne_workspace__document_list",
+      "mcp__plugin_mnemosyne_workspace__document_find",
+      "mcp__plugin_mnemosyne_workspace__document_create",
+      "mcp__plugin_mnemosyne_workspace__document_update",
+      "mcp__plugin_mnemosyne_workspace__document_edit",
+      "mcp__plugin_mnemosyne_workspace__document_comment",
+      "mcp__plugin_mnemosyne_workspace__document_relation",
+      "mcp__plugin_mnemosyne_workspace__document_tags_update",
+      "mcp__plugin_mnemosyne_workspace__queue_create",
+      "mcp__plugin_mnemosyne_workspace__queue_get",
+      "mcp__plugin_mnemosyne_workspace__queue_list",
+      "mcp__plugin_mnemosyne_workspace__queue_update",
+      "mcp__plugin_mnemosyne_workspace__queue_item_add",
+      "mcp__plugin_mnemosyne_workspace__queue_item_update",
+      "mcp__plugin_mnemosyne_workspace__queue_item_move",
+      "mcp__plugin_mnemosyne_workspace__research_start",
+      "mcp__plugin_mnemosyne_workspace__research_submit",
+      "mcp__plugin_mnemosyne_workspace__research_source_add",
+      "mcp__plugin_mnemosyne_workspace__research_references",
+      "mcp__plugin_mnemosyne_workspace__project_overview",
+      "mcp__plugin_mnemosyne_workspace__workspace_search",
       "mcp__exa__web_search_exa",
       "mcp__exa__web_search_advanced_exa",
       "mcp__exa__web_fetch_exa",
@@ -24,8 +59,8 @@
     "deny": [
       "WebSearch",
       "WebFetch",
-      "mcp__secrets__secret_set",
-      "mcp__secrets__secret_delete",
+      "mcp__plugin_mnemosyne_secrets__secret_set",
+      "mcp__plugin_mnemosyne_secrets__secret_delete",
       "Bash(rm -rf:*)",
       "Bash(sudo:*)",
       "Bash(chmod 777:*)"
@@ -84,21 +119,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": ".claude/hooks/prettier-on-edit.sh"
-          },
-          {
-            "type": "command",
             "command": ".claude/hooks/shellcheck-on-edit.sh"
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": ".claude/hooks/mnemosyne-capture.sh"
           }
         ]
       }

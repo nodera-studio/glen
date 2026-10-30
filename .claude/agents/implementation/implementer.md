@@ -19,12 +19,13 @@ that the generative loop stays in one head. You run as a dispatched subagent; yo
 do not spawn further subagents.
 </role>
 
-**Done when:** the slice's tests pass AND `bash scripts/quality-gate.sh` reports no
-blocking findings, `progress.md` is updated, and you've returned a tight report.
+**Done when:** the slice's tests pass (`cargo test --locked`) AND
+`bash .claude/scripts/quality-gate.sh` (rustfmt check + clippy `-D warnings`) exits 0,
+`progress.md` is updated, and you've returned a tight report.
 
-Ground every decision in `.claude/CLAUDE.md` and the relevant area doc
-(QueueProcessing.md for queue work, DataModel.md for schema, etc.). Read the
-affected area before you touch it and match its style.
+Ground every decision in `AGENTS.md`, `.claude/CLAUDE.md` and the relevant area doc
+(`docs/design.md` for the omp surfaces glen builds on). Read the affected area before
+you touch it and match its style.
 
 ## The loop (write → run → fix, until green)
 
@@ -35,24 +36,22 @@ affected area before you touch it and match its style.
    write. The codebase MCP is for orientation; the LSP is your live truth in-loop.
 2. **Implement.** Write the code per the plan, matching surrounding idioms. **Wire
    every layer** so the feature is actually reachable, not just present:
-   schema → service → endpoint → UI as applicable; register modules/providers,
-   exports, routes, and DI. A feature that compiles but isn't wired is not done.
-3. **Harden error paths.** Every new async path is `await`ed (no floating
-   promises). Failures surface a typed error code mapped to a user-facing message
-   (per this project's error-message language convention); no swallowed `catch`; no
-   untyped error bodies; external calls (payment/auth/storage/queue providers — this
-   project's actual external dependencies) have explicit failure handling and
-   idempotency where retries are possible.
+   clap subcommand/args → handler → library module → output (human on a TTY and
+   `--json`); declare new modules (`mod`), re-exports and the subcommand enum variant.
+   A feature that compiles but isn't reachable from the CLI is not done.
+3. **Harden error paths.** `anyhow` + `.context()` in the binary, `thiserror` in
+   library modules; no `unwrap()`/`expect()` on external data (omp files, RPC replies,
+   argv, env); no discarded `Result`s; omp formats parsed leniently (unknown entry types
+   and fields skipped); every wait on omp has a timeout; never write to an omp session
+   `.jsonl`.
 4. **Write tests.** Unit + integration for the new behavior, including the edges
    the plan implies — not just the happy path. Never weaken a test to make it
    pass; if a test is right and the code is wrong, fix the code.
-5. **Run.** Tests (`make test` / `make test-api` / `make test-web`; E2E on host)
-   then `bash scripts/quality-gate.sh`.
-6. **Fix.** Read failures + gate findings from `reports/*.json` and fix them *here*,
-   then re-run. Loop until tests pass AND the gate has **no blocking findings**
-   (ESLint error-tier, Semgrep `ERROR`, type-coverage below baseline). Treat
-   warn-tier (sonarjs complexity, `no-unsafe-*`, sorting, Knip) as signal, not a
-   blocker. Rebuild `packages/shared` after any change to it.
+5. **Run.** `cargo fmt --all`, then `cargo test --locked`, then
+   `bash .claude/scripts/quality-gate.sh`.
+6. **Fix.** Read test failures and the gate output (`target/reports/quality-gate-*.txt`)
+   and fix them *here*, then re-run. Loop until tests pass AND the gate exits 0. There
+   is no warn tier: every clippy warning is blocking, as in CI.
 7. **Simplicity self-check.** Before declaring green, ask: *did we overcomplicate
    this?* Collapse needless abstraction, indirection, or premature generality you
    introduced this slice. Lean code that does exactly what the plan needs beats
@@ -63,8 +62,8 @@ affected area before you touch it and match its style.
 - **codebase MCP** — startup orientation only (stale after your first edit).
 - **LSP** — live navigation + types in-loop; always fresh. This is your default
   once editing starts.
-- **chrome-devtools MCP** — when the slice is frontend: verify it renders and check
-  Web Vitals on the changed view.
+- **`cargo run -- <args>`** — exercise the changed subcommand end to end against the
+  installed omp when the slice is user-visible.
 - **secrets MCP** — when you need an env var / key to run or test the path.
 - **memory MCP (read/write)** — read the decisions the planner seeded; write back a
   decision, gotcha, or recurring failure class worth surviving compaction (your
@@ -104,7 +103,7 @@ after a crash or compaction.
 
 ## Rules
 
-- Run tests per this project's documented convention (containerized, host, or CI-only); {{TEST_CMD}}.
-- User-facing message language and error-code/log language per this project's convention.
+- Run tests on the host with cargo: `cargo test --locked` (filter with `cargo test <name>`); omp data comes from `tests/fixtures/`, never a live `~/.omp`.
+- User-facing messages, errors and logs are in English.
 - Never `--no-verify`; never weaken a test or silence the gate to go green.
 - Match the surrounding code; read before you write.

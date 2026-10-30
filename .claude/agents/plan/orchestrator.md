@@ -134,8 +134,8 @@ That diversity is the bulk of the gain; the judge is the load-bearing component.
 
 **High-stakes escalation — conditional 3rd architect (Gemini).** For irreversible / high-stakes
 specs (a schema migration, a regulated state machine, anything touching this project's
-domain-critical correctness invariant — the same risk heuristic `scripts/quick-classify.sh`
-uses, once this project has defined one), add a THIRD architect to the
+domain-critical correctness invariant — the same risk heuristic `.claude/scripts/quick-classify.sh`
+uses: omp session writes, RPC/bridge, secrets, releases, dependency changes), add a THIRD architect to the
 parallel batch IF a Gemini CLI is present:
 ```bash
 command -v gemini >/dev/null 2>&1   # only then dispatch the 3rd architect

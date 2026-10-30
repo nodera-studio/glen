@@ -17,6 +17,6 @@ a new repo and decide which project-specific hooks to author yourself.
 
 None of these are wired into `settings.json` by default. Author the ones your
 project needs, following the same fail-open / non-blocking-unless-warranted
-posture as the hooks that did ship (see `prettier-on-edit.sh`,
-`shellcheck-on-edit.sh` for warn-don't-block examples, and
+posture as the hooks that did ship (see `shellcheck-on-edit.sh` for a
+warn-don't-block example, and
 `capture-before-merge.sh` for a hard-block example).

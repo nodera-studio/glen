@@ -6,7 +6,7 @@
 # Scope (deliberately narrow — over-blocking traps the agent in retry loops):
 #   - `sed -i` editing a file        -> Edit tool / LSP rename
 #   - `cat`/`head`/`tail` of a CODE file (not heredocs, not logs) -> Read tool
-#   - shell reads of `.env`/secret files (not `.env.example`)     -> secrets MCP
+#   - shell reads of `.env`/secret files (not `.env.example`)     -> Mnemosyne secrets MCP
 #   - `curl`/`wget` to an EXTERNAL url -> Exa MCP (web) / a service SDK-CLI (APIs).
 #     Loopback stays allowed (local API, MCP servers, health checks).
 # Does NOT touch grep/rg (agentic search is good in-loop — routed via CLAUDE.md)
@@ -35,7 +35,7 @@ while IFS= read -r seg || [ -n "$seg" ]; do
   if printf '%s' "$seg" | grep -qE '\.env(\.[a-z._-]+)?' \
      && ! printf '%s' "$seg" | grep -qE '\.env(\.[a-z._-]*)?\.example' \
      && printf '%s' "$base" | grep -qE '^(cat|less|more|head|tail|grep|rg|bat|xxd|od|strings|awk|sed)$'; then
-    deny "Don't read .env / secret files from the shell. Use the secrets MCP (mcp__secrets__*) — secrets must never enter context. (.env.example templates are fine via the Read tool.)"
+    deny "Don't read .env / secret files from the shell. Use the Mnemosyne secrets MCP (mcp__plugin_mnemosyne_secrets__*, project \"glen\") — secrets must never enter context. (.env.example templates are fine via the Read tool.)"
   fi
 
   case "$base" in
@@ -47,22 +47,14 @@ while IFS= read -r seg || [ -n "$seg" ]; do
     cat|head|tail)
       # allow heredocs (cat <<EOF) and non-code reads (logs etc.); block reads of code files
       if ! printf '%s' "$seg" | grep -qE '<<' \
-         && printf '%s' "$seg" | grep -qE '\.(ts|tsx|js|jsx|mjs|cjs|json|md|mdx|css|scss|sql|ya?ml|toml|env)([[:space:]]|$|"|'"'"')'; then
+         && printf '%s' "$seg" | grep -qE '\.(rs|ts|tsx|js|jsx|mjs|cjs|json|md|mdx|css|scss|sql|ya?ml|toml|env)([[:space:]]|$|"|'"'"')'; then
         deny "Don't read files with $base. Use the Read tool — cacheable, structured, supports offset/limit."
       fi
       ;;
     curl|wget)
-      # Service-specific redirects fire FIRST (more useful reason than the generic deny below).
-      # These name the ONE replacement tool — no routing index duplicated in the hook.
-      if printf '%s' "$seg" | grep -qiE 'https?://([a-z0-9.-]+\.)?cloudflare\.com([:/ ]|$|"|'"'"')'; then
-        deny "Don't curl Cloudflare's API — use the wrangler CLI (deploy / R2 / D1 writes, headless) or the Cloudflare MCP (read-only account queries). See the /wrangler skill."
-      fi
-      if printf '%s' "$seg" | grep -qiE 'https?://([a-z0-9.-]+\.)?sentry\.io([:/ ]|$|"|'"'"')'; then
-        deny "Don't curl Sentry's API — use sentry-cli (releases / sourcemaps) or the Sentry MCP (issue lookup / Seer). See the /sentry-cli skill."
-      fi
-      if printf '%s' "$seg" | grep -qiE 'https?://([a-z0-9.-]+\.)?linear\.app([:/ ]|$|"|'"'"')'; then
-        deny "Don't curl Linear's API — use the Linear connector (mcp__*Linear* tools). See the /linear skill."
-      fi
+      # Service-specific redirects go here when a project needs them (fire before the generic
+      # deny below, naming the ONE replacement tool). glen uses none: it has no Cloudflare,
+      # Sentry or Linear integration, so their upstream redirects were dropped.
       # Loopback stays allowed. External http(s) fetches are denied: route web
       # CONTENT to the Exa MCP, and known APIs to their SDK/CLI — WebFetch is
       # off by design, and ad-hoc scraping bypasses the stack. Extend

@@ -144,7 +144,7 @@ advisor is unavailable (no key / rate-limited), note it and proceed.
 Dispatch the **Codex Implementer** with the approved plan (or the next slice / wave).
 Codex runs the **entire** generative loop in its own context — write, wire every
 layer, harden error paths, write unit + integration tests, run them, run
-`scripts/quality-gate.sh`, and fix every failure and finding — until tests AND the
+`.claude/scripts/quality-gate.sh` (rustfmt check + clippy `-D warnings`), and fix every failure and finding — until tests AND the
 gate are green. `coder-codex.md` is the thin Claude-side host: it hands Codex the
 envelope (`AGENTS.md` + `implementer.md`), runs `codex-companion.mjs task --json
 --write`, and parses the JSON `touchedFiles`/completion envelope back into the report
@@ -231,13 +231,13 @@ engine's indexer) so semantic search reflects the merged code rather than the
 pre-edit snapshot. A lefthook pre-push hook backstops this so it cannot be silently
 skipped; run it here as the pipeline tail as well.
 
-### Ensure Docker Is Running
+### Manual-test entry point
 
-After all gates pass, make sure the dev environment is up so the user can manually
-test:
+glen has no dev stack, Docker or server to start. After all gates pass, give the user the
+exact commands to try the change:
 
 ```bash
-{{DEV_CMD}}   # this project's actual "start the dev stack" command
+cargo run -- <args>   # e.g. the new or changed subcommand, against the installed omp
 ```
 
 ### Report (Hand Off to User)
@@ -285,10 +285,10 @@ Plans are **kept after implementation** — they accumulate as project history. 
   convention. Push by default after committing (any pre-push cleanup → push →
   open/update PR → watch CI) without asking. Never `--no-verify`, never force-push a
   shared branch.
-- Rebuild the shared package after any change to it, if this project has one (its
-  actual build command, e.g. `{{BUILD_CMD}}`).
-- Run tests per this project's documented convention (containerized, host, or CI-only)
-  — {{TEST_CMD}} for unit/integration, plus its E2E command if one exists.
+- glen has no shared package; `cargo build` covers the single crate.
+- Run tests on the host with cargo — `cargo test --locked` for unit and integration
+  tests (there is no E2E suite); the conformance suite runs with
+  `cargo test --test conformance`.
 - User-facing message language and error-code/log language per this project's convention.
 - Each role reads existing code in the affected area and matches the style.
 

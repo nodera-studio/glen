@@ -77,9 +77,11 @@ Run the suite against the working tree and report the result. Output the exact
 command so it can be re-run after a fix — e.g. (adapt to this project's actual runner):
 
 ```bash
-{{TEST_CMD}} -- --testPathPattern=conformance
-# and/or the project's E2E command scoped to a "conformance" project/tag
+cargo test --locked --test conformance
 ```
+
+The suite lives in `tests/conformance.rs` (submodules under `tests/conformance/`) and reads
+omp data only from `tests/fixtures/`.
 
 ## Domain-critical rigor — when the change touches a project-critical logic package (Role 3b)
 

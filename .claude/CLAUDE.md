@@ -1,120 +1,171 @@
-# {{PROJECT_NAME}} — Claude Code Configuration
+# glen — Claude Code harness configuration
 
-**This is the primary Claude Code configuration for the {{PROJECT_NAME}} repo.**
+How the agent-os harness in `.claude/` maps onto glen. What glen is, the omp facts, the cargo
+commands and the coding conventions are in the root [`AGENTS.md`](../AGENTS.md), which Claude
+Code loads through the root `CLAUDE.md` and Codex reads directly. This file does not repeat them.
 
-## Project at a glance
+## Session start
 
-**{{PROJECT_NAME}}** — {{PROJECT_DESCRIPTION}}
+Check the available skills before starting work, and recall Mnemosyne project `glen` before
+substantial work (see Memory below).
 
-Stack:
+## Project profile (harness tokens)
 
-- **Frontend**: {{FRONTEND_STACK}}
-- **Backend**: {{BACKEND_STACK}}
-- **DB**: {{DATABASE_STACK}}
-- **Hosting**: {{HOSTING_STACK}}
+The bootstrap filled these values into the agent prompts, commands and skills under
+`.claude/`. This table is the reference when the stack changes. Token names that remain in
+`.claude/` are template meta only (the bootstrap agent and command, `agents/README.md`,
+`docs/Claude-Code-Setup.md`, `prompts/`, `rules/*.template`) plus the issue-key prefix below.
 
-## Session Start
+| Token | glen |
+| --- | --- |
+| `{{PROJECT_NAME}}` | glen |
+| `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. A small TypeScript omp extension may come later. |
+| `{{FRAMEWORK}}` | clap 4 (derive) CLI with serde, serde_json, anyhow, dirs. No web framework. |
+| `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked` |
+| `{{MONOREPO}}` | no: a single crate, no Cargo workspace |
+| `{{FRONTEND_DIR}}` | none |
+| `{{BACKEND_DIR}}` | `src/`, the crate itself (there is no backend service) |
+| `{{SHARED_DIR}}` | none |
+| `{{DEV_CMD}}` | `cargo run -- <args>` (no dev server, no dev stack) |
+| `{{BUILD_CMD}}` | `cargo build` (`cargo build --release` for an optimised binary) |
+| `{{TEST_CMD}}` | `cargo test` (CI form: `cargo test --locked`) |
+| `{{TYPECHECK_CMD}}` | `cargo check --all-targets` |
+| `{{LINT_CMD}}` | `cargo clippy --all-targets -- -D warnings` |
+| `{{FORMAT_CMD}}` | `cargo fmt --all` writes; `cargo fmt --all -- --check` is the report-only form for CI-style runs |
+| `{{VCS_DEFAULT_BRANCH}}` | `main` |
+| `{{DOCKER}}` | none: glen does not use Docker |
+| `{{QUEUE_OR_TOPIC_1}}`, `{{QUEUE_OR_TOPIC_2}}` | none: no queues or background jobs |
+| `{{ISSUE_KEY_PREFIX}}` | **UNCONFIRMED.** Board keys are `<PREFIX>-<n>`. The owner confirmed prefixes for the eight older projects (NDX, MET, AOS, MNE, WEB, KLE, DTC, OPS; Mnemosyne decision `994bbe77`, project `mnemosyne`), but none is recorded for Glen and its board is empty. The first issue created settles it: read the key from the `document_create` response, then replace this cell and the key example under Issue tracking. |
 
-At the start of every conversation, check available skills (via the skills list in the system prompt) before doing anything else. Use skills when they match the task at hand.
+### Reading web-shaped agent prompts against glen
 
-## Commands
+Several agent prompts were written for a TypeScript web monorepo. Apply them to glen like this:
 
-```bash
-{{DEV_CMD}}         # Start local dev environment
-{{BUILD_CMD}}       # Production build
-{{TEST_CMD}}        # Run tests
-{{TYPECHECK_CMD}}   # Type-check
-{{LINT_CMD}}        # Lint
-{{FORMAT_CMD}}      # Format
-```
+- glen has no frontend, backend service, database, ORM, queue, Docker, hosting or error tracker
+  (no Sentry). Skip any step, pass or report section about those and mark it n/a; never invent a
+  target for it.
+- Tooling: npm/pnpm means cargo; tsc or "typecheck" means `cargo check --all-targets`; eslint means
+  clippy; prettier means `cargo fmt`; jest/vitest filters mean `cargo test <filter>`; `npm audit`
+  and `npm outdated` mean `cargo audit` and `cargo outdated` (neither is installed yet).
+- "Logs" are the CLI's own stderr and omp's files under `~/.omp`. "Runtime context" is a local
+  reproduction with `cargo run -- <args>` against the installed omp (18.14.0), not a monitoring
+  service.
+- Tests live in `#[cfg(test)]` modules and under `tests/`; omp data comes from `tests/fixtures/`.
+  The `/implement` conformance writer puts its suite in `tests/conformance.rs` (submodules under
+  `tests/conformance/`) and runs it with `cargo test --test conformance`.
+- There is no dev stack to start: skip "ensure Docker / the dev stack is running". Manual testing
+  is `cargo run -- <args>`.
+- Review engines are Claude and Codex. The CodeRabbit CLI is not installed, so review orchestrators
+  skip the third engine and say so.
+- The `/implement` re-index step (Role 4) applies only if `code_index_status` with project `glen`
+  shows an index; otherwise skip it and say so.
+- The Implementer's deterministic gate is `.claude/scripts/quality-gate.sh` (rustfmt check +
+  clippy `-D warnings`); `/implement-quick`'s fail-safe classifier is
+  `.claude/scripts/quick-classify.sh`. Where a prompt says `scripts/quality-gate.sh`, use these.
+- `/run-ci`, `/docs-audit`, `/tech-debt-audit`, `/error-audit` and the `/codebase-audit` scans
+  (including the dependency audit) are ported to cargo and `rg`. `cargo-audit`, `cargo-outdated`,
+  `cargo-deny` and `cargo-license` are not installed: the audits probe for them, fall back, and
+  report the gap.
+
+## Workflows
+
+The full agent index is `.claude/agents/README.md`; commands are listed in
+`.claude/commands/README.md`.
+
+| Command | Use for |
+| --- | --- |
+| `/plan-implementation` → `/implement` (`/implement-quick` for small changes) | Plan, then build with the Codex Implementer, the Claude ‖ Codex review gate and the conformance tail |
+| `/code-review`, `/review-implementation`, `/respond-to-review` | Review the current diff or branch; answer PR review comments |
+| `/deep-debug` | Root-cause a bug: Claude ‖ Codex investigator, then the adversary |
+| `/run-ci` | Run the same checks as `.github/workflows/ci.yml` locally |
+| `/goal` + `/auto-mode` | Carry a multi-wave goal to merged completion on `main` |
+| `/explore`, `/research`, `/brainstorm` | Map code, research a topic with Exa, turn an idea into requirements |
+| `/security-audit`, `/error-audit`, `/docs-audit`, `/tech-debt-audit`, `/codebase-audit` | Periodic whole-repo audits |
+| `/orchestrate`, `/audit-agent-gaps`, `/codex`, `/codex-advisor`, `/improve-prompt`, `/security-scan` | Harness and cross-model utilities |
+
+Removed for glen, so do not look for them: `/copywrite` and its agents (no localised UI copy),
+`/api-audit` (written for a NestJS HTTP API), the frontend error-audit arm, and the `linear`,
+`playwright-cli`, `sentry-cli`, `wrangler` and `promote-to-prod` skills. `promote-to-prod` became
+the `release` skill.
 
 ## Git hooks
 
-If this project uses `lefthook` (or an equivalent pre-commit/pre-push runner), document
-what it enforces here (lint/format on staged files, secret scanning, the test suites
-that gate `git push`) and how to bypass it deliberately (`--no-verify`) when justified.
+`lefthook.yml` at the repo root, described in `AGENTS.md`: pre-commit checks rustfmt and runs
+gitleaks on staged changes; pre-push runs clippy and the tests. Run `lefthook install` once per
+clone (`brew install lefthook` first if it is missing). Bypass with `--no-verify` only with a
+written reason.
 
-## Branching & release model
+## Branching and releases
 
-Document your branching model here — trunk name, release-branch name (if any), PR
-target, squash vs merge-commit policy, and any branch-protection rulesets. If you use
-the `/branching-model` skill pattern from this harness, describe day-to-day branch/PR
-rules there and keep this section to the summary.
+- Trunk is `main`. There is no staging branch and no release branch.
+- Branch off `main` (`feat/<slug>`, `fix/<slug>`, `chore/<slug>`), open the PR into `main`, and
+  squash-merge it. Never push to `main` directly.
+- Before merging a PR, store its durable decisions in Mnemosyne; the `capture-before-merge` hook
+  blocks `gh pr merge` until a `memory_store` call referencing the PR exists in the session.
+- A release is an annotated tag `v0.x.y` on a commit on `main`, after a version-bump PR. The
+  runbook is the `release` skill. Day-to-day rules are in the `branching-model` skill.
 
-## `.claude/` Directory Structure
+## Issue tracking
 
-| Directory    | Purpose                                                                                                                                                         | Access                                                     |
-| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------- |
-| `agents/`    | Orchestration prompts for complex multi-step tasks                                                                                                              | Read freely                                                |
-| `skills/`    | Reusable capabilities, invoked via `/skill-name`                                                                                                                | Invoke via `/skill-name`                                   |
-| `commands/`  | Slash commands that kick off agent workflows                                                                                                                    | Invoke via `/command-name`                                 |
-| `hooks/`     | Enforcement scripts (PreToolUse/PostToolUse/etc.)                                                                                                               | Automatic                                                  |
-| `rules/`     | Path-scoped conventions, loaded automatically when editing matching files                                                                                       | Automatic                                                  |
-| `docs/`      | Harness reference docs (setup, security posture, statusline, etc.)                                                                                              | Read freely                                                |
-| `scripts/`   | Standalone tooling invoked by hooks, commands, or cron (bootstrap, statusline, learned-rules loop)                                                               | Read/run on demand                                         |
-| `prompts/`   | General-purpose prompt-engineering reference material                                                                                                           | Read on demand                                             |
-| `plans/`     | Implementation plans — kept after execution (marked completed, NOT deleted) so the directory accumulates as project history                                     | Read when planning or reviewing past decisions             |
-| `research/`  | Research reports — topic deep-dives, library comparisons                                                                                                        | Read on demand when relevant                               |
-| `tech-debt/` | Tech debt registry — categorized items from reviews, audits, and manual findings                                                                                | Read when planning work or fixing debt                     |
-| `testing/`   | Test plan TODO (supervised test writing)                                                                                                                        | Read when working on tests                                 |
-| `evidence/`  | Captured evidence artifacts from audits/reviews (screenshots, logs, reports)                                                                                    | Read on demand                                             |
-| `handoffs/`  | Session handoff notes between agents or sessions                                                                                                                | Read on demand                                             |
-| `orchestrator/` | `/orchestrate` mode's gap log (`GapLog.md` + `gaps.jsonl`) — one-off subagent spawns with no matching harness agent, clustered periodically by `/audit-agent-gaps` | Read when reviewing gaps or running `/audit-agent-gaps`  |
+Issues live on the Mnemosyne board of project **Glen** (project name `glen`, case-insensitive;
+workspace `projectId` `ff92abe1-da63-402d-a4f1-c8690e471be1`, taken from the 2026-10-30 handoff).
+Not Linear, not GitHub Issues. Keys look like `<PREFIX>-12`; the Glen prefix is unconfirmed until
+the first issue exists (see the profile table). Tags `shipped:main` and `released:v0.x.y` mark
+where an issue's code is. Board operations are in
+the `mnemosyne` skill. Don't track work that belongs on the board in a TODO file.
 
-### Agents
+## Memory, code index and secrets
 
-Full agent suite documented in `.claude/agents/README.md`. Fill in your project's key
-workflows here once `/bootstrap-project` (or manual setup) has wired the agent suite —
-e.g. a table mapping `/plan-implementation`, `/implement`, `/review-implementation`,
-`/debug`, and any audit commands to the agents they dispatch.
+Mnemosyne through the `mnemosyne` plugin. Tools are named `mcp__plugin_mnemosyne_<server>__<tool>`
+(servers `memory`, `codebase`, `secrets`, `workspace`). Always pass `project: "glen"` on memory,
+code and secrets calls, and the `projectId` above on workspace calls. omp-as-a-donor research
+belongs to project `metis`, harness questions to `agent-os`, machine and toolchain setup to
+`ops`. The `mnemosyne` skill in `.claude/skills/` is the glen-specific guide; the plugin's own
+skills (`mnemosyne:mnemosyne`, `mnemosyne:mnemosyne-workspace`) are the full manual.
 
-`/orchestrate` (dispatch-only mode) and `/audit-agent-gaps` (cluster the gap log, propose
-promoting recurring one-off shapes into permanent agents) are pre-wired and generic — no
-per-project filling-in needed, see `agents/orchestrator/README.md`.
+## Codex
 
-### Skills & Tools
-
-Use these proactively — not just inside agent workflows. If a task matches the trigger, invoke the skill via the Skill tool.
-
-| Skill      | Trigger — use when...                                          |
-| ---------- | ---------------------------------------------------------------- |
-| `/find-docs` (Context7) | Working with ANY library API — verify patterns against current docs, not training data. |
-| `/research` | Deep-diving any topic — library comparison, best practices, architecture decisions. |
-| _(add project-specific skills here as they're installed)_ | |
-
-## Reference Documents (read on demand, not at startup)
-
-Point at your own harness setup doc, e.g. `.claude/docs/Claude-Code-Setup.md`, and any
-other on-demand reference docs you add.
-
-## Response style
-
-Adjust to taste — this is a common starting point:
-
-- Be brief: prefer fewer complete sentences over more.
-- Don't reproduce code, diffs, or file contents you just wrote; reference `path:line`.
-- No preamble or sign-offs. State the result once; don't re-explain your work.
+Codex is the second engine for review, debug and audits. Dispatch it only through the
+`codex:codex-rescue` agent, `codex-companion.mjs` (the Implementer) or `codex review`; the
+`block-old-codex` hook blocks `codex exec`. Harness prompts do not pass a Codex model; model
+choice is configured outside the harness (see `AGENTS.md`).
 
 ## Tool routing
 
-If this project wires up MCP servers, CLIs, or other tools with overlapping
-responsibilities, keep a terse routing table here so the judgment call ("which tool for
-this need") is always-loaded instead of re-derived every session. Start from the CLI
-tool-routing table in `docs/Claude-Code-Setup.md` (rg vs grep, sd vs sed, ast-grep,
-difft, yq, gron, scc, the Exa-vs-curl boundary — the tools `bootstrap-tools.sh`
-installs and `hooks/steer-bash.sh` partly enforces) and append this project's own
-MCP/service routing rows below it. Pattern:
+The CLI tool table (rg, sd, ast-grep, difft, yq, gron, scc) is in
+`.claude/docs/Claude-Code-Setup.md`; `hooks/steer-bash.sh` enforces part of it.
 
-| Need                                   | Route to        | Why / boundary                                          | → skill      |
-| --------------------------------------- | ---------------- | -------------------------------------------------------- | ------------ |
-| [e.g. "literal in-loop string match"]   | `rg` / grep      | fast, exact — not routed through a heavier tool           | —            |
-| [e.g. "web search"]                     | [your web-search MCP/tool] | [why this over a native tool, if one is denied] | `/[skill]`   |
-| [e.g. "remember a decision across sessions"] | [your memory MCP/tool] | context that must survive compaction         | `/[skill]`   |
+| Need | Route to | Boundary |
+| --- | --- | --- |
+| Literal string or symbol in this repo | `rg` | not the codebase MCP |
+| How omp works | `../metis/references/oh-my-pi` (read-only, v18.14.0) and `.claude/research/` | never edit or push the clone |
+| Library or crate docs | `ctx7` CLI (Context7), `/find-docs` | not web search |
+| Web pages, articles, current state of a tool | Exa MCP, `/exa` | native WebSearch and WebFetch are denied |
+| Decisions and facts across sessions | Mnemosyne memory, project `glen` | not ad-hoc notes |
+| Issues | Mnemosyne board, `mnemosyne` skill | not Linear, not GitHub Issues |
+| Secrets | Mnemosyne secrets, project `glen` | never echo a value |
+| PRs, CI checks, run logs | `gh`, `/gh` | git stays git |
+| Second opinion, hard bug | `codex:codex-rescue`, `/codex` | never `codex exec` |
+
+## `.claude/` layout
+
+| Directory | Purpose |
+| --- | --- |
+| `agents/`, `commands/`, `skills/` | Agent prompts, slash commands, skills |
+| `hooks/` | Enforcement scripts wired in `settings.json` |
+| `rules/` | Path-scoped conventions; `behavioral-preamble.md` is the one always-loaded rule |
+| `docs/`, `prompts/`, `scripts/` | Harness reference, prompt-engineering guides, tooling |
+| `plans/`, `research/`, `handoffs/`, `evidence/`, `tech-debt/`, `testing/` | Working material, git-ignored; plans are kept after execution as history |
+| `auto-mode/` | `/goal` and `/auto-mode` state file (git-ignored: per-machine loop state) |
+| `reviews/` | Audit reports |
+
+## Response style
+
+- Be brief: prefer fewer complete sentences over more.
+- Don't reproduce code, diffs or file contents you just wrote; reference `path:line`.
+- No preamble or sign-offs. State the result once.
 
 ## Learned review conventions
 
-> If you adopt the learned-rules loop (`.claude/scripts/mnemosyne/` +
-> `docs/LearnedRulesLoop.md`), this section is auto-maintained by
-> `.claude/scripts/mnemosyne/promote.mjs` — do not hand-edit. Keep it hard-capped
-> (e.g. 15 lines); lowest-value rules decay out over time. Promotion should be
-> human-gated (a deliberately pasted `promote.mjs` command), not automatic.
+Not adopted. The learned-rules loop (`.claude/scripts/mnemosyne/`, `docs/LearnedRulesLoop.md`)
+needs a project Postgres, which glen does not have, so its Stop hook is not wired.

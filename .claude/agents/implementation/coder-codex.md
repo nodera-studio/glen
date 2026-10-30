@@ -21,8 +21,8 @@ Claude-side discipline: read-context-first, and STOP-and-report on architectural
 surprise instead of guessing.
 </role>
 
-**Done when:** Codex reports the slice green (its tests + `scripts/quality-gate.sh`
-pass), you have parsed its JSON envelope, and you have returned the standard
+**Done when:** Codex reports the slice green (`cargo test --locked` + 
+`bash .claude/scripts/quality-gate.sh` pass), you have parsed its JSON envelope, and you have returned the standard
 completion report (files, decisions, tests, gate state, deferred risks).
 
 ## Step 1 — Orient (Claude side, read-only)
@@ -64,19 +64,19 @@ root — follow them. Plan:
 Run the WHOLE fused loop in your own context, until green:
 1. Read the affected area before you touch it; match its style.
 2. Implement per the plan. WIRE every layer so the feature is reachable
-   (schema → service → endpoint → UI as applicable; register modules/providers,
-   exports, routes, DI). Compiles-but-unwired is NOT done.
-3. Harden error paths: every async path awaited; a typed error code mapped to a
-   user-facing message (per this project's error-message language convention); no
-   swallowed catch; idempotency on retryable external calls (payment/auth/storage/queue
-   providers — this project's actual external dependencies).
+   (clap subcommand/args → handler → library module → human and --json output;
+   declare modules and enum variants). Compiles-but-unreachable is NOT done.
+3. Harden error paths: anyhow + .context() in the binary, thiserror in library
+   modules; no unwrap()/expect() on external data (omp files, RPC replies, argv, env);
+   no discarded Results; parse omp formats leniently (skip unknown entry types and
+   fields); a timeout on every wait for omp; NEVER write to an omp session .jsonl.
 4. Write unit + integration tests for the new behavior incl. the edges the plan
    implies. NEVER weaken a test to go green — if a test is right and the code is
    wrong, fix the code.
-5. Run tests (make test / make test-api / make test-web; E2E on host) then
-   `bash scripts/quality-gate.sh`. Fix every failure + blocking finding HERE and
-   re-run, looping until tests pass AND the gate has no blocking findings. Rebuild
-   packages/shared after touching it.
+5. Run `cargo fmt --all`, then `cargo test --locked`, then
+   `bash .claude/scripts/quality-gate.sh` (rustfmt check + clippy -D warnings). Fix
+   every failure HERE and re-run, looping until tests pass AND the gate exits 0.
+   Tests read omp data from tests/fixtures/, never a live ~/.omp.
 6. Simplicity self-check: collapse needless abstraction you introduced this slice.
 </default_follow_through_policy>
 

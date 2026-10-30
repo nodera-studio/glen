@@ -69,7 +69,8 @@ against your own working tree.
 
 ## What's intentionally NOT here
 
-- **A staging/remote-branch poll-reindex script.** That pattern only earns its
+- **A remote-branch poll-reindex script** (upstream polled a remote trunk branch; glen has
+  only `main`). That pattern only earns its
   complexity when the Mnemosyne box has no direct network path to your CI/git host
   (tunnel-only) and needs to reconcile deletions on a schedule. See the section above
   for the local-only equivalent.

@@ -11,7 +11,7 @@ workflow below) once to adapt the templated files to that project's actual stack
 - **Claude + Codex** (dual-engine) for review comprehensive passes, debug agents, and codebase audits — multi-pass voting with cross-model consensus catches issues a single model misses
 - **Claude only** for planning, orchestrators, testing, error handling, docs, and all implementation stages EXCEPT the lean code-review gate inside `/implement` (1 Claude + 1 Codex pass, 2-vote)
 - Codebase audits use dual-engine (Claude + Codex) per group. Security audit additionally uses checklist perturbation.
-- **Model rides the session, not a hardcoded tier.** Every frontier role — orchestrators, planner/architect, the Implementer, reviewers, security/error finders, the debug investigator + adversary, research, and copywrite voice — is `model: inherit`, so it runs on whatever the session runs. Never pin a frontier agent to a model that won't follow the session. Mechanical / summarization roles (test-runner, verifier, docs-updater, light audits, plan explorer/researcher, line/microcopy/consistency editors) stay pinned `sonnet` — they don't need frontier compute. Effort: `high` is the default; `xhigh` is reserved for the Implementer, planner, and orchestrators on hard waves.
+- **Model rides the session, not a hardcoded tier.** Every frontier role — orchestrators, planner/architect, the Implementer, reviewers, security/error finders, the debug investigator + adversary, and research — is `model: inherit`, so it runs on whatever the session runs. Never pin a frontier agent to a model that won't follow the session. Mechanical / summarization roles (test-runner, verifier, docs-updater, light audits, plan explorer/researcher) stay pinned `sonnet` — they don't need frontier compute. Effort: `high` is the default; `xhigh` is reserved for the Implementer, planner, and orchestrators on hard waves.
 
 **Core principle:** The user is ALWAYS in the driver's seat. Agents do the heavy lifting (research, code, review) but NEVER take autonomous actions on git or external systems. No auto-commits, no auto-pushes. Every workflow ends with "ready for your manual testing."
 
@@ -31,7 +31,7 @@ workflow below) once to adapt the templated files to that project's actual stack
 │
 ├── research/                        # Standalone research (user-facing, not pipeline)
 │   └── agent.md                     # Context7 + web search + Playwright — saves to .claude/research/
-├── local-ci.md                      # Full CI pipeline (format, lint, typecheck, build, test)
+├── local-ci.md                      # Local CI with cargo, mirroring ci.yml (fmt, clippy, check, build, test)
 ├── respond-to-review.md             # PR review response — verify claims, draft responses
 │
 ├── implementation/                  # Workflow: Build a feature/fix (4 roles)
@@ -73,31 +73,14 @@ workflow below) once to adapt the templated files to that project's actual stack
 │   │   ├── domain-integrity.md      # Stage 2 (project-specific SLOT — a template, not a ready agent; see its own header)
 │   │   └── audit-synthesizer.md     # Stage 3 — evidence-demanding synthesis, ASVS 5.0, memory write
 │   ├── error-audit/
-│   │   ├── orchestrator.md          # 6-agent dual-engine (3 Claude + 3 Codex)
-│   │   ├── backend.md               # Controllers/routes, services, global infra
-│   │   ├── frontend.md              # Hooks, components, pages, global UI
-│   │   └── queue.md                 # Background-job processors, pipeline UX, concurrency
-│   ├── api-audit/
-│   │   └── orchestrator.md          # 4-agent dual-engine (endpoint inventory + contract)
+│   │   ├── orchestrator.md          # 2-agent dual-engine (Claude ‖ Codex) over the crate
+│   │   ├── backend.md               # glen's crate (src/): CLI entry, omp I/O, parsing, output
+│   │   └── queue.md                 # Async-pipeline auditor — n/a for glen (no queues), kept for later
 │   ├── docs-audit/
 │   │   └── orchestrator.md          # 3-agent (2 Claude + 1 Codex stale scanner)
 │   └── tech-debt-audit/
 │       └── orchestrator.md          # 4-agent (3 Claude + 1 Codex)
 │
-└── copywrite/                       # Workflow: Polish user-facing copy to Apple voice
-    ├── orchestrator.md              # Pipeline manager — dispatch, merge, gate, write
-    ├── voice-editor.md              # Apple voice transfer (loads full Apple guide)
-    ├── line-editor.md               # Sentence-level surgery
-    ├── microcopy-specialist.md      # Buttons, toasts, errors, empty states, ICU plural quarantine
-    ├── localization-editor.md       # Cross-locale cultural adaptation, defends the committed register
-    ├── consistency-checker.md       # Glossary, cross-locale parity, diacritic/script gate
-    ├── apple-style-guide.md         # Unabridged Apple Style Guide — voice-editor only
-    ├── voice-rubric.md              # 9-rule distillation of the Apple guide
-    ├── localization-register-memo.md.template  # SKELETON — fill in this project's register decision + formality pitfalls + locale invariants
-    ├── brand-terms.md.template                 # SKELETON — fill in this project's canonical spellings glossary
-    ├── microcopy-patterns.md        # Buttons / errors / toasts / empty states / form labels (generic examples — swap in real product vocabulary)
-    └── README.md                    # Suite overview + invocation cheatsheet + pipeline diagram
-
 └── orchestrator/                    # Workflow: /orchestrate mode -- dispatch-only + gap tracking
     ├── orchestrator-mode.md         # Governing prompt: match -> dispatch, no match -> one-off + log gap
     ├── gap-auditor.md               # Clusters gaps.jsonl, proposes promoting recurring shapes (/audit-agent-gaps)
@@ -119,6 +102,11 @@ reports a follow-up punch list (credentials, repo settings, unfilled optional sl
 Run it once when adopting this harness on a new codebase; re-run it if the stack
 changes significantly.
 
+**In glen** the bootstrap has run: `.claude/CLAUDE.md` holds the resolved profile, and the
+agent prompts have the project tokens filled in. Removed because glen has no use for them:
+the copywrite suite (`/copywrite`), the API audit (`/api-audit`) and the frontend
+error-audit arm.
+
 ## Complete workflow: idea to shipped
 
 The workflows below compose into one lifecycle — this is what actually happens between
@@ -131,7 +119,7 @@ flowchart TD
     PLAN -->|"/implement"| CODE["Code, wired + tested +<br/>reviewed (Claude ‖ Codex) +<br/>conformance-gated + docs updated"]
     CODE -->|"gh pr create"| PR["Pull request"]
     PR -.->|"optional standalone pass"| DEEPREV["/review-implementation<br/>(Claude ‖ Codex ‖ 3rd engine → synthesizer)"]
-    PR -->|"CI + review bots green"| SHIP["Merged — shipped"]
+    PR -->|"CI green, no unresolved comments"| SHIP["Squash-merged on main"]
 
     IDEA -.->|"or: declare the whole thing as one goal"| GOAL["/goal + /auto-mode"]
     GOAL -.->|"wave loop: plan → implement → PR →<br/>poll → fix → merge, no gate between waves"| SHIP
@@ -190,35 +178,13 @@ this project actually runs. See `agents/debug/README.md` for the full diagram.
 ## Codebase audit workflows (`/codebase-audit` and friends)
 
 A two-tier system for whole-repo analysis, not a per-PR gate. Tier 1 (`/codebase-audit`,
-~5 min) is a quick health check — dependency issues, dead code, tech-debt signals, API
-surface, doc freshness. Tier 2 is five independently-invocable deep audits (security, API
-contract, error paths, docs accuracy, tech debt), each dual-engine where it matters most.
+~5 min) is a quick health check — dependency issues, tech-debt signals, CLI surface, doc
+freshness. Tier 2 is four independently-invocable deep audits (security, error paths, docs
+accuracy, tech debt), each dual-engine where it matters most.
 The security audit is the deepest: a cartographer builds a shared app-intent map first
 (endpoints/authz, PII/SSRF surface), two stage-2 agents hunt in parallel against that map,
 and an evidence-demanding synthesizer refuses to let a finding through without proof,
 reporting against ASVS 5.0 L2. See `agents/codebase/README.md` for the full diagram.
-
-## Copywriting suite (`/copywrite`)
-
-A six-agent suite for polishing user-facing copy to Apple voice — generic across any
-product's locale(s) and register. The orchestrator dispatches three stage-1 specialists
-(voice + line + microcopy) in parallel, then runs `localization-editor` and
-`consistency-checker` sequentially as gates. Findings merge into a report (default) or
-land as edits in place (`--apply`), with three pre-write gates: ICU
-`isStructurallySame()` for plural strings, Babel re-parse for TSX files, and a
-locale-invariant (diacritic/script) survival check. **Before first use**, fill in
-`copywrite/brand-terms.md.template` and `copywrite/localization-register-memo.md.template`
-with this project's actual glossary and register decisions — the suite ships with
-generic mechanism and no real per-project vocabulary baked in.
-
-| Agent                  | Mission                                                                                             |
-| ----------------------- | ---------------------------------------------------------------------------------------------------- |
-| `orchestrator`         | Resolve scope, dispatch parallel triad, sequence localization + consistency, merge, gate, write     |
-| `voice-editor`         | Apply Apple voice — clarity, warmth, second-person, active voice. Loads the full Apple Style Guide. |
-| `line-editor`          | Sentence-level surgery — cut filler, flip passive to active, tighten cadence                        |
-| `microcopy-specialist` | Buttons, toasts, errors, empty states, form labels; quarantines ICU plural strings                  |
-| `localization-editor`  | Cross-locale cultural adaptation; defends this project's committed register against formality drift |
-| `consistency-checker`  | Glossary enforcement, cross-locale parity, diacritic/script survival gate                           |
 
 ---
 
@@ -263,10 +229,8 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 | `/codebase-audit`        | Codebase analysis                                                                 | `codebase/orchestrator.md` (quick or deep mode)                                               |
 | `/security-audit`        | Codebase analysis                                                                 | `codebase/security-audit/orchestrator.md` — OWASP ASVS L2                                     |
 | `/error-audit`           | Codebase analysis                                                                 | `codebase/error-audit/orchestrator.md` — error path audit                                     |
-| `/api-audit`             | Codebase analysis                                                                 | `codebase/api-audit/orchestrator.md` — API contract audit                                     |
 | `/docs-audit`            | Codebase analysis                                                                 | `codebase/docs-audit/orchestrator.md` — documentation accuracy                                |
 | `/tech-debt-audit`       | Codebase analysis                                                                 | `codebase/tech-debt-audit/orchestrator.md` — tech debt audit                                  |
-| `/copywrite`             | Polish user-facing copy                                                           | `copywrite/orchestrator.md` — report mode (default) or `--apply` for in-place edits           |
 | `/orchestrate`           | Toggle dispatch-only mode for arbitrary tasks                                     | `orchestrator/orchestrator-mode.md` — match an existing agent or spawn + log a scoped one-off |
 | `/audit-agent-gaps`      | Cluster the gap log, propose promoting recurring shapes into permanent agents     | `orchestrator/gap-auditor.md` — report-then-approve, writes nothing until told to proceed     |
 
@@ -322,8 +286,8 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 
 **Codebase audit two-tier system:**
 
-- Tier 1 quick health check (~5 min): lightweight agents scan for dependency issues, dead code, tech debt signals, API surface, and doc freshness
-- Tier 2 deep audits: 5 standalone multi-agent audits (security, error, API, docs, tech debt) with dual-engine consensus, semi-formal reasoning, mid-thought abort, and conventions-first anchoring
+- Tier 1 quick health check (~5 min): lightweight agents scan for dependency issues, tech debt signals, CLI surface, and doc freshness
+- Tier 2 deep audits: 4 standalone multi-agent audits (security, error, docs, tech debt) with dual-engine consensus, semi-formal reasoning, mid-thought abort, and conventions-first anchoring
 - Security audit (periodic, up to 6 agents / 4 passes): cartographer → access-control/IDOR ‖ domain-integrity (project-specific slot, optional) → evidence-demanding synthesizer; ASVS 5.0 L2 as the reporting taxonomy, not the decomposition
 - Each tier 2 audit is independently invocable via its own slash command
 - `docs-expert.md` discovers the project's actual documentation layout fresh via Glob each time — it has no hardcoded doc map, so it never goes stale when ported to a new project
@@ -338,7 +302,7 @@ All review agents produce findings in this format:
 #### [CRITICAL|HIGH|MEDIUM|LOW]-001: [title]
 
 - **Severity**: CRITICAL | HIGH | MEDIUM | LOW
-- **File**: `path/to/file.ts:L42-L58`
+- **File**: `src/path/to/file.rs:L42-L58`
 - **Issue**: [description]
 - **Impact**: [what happens if unfixed]
 - **Fix**: [specific approach]
@@ -351,6 +315,6 @@ All review agents produce findings in this format:
 
 - Model rides the session via `model: inherit` for every frontier role; mechanical/summarization roles stay pinned `sonnet`. Don't pin a frontier agent to a specific model — inherit is what lets the suite follow the session. See the Engine strategy note at the top.
 - Agents read this project's own `CLAUDE.md` dynamically — conventions live there, not hardcoded into the agent files.
-- Several files ship as explicit templates (`{{TOKEN}}` placeholders, `.template` suffixes, or a "STUB — fill this in" header): `bootstrap/orchestrator.md`'s target is `CLAUDE.md`/`settings.json`; `codebase/security-audit/domain-integrity.md`; `copywrite/brand-terms.md.template` and `copywrite/localization-register-memo.md.template`. Fill these in per-project before relying on the agents that read them.
+- Several files ship as explicit templates (`{{TOKEN}}` placeholders, `.template` suffixes, or a "STUB — fill this in" header): `bootstrap/orchestrator.md`'s target is `CLAUDE.md`/`settings.json`; `codebase/security-audit/domain-integrity.md`. Fill these in per-project before relying on the agents that read them.
 - Stack-specific checklists (`comprehensive-review.md`, `code-review.md`'s Project Conventions blocks, the error-audit agents' `<context>`/`<conventions>` blocks) ship as placeholder shapes — fill them in with this project's real conventions; project-specific invariants belong in this project's own `.claude/rules/` files, referenced from these agents, not hand-copied into every agent.
 - Each agent is standalone — orchestrators are convenience, any specialist can be invoked directly

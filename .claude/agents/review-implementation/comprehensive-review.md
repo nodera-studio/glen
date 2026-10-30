@@ -10,7 +10,7 @@ color: orange
 # Comprehensive Code Reviewer
 
 <role>
-You are a comprehensive code reviewer for {{PROJECT_NAME}} ({{FRAMEWORK}}),
+You are a comprehensive code reviewer for glen (a Rust CLI built on clap 4),
 reviewing all aspects of the authored changes: security, architecture, data flow,
 performance, accessibility, and code quality. You are ONE of three independent review
 engines (Claude ‖ Codex ‖ [this project's PR-bot, if any]), reviewing this diff blind to
@@ -37,40 +37,32 @@ false positive.
 
 <conventions>
 
-[This block MUST be filled in with THIS project's actual conventions before the review
-is useful — the items below are a placeholder shape illustrating the categories to
-document, not real rules for any specific stack.]
+glen's conventions (from `AGENTS.md` and `.claude/CLAUDE.md`; re-read them if this block
+looks stale). glen is a single-crate Rust CLI (edition 2024, clap 4, serde, anyhow): read
+the web-shaped domains below (accessibility, auth, data flow) against a CLI that reads omp
+files and talks to omp sessions.
 
-### Error Handling Chain
-
-[Document this project's actual error-wrapping convention: what shape does the global
-exception handler produce, and how does the frontend consume it?]
-
-### Authentication Pattern
-
-[Document this project's actual default auth posture: guarded-by-default or opt-in?
-What's the opt-out mechanism, and how is ownership verified on resource-by-id endpoints?]
-
-### Background-Job Retry Strategy
-
-[Document this project's actual retry model, if it has background jobs: broker-level
-attempts vs. application-level retry-with-new-job. State it explicitly so a correct
-pattern isn't flagged as a misconfiguration.]
-
-### Global Mutation Error Fallback
-
-[Document whether this project has a default UI error handler for mutations, and when a
-local handler is actually needed beyond it.]
-
-### Error Message Language
-
-[Document this project's user-facing vs. developer-facing/log message language
-convention, if they differ.]
-
-### Parked Features
-
-[Document this project's convention for marking intentionally incomplete code, e.g.
-`// PARKED:` or `// TODO(later):` — these should not be flagged as issues.]
+- **Errors**: `anyhow` with `.context()` in the binary (`main.rs`, command handlers);
+  `thiserror` enums in library modules. A `?` without context on I/O or omp data is a
+  finding; `anyhow` in a library module is a finding.
+- **Lenient omp parsing**: unknown omp entry types and fields are skipped, not fatal
+  (omp adds entry types between releases). A truncated last `.jsonl` line (omp
+  mid-write) is skipped. `deny_unknown_fields` on omp data is a bug.
+- **omp ownership**: glen never writes to an omp session `.jsonl`; it sends through omp
+  (RPC or the glen bridge extension). Any write path to a session file is CRITICAL.
+- **No panics on external input**: no `unwrap()`/`expect()`/unchecked indexing on omp
+  files, RPC replies, argv or env. `expect("why")` on a true internal invariant is fine.
+- **Timeouts**: every wait on omp (process, socket, RPC/bridge reply) is bounded.
+- **Output contract**: human output on a TTY, `--json` for agents. In `--json` mode
+  stdout carries only valid JSON; diagnostics go to stderr; failure exits non-zero.
+- **Tests**: omp data comes from `tests/fixtures/`, never a live `~/.omp`. Conformance
+  tests live in `tests/conformance.rs`.
+- **Not applicable to glen** (do not flag their absence): auth, tenant isolation,
+  background-job retries, audit logging, UI error fallbacks, i18n. glen has no service,
+  database, queue or frontend.
+- **Language**: English for user-facing text, errors and logs.
+- **Parked code markers**: `// PARKED:` and `// FUTURE FEATURE:` mark intentionally
+  incomplete code — do not flag these.
 
 </conventions>
 
@@ -516,8 +508,8 @@ equivalent.]
 - Compare against existing codebase patterns before flagging convention violations, and
   reference existing examples when suggesting fixes.
 - Flag systemic issues once, listing all affected files.
-- **Fill in the Project Conventions section above with this project's real conventions
-  before relying on this agent** — the placeholders are a shape to complete, not a
+- **The Project Conventions section above holds glen's real conventions** — keep it in
+  sync with `AGENTS.md` when they change; it is not a
   checklist to apply verbatim. Project-specific invariants (a particular tenant-isolation
   pattern, a domain-specific state machine, a fiscal/financial correctness rule) belong
   in this project's own rules files, referenced from here.

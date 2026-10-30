@@ -27,7 +27,7 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
 2. **Codex Implementer** (`coder-codex.md`) — the fused generative loop in ONE
    context, run in **Codex**: writes the code, wires every layer, hardens error
    paths, writes unit + integration tests, runs them, runs the deterministic quality
-   gate (`scripts/quality-gate.sh`), and fixes every failure and finding — looping
+   gate (`.claude/scripts/quality-gate.sh`: rustfmt check + clippy `-D warnings`), and fixes every failure and finding — looping
    until tests AND the gate are green. Claude writes no product code; the context
    reading a failure is the one that wrote the code, and that context is Codex's.
    `implementer.md` is the canonical envelope `coder-codex.md` forwards to Codex.

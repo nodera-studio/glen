@@ -38,5 +38,4 @@ Question: $ARGUMENTS
 5. **Save.** Write the report to `.claude/research/{YYYY-MM-DD}-{slug}.md` and summarize the
    key findings + the open questions back to the user.
 
-If no arguments were provided, ask the user what they want to research first. The
-`playwright-cli` skill is for E2E test authoring, NOT research — do not use it here.
+If no arguments were provided, ask the user what they want to research first.

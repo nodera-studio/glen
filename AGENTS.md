@@ -13,6 +13,15 @@ omp talk back:
 - **send** a message into a session (prompt, steer, follow-up) and **receive** the reply;
 - give the omp model a way to **reply to the calling agent**.
 
+Product direction (owner, 2026-10-30; details in the Glen project's Ideas in Mnemosyne):
+
+- **Standalone and agent-callable, the `playwright-cli` way.** One binary with short verb-first
+  subcommands, short session handles, human output on a TTY and `--json` for agents, and a
+  shipped agent skill (`SKILL.md`) for Claude Code and Codex. No MCP server needed to use it.
+- **It has to look good.** Polished terminal output and a live full-screen session view.
+- **An Astro landing page** that blends Mnemosyne's design language with morphin.dev motion
+  components.
+
 Design and the omp surfaces it builds on: [`docs/design.md`](docs/design.md).
 
 ## omp facts that matter
@@ -57,5 +66,7 @@ done. omp-as-a-donor research for Metis lives in project `metis`; harness questi
 ## Codex
 
 Codex is the second engine in the agent-os review, debug and audit workflows, dispatched through
-the `codex:codex-rescue` agent (direct `codex exec` is blocked by a hook). The ChatGPT account
-does not accept `gpt-6.1-sol`; use `gpt-6-astra` (verified 2026-10-30).
+the `codex:codex-rescue` agent (direct `codex exec` is blocked by a hook). Codex runs `gpt-6.1-sol`
+at `high` effort and reaches Mnemosyne through the same token as Claude Code. `gpt-6.1-sol` needs
+Codex CLI 0.166 or newer: older CLIs get "model is not supported when using Codex with a ChatGPT
+account".
