@@ -488,6 +488,48 @@ fn error_shape_optional_fields_are_validated_on_both_sides() {
     mismatched["details"]["text"] = serde_json::json!(42);
     assert!(shape_eq(&optional, &mismatched, "error.usage.error").is_err());
 }
+fn is_help_invocation(args: &[Value]) -> bool {
+    args.iter()
+        .filter_map(Value::as_str)
+        .take_while(|arg| *arg != "--")
+        .any(|arg| matches!(arg, "--help" | "-h"))
+}
+#[test]
+fn help_invocations_respect_argument_separator() {
+    for (args, expected) in [
+        (serde_json::json!(["inbox", "--help", "--"]), true),
+        (serde_json::json!(["inbox", "-h", "--"]), true),
+        (serde_json::json!(["send", "--", "--help"]), false),
+        (serde_json::json!(["send", "--", "-h"]), false),
+        (serde_json::json!(["inbox", "--json"]), false),
+    ] {
+        assert_eq!(is_help_invocation(args.as_array().unwrap()), expected);
+    }
+}
+#[test]
+fn evidence_help_is_skipped_while_contract_is_checked() {
+    let docs = examples();
+    let example = &docs["error.usage"].values[0];
+    let calls = [
+        serde_json::json!({
+            "argv": ["glen", "inbox", "--help"],
+            "stdout": "Usage: glen inbox [OPTIONS]"
+        }),
+        serde_json::json!({
+            "argv": ["glen", "tail", "--json", "--cwd"],
+            "stdout": example
+        }),
+    ];
+    let mut checked = 0;
+    for call in calls {
+        if is_help_invocation(call["argv"].as_array().unwrap()) {
+            continue;
+        }
+        shape_eq(example, &call["stdout"], "error.usage").unwrap();
+        checked += 1;
+    }
+    assert_eq!(checked, 1);
+}
 #[test]
 #[ignore]
 fn evidence_shapes() {
@@ -509,6 +551,9 @@ fn evidence_shapes() {
             continue;
         }
         let args = call["argv"].as_array().unwrap();
+        if is_help_invocation(args) {
+            continue;
+        }
         let Some(command) = args
             .iter()
             .filter_map(Value::as_str)
