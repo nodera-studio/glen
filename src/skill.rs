@@ -1,6 +1,7 @@
 //! A block guard is an exact `<!-- glen:if NAME[ NAME…] -->` line, closed by
 //! `<!-- glen:end -->`. Blocks cannot nest. A line guard uses the same opening
 //! comment after one space at the end of a line. Names match [a-z][a-z-]*.
+pub(crate) mod write;
 use crate::{
     cli,
     env::Env,
@@ -269,7 +270,10 @@ pub fn inspect_scoped(
     if meta.file_type().is_symlink() {
         return Ok(inspection(State::Foreign, None, "SKILL.md is a symlink"));
     }
-    let content = fs::read_to_string(path)?;
+    let bytes = fs::read(path)?;
+    let Ok(content) = String::from_utf8(bytes) else {
+        return Ok(inspection(State::Foreign, None, "not written by glen"));
+    };
     let found = content
         .split_inclusive('\n')
         .enumerate()
@@ -281,7 +285,7 @@ pub fn inspect_scoped(
     if installed_agent != agent.as_str() {
         return Ok(inspection(
             State::Foreign,
-            v,
+            None,
             format!("installed for {installed_agent}"),
         ));
     }

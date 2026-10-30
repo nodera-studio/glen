@@ -147,6 +147,52 @@ fn exit_errors(s: &str) -> Vec<String> {
             errors.push(format!("unknown exit {exit}"));
         }
     }
+    errors.extend(common::exit_code_errors(s, 2));
+    errors
+}
+fn check_options(tokens: &[Word], args: &[&clap::Arg], context: &str) -> Vec<String> {
+    let mut errors = Vec::new();
+    let mut j = 0;
+    while j < tokens.len() {
+        let w = &tokens[j];
+        if w.text == "--" {
+            break;
+        }
+        if w.text.starts_with('-') && w.text != "-" && w.text != "---" && w.text != "-->" {
+            let (flag, inline) = w
+                .text
+                .split_once('=')
+                .map_or((w.text.as_str(), None), |(f, v)| (f, Some(v)));
+            let arg = args.iter().find(|a| {
+                !a.is_hide_set()
+                    && (a.get_long().is_some_and(|n| flag == format!("--{n}"))
+                        || a.get_short().is_some_and(|n| flag == format!("-{n}")))
+            });
+            if let Some(a) = arg {
+                let possible = a
+                    .get_value_parser()
+                    .possible_values()
+                    .map(|v| v.map(|v| v.get_name().to_owned()).collect::<Vec<_>>())
+                    .unwrap_or_default();
+                let value = inline.or_else(|| tokens.get(j + 1).map(|w| w.text.as_str()));
+                if a.get_action().takes_values()
+                    && !possible.is_empty()
+                    && let Some(value) = value
+                    && !value.starts_with('<')
+                    && !value.starts_with('-')
+                    && !possible.iter().any(|v| v == value)
+                {
+                    errors.push(format!("invalid {flag} value {value} on {context}"));
+                }
+                if a.get_action().takes_values() && inline.is_none() {
+                    j += 1;
+                }
+            } else {
+                errors.push(format!("unknown flag {flag} on {context}"));
+            }
+        }
+        j += 1;
+    }
     errors
 }
 /// Shared plain checker: mutation tests exercise exactly the same checks as the real skill.
@@ -157,6 +203,11 @@ fn check_skill(rendered: &str, cmd: &clap::Command) -> Vec<String> {
         let Some(i) = subcommand_index(&tokens, cmd) else {
             continue;
         };
+        errors.extend(check_options(
+            &tokens[..i],
+            &cmd.get_arguments().collect::<Vec<_>>(),
+            "glen",
+        ));
         let name = &tokens[i].text;
         if name.starts_with('<') {
             continue;
@@ -216,6 +267,28 @@ fn check_skill(rendered: &str, cmd: &clap::Command) -> Vec<String> {
             j += 1;
         }
     }
+    let all_args: Vec<_> = cmd
+        .get_arguments()
+        .chain(cmd.get_subcommands().flat_map(|s| s.get_arguments()))
+        .collect();
+    for span in spans(rendered)
+        .into_iter()
+        .filter(|s| !words(s).iter().any(|w| w.text == "glen"))
+    {
+        errors.extend(check_options(&words(&span), &all_args, "skill prose"));
+    }
+    for line in rendered.lines() {
+        // Inline code is checked above; inspect bare option references in ordinary prose too.
+        for (i, prose) in line.split('`').enumerate().filter(|(i, _)| i % 2 == 0) {
+            let _ = i;
+            let normalized = prose
+                .split_whitespace()
+                .map(|w| w.trim_matches(['(', ')', ',', ';', '.', ':']))
+                .collect::<Vec<_>>()
+                .join(" ");
+            errors.extend(check_options(&words(&normalized), &all_args, "skill prose"));
+        }
+    }
     for sub in cmd
         .get_subcommands()
         .filter(|c| !c.is_hide_set() && c.get_name() != "help")
@@ -250,6 +323,17 @@ fn ac404_checker_mutations() {
     for (mutation, token) in [
         (format!("{text}\n`glen frobnicate`"), "frobnicate"),
         (format!("{text}\n`glen ls --bogus`"), "--bogus"),
+        (format!("{text}\n`glen --bogus ls`"), "--bogus"),
+        (format!("{text}\n`glen --color=bogus ls`"), "bogus"),
+        (format!("{text}\n`--dir DIR`"), "--dir"),
+        (format!("{text}\n`--tools fuller`"), "fuller"),
+        (format!("{text}\n`--as automatic`"), "automatic"),
+        (format!("{text}\n`--nowait`"), "--nowait"),
+        (format!("{text}\nUse --dir DIR here."), "--dir"),
+        (
+            text.replace("`no_route` |", "`no_route`, `io` |"),
+            "no_route",
+        ),
         (format!("{text}\n`glen jobs --follow-up`"), "--follow-up"),
         (text.replace("glen jobs", "glen ls"), "jobs"),
         (
@@ -364,4 +448,24 @@ fn ac404_numeric_defaults() {
         assert_eq!(a.get_default_values(), [std::ffi::OsStr::new(value)]);
         assert!(text.contains(prose), "{prose}");
     }
+}
+
+#[test]
+fn cycle1_skill_sandbox_guard_exit_guidance_and_plain_command_example() {
+    let text = skill::render_current(Agent::Claude).unwrap();
+    assert!(!text.contains("support live sessions"));
+    assert!(text.contains("Only non-empty `CODEX_SANDBOX` marks a sandbox"));
+    assert!(text.contains("`CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends"));
+    assert!(text.contains("done; read `data`, then use `data.forked.to_handle`"));
+    assert!(text.contains("send/wait: `glen wait <job>`; tail -f: stream ended"));
+    assert!(text.contains("glen send <handle> -- \"-v is broken\""));
+    assert!(!text.contains("< file.md"));
+    let visible = skill::visible_commands()
+        .into_iter()
+        .chain(["install-extension".into()])
+        .collect();
+    let future = skill::render(Agent::Claude, "0.1.0", &visible).unwrap();
+    assert!(future.contains("support live sessions"));
+    let faq = include_str!("../site/src/components/FAQ.astro");
+    assert!(faq.contains("CODEX_SANDBOX_NETWORK_DISABLED=1</code> alone allows sending"));
 }

@@ -387,6 +387,35 @@ mod tests {
         }
     }
     #[test]
+    fn whitespace_path_variables_are_unset() {
+        let expected = resolve_vars(&[]);
+        for key in [
+            "PI_CONFIG_DIR",
+            "PI_CODING_AGENT_DIR",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+        ] {
+            let actual = resolve_vars(&[(key, " \t ")]);
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{key}"
+            );
+        }
+        let env = Env::for_test(
+            Some(Path::new("/h")),
+            Path::new("/w"),
+            &[("CLAUDE_CONFIG_DIR", " \t ")],
+        );
+        assert_eq!(
+            crate::skill::user_target(&env, crate::skill::Agent::Claude).unwrap(),
+            Path::new("/h/.claude/skills/glen/SKILL.md")
+        );
+        let env = Env::for_test(Some(Path::new(" \t ")), Path::new("/w"), &[]);
+        assert!(!env.home_is_explicit());
+        assert_eq!(resolve(&env, None).unwrap_err().code, ErrorCode::InvalidEnv);
+    }
+    #[test]
     fn no_home() {
         assert_eq!(
             resolve(&Env::for_test(None, Path::new("/w"), &[]), None)

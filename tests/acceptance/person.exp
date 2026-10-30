@@ -13,7 +13,7 @@ set plan {
   {glen send L glen_reply NONCE_A3 => 0; reply arrow and nonce}
   {glen inbox => 0; nonce}
   {glen send X hello => 6; stderr error and hint}
-  {glen install-skill --project --dry-run => 0; would installed}
+  {glen install-skill --project --dry-run => 0; would install}
   {glen install-skill --project => 0; installed twice}
   {glen install-skill --project => 0; unchanged twice}
   {glen completions zsh | head -1 => 0; #compdef glen}
@@ -43,7 +43,9 @@ proc step {command code {pattern {}} {human 1}} {
   if {[clock milliseconds]-$started > 900000} {fail "15-minute budget exceeded"}
   incr number
   set timeout 150
+  # Consume the terminal echo separately: nonces in commands cannot prove a reply.
   send -- "$command; printf '\\n__GLEN_EXIT_$number=%s__\\n' \$?\r"
+  expect -re {\r?\n}
   expect {
     -re "\r?\n__GLEN_EXIT_$number=(\[0-9\]+)__\r?\n" {
       set got $expect_out(1,string); set output $expect_out(buffer)
@@ -70,6 +72,7 @@ spawn bash --norc --noprofile -i
 set timeout 10
 expect -re {[$#] }
 send -- "PS1='acc> '\r"
+expect -re {\r?\n}
 expect -exact "acc> "
 step {glen --version} 0 {glen [0-9]}
 step {glen doctor} 0 {glen doctor}
@@ -87,7 +90,7 @@ step "glen send $L [quote "Call glen_reply with text $n3 and final true, then an
 step {glen inbox} 0 $n3
 set refused [step "glen send $X hello" 6 {error:}]
 if {![string match *hint:* $refused]} {fail "missing refusal hint"}
-step {glen install-skill --project --dry-run} 0 {would installed}
+step {glen install-skill --project --dry-run} 0 {would install}
 set installed [step {glen install-skill --project} 0 {installed}]
 if {[regexp -all {installed} $installed] < 2} {fail "expected two installed skills"}
 set unchanged [step {glen install-skill --project} 0 {unchanged}]

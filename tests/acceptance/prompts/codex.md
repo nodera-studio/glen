@@ -12,6 +12,4 @@ Task:
 5. Find out whether omp sent you anything else and report it.
 6. Ask X to reply ok; handle the result as the skill says.
 
-Use a shell timeout of at least 100 seconds, or the skill's 5-second bounded wait loop.
-Never repeat a send after exit 10, exit 130 or a cut-off call. Never work around a sandbox refusal.
 Finish with every command and exit code, exact available nonces, the discovered skill path and refusal hints.

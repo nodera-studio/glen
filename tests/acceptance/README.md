@@ -8,7 +8,8 @@ checks as real omp, Claude Code or Codex acceptance.
 Prerequisites: Rust toolchain, omp/18.14.0 with a working normal model/auth configuration, jq,
 perl, GNU screen, expect for person mode, Claude Code for b/b2/b3, Codex plus the
 `codex:codex-rescue` companion for c1/c2, shasum, and gitleaks. No download or package upgrade is
-performed by the harness. Build, version checks and setup progress go to stderr; setup prints
+performed by the harness. **Close other omp sessions first**, so the owner-session snapshot
+can attribute all changes to the recorded scratch buckets. Build, version checks and setup progress go to stderr; setup prints
 only its scratch path to stdout.
 
 Final orchestrator decisions override the draft plan's credential-copy design:

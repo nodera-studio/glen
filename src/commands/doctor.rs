@@ -14,7 +14,7 @@ use std::{path::Path, time::Duration};
 struct Check {
     name: &'static str,
     status: &'static str,
-    value: String,
+    value: serde_json::Value,
     detail: String,
 }
 pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
@@ -27,7 +27,7 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         checks.push(Check {
             name,
             status,
-            value: value.clone(),
+            value: json!(value),
             detail: detail.clone(),
         });
         let value = if matches!(
@@ -153,7 +153,8 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         },
     );
     let (status, value, detail) = omp::dotenv::describe(env, &paths);
-    add("omp_env_files", status, value, detail);
+    add("omp_env_files", status, value.join(", "), detail);
+    let env_files = value;
     let mut skills = serde_json::Map::new();
     for agent in crate::skill::Agent::ALL {
         let path = crate::skill::user_target(env, agent)?;
@@ -195,27 +196,41 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             ),
         };
         let project_path = crate::skill::project_target(env.cwd(), agent);
-        let project = match crate::skill::inspect_scoped(&project_path, env.cwd(), agent, &rendered)
-        {
-            Ok(i) if i.state == crate::skill::State::NotInstalled => serde_json::Value::Null,
-            Ok(i) => {
-                if i.state != crate::skill::State::Current {
-                    status = "warn";
-                    detail.push_str(&format!(
-                        "; project copy at {} is {}: run `glen install-skill --project`",
-                        render::tilde(&project_path, env.home()),
-                        i.state.as_str()
-                    ));
+        let same_copy = project_path == path
+            || std::fs::canonicalize(&project_path)
+                .ok()
+                .zip(std::fs::canonicalize(&path).ok())
+                .is_some_and(|(a, b)| a == b);
+        let project = if same_copy {
+            serde_json::Value::Null
+        } else {
+            match crate::skill::inspect_scoped(&project_path, env.cwd(), agent, &rendered) {
+                Ok(i) if i.state == crate::skill::State::NotInstalled => serde_json::Value::Null,
+                Ok(i) => {
+                    if i.state != crate::skill::State::Current {
+                        status = "warn";
+                        if !detail.is_empty() {
+                            detail.push_str("; ");
+                        }
+                        detail.push_str(&format!(
+                            "project copy at {} is {}: run `glen install-skill --project`",
+                            render::tilde(&project_path, env.home()),
+                            i.state.as_str()
+                        ));
+                    }
+                    json!({"path":path_value(&project_path),"state":i.state.as_str(),"version":i.version})
                 }
-                json!({"path":path_value(&project_path),"state":i.state.as_str(),"version":i.version})
-            }
-            Err(e) => {
-                status = "warn";
-                detail.push_str(&format!(
-                    "; cannot inspect project copy {}: {e}; run `glen install-skill --project`",
-                    project_path.display()
-                ));
-                json!({"path":path_value(&project_path),"state":"foreign","version":null})
+                Err(e) => {
+                    status = "warn";
+                    if !detail.is_empty() {
+                        detail.push_str("; ");
+                    }
+                    detail.push_str(&format!(
+                        "cannot inspect project copy {}: {e}; run `glen install-skill --project`",
+                        project_path.display()
+                    ));
+                    json!({"path":path_value(&project_path),"state":"foreign","version":null})
+                }
             }
         };
         skills.insert(agent.as_str().into(),json!({"path":path_value(&path),"state":state,"version":installed,"current":state=="current","project":project}));
@@ -246,6 +261,9 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
     } else {
         serde_json::Value::Null
     };
+    if let Some(check) = checks.iter_mut().find(|c| c.name == "omp_env_files") {
+        check.value = json!(env_files);
+    }
     let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":json_paths,"checks":checks,"skills":skills});
     let p = &ctx.painter;
     let mut table = render::Table::new(p, ctx.width);

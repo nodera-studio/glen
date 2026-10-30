@@ -88,7 +88,11 @@ pub fn probe_abstract(path: &str) -> Lease {
         Err(e) => Lease::Unknown(e.to_string()),
     }
 }
+#[cfg(test)]
+thread_local! { pub(crate) static PROBE_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub fn probe(owners: &Path, id: &str) -> Lease {
+    #[cfg(test)]
+    PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let Some(path) = lock_path(owners, id) else {
         return Lease::Unknown("session id is not a plain token".into());
     };

@@ -35,8 +35,8 @@ Every command has `--help`.
 | 7 | `job_failed` | report `error.details` |
 | 8 | `not_implemented` | this version lacks the command |
 | 10 | running | `glen wait <job>`; the job keeps running |
-| 11 | forked | use `data.forked.to_handle` from now on |
-| 130 | interrupted | `glen wait <job>`; the job keeps running |
+| 11 | forked | done; read `data`, then use `data.forked.to_handle` |
+| 130 | interrupted | send/wait: `glen wait <job>`; tail -f: stream ended |
 
 Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not retry in a loop or work around it.
 - `sandboxed`: rerun this command outside the sandbox (ask for escalated permissions for `glen`).
@@ -59,8 +59,7 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 - omp has `glen_reply` (`text`, optional `final`) in sessions glen reaches. Ask for it for progress or specific answers;
   replies arrive in `data.replies`.
 - Replies also land in `glen inbox`, with `job_id` naming their job. <!-- glen:if inbox -->
-- Long text: `glen send <handle> - < file.md` reads stdin. A message starting with `-` needs `--` before it:
-  `glen send <handle> -- "-v is broken"`.
+- Send quoted text: `glen send <handle> -- "-v is broken"`; `--` lets a message start with `-`.
 - Never send the same message twice. After exit 10, exit 130 or a call your shell cut off, it is still queued or
   running: `glen jobs --active`, then `glen wait <job>`.
 
@@ -72,7 +71,9 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 - In Codex's sandbox reads work. Spills need writable `GLEN_HOME`; otherwise exit 6 `sandboxed` with
   `glen_home_writable:false`: set `GLEN_HOME` under `$TMPDIR`. Prefer `glen tail <handle> -n 20`.
   Sending and session controls must reach omp outside the sandbox; exit 6 `sandboxed` explains the restriction.
-  Rerun with escalated permissions. Network-enabled sandboxes support live sessions only, with writable `GLEN_HOME`.
+  Only non-empty `CODEX_SANDBOX` marks a sandbox. `CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends;
+  a real permission failure returns exit 6 with the hint. Rerun with escalated permissions if refused.
+- Network-enabled sandboxes support live sessions only, with writable `GLEN_HOME`. <!-- glen:if install-extension -->
 - Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker. <!-- glen:if inbox -->
 
 <!-- glen:if abort stop models model thinking compact -->

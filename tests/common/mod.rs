@@ -303,3 +303,43 @@ pub fn poll<T>(timeout: std::time::Duration, mut f: impl FnMut() -> Option<T>) -
     }
 }
 pub const A_ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+
+/// Only backticked error codes count; statuses in successful rows are prose.
+pub fn exit_code_errors(text: &str, column: usize) -> Vec<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut expected: BTreeMap<u8, BTreeSet<&str>> = BTreeMap::new();
+    for exit in [0, 10, 11, 130] {
+        expected.insert(exit, BTreeSet::new());
+    }
+    for code in glen::error::ErrorCode::ALL {
+        expected
+            .entry(code.exit_code())
+            .or_default()
+            .insert(code.as_str());
+    }
+    let rows: BTreeMap<u8, BTreeSet<&str>> = text
+        .lines()
+        .filter_map(|line| {
+            let cells: Vec<_> = line.split('|').map(str::trim).collect();
+            let exit = cells.get(1)?.parse().ok()?;
+            let codes = cells
+                .get(column)?
+                .split('`')
+                .enumerate()
+                .filter(|(i, _)| i % 2 == 1)
+                .map(|(_, s)| s)
+                .collect();
+            Some((exit, codes))
+        })
+        .collect();
+    expected
+        .iter()
+        .filter(|(exit, want)| rows.get(exit) != Some(*want))
+        .map(|(exit, want)| format!("exit {exit}: expected {want:?}, found {:?}", rows.get(exit)))
+        .chain(
+            rows.keys()
+                .filter(|exit| !expected.contains_key(exit))
+                .map(|exit| format!("unknown exit {exit}")),
+        )
+        .collect()
+}

@@ -494,8 +494,24 @@ List jobs, newest first. Absent glen home gives an empty list without creating i
 ```json
 {
   "data": {
-    "jobs": [],
-    "total": 0
+    "jobs": [{
+      "id": "01a18bcc-6d3e-75f2-b9cf-6ffc7656f7d4",
+      "handle": "j656f7d4",
+      "status": "completed",
+      "route": "rpc",
+      "deliver_as": "auto",
+      "delivered_as": "prompt",
+      "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "session_handle": "e27c0de",
+      "actual_session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "created_at": "2026-10-30T12:00:00Z",
+      "updated_at": "2026-10-30T12:00:01Z",
+      "elapsed_ms": 1000,
+      "text_preview": "hi",
+      "error": null,
+      "forked": null
+    }],
+    "total": 1
   },
   "ok": true,
   "v": 1
@@ -572,6 +588,7 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 
 Check order: omp_binary, omp_version, profile, agent_dir, sessions_dir, glen_home, omp_env_files,
 skill_claude, skill_codex, sandbox. W3 inserts extension and live_endpoints after glen_home.
+The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
 
 ## `glen completions`
 

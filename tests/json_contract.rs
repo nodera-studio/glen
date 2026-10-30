@@ -144,7 +144,6 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         ("show", vec!["show", "e27c0de"]),
         ("show.raw", vec!["show", "e27c0de", "--raw"]),
         ("tail", vec!["tail", "e27c0de", "-n", "1"]),
-        ("jobs", vec!["jobs"]),
         ("completions", vec!["completions", "zsh", "--json"]),
         (
             "install-skill",
@@ -208,6 +207,14 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
             v["data"]["job"]["id"].as_str().unwrap()
         };
         r.wait_worker_gone(job);
+        if id == "send.completed" {
+            let out = r.glen(&["jobs"]).output().unwrap();
+            let rows = json(&out);
+            assert_eq!(rows["data"]["total"], 1);
+            assert_eq!(rows["data"]["jobs"].as_array().unwrap().len(), 1);
+            assert_eq!(rows["data"]["jobs"][0]["status"], "completed");
+            all.insert("jobs".into(), vec![rows]);
+        }
         all.insert(id.into(), vec![v]);
     }
     let r = RpcBox::new();
@@ -303,6 +310,7 @@ fn ac412_command_sections_and_exit_codes() {
         assert!(rows.contains_key(&exit));
     }
     assert_eq!(rows.len(), 12);
+    assert!(common::exit_code_errors(text, 3).is_empty());
 }
 #[test]
 fn shape_checker_reports_path() {
@@ -359,4 +367,16 @@ fn evidence_shapes() {
         checked += 1;
     }
     assert!(checked > 0, "no contract calls in evidence");
+}
+
+#[test]
+fn exit_code_checker_rejects_extra_or_misplaced_codes() {
+    let text = include_str!("../docs/json.md");
+    for changed in [
+        text.replace("`no_route` |", "`no_route`, `io` |"),
+        text.replace("`usage`, `invalid_env`", "`usage`"),
+        text.replace("| done |", "| `io` |"),
+    ] {
+        assert!(!common::exit_code_errors(&changed, 3).is_empty());
+    }
 }

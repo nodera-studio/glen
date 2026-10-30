@@ -110,7 +110,7 @@ fn home_write_error(
     action: &str,
     e: io::Error,
 ) -> GlenError {
-    if crate::sandbox::detect(&ctx.env).is_some() && e.kind() == io::ErrorKind::PermissionDenied {
+    if crate::sandbox::restricted(&ctx.env, &e) {
         crate::sandbox::map_home_write(&ctx.env, command, e)
     } else {
         GlenError::new(
@@ -208,7 +208,8 @@ pub fn emit_to(
         Ok(bytes) => bytes,
         Err(e) => return emit_error_to(ctx, e.into(), out, err),
     };
-    let bytes = if !ctx.stdout_tty
+    let bytes = if !(command == "install-skill" && outcome.data["dry_run"] == true)
+        && !ctx.stdout_tty
         && ctx.mode != Mode::Raw
         && ctx.max_output.is_some_and(|max| {
             anstream::adapter::strip_str(&String::from_utf8_lossy(&bytes))
@@ -326,6 +327,25 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn readonly_spill_failure_maps_for_host_network_disabled_commands() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = ctx(t.path(), Mode::Json, false);
+        c.env = crate::env::Env::for_test(
+            Some(t.path()),
+            t.path(),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        let error = home_write_error(
+            &c,
+            "show",
+            &t.path().join("out"),
+            "write",
+            io::ErrorKind::ReadOnlyFilesystem.into(),
+        );
+        assert_eq!(error.code, ErrorCode::NoRoute);
+        assert_eq!(error.details.unwrap()["glen_home_writable"], false);
     }
     #[test]
     fn success_contract_and_warnings() {

@@ -8,7 +8,23 @@ use std::{
     path::Path,
 };
 fn install(b: &OmpBox, args: &[&str]) -> Value {
-    data(&b.glen(args, &b.alpha()))
+    data(&with_umask(b, args, "022").output().unwrap())
+}
+fn with_umask(b: &OmpBox, args: &[&str], mask: &str) -> std::process::Command {
+    let base = b.command(&[], &b.alpha());
+    let mut command = std::process::Command::new("/bin/sh");
+    command
+        .env_clear()
+        .envs(base.get_envs().filter_map(|(k, v)| v.map(|v| (k, v))))
+        .current_dir(b.alpha())
+        .args([
+            "-c",
+            &format!("umask {mask}; exec \"$@\""),
+            "glen-test",
+            env!("CARGO_BIN_EXE_glen"),
+        ])
+        .args(args);
+    command
 }
 fn user(b: &OmpBox, a: Agent) -> std::path::PathBuf {
     b.home
@@ -125,6 +141,13 @@ fn ac406_state_table() {
             action(&data(&out), 0, "removed");
         } else {
             action(&data(&out), 0, "skipped");
+            assert_eq!(json(&out)["warnings"][0]["code"], *code);
+            assert!(
+                json(&out)["warnings"][0]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("--force removes it")
+            );
             action(
                 &install(&b, &["install-skill", "--claude", "--force", "--uninstall"]),
                 0,
@@ -243,6 +266,13 @@ fn ac407_output_and_preflight() {
         .unwrap();
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(json(&out)["error"]["code"], "invalid_env");
+    let out = b
+        .command(&["install-skill"], &b.alpha())
+        .env("HOME", " \t ")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    assert_eq!(json(&out)["error"]["code"], "invalid_env");
     let parent = user(&b, Agent::Codex).parent().unwrap().to_path_buf();
     fs::create_dir_all(&parent).unwrap();
     fs::set_permissions(&parent, fs::Permissions::from_mode(0o000)).unwrap();
@@ -324,7 +354,10 @@ fn ac409_env_files() {
     };
     let v = doctor(false);
     assert_eq!(v["checks"][6]["status"], "warn");
-    assert!(v["checks"][6]["value"].as_str().unwrap().contains("~/.env"));
+    assert_eq!(
+        v["checks"][6]["value"],
+        serde_json::json!([b.home.join(".env")])
+    );
     assert!(
         v["checks"][6]["detail"]
             .as_str()
@@ -410,4 +443,210 @@ fn ac410_sandbox() {
         .unwrap();
     assert_eq!(out.status.code(), Some(1));
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn cycle1_project_without_home_whitespace_config_and_umask() {
+    let b = OmpBox::new();
+    let out = b
+        .command(&["install-skill", "--project"], &b.alpha())
+        .env_remove("HOME")
+        .output()
+        .unwrap();
+    assert_eq!(data(&out)["scope"], "project");
+    let out = with_umask(&b, &["install-skill", "--claude"], "077")
+        .env("CLAUDE_CONFIG_DIR", "  ")
+        .output()
+        .unwrap();
+    assert_eq!(
+        data(&out)["targets"][0]["path"],
+        user(&b, Agent::Claude).to_str().unwrap()
+    );
+    assert_eq!(
+        fs::metadata(user(&b, Agent::Claude)).unwrap().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(user(&b, Agent::Claude).parent().unwrap())
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+#[test]
+fn cycle1_modified_older_foreign_agent_and_non_utf8_skip_safely() {
+    let b = OmpBox::new();
+    install(&b, &["install-skill", "--claude"]);
+    let path = user(&b, Agent::Claude);
+    let old = skill::render(Agent::Claude, "0.0.1", &skill::visible_commands()).unwrap();
+    for (bytes, state, version) in [
+        (
+            format!("{old}edited").into_bytes(),
+            "modified",
+            serde_json::json!("0.0.1"),
+        ),
+        (
+            skill::render_current(Agent::Codex).unwrap().into_bytes(),
+            "foreign",
+            Value::Null,
+        ),
+        (vec![0xff, 0xfe], "foreign", Value::Null),
+    ] {
+        fs::write(&path, &bytes).unwrap();
+        for flags in [vec![], vec!["--uninstall"]] {
+            let mut args = vec!["install-skill", "--claude"];
+            args.extend(flags);
+            let out = b.glen(&args, &b.alpha());
+            let v = data(&out);
+            action(&v, 0, "skipped");
+            assert_eq!(v["targets"][0]["state"], state);
+            assert_eq!(v["targets"][0]["installed_version"], version);
+            assert_eq!(json(&out)["warnings"][0]["code"], format!("skill_{state}"));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        }
+    }
+}
+#[test]
+fn cycle1_dry_run_never_spills_or_prunes_and_human_verbs_fit() {
+    let b = OmpBox::new();
+    for human in [false, true] {
+        let mut args = vec!["install-skill", "--dry-run"];
+        if human {
+            args.push("--human");
+        }
+        let out = b
+            .command(&args, &b.alpha())
+            .env("GLEN_MAX_OUTPUT", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert!(!b.glen_home.exists());
+    }
+    let outdir = b.glen_home.join("out");
+    fs::create_dir_all(&outdir).unwrap();
+    let retained = outdir.join("old.json");
+    fs::write(&retained, b"retain").unwrap();
+    fs::File::open(&retained)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(9 * 86400))
+        .unwrap();
+    let before = tree(&b.glen_home);
+    let out = b
+        .command(&["install-skill", "--dry-run"], &b.alpha())
+        .env("GLEN_MAX_OUTPUT", "1")
+        .output()
+        .unwrap();
+    data(&out);
+    assert_eq!(tree(&b.glen_home), before);
+    for width in ["40", "60"] {
+        let out = b
+            .command(&["install-skill", "--human", "--dry-run"], &b.alpha())
+            .env("COLUMNS", width)
+            .output()
+            .unwrap();
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("would install"));
+        assert!(!text.contains("would installed"));
+        assert!(
+            text.lines()
+                .all(|line| glen::render::text::width(line) <= width.parse::<usize>().unwrap()),
+            "{text}"
+        );
+    }
+    install(&b, &["install-skill"]);
+    let out = b.glen(
+        &["install-skill", "--human", "--uninstall", "--dry-run"],
+        &b.alpha(),
+    );
+    let text = String::from_utf8(out.stdout).unwrap();
+    assert!(text.contains("would remove"));
+    let footer = text.lines().last().unwrap();
+    assert!(!footer.contains("/glen") && !footer.contains("$glen"));
+}
+#[test]
+fn cycle1_doctor_home_symlink_is_user_copy_and_project_detail_has_no_leading_separator() {
+    let b = OmpBox::new();
+    let config = b.tmp.path().join("config");
+    fs::create_dir(&config).unwrap();
+    symlink(config, b.home.join(".claude")).unwrap();
+    install(&b, &["install-skill"]);
+    let out = b
+        .command(&["doctor"], &b.home)
+        .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
+        .output()
+        .unwrap();
+    let v = data(&out);
+    assert_eq!(v["skills"]["claude"]["project"], Value::Null);
+    assert_eq!(v["checks"][7]["status"], "ok");
+    let project = skill::project_target(&b.alpha(), Agent::Claude);
+    fs::create_dir_all(project.parent().unwrap()).unwrap();
+    fs::write(&project, "foreign").unwrap();
+    let out = b
+        .command(&["doctor"], &b.alpha())
+        .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
+        .output()
+        .unwrap();
+    let v = data(&out);
+    let detail = v["checks"][7]["detail"].as_str().unwrap();
+    assert!(detail.starts_with("project copy"), "{detail}");
+}
+#[test]
+fn cycle1_uninstall_error_keeps_removed_target_and_earlier_warnings() {
+    let b = OmpBox::new();
+    install(&b, &["install-skill"]);
+    fs::write(user(&b, Agent::Claude), "foreign").unwrap();
+    let skills = user(&b, Agent::Codex)
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_path_buf();
+    fs::set_permissions(&skills, fs::Permissions::from_mode(0o555)).unwrap();
+    let out = b.glen(&["install-skill", "--uninstall"], &b.alpha());
+    fs::set_permissions(&skills, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let v = json(&out);
+    assert_eq!(v["error"]["details"]["done"][1]["action"], "removed");
+    assert_eq!(
+        v["error"]["details"]["warnings"][0]["code"],
+        "skill_foreign"
+    );
+    assert!(!user(&b, Agent::Codex).exists());
+}
+#[test]
+fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() {
+    let b = RpcBox::new();
+    let out = b
+        .glen(&["send", "e27c0de", "hi"])
+        .env("CODEX_SANDBOX", "")
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        .output()
+        .unwrap();
+    let v = data(&out);
+    assert_eq!(v["status"], "completed");
+    b.wait_worker_gone(v["job"]["id"].as_str().unwrap());
+    let out = b
+        .glen(&["doctor"])
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        .output()
+        .unwrap();
+    let v = data(&out);
+    assert_eq!(v["checks"][9]["status"], "info");
+    assert_eq!(
+        v["checks"][9]["detail"],
+        "network disabled by the host; escalated commands still work"
+    );
+    fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o500)).unwrap();
+    // A fresh home child makes the denied operation occur during job creation.
+    let out = b
+        .glen(&["send", "@new", "hi"])
+        .env("GLEN_HOME", b.omp.glen_home.join("blocked"))
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        .output()
+        .unwrap();
+    fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(out.status.code(), Some(6));
+    assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
+    assert_eq!(json(&out)["error"]["details"]["glen_home_writable"], false);
 }
