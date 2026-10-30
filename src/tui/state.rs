@@ -26,6 +26,8 @@ pub struct App {
     pub size: (u16, u16),
     pub now: Instant,
     pub wall: SystemTime,
+    /// Resolved by the caller; UTC keeps pure scene construction deterministic.
+    pub timezone: jiff::tz::TimeZone,
     pub frame: usize,
     pub focus: Focus,
     pub narrow_tab: Pane,
@@ -64,6 +66,7 @@ impl App {
             size,
             now,
             wall,
+            timezone: jiff::tz::TimeZone::UTC,
             frame: 0,
             focus: Focus::Sessions,
             narrow_tab: Pane::Sessions,

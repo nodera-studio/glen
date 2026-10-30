@@ -7,7 +7,7 @@ use crate::{
     glen_home::{self, GlenHome},
     omp::paths,
     output::{self, Mode, OutputCtx, Terminal},
-    render::text,
+    render::{self, text},
     tui::{
         runtime,
         state::{App, Focus, Pane, Scope, Target, TranscriptStatus},
@@ -44,6 +44,8 @@ fn prepare(
     stdin_tty: bool,
 ) -> Result<Prepared, GlenError> {
     gate(ctx, term, env, stdin_tty)?;
+    // Glen has already resolved flag/environment precedence; do not let the backend reapply NO_COLOR.
+    ratatui::crossterm::style::force_color_output(ctx.stdout_color);
     let Command::Watch(args) = &cli.command else {
         return Err(GlenError::new(
             ErrorCode::Internal,
@@ -72,7 +74,7 @@ fn prepare(
         })
         .unwrap_or_else(|| env.cwd().into());
     let bucket = Scope::Bucket {
-        label: text::single_line(&project.to_string_lossy()),
+        label: text::single_line(&render::tilde(&project, env.home())),
         cwd: project,
     };
     let mut app = App::new(
@@ -272,6 +274,7 @@ mod tests {
             .unwrap();
         let prepared = prepare(&cli, &env, &output, &term, true).unwrap();
         assert!(matches!(prepared.app.scope,Scope::Bucket {cwd:ref project,..} if project == &cwd));
+        assert!(matches!(&prepared.app.scope, Scope::Bucket {label,..} if label == "~/work/beta"));
         assert_eq!(
             prepared.opened.as_ref().unwrap().summary.file.bucket,
             "-work-beta"

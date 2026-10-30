@@ -1,9 +1,10 @@
-//! A byte-indexed, character-boundary editor. Text remains raw until display.
+//! A byte-indexed, grapheme-boundary editor. Text remains raw until display.
 use super::state::ErrView;
 use crate::{
     cli::DeliverAs,
     render::{sanitize, text},
 };
+use unicode_segmentation::UnicodeSegmentation;
 
 #[derive(Clone, Debug)]
 pub struct Prompt {
@@ -80,23 +81,29 @@ impl Prompt {
         self.boundary();
     }
     fn boundary(&mut self) {
-        self.cursor = self.cursor.min(self.text.len());
-        while !self.text.is_char_boundary(self.cursor) {
-            self.cursor -= 1;
-        }
+        self.cursor = self.cursor_boundary();
+    }
+    fn cursor_boundary(&self) -> usize {
+        self.text
+            .grapheme_indices(true)
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.text.len()))
+            .take_while(|i| *i <= self.cursor)
+            .last()
+            .unwrap_or(0)
     }
     fn previous(&self) -> usize {
         self.text[..self.cursor]
-            .char_indices()
+            .grapheme_indices(true)
             .next_back()
             .map_or(0, |(i, _)| i)
     }
     fn next(&self) -> usize {
         self.cursor
             + self.text[self.cursor..]
-                .chars()
+                .graphemes(true)
                 .next()
-                .map_or(0, char::len_utf8)
+                .map_or(0, str::len)
     }
     fn line_start(&self) -> usize {
         self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1)
@@ -229,17 +236,32 @@ impl Prompt {
         let mut col = 0usize;
         let mut row = 0usize;
         let mut cursor = (0, 0);
-        let mut point = self.cursor.min(self.text.len());
-        while !self.text.is_char_boundary(point) {
-            point -= 1;
-        }
-        for (i, c) in self
+        let point = self.cursor_boundary();
+        for (i, raw) in self
             .text
-            .char_indices()
-            .chain(std::iter::once((self.text.len(), '\0')))
+            .grapheme_indices(true)
+            .chain(std::iter::once((self.text.len(), "")))
         {
-            if i == self.text.len() || c == '\n' {
-                if i == point {
+            let newline = raw.ends_with('\n');
+            let shown = sanitize(raw.strip_suffix('\n').unwrap_or(raw));
+            for (part, glyph) in shown.graphemes(true).enumerate() {
+                let cells = text::width(glyph);
+                if col > 0 && col + cells > available {
+                    lines.push(String::new());
+                    row += 1;
+                    col = 0;
+                }
+                if i == point && part == 0 {
+                    cursor = (
+                        (prefix + col).min(usize::from(width.saturating_sub(1))) as u16,
+                        row.min(u16::MAX as usize) as u16,
+                    );
+                }
+                lines[row].push_str(glyph);
+                col += cells;
+            }
+            if i == self.text.len() || newline {
+                if i == point && shown.is_empty() {
                     let (x, y) = if col >= available {
                         (prefix, row + 1)
                     } else {
@@ -253,30 +275,11 @@ impl Prompt {
                         lines.push(String::new());
                     }
                 }
-                if i < self.text.len() {
+                if newline {
                     lines.push(String::new());
                     row += 1;
                     col = 0;
                 }
-                continue;
-            }
-            let shown = sanitize(&c.to_string()).into_owned();
-            for (part, glyph) in shown.chars().enumerate() {
-                let glyph = glyph.to_string();
-                let cells = text::width(&glyph);
-                if col > 0 && col + cells > available {
-                    lines.push(String::new());
-                    row += 1;
-                    col = 0;
-                }
-                if i == point && part == 0 {
-                    cursor = (
-                        (prefix + col).min(usize::from(width.saturating_sub(1))) as u16,
-                        row.min(u16::MAX as usize) as u16,
-                    );
-                }
-                lines[row].push_str(&glyph);
-                col += cells;
             }
         }
         (lines, cursor)
@@ -292,6 +295,32 @@ mod tests {
         p.insert_paste("a\r\nb");
         assert_eq!(p.text, "a\nb");
         assert_eq!(p.cursor, 3);
+    }
+    #[test]
+    fn grapheme_wrap_cursor_and_edits_match_rendered_clusters() {
+        let mut p = Prompt::default();
+        p.insert("👩‍💻你好世界");
+        let (lines, cursor) = p.display(8);
+        assert_eq!(lines, ["👩‍💻你好", "世界"]);
+        assert_eq!(cursor, (6, 1));
+        assert_eq!(ratatui::text::Span::raw(&lines[0]).width(), 6);
+        assert_eq!(
+            ratatui::text::Span::raw(&lines[1]).width() + 2,
+            usize::from(cursor.0)
+        );
+        p.clear();
+        p.insert("👩‍💻e\u{301}你");
+        assert_eq!(p.display(20).1, (7, 0));
+        p.edit(Edit::Left);
+        p.edit(Edit::Backspace);
+        assert_eq!(p.text, "👩‍💻你");
+        assert_eq!(p.cursor, "👩‍💻".len());
+        p.edit(Edit::Home);
+        p.edit(Edit::Delete);
+        assert_eq!(p.text, "你");
+        p.clear();
+        p.insert("🇷🇴x");
+        assert_eq!(p.display(20).1, (5, 0));
     }
     #[test]
     fn paste_mixed_newlines_and_controls_remains_raw_until_display() {

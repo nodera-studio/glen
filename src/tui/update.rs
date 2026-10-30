@@ -765,7 +765,9 @@ fn render_new(app: &mut App, start: usize) {
         }
         t.starts.push(t.lines.len());
         let rendered = match block {
-            Block::Item(item) => transcript::render_item(item, &mut t.prev_model, &st),
+            Block::Item(item) => {
+                transcript::render_item_in(item, &mut t.prev_model, &st, &app.timezone)
+            }
             Block::Notice(s) => p.paint(Token::Muted, &render::sanitize(s)),
         };
         t.lines.extend(ansi::lines(&rendered));

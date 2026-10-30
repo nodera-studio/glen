@@ -65,6 +65,7 @@ fn role(
     timestamp: &Option<String>,
     model: Option<&str>,
     st: &Style<'_>,
+    timezone: &jiff::tz::TimeZone,
 ) -> String {
     let mut s = st.painter.paint(token, &st.painter.bold(name));
     if let Some(m) = model {
@@ -77,7 +78,10 @@ fn role(
         .as_deref()
         .and_then(|s| s.parse::<jiff::Timestamp>().ok())
     {
-        s.push_str(&muted(&format!(" · {}", text::local_hm(&t)), st))
+        s.push_str(&muted(
+            &format!(" · {}", text::local_hm_in(&t, timezone)),
+            st,
+        ))
     }
     s
 }
@@ -200,13 +204,22 @@ pub fn render_items(items: &[Item], st: &Style<'_>) -> String {
         .join("\n\n")
 }
 pub fn render_item(item: &Item, prev_model: &mut Option<String>, st: &Style<'_>) -> String {
+    render_item_in(item, prev_model, st, &jiff::tz::TimeZone::system())
+}
+/// Render using a caller-owned timezone; full-screen callers perform no timezone discovery.
+pub fn render_item_in(
+    item: &Item,
+    prev_model: &mut Option<String>,
+    st: &Style<'_>,
+    timezone: &jiff::tz::TimeZone,
+) -> String {
     let p = st.painter;
     match item {
         Item::User {
             text, timestamp, ..
         } => format!(
             "{}\n{}",
-            role("❯ user", Token::Accent, timestamp, None, st),
+            role("❯ user", Token::Accent, timestamp, None, st, timezone),
             body(text, None, st)
         ),
         Item::Assistant {
@@ -231,6 +244,7 @@ pub fn render_item(item: &Item, prev_model: &mut Option<String>, st: &Style<'_>)
                     None
                 },
                 st,
+                timezone,
             );
             *prev_model = model.clone();
             if *has_thinking {

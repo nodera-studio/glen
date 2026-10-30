@@ -25,6 +25,7 @@ use ratatui::{
     widgets::{Clear, Paragraph},
 };
 use std::borrow::Cow;
+use unicode_segmentation::UnicodeSegmentation;
 
 pub fn prepare(app: &mut App) {
     let (width, height) = layout::viewport(app);
@@ -95,15 +96,15 @@ fn fit(line: Line<'static>, width: u16) -> Line<'static> {
     'outer: for span in line.spans {
         let mut content = String::new();
         last = span.style;
-        for c in span.content.chars() {
-            let cells = text::width(&c.to_string());
+        for grapheme in span.content.graphemes(true) {
+            let cells = text::width(grapheme);
             if used + cells > width - 1 {
                 if !content.is_empty() {
                     spans.push(Span::styled(content, last));
                 }
                 break 'outer;
             }
-            content.push(c);
+            content.push_str(grapheme);
             used += cells;
         }
         if !content.is_empty() {
@@ -169,7 +170,7 @@ fn selected(app: &App) -> Option<&SessionRow> {
         .iter()
         .find(|r| Some(&r.id) == app.list.selected.as_ref())
 }
-fn session_title(row: &SessionRow) -> String {
+fn session_title(row: &SessionRow, timezone: &jiff::tz::TimeZone) -> String {
     if !row.title.trim().is_empty() {
         return text::single_line(&row.title);
     }
@@ -182,7 +183,7 @@ fn session_title(row: &SessionRow) -> String {
     }
     let time = jiff::Timestamp::try_from(row.updated)
         .ok()
-        .map(|t| text::local_hm(&t))
+        .map(|t| text::local_hm_in(&t, timezone))
         .unwrap_or_else(|| "??:??".into());
     format!("untitled · {time}")
 }
@@ -289,7 +290,7 @@ fn transcript_tab(app: &App, width: u16, narrow: bool) -> Line<'static> {
         .as_ref()
         .map(|h| text::single_line(&h.title))
         .filter(|s| !s.is_empty())
-        .or_else(|| row.map(session_title))
+        .or_else(|| row.map(|row| session_title(row, &app.timezone)))
         .unwrap_or_else(|| "session".into());
     let caption = if narrow {
         format!("{} · ", text::single_line(handle(app)))
@@ -323,21 +324,24 @@ fn transcript_tab(app: &App, width: u16, narrow: bool) -> Line<'static> {
 }
 fn tabs(f: &mut Frame, app: &App, a: &Areas) {
     let mode = layout::mode(app.size.0, app.size.1);
+    let left_w = match mode {
+        Mode::Wide => 34,
+        Mode::Medium => 24,
+        _ => 12.min(a.tabs.width),
+    };
     let list_caption = if mode == Mode::Wide {
         format!(
             "sessions · {}",
             match &app.scope {
                 Scope::All => "all projects".into(),
-                Scope::Bucket { label, .. } => text::single_line(label),
+                Scope::Bucket { label, .. } => text::truncate_left(
+                    &text::single_line(label),
+                    usize::from(left_w).saturating_sub(text::width("▍sessions · ")),
+                ),
             }
         )
     } else {
         "sessions".into()
-    };
-    let left_w = match mode {
-        Mode::Wide => 34,
-        Mode::Medium => 24,
-        _ => 12.min(a.tabs.width),
     };
     paint(
         f,
@@ -442,7 +446,7 @@ fn list(f: &mut Frame, app: &App, rect: Rect) {
                 app.theme.style(Token::Focus),
             ),
         ]);
-        let title = session_title(row);
+        let title = session_title(row, &app.timezone);
         let unread = app
             .inbox
             .unread_by_session
@@ -457,7 +461,7 @@ fn list(f: &mut Frame, app: &App, rect: Rect) {
             ));
         }
         right.push(Span::styled(
-            text::age(app.wall, row.updated),
+            text::age_in(app.wall, row.updated, &app.timezone),
             app.theme.style(Token::Muted),
         ));
         if mode == Mode::Wide {
@@ -534,10 +538,11 @@ fn reflow(app: &App, width: u16) -> (Vec<Line<'static>>, Vec<usize>) {
         }
         starts.push(lines.len());
         match block {
-            Block::Item(item) => lines.extend(ansi::lines(&renderer::render_item(
+            Block::Item(item) => lines.extend(ansi::lines(&renderer::render_item_in(
                 item,
                 &mut previous,
                 &style,
+                &app.timezone,
             ))),
             Block::Notice(s) => lines.push(styled(
                 text_render::sanitize(s).into_owned(),
@@ -685,8 +690,12 @@ fn activity_groups(app: &App) -> Vec<Activity> {
         match &send.phase {
             SendPhase::Routing => {
                 let text = text::single_line(&send.text);
-                let preview = text.chars().take(40).collect::<String>();
-                let dots = if text.chars().count() > 40 { "…" } else { "" };
+                let preview = text.graphemes(true).take(40).collect::<String>();
+                let dots = if text.graphemes(true).count() > 40 {
+                    "…"
+                } else {
+                    ""
+                };
                 lines.push(styled(
                     format!(
                         "{} sending \"{preview}{dots}\" · {}",
@@ -1415,7 +1424,7 @@ fn overlay(f: &mut Frame, app: &App, a: &Areas) {
                     .at
                     .parse::<jiff::Timestamp>()
                     .ok()
-                    .map(|t| text::age(app.wall, t.into()))
+                    .map(|t| text::age_in(app.wall, t.into(), &app.timezone))
                     .unwrap_or_else(|| "unknown age".into());
                 let job = record
                     .job_id
@@ -1977,6 +1986,120 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn list_tab_preserves_the_tail_of_a_long_project_path() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.scope = Scope::Bucket {
+            cwd: "/home/test/work/a-very-long-parent-directory/你好项目".into(),
+            label: "~/work/a-very-long-parent-directory/你好项目".into(),
+        };
+        let (buffer, _, _) = screenshot(&mut app);
+        let mut shown = String::new();
+        let mut x = 0;
+        while x < 34 {
+            let symbol = buffer[(x, 1)].symbol();
+            shown.push_str(symbol);
+            x += text::width(symbol).max(1) as u16;
+        }
+        let shown = shown.trim_end();
+        assert!(shown.starts_with(" sessions · …"), "{shown}");
+        assert!(shown.ends_with("/你好项目"), "{shown}");
+        assert!(text::width(shown) <= 34);
+    }
+    #[test]
+    fn grapheme_fitting_and_prompt_cursor_match_the_test_backend() {
+        for (value, width, expected) in [
+            ("👩‍💻ab", 3, "👩‍💻…"),
+            ("你好世界", 5, "你好…"),
+            ("e\u{301}xy", 2, "e\u{301}…"),
+            ("🇷🇴ab", 3, "🇷🇴…"),
+        ] {
+            let fitted = fit(Line::raw(value), width);
+            assert_eq!(fitted.to_string(), expected);
+            assert!(fitted.width() <= usize::from(width));
+            let mut terminal = Terminal::new(TestBackend::new(width, 1)).unwrap();
+            terminal
+                .draw(|frame| frame.render_widget(Paragraph::new(fitted), frame.area()))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(
+                buffer[(0, 0)].symbol(),
+                value.graphemes(true).next().unwrap()
+            );
+            assert_eq!(buffer[(width - 1, 0)].symbol(), "…");
+        }
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.size = (60, 20);
+        app.prompt.clear();
+        app.prompt.notice = None;
+        app.prompt.insert("👩‍💻你好世界e\u{301}");
+        let (buffer, visible, cursor) = screenshot(&mut app);
+        let area = layout::areas(&app).input;
+        let prefix = text::width("e27c0de ❯ ") as u16;
+        assert!(visible);
+        assert_eq!(buffer[(prefix, area.y)].symbol(), "👩‍💻");
+        assert_eq!(buffer[(prefix + 2, area.y)].symbol(), "你");
+        assert_eq!(cursor.x, prefix + 11);
+        assert_eq!(cursor.y, area.y);
+    }
+    #[test]
+    fn view_and_transcript_cache_use_the_supplied_timezone() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.timezone = jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_hours(9).unwrap());
+        let timestamp: jiff::Timestamp = "2026-10-30T23:30:00Z".parse().unwrap();
+        app.wall = "2026-11-10T00:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .into();
+        app.list.rows[0].title.clear();
+        app.list.rows[0].first_message = None;
+        app.list.rows[0].updated = timestamp.into();
+        assert_eq!(
+            session_title(&app.list.rows[0], &app.timezone),
+            "untitled · 08:30"
+        );
+        let r#gen = app.transcript.r#gen;
+        update::update(
+            &mut app,
+            Msg::Follow {
+                r#gen,
+                ev: FollowMsg::Opened {
+                    header: Header {
+                        title: "".into(),
+                        handle: "e27c0de".into(),
+                        model: None,
+                    },
+                    items: vec![Item::User {
+                        id: "timezone".into(),
+                        timestamp: Some(timestamp.to_string()),
+                        text: "timezone body".into(),
+                        images: 0,
+                    }],
+                    dropped: 0,
+                    not_yet_persisted: false,
+                },
+            },
+        );
+        let cached = app
+            .transcript
+            .lines
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(cached.contains("08:30"));
+        assert!(!cached.contains("23:30"));
+        app.size = (100, 40);
+        assert_ne!(app.transcript.width, layout::transcript_width(&app));
+        let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let shown = region_text(buffer, buffer.area).join("\n");
+        assert!(shown.contains("untitled · 08:30"));
+        assert!(shown.contains("2026-10-31"));
+        assert!(shown.contains("❯ user · 08:30"));
+        assert!(!shown.contains("23:30"));
+    }
+    #[test]
     fn ascii_key_spellings_and_pane_hint_priority_are_depth_independent() {
         for depth in [
             ColorDepth::None,
@@ -2386,11 +2509,11 @@ pub(crate) mod tests {
         app.list.rows[1].title.clear();
         app.list.rows[1].first_message = Some("First message\nwith control \x1b".into());
         assert_eq!(
-            session_title(&app.list.rows[1]),
+            session_title(&app.list.rows[1], &app.timezone),
             r"First message with control \x1b"
         );
         app.list.rows[1].first_message = None;
-        assert!(session_title(&app.list.rows[1]).starts_with("untitled · "));
+        assert!(session_title(&app.list.rows[1], &app.timezone).starts_with("untitled · "));
         let (buffer, _, _) = screenshot(&mut app);
         assert!(row_text(&buffer, 0).starts_with("glen watch"));
         assert!(row_text(&buffer, 0).contains("8 sessions"));

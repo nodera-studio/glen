@@ -600,6 +600,7 @@ pub(crate) fn run(
     mut app: App,
     opened: Option<Opened>,
 ) -> Result<i32, GlenError> {
+    app.timezone = jiff::tz::TimeZone::system();
     let _hook = PanicHook::install();
     let (tx, rx) = mpsc::channel();
     let ctx = Ctx {

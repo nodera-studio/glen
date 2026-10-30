@@ -40,6 +40,12 @@ mod purity {
                 "lease::probe",
                 "JobStore",
                 "registry::",
+                "TimeZone::system",
+                "TimeZone::try_system",
+                "text::age(",
+                "text::local_hm(",
+                "transcript::render_item(",
+                "renderer::render_item(",
             ] {
                 assert!(
                     !source.contains(forbidden),

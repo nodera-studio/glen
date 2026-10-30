@@ -575,6 +575,26 @@ fn start_and_quit_restores_terminal_without_creating_home() {
         b.clean();
     }
 }
+#[test]
+fn explicit_color_always_overrides_no_color_for_real_frame_writes() {
+    let b = OmpBox::new();
+    for (choice, colored) in [("always", true), ("auto", false), ("never", false)] {
+        let mut cmd = command(&b, &["watch", "e27c0de", "--color", choice]);
+        cmd.env("NO_COLOR", "1").env("COLORTERM", "truecolor");
+        let mut pty = Pty::start(cmd, 120, 40);
+        pty.ready();
+        let output = pty.bytes();
+        assert_eq!(
+            output
+                .windows(b"\x1b[38;2;".len())
+                .any(|run| run == b"\x1b[38;2;"),
+            colored,
+            "--color {choice} did not honor Glen's resolved precedence"
+        );
+        pty.quit();
+        b.clean();
+    }
+}
 
 #[test]
 fn separate_placeholder_row_keeps_the_draft_empty_for_ctrl_d() {

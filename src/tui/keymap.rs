@@ -104,6 +104,13 @@ impl KeyBinding {
             code = KeyCode::Char('j');
             modifiers = KeyModifiers::CONTROL;
         }
+        // Return may arrive as its C0 spelling, either a Ctrl-M chord or bare CR.
+        if (code == KeyCode::Char('m') && modifiers == KeyModifiers::CONTROL)
+            || (code == KeyCode::Char('\r') && modifiers.is_empty())
+        {
+            code = KeyCode::Enter;
+            modifiers = KeyModifiers::NONE;
+        }
         if matches!(code,KeyCode::Char(c) if c.is_uppercase() || matches!(c,'?' )) {
             modifiers.remove(KeyModifiers::SHIFT);
         }
@@ -522,6 +529,51 @@ pub fn action(ctx: KeymapCtx, key: KeyEvent) -> Option<Action> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ctrl_m_and_cr_match_return_in_every_context() {
+        for overlay in [
+            OverlayCtx::None,
+            OverlayCtx::Help,
+            OverlayCtx::Inbox,
+            OverlayCtx::Confirm,
+            OverlayCtx::Picker,
+        ] {
+            for focus in [Focus::Sessions, Focus::Transcript, Focus::Prompt] {
+                let ctx = KeymapCtx { overlay, focus };
+                for kind in [
+                    KeyEventKind::Press,
+                    KeyEventKind::Repeat,
+                    KeyEventKind::Release,
+                ] {
+                    let mut enter = KeyEvent::new(Enter, M::NONE);
+                    enter.kind = kind;
+                    for mut compatible in [
+                        KeyEvent::new(Char('m'), M::CONTROL),
+                        KeyEvent::new(Char('\r'), M::NONE),
+                    ] {
+                        compatible.kind = kind;
+                        assert_eq!(action(ctx, compatible), action(ctx, enter), "{ctx:?}");
+                    }
+                }
+            }
+        }
+        let ctx = KeymapCtx {
+            overlay: OverlayCtx::None,
+            focus: Focus::Prompt,
+        };
+        assert_eq!(
+            action(ctx, KeyEvent::new(Char('m'), M::CONTROL)),
+            Some(A::Send)
+        );
+        let ctx = KeymapCtx {
+            focus: Focus::Sessions,
+            ..ctx
+        };
+        assert_eq!(
+            action(ctx, KeyEvent::new(Char('m'), M::CONTROL)),
+            Some(A::FocusPrompt)
+        );
+    }
     #[test]
     fn newline_compatibility_and_kind_filtering() {
         let ctx = KeymapCtx {
