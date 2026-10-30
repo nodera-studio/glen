@@ -34,6 +34,9 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
      for the first release).
    - Confirm the tag does not exist yet: `git ls-remote --tags origin "refs/tags/v<version>"`
      prints nothing.
+   - Dry-run the release workflow: `gh workflow run release.yml --ref main`, then `gh run watch`.
+     It builds, smoke-tests, packages and test-installs all four targets without publishing; it
+     must be green.
 2. **Version-bump PR.**
    - `git switch -c chore/release-v<version>`.
    - Set `version = "<version>"` in `Cargo.toml`, then run `cargo build` (without `--locked`)
@@ -58,10 +61,17 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
    is a mutator and stays prompt-gated. Never tag a commit that is not on `main`, never move or
    re-push an existing tag; if the tag is wrong, stop and ask the owner.
 7. **Post-tag.**
-   - If `.github/workflows/` has a workflow triggered by tags (none today; only `ci.yml`), watch
-     it with `gh run list --limit 3` / `gh run watch <id>` and confirm it is green.
-   - If the owner wants a GitHub Release: `gh release create v<version> --verify-tag --notes-file
-     <file>` with the same notes as the PR body (only when asked).
+   - The tag push starts `release.yml`. It checks the tag (annotated, equal to `v` + the
+     `Cargo.toml` version, on `main`), builds and verifies the four targets, and publishes the
+     GitHub Release with generated notes. Watch it with `gh run list --workflow release.yml
+     --limit 1` / `gh run watch <id>` and confirm it is green.
+   - Confirm the 9 assets (4 `glen-<target>.tar.gz`, 4 `.sha256`, `SHA256SUMS`):
+     `gh release view v<version> --json assets --jq '.assets[].name'`.
+   - Fallback only if the workflow cannot run: `gh release create v<version> --verify-tag
+     --notes-file <file>` with the same notes as the PR body, then upload the assets by hand.
+   - After the first release (v0.1.0): set `releaseAvailable: true` in `site/src/data/site.ts` in a
+     PR, so the site offers the install script and the latest release, and redeploy the site
+     (`npm --prefix site run deploy`; its online link check verifies the script and the assets).
    - Tag every board issue shipped in this release with `released:v<version>`
      (`document_tags_update`, `mode: "add"`, on the Mnemosyne board of project Glen; read the
      issue with `document_get` first for its `revision`). Keep their `shipped:main` tag.

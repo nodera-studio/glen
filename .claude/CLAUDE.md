@@ -42,7 +42,8 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 Several agent prompts were written for a TypeScript web monorepo. Apply them to glen like this:
 
 - glen's only frontend is the static site in `site/`; it has no backend service, database, ORM,
-  queue, Docker, hosting config (W7) or error tracker. Mark those areas n/a.
+  queue, Docker or error tracker, and its hosting is an assets-only Cloudflare Worker
+  (`site/wrangler.jsonc`, no bindings). Mark those areas n/a.
 - For `site/`, npm, tsc and Playwright mean the site's own scripts.
 - For Rust tooling: npm/pnpm means cargo; tsc or "typecheck" means `cargo check --all-targets`; eslint means
   clippy; prettier means `cargo fmt`; jest/vitest filters mean `cargo test <filter>`; `npm audit`

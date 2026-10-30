@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { plan, total, paneAt, typeDelays, mulberry32, SPINNER_TICKS, TICK_MS, ROW_KINDS, CUE_KINDS, TYPE } from './terminal-player.mjs';
-import { script, COLS, ROWS, WINDOWS, SEED, lsTable, wrap, plain, selection, duration, PROGRESS } from '../../data/demo.mjs';
+import { script, COLS, ROWS, WINDOWS, SEED, lsTable, completedBlock, items, tailHeader, lines, plain, selection, job, session, message, PROGRESS } from '../../data/demo.mjs';
+import capture from '../../data/demo-capture.json' with { type: 'json' };
 
 const wide = plan(script, { seed: SEED });
 const narrow = plan(script, { seed: SEED, narrow: true });
@@ -72,7 +73,7 @@ test('rows become visible in order, and the spinner is replaced by the completio
  }
  const spin = wide.find(c => c.k === 'spin');
  const done = wide.find(c => c.k === 'flush' && c.at === spin.end);
- assert.ok(done && plain(done.line).startsWith('✓ completed · j3c9f41 · e27c0de · '));
+ assert.ok(done && plain(done.line).startsWith(`✓ completed · ${job} · ${session} · `));
  const send = wide.find(c => c.k === 'cmd' && c.text.startsWith('glen send'));
  assert.ok(spin.at >= send.commit, 'spinner starts after Enter');
  const reply = wide.find(c => c.k === 'event' && plain(c.line).startsWith('  ↳ glen_reply'));
@@ -80,11 +81,11 @@ test('rows become visible in order, and the spinner is replaced by the completio
  assert.ok(hop.at >= reply.at && hop.at < spin.end, 'the reply hops across before glen prints it');
 });
 
-test('glen send and wait output is W2’s: spinner messages in job order, the completed line in seconds', () => {
- // wait.rs duration() and the cases its tests pin.
- for (const [ms, text] of [[41207, '41s'], [41000, '41s'], [59999, '59s'], [65000, '1m 05s'], [3600000, '60m 00s'], [0, '0s'], [-5, '0s']]) assert.equal(duration(ms), text, `${ms} ms`);
+test('glen send and wait output is W2’s: spinner messages in job order, then the captured outcome', () => {
+ // W2 job handles are j plus 7 hex digits (src/jobs/mod.rs JobId::handle).
+ assert.match(job, /^j[0-9a-f]{7}$/);
  const spin = wide.find(c => c.k === 'spin');
- assert.equal(spin.v, 'sending to e27c0de · j3c9f41');
+ assert.equal(spin.v, `sending to ${session} · ${job}`);
  const msgs = wide.filter(c => c.k === 'msg');
  assert.deepEqual(msgs.map(c => c.v), ['starting omp', 'waiting for the reply']);
  for (const m of msgs) assert.ok(m.at > spin.at && m.at < spin.end, `${m.v} shows while the spinner does`);
@@ -92,8 +93,16 @@ test('glen send and wait output is W2’s: spinner messages in job order, the co
  assert.ok(msgs[1].at <= user.at, 'omp accepts the prompt before its user message shows');
  for (const cues of [wide, narrowCols]) {
   const done = cues.find(c => c.k === 'flush' && c.at === cues.find(x => x.k === 'spin').end);
-  assert.deepEqual(done.line, [{ text: '✓ completed · j3c9f41 · e27c0de · 41s', tone: 'success' }]);
+  assert.deepEqual(done.line, [{ text: `✓ completed · ${job} · ${session} · 41s`, tone: 'success' }]);
  }
+});
+
+test('the tail -f diagnostic is the one glen’s source prints to a TTY', () => {
+ const tail = readFileSync(fileURLToPath(new URL('../../../../src/commands/tail.rs', import.meta.url)), 'utf8');
+ assert.ok(tail.includes('"following {} · Ctrl-C to stop"'));
+ const diag = wide.filter(c => c.p === 'b' && c.line && plain(c.line) === `following ${session} · Ctrl-C to stop`);
+ assert.equal(diag.length, 1);
+ assert.deepEqual(diag[0].line, [{ text: `following ${session} · Ctrl-C to stop`, tone: 'muted' }]);
 });
 
 const w2 = fileURLToPath(new URL('../../../../src/commands/wait.rs', import.meta.url));
@@ -132,19 +141,46 @@ test('the narrow command wraps at the column like a shell, without losing a char
  assert.equal(rows[1].at, rows[1].ty[0], 'the second line appears with its first key');
 });
 
-test('glen ls drops columns the way ls.rs does', () => {
+// AC-732: every line of glen stdout in the demo is the decoded capture, span for span.
+for (const [name, cols] of Object.entries(COLS)) {
+ const cues = plan(script, { seed: SEED, cols });
+ test(`${name}: the agent pane prints the captured ls table and wait outcome`, () => {
+  const flush = cues.filter(c => c.p === 'a' && c.k === 'flush').map(c => c.line);
+  const ls = lsTable(cols.a);
+  assert.deepEqual(flush.slice(0, ls.length), ls);
+  assert.deepEqual(flush.slice(ls.length), completedBlock(cols.a));
+ });
+ test(`${name}: the omp pane prints every captured transcript item, in order, nothing missing`, () => {
+  const rows = cues.filter(c => c.p === 'b' && (c.k === 'static' || c.k === 'event')).map(c => c.line);
+  assert.equal(plain(rows[0]), `~/work/alpha ❯ glen tail -f ${session}`);
+  const header = tailHeader(cols.b);
+  assert.deepEqual(rows.slice(1, 1 + header.length), header);
+  assert.equal(plain(rows[1 + header.length]), `following ${session} · Ctrl-C to stop`);
+  const shown = rows.slice(2 + header.length).filter(line => plain(line) !== '');
+  assert.deepEqual(shown, items(cols.b).flat());
+ });
+ test(`${name}: the agent sends the message the transcript shows`, () => {
+  const sent = items(cols.b).findLast(item => plain(item[0]).startsWith('❯ user'));
+  assert.equal(message, sent.slice(1).map(l => plain(l).replace(/^ {2}/, '')).join(' '));
+  const typed = cues.filter(c => c.k === 'cmd' && c.p === 'a').map(c => c.text).join('');
+  assert.ok(typed.endsWith(`glen send ${session} "${message}"`), typed);
+ });
+}
+
+test('every capture decodes, and each tone it uses has a terminal colour class', () => {
+ const css = readFileSync(fileURLToPath(new URL('./terminal.css', import.meta.url)), 'utf8');
+ const tones = new Set(Object.keys(capture.captures).flatMap(key => lines(key).flat().map(span => span.tone).filter(Boolean)));
+ assert.ok(tones.size >= 4, [...tones].join(' '));
+ for (const tone of tones) assert.match(css, new RegExp(`\\.c-${tone}\\s*\\{`), `.c-${tone}`);
+ assert.throws(() => lines('nope@1'), /no demo capture nope@1; add it to tests\/site_demo\.rs/);
+});
+
+test('the capture is glen’s ls with the demo sessions, the selection its reply line', () => {
  const header = w => plain(lsTable(w)[0]).split(/\s+/).filter(Boolean);
  assert.deepEqual(header(76), ['handle', 'state', 'title', 'turn', 'updated', 'model']);
  assert.deepEqual(header(44), ['handle', 'state', 'title', 'updated']);
  assert.equal(plain(lsTable(76).at(-1)), '3 sessions · 1 live');
- for (const w of [44, 76]) for (const line of lsTable(w)) assert.ok([...plain(line)].length <= w);
- assert.equal(plain(lsTable(76)[1]), 'e27c0de  ● live  Fix migration 0012  complete  2s ago   claude-sonnet-4-5');
-});
-
-test('text::wrap keeps the indent and breaks on words', () => {
- assert.deepEqual(wrap('  Added the index. All 12 tests pass. Migration 0012 is ready.', 44), ['  Added the index. All 12 tests pass.', '  Migration 0012 is ready.']);
- assert.deepEqual(wrap('short', 10), ['short']);
- assert.deepEqual(wrap('abcdefghij', 4), ['abcd', 'efgh', 'ij']);
+ assert.equal(selection, '↩ Added the index. All 12 tests pass.');
 });
 
 test('the selection covers the reply line', () => {

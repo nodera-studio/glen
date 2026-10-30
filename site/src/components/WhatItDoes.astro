@@ -6,7 +6,7 @@ import SectionHead from './SectionHead.astro';
 import HowCards from './islands/HowCards';
 import Topology from './islands/Topology';
 import palette from '../../../src/render/palette.json';
-import { lsTable, prompt, role, body, tool, s, cwd, reply, answer, completed, PROGRESS } from '../data/demo.mjs';
+import { lsTable, showHeader, items, itemParts, completedBlock, prompt, s, plain, cwd, job, session, message, PROGRESS } from '../data/demo.mjs';
 import { spans, esc } from './terminal/lines';
 
 const W = 76;
@@ -16,20 +16,24 @@ const bar = (title: string) => `<div class="peek-bar"><i></i><i></i><i></i><span
 const peek = (title: string, rows: string) => `<div class="peek">${bar(title)}<div class="peek-body">${rows}</div></div>`;
 
 const find = peek(`${cwd} — glen`, cmd('glen ls') + lsTable(W).map((l, i) => line(l, i >= 1 && i <= 3 ? ' data-row' : '')).join(''));
-const read = peek(`${cwd} — glen`, cmd('glen show e27c0de') + [
- [s('Fix migration 0012', undefined, true)],
- [s('e27c0de · ', 'muted'), s(cwd), s(' · '), s('claude-sonnet-4-5', 'muted'), s(' · '), s('●', 'success'), s(' '), s('live', 'success'), s(' · updated 2s ago', 'muted')],
- [], role('user', '12:04'), ...body('Fix 0012 and tell me when it passes.', W), [], role('assistant', '12:04'), ...tool('bash', 'cargo test migration_0012', '14 lines')(W),
+// The sent message, then the turn's role line and its bash row: real show output, with the
+// thinking row and the other items left out.
+const transcript = items(W);
+const sent = transcript.findLastIndex(item => plain(item[0]!).startsWith('❯ user'));
+const work = itemParts(transcript[sent + 1]!);
+const bash = work.find(part => plain(part[0]!).startsWith('  ↳ bash '))!;
+const read = peek(`${cwd} — glen`, cmd(`glen show ${session}`) + [
+ ...showHeader(W), [], ...transcript[sent]!, [], work[0]![0]!, ...bash,
 ].map(l => line(l, ' data-row')).join(''));
 const shimmer = [...PROGRESS.accepted].map(c => `<span>${esc(c)}</span>`).join('');
-const hear = peek(`${cwd} — glen`, cmd('glen wait j3c9f41')
+const hear = peek(`${cwd} — glen`, cmd(`glen wait ${job}`)
  + `<div data-before><i class="g">⠙</i> <span class="shimmer" style="--base-color:var(--glen-muted);--base-gradient-color:var(--term-fg)">${shimmer}</span></div>`
- + [completed, [],[s(`  ${answer}`)], [s(`↩ ${reply} ✓`, 'muted')]].map(l => line(l, ' data-after')).join(''));
+ + completedBlock(W).map(l => line(l, ' data-after')).join(''));
 const send = `<div class="route">
  <svg class="route-line" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true"><path d="M22 40C22 72 38 74 59 74" vector-effect="non-scaling-stroke"/></svg>
  <div class="route-node source"><b>Claude Code</b><span>your agent</span></div>
- <div class="route-node target" data-target><b><i class="on"></i>e27c0de</b><span>omp · live</span></div>
- <div class="route-chip" data-chip>“Fix 0012 and tell me when it passes.”</div>
+ <div class="route-node target" data-target><b><i class="on"></i>${session}</b><span>omp · live</span></div>
+ <div class="route-chip" data-chip>“${esc(message)}”</div>
 </div>`;
 
 const cards = [
