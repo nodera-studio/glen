@@ -132,7 +132,7 @@ algorithms. SKIP for naming, style, or routine CRUD.
 Agent tool:
   subagent_type: "codex:codex-rescue"
   description: "Advisor gate — adversarial plan critique"
-  prompt: "READ-ONLY adversarial second opinion on this approved implementation plan — advise, do NOT implement. A DIFFERENT model with uncorrelated blind spots, NOT the author. Rank the risks worst-first, steelman the alternative you would choose, state what you cannot assess, end with VERDICT: endorse | endorse-with-changes | reject. Constraints: {key constraints}. Plan: {approved plan}. --wait. Run in the foreground: wait for the Codex task to finish and return its full result; never return only a task id."
+  prompt: "READ-ONLY adversarial second opinion on this approved implementation plan — advise, do NOT implement. A DIFFERENT model with uncorrelated blind spots, NOT the author. Rank the risks worst-first, steelman the alternative you would choose, state what you cannot assess, end with VERDICT: endorse | endorse-with-changes | reject. Constraints: {key constraints}. Plan: {approved plan}. Do NOT write any file: return the full critique as your final message text. --wait. Run in the foreground: wait for the Codex task to finish and return its full result; never return only a task id."
 ```
 
 The advisor returns a verdict + ranked risks + steelman + what-it-cannot-assess. The
@@ -198,6 +198,31 @@ the sandbox keep running and keep editing the worktree. Whenever you stop such a
 the cancel path in `coder-codex.md` → "Cancelling a run" (companion `cancel`, then kill the
 worktree's `app-server-broker.mjs serve --cwd <worktree>` tree if anything survives) and
 confirm the worktree has stopped changing before dispatching anything else into it.
+
+**Removing a worktree stops its broker.** The companion broker (`app-server-broker.mjs serve
+--cwd <worktree>`) and its app-server outlive a finished run and the worktree itself; 7
+orphans serving deleted glen worktrees were once killed by hand. Whenever you remove a wave
+or fix worktree (after its merge, or when abandoning it), first run `coder-codex.md` →
+"Removing a worktree" (the guarded cancel recipe, step 2 unconditional), then `git worktree
+remove`, then its orphan sweep (brokers whose `--cwd` no longer exists, only under this repo's
+`.claude/worktrees/`).
+
+**Host re-verification (never trust Codex's red or green).** The Implementer's sandbox
+reports failures that are not real: `EPERM` on Unix-socket bind/connect (socket tests
+"fail"), a denied `.git/worktrees/<wt>/index.lock` (no `git add`, no commit), no network (no
+Mnemosyne writes). It happened in every Codex Implementer run of one session. `coder-codex.md`
+→ Step 6 has the host re-run the gate and tests outside the sandbox and commit on Codex's
+behalf. Do not take its report on faith either: before Role 2, in the same worktree,
+independently run `bash .claude/scripts/quality-gate.sh` and `cargo test --locked`.
+- A Codex failure is a sandbox artifact only when it is one of those sandbox-only shapes AND
+  the host re-run is green. Anything else, or any failure the host reproduces, is real: send
+  it back to a fresh Implementer as a fix.
+- Codex green but host red is real too.
+- On a green host re-run with Codex unable to commit, stage exactly the files Codex reported
+  (`touchedFiles` and the `COMPLETION` block), by path, and commit on its behalf; an
+  unreported file in `git status` is a deviation, not staged.
+- List every sandbox-vs-host discrepancy in the Report, one line each: Codex said / host
+  showed / verdict.
 
 **Network pre-flight.** The Codex sandbox may have no network. If the plan has network
 steps (`npm install`, CLI scaffolds, browser downloads, `cargo add` of a new crate), the
@@ -268,6 +293,13 @@ background task id." A codex-rescue pass once returned at once with a task id an
 doesn't exist yet", and the orchestrator had to poll for the output. If one still comes back with only a task id, fetch the
 result (`codex-companion.mjs status <id> --wait`, then `result <id>`) before merging votes;
 never merge a pass you have not read.
+
+**Codex returns the review as text.** The codex-rescue sandbox writes only inside its own cwd
+(your shell's directory at dispatch, often a worktree) and does not escalate, so a brief that
+names an output path elsewhere fails on the write. Every codex-rescue brief here (review,
+advisor, fix verification) says "do NOT write any file; return the full review as your final
+message text" and names no output path; you save it (see Review file names) if it must be on
+disk.
 
 **UI diffs are reviewed by running them.** When the diff touches rendered output
 (`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
@@ -406,8 +438,9 @@ cargo run -- <args>   # e.g. the new or changed subcommand, against the installe
 ### Report (Hand Off to User)
 
 Present a completion summary: task, files created (one-line purpose each), files
-modified, tests added (count + coverage areas), docs updated, risks/notes (manual
-steps, env vars, migrations), and what to manually test in the running app.
+modified, tests added (count + coverage areas), docs updated, sandbox-vs-host discrepancies
+(Role 1 host re-verification), risks/notes (manual steps, env vars, migrations), and what to
+manually test in the running app.
 
 **Commit per logical unit.** Multi-wave plans: one commit per wave once that wave is
 green. Single-feature work: one commit at the end. Use the standard HEREDOC format.
@@ -437,7 +470,13 @@ Plans are **kept after implementation** — they accumulate as project history. 
   UI Implementer `coder-ui.md`) and does not re-introduce separate
   coder/wiring/error-handling/test/verifier dispatches.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
-  alone leaves Codex editing the worktree.
+  alone leaves Codex editing the worktree. Removing a worktree stops its broker first and
+  sweeps orphaned brokers under `.claude/worktrees/`.
+- Never trust the Implementer's red or green: re-run the gate and tests on the host; a
+  sandbox-only failure is an artifact only when the host re-run is green; report every
+  discrepancy.
+- codex-rescue briefs never name an output path; Codex returns its review as final-message
+  text.
 - **Generative loop in ONE context (Codex's); discriminative checks in fresh Claude
   ones.** Never feed the Implementer's transcript to the reviewer — only the diff +
   spec. Split large work at slice boundaries (fresh Codex Implementer via

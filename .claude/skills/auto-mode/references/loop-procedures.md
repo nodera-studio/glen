@@ -207,7 +207,9 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    the wave's queue item `done`. Refresh the code index:
    `git -C ~/Developer/.mnemosyne-index/glen pull --ff-only`, then `code_reindex {project:
    "glen", repo: "glen"}`, confirmed with `code_index_status`. Update the ledger. Then
-   `git push origin --delete <branch>` and `git switch main && git pull --ff-only`.
+   `git push origin --delete <branch>` and `git switch main && git pull --ff-only`. If the
+   wave ran in a worktree (a parallel wave, or a fix worktree), remove it per "Removing a
+   worktree" below, which stops its Codex broker first.
 10. **Advance** to the next wave without asking. 2–3 line status at wave boundaries only;
     silent during polling.
 
@@ -238,7 +240,8 @@ a wave, add a line to the state file's **Harness friction log** (and log a gap i
    workaround in the skill or agent prompt that hits them.
 4. Commit, push, PR into `main`, then poll, capture a memory and squash-merge exactly like a
    wave. Mark the fixed friction lines `fixed in PR #NN`, close the gaps, and record the batch
-   in **Harness self-improvement**. Remove the worktree after the merge.
+   in **Harness self-improvement**. Remove the worktree after the merge, stopping its Codex
+   broker first (see "Removing a worktree" below).
 
 ### Independent waves in parallel
 
@@ -253,7 +256,19 @@ brief for that wave (Implementer, fix, conformance, docs, reviewers) passes the 
 path in the main checkout
 (`"$(git rev-parse --path-format=absolute --git-common-dir)/../.claude/plans/..."`, which
 resolves to the main checkout from any worktree) and says its absence from the worktree is expected; otherwise Implementers report it "missing".
-Design-heavy UI waves (the `site/`) follow the UI routing in step 3 above.
+Design-heavy UI waves (the `site/`) follow the UI routing in step 3 above. After the wave's
+squash-merge (step 9), remove its worktree, and any fix worktree cut for it, as below.
+
+### Removing a worktree (stop its Codex broker)
+
+Every Codex run in a worktree leaves a codex-companion broker (`app-server-broker.mjs serve
+--cwd <worktree>`) and its app-server running after the run ends and after the worktree is
+deleted; 7 such orphans were once killed by hand. For each wave, fix or harness worktree you
+remove: run `implementation/coder-codex.md` → "Removing a worktree" with `WT` = its absolute
+path (the guarded cancel recipe with step 2 unconditional: refuses an empty `WT` or the main
+checkout, matches the node broker only, skips `$$`/`$PPID`), then `git worktree remove "$WT"`,
+then that section's orphan sweep (brokers whose `--cwd` no longer exists, only under this
+repo's `.claude/worktrees/`).
 
 ## Shipping tags (`shipped:main` / `released:v0.x.y`)
 

@@ -140,10 +140,19 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            files affected, trade-offs, complexity, risk, and a recommendation. Attack the
            assumptions and failure modes a single model would miss. Approaches only —
            no code changes. Keep it compact (about 120 lines at most); no web fetches —
-           the research is already in the reports above. Return the analysis as your
-           final message. --wait. Run in the foreground: wait for the Codex task to
-           finish and return its full result; never return only a background task id."
+           the research is already in the reports above. Do NOT write any file: return
+           the full analysis as your final message text; the orchestrator saves it.
+           --wait. Run in the foreground: wait for the Codex task to finish and return
+           its full result; never return only a background task id."
 ```
+
+**Codex returns artifacts as text; you save them.** The codex-rescue sandbox is
+workspace-write, does not escalate, and can write only inside its own cwd, which is whatever
+directory your shell was in at dispatch (often a worktree). A planner told to write
+`.claude/plans/<slug>.private/plan-2.md` in the main checkout failed on that write. So every
+codex-rescue brief that produces an artifact (architect, planner) says "do NOT write any file;
+return the full artifact as your final message text" and never names an output path; you
+save the returned text to `.claude/plans/` yourself (below).
 
 **Codex runs in the foreground.** The `codex:codex-rescue` forwarder picks background mode for
 any task that looks long unless the brief says `--wait`; then it returns at once with a task id
@@ -288,10 +297,12 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            Researcher report: {researcher output}
            Return ordered steps with files-to-create vs modify, verification per step, and
            prerequisites. Plan only — no code. Keep it compact (about 120 lines at most);
-           no web fetches — the research is already in the reports above. Return the plan
-           as your final message. --wait. Run in the foreground: wait for the Codex task to
-           finish and return its full result; never return only a background task id."
+           no web fetches — the research is already in the reports above. Do NOT write any
+           file: return the full plan as your final message text; the orchestrator saves it.
+           --wait. Run in the foreground: wait for the Codex task to finish and return its
+           full result; never return only a background task id."
 ```
+The Codex plan arrives as the final message text (Step 4 → "Codex returns artifacts as text").
 Persist and anonymise both plans as in Step 4: raw plans to `.claude/plans/<slug>.private/plan-claude.md`
 and `plan-codex.md`, a fresh coin flip (independent of the Step 4 one), anonymised copies to
 `.claude/plans/<slug>.candidate-a.md` and `.claude/plans/<slug>.candidate-b.md`, and the mapping
@@ -333,6 +344,8 @@ when one is given. Tell the user:
 - Never override agent models. Each agent's frontmatter controls its model.
 - Explore before architecting — the architect needs real data, not assumptions.
 - Every `codex:codex-rescue` brief runs foreground (`--wait`) and returns the full result.
+- A codex-rescue brief never names an output path: Codex returns the artifact as its final
+  message text and the orchestrator saves it (its sandbox writes only inside its own cwd).
 - UI waves get the catalogue survey and reference inventory before components are chosen.
 
 </rules>

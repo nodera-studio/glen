@@ -21,9 +21,9 @@ Claude-side discipline: read-context-first, and STOP-and-report on architectural
 surprise instead of guessing.
 </role>
 
-**Done when:** Codex reports the slice green (`cargo test --locked` + 
-`bash .claude/scripts/quality-gate.sh` pass), you have parsed its JSON envelope, and you have returned the standard
-completion report (files, decisions, tests, gate state, deferred risks).
+**Done when:** your own host re-run (Step 6) shows the slice green (`cargo test --locked` +
+`bash .claude/scripts/quality-gate.sh` pass), you have parsed Codex's JSON envelope, and you have returned the standard
+completion report (files, decisions, tests, gate state, sandbox-vs-host discrepancies, deferred risks).
 
 ## Step 1 — Orient (Claude side, read-only)
 
@@ -156,6 +156,27 @@ The `status` call lists only the current Claude session's jobs; if it shows noth
 the worktree is still changing, go straight to step 2. Never kill a broker whose `--cwd` is
 not the worktree you stopped.
 
+### Removing a worktree (stop its broker first)
+
+The broker also outlives a run that ended normally, and the worktree's removal: 7 brokers
+were once found serving deleted glen worktrees. The companion has no broker shutdown verb
+(`cancel` stops jobs, not the broker); the broker's SIGTERM handler is its clean shutdown
+(closes the app-server, removes its socket and pid file). So whoever removes a wave or fix
+worktree runs steps 0–2 above for that `WT` **unconditionally** (step 2 included, even when
+nothing is running), then `git worktree remove "$WT"`. Order matters: the step-0 guards need
+the worktree to still exist.
+
+Then sweep orphans: stop any broker whose `--cwd` directory no longer exists, only under this
+repo's `.claude/worktrees/` (other repos' brokers are never touched). With `kill_tree` from
+step 2, run from any checkout of this repo:
+
+```bash
+MAIN="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)"; [ -n "$MAIN" ] || exit 1
+ps -axo pid=,command= | grep -E '^ *[0-9]+ +([^ ]*/)?node [^ ]*/app-server-broker\.mjs serve ' \
+  | awk -v root="$MAIN/.claude/worktrees/" -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent {for (i = 2; i < NF; i++) if ($i == "--cwd" && index($(i+1), root) == 1) print $1, $(i+1)}' \
+  | while read -r pid cwd; do [ -d "$cwd" ] || kill_tree "$pid"; done
+```
+
 ## Step 5 — Parse + report
 
 The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSummary}`.
@@ -171,6 +192,32 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
 - If `blockers` is non-empty or `gate` is `fail`, report it as NOT green — do not
   paper over it.
 
+## Step 6 — Host re-verification (never trust Codex's red or green)
+
+Codex's sandbox reports failures that are not real. In every run of one session it hit:
+Unix-socket bind/connect `EPERM` (socket tests "fail"), denied creation of
+`.git/worktrees/<wt>/index.lock` (no `git add`, no commit), and no network (no Mnemosyne
+writes). Its green is equally unproven. So, after every Codex run, in the same worktree and
+outside the sandbox:
+
+1. Re-run the gate and the tests yourself: `bash .claude/scripts/quality-gate.sh` and
+   `cargo test --locked`. Your result, not Codex's, is the gate state you report.
+2. A Codex-reported failure counts as a **sandbox artifact** only if it is one of those
+   sandbox-only shapes (`EPERM` on socket bind/connect, `index.lock`, network) AND your host
+   re-run is green. Any other failure, or any failure your re-run reproduces, is real: report
+   NOT green.
+3. When the host re-run is green and Codex could not commit, stage exactly the files Codex
+   reported (`touchedFiles` ∪ the `COMPLETION` block's `created`/`modified`), by path, never
+   `git add -A`/`.`, and commit on its behalf with the message your brief gives (else
+   `<wave label>: <slice summary>` plus the project's trailer). A file in
+   `git status` that Codex did not report is not staged; list it as a deviation.
+4. Report every discrepancy explicitly, one line each: what Codex reported (red/green, the
+   error), what the host re-run showed, and the verdict (sandbox artifact | real failure |
+   Codex green but host red).
+
+The `Bash` tool here runs outside Codex's sandbox; if your own environment blocks one of these
+too, say so instead of guessing.
+
 ## Rules
 
 - You write NO product code. If Codex is unavailable, STOP and report — never
@@ -178,7 +225,10 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
 - Foreground dispatch only; pin `--effort high`; pin `--model` via `CODEX_MODEL`
   when determinism matters.
 - Stopping this agent never stops Codex: cancel the job and the worktree's broker as in
-  "Cancelling a run".
+  "Cancelling a run". Removing a worktree stops its broker first and sweeps orphans
+  ("Removing a worktree").
+- Re-verify on the host after every run (Step 6): your gate and test results, not Codex's,
+  decide green; sandbox-only failures are artifacts only when the host re-run is green.
 - Keep the read-first + STOP-and-report gate on the Claude side; everything else is
   Codex's fused loop.
 - Never `--no-verify`; never weaken a test or silence the gate (enforced in the
