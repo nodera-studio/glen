@@ -21,6 +21,7 @@ Error `hint` and `details` are optional. Optional top-level `warnings` is an arr
 Events are `session`, `item`, `continued`, `rewritten`, `branch_switch`, `warning`, then exactly one terminal
 `{"v":1,"event":"end","ok":true}` or error envelope, last. SIGINT ends the stream with exit 130.
 A second SIGINT terminates immediately and may prevent a terminal line.
+`inbox -f` is always NDJSON, even with `--human`: `message` events, then the same terminal line.
 
 ## Exit codes
 
@@ -59,7 +60,7 @@ model_change `model`; thinking_level `level`. Consumers dispatch by kind rather 
 Unknown omp records are skipped by the rendered reader and preserved by raw output.
 
 Job views share `id,handle,status,route,deliver_as,delivered_as,session_id,session_handle,actual_session_id,
-created_at,updated_at,elapsed_ms`. Routes currently are `rpc|new`. W3 will add `live`.
+created_at,updated_at,elapsed_ms`. Routes are `rpc|new|live`.
 Replies carry `text,final` and context/sequence metadata; read their field names from the examples below.
 
 ## `glen ls`
@@ -518,6 +519,52 @@ List jobs, newest first. Absent glen home gives an empty list without creating i
 }
 ```
 
+## `glen inbox`
+
+Replies omp sent with `glen_reply`, oldest first. Reading marks them read unless `--peek`; `--all` includes read ones.
+Missing glen home or inbox gives an empty list without creating it. `-f` streams NDJSON `message` events.
+
+| Field | Meaning |
+|---|---|
+| `total` | messages returned |
+| `marked_read` | true when this call advanced the read cursors |
+| `skipped_lines` | malformed inbox lines skipped |
+| `messages` | reply records plus session_handle and job_handle (null without a job) |
+
+<!-- contract: inbox -->
+```json
+{
+  "data": {
+    "marked_read": false,
+    "messages": [
+      {
+        "at": "2026-10-30T07:53:12.332571Z",
+        "final": true,
+        "id": "01a18bcc-6b8c-74bc-81aa-d8b5134e7534",
+        "job_handle": "j6977273",
+        "job_id": "01a18bcc-6970-7685-8f03-0ecc16977273",
+        "request_id": null,
+        "session_handle": "e27c0de",
+        "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+        "text": "reply: hi",
+        "tool_call_id": "call_1",
+        "v": 1
+      }
+    ],
+    "skipped_lines": 0,
+    "total": 1
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: inbox.follow ndjson -->
+```json
+{"event":"message","message":{"at":"2026-10-30T07:53:12.332571Z","final":true,"id":"01a18bcc-6b8c-74bc-81aa-d8b5134e7534","job_handle":"j6977273","job_id":"01a18bcc-6970-7685-8f03-0ecc16977273","request_id":null,"session_handle":"e27c0de","session_id":"01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de","text":"reply: hi","tool_call_id":"call_1","v":1},"v":1}
+{"event":"end","ok":true,"v":1}
+```
+
 ## `glen doctor`
 
 Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
@@ -527,6 +574,7 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 | `glen` | version, home, home_exists |
 | `omp` | bin, version, tested_version |
 | `paths` | resolved omp paths and their sources |
+| `extension` | path, state, version, current of the installed omp extension |
 | `checks` | ordered {name,status,value,detail}, status ok/warn/fail/info |
 | `skills` | claude/codex: path, state, version, current, project |
 | `skills.*.project` | null or {path,state,version} |
@@ -543,6 +591,12 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
         "value": "/work/glen/tests/fixtures/bin/fake-omp"
       }
     ],
+    "extension": {
+      "current": false,
+      "path": "/tmp/glen-example/agent/extensions/glen/index.ts",
+      "state": "not_installed",
+      "version": null
+    },
     "glen": {
       "home": "/tmp/glen-example/glen",
       "home_exists": false,
@@ -586,8 +640,9 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 }
 ```
 
-Check order: omp_binary, omp_version, profile, agent_dir, sessions_dir, glen_home, omp_env_files,
-skill_claude, skill_codex, sandbox. W3 inserts extension and live_endpoints after glen_home.
+Check order: omp_binary, omp_version, profile, agent_dir, sessions_dir, glen_home, extension,
+live_endpoints, omp_env_files, skill_claude, skill_codex, sandbox. `extension.state` is
+current/not_installed/outdated/newer/different_home/modified/foreign; `live_endpoints` reports live and stale counts.
 The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
 
 ## `glen completions`
@@ -605,6 +660,38 @@ Raw script by default; JSON only when explicitly requested.
   "data": {
     "script": "#compdef glen\n# shell completion script…\n",
     "shell": "zsh"
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+## `glen install-extension`
+
+Install the bundled omp extension into the effective agent dir and profile. Dry runs make no changes.
+
+| Field | Meaning |
+|---|---|
+| `action` | installed/unchanged/upgraded/reinstalled/replaced/removed/not_installed/skipped |
+| `path, version, previous_version` | extension file, this build's version, marker version before the run or null |
+| `glen_home` | GLEN_HOME baked into the file |
+| `profile, agent_dir, agent_dir_source` | resolved omp profile (null for default) and agent dir |
+| `dry_run, restart_required` | booleans; restart running omp sessions when the file changed |
+
+<!-- contract: install-extension -->
+```json
+{
+  "data": {
+    "action": "installed",
+    "agent_dir": "/tmp/glen-example/agent",
+    "agent_dir_source": "env",
+    "dry_run": true,
+    "glen_home": "/tmp/glen-example/glen",
+    "path": "/tmp/glen-example/agent/extensions/glen/index.ts",
+    "previous_version": null,
+    "profile": null,
+    "restart_required": false,
+    "version": "0.1.0"
   },
   "ok": true,
   "v": 1
@@ -753,7 +840,7 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 {
   "error": {
     "code": "no_route",
-    "hint": "close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)",
+    "hint": "run `glen install-extension`, then restart that omp session",
     "message": "session e27c0de is open in another omp process"
   },
   "ok": false,
@@ -794,6 +881,12 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
             "value": "not found"
           }
         ],
+        "extension": {
+          "current": false,
+          "path": "/tmp/glen-example/agent/extensions/glen/index.ts",
+          "state": "not_installed",
+          "version": null
+        },
         "glen": {
           "home": "/tmp/glen-example/glen",
           "home_exists": false,
@@ -870,5 +963,15 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `skill_sync_failed` | install-skill | file published successfully, but directory sync failed |
 | `changed_during_install` | install-skill | destination or ancestor changed after inspection; skipped even with --force |
 | `skill_dir_not_empty` | install-skill | removed file, retained nonempty glen directory |
+| `not_yet_persisted` | show, tail | live session has not written a transcript yet |
+| `extension_version_mismatch` | send | live extension version differs from glen |
+| `batched` | send, wait | omp answered this request together with other queued requests |
+| `live_turn_continues` | send, wait | live job cancelled; the omp turn keeps running |
+| `delivery_unknown` | send, wait | live endpoint never acknowledged the message |
+| `socket_path_too_long` | install-extension | GLEN_HOME is too long for a unix socket; live delivery is off |
+| `unsafe_path` | install-extension | symlink in the extension path; skipped even with --force |
+| `extension_newer`, `extension_modified`, `extension_foreign` | install-extension | file skipped unless --force |
+| `extension_dir_not_empty` | install-extension | removed file, retained nonempty glen directory |
+| `changed_during_install` | install-extension | extension file or directory changed during install; skipped |
 
 New visible commands and visible aliases must add a section and contract runner in their own wave.

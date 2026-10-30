@@ -82,9 +82,9 @@ fn terminal_stream(lines: &[Value]) {
     assert_eq!(terminal.len(), 1, "{lines:?}");
     assert_eq!(terminal[0].0, lines.len() - 1);
 }
-fn tail_follow(b: &OmpBox) -> Vec<Value> {
+fn follow(b: &OmpBox, args: &[&str], first: &str) -> Vec<Value> {
     let mut child = b
-        .command(&["tail", "e27c0de", "-n", "1", "-f", "--json"], &b.alpha())
+        .command(args, &b.alpha())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -102,7 +102,7 @@ fn tail_follow(b: &OmpBox) -> Vec<Value> {
     loop {
         let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let v: Value = serde_json::from_str(&line).unwrap();
-        let item = v["event"] == "item";
+        let item = v["event"] == first;
         values.push(v);
         if item {
             break;
@@ -149,6 +149,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
             "install-skill",
             vec!["install-skill", "--project", "--dry-run"],
         ),
+        ("install-extension", vec!["install-extension", "--dry-run"]),
         ("error.usage", vec!["ls", "--bogus"]),
         ("error.not_found", vec!["show", "fffffff"]),
         ("error.ambiguous", vec!["show", "c0de"]),
@@ -165,7 +166,27 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         .unwrap();
     assert!(out.status.success());
     all.insert("doctor".into(), vec![json(&out)]);
-    all.insert("tail.follow".into(), tail_follow(&b));
+    all.insert(
+        "tail.follow".into(),
+        follow(&b, &["tail", "e27c0de", "-n", "1", "-f", "--json"], "item"),
+    );
+    let inbox = b.glen_home.join("inbox");
+    fs::create_dir_all(&inbox).unwrap();
+    fs::write(
+        inbox.join(format!("{A_ID}.ndjson")),
+        format!(
+            "{}\n",
+            serde_json::json!({"v":1,"id":"01a18bcc-6b8c-74bc-81aa-d8b5134e7534","session_id":A_ID,"job_id":"01a18bcc-6970-7685-8f03-0ecc16977273","request_id":null,"tool_call_id":"call_1","text":"reply: hi","final":true,"at":"2026-10-30T07:53:12.332571Z"})
+        ),
+    )
+    .unwrap();
+    all.insert(
+        "inbox.follow".into(),
+        follow(&b, &["inbox", "-f", "--peek", "--json"], "message"),
+    );
+    let out = b.glen(&["inbox", "--peek"], &b.alpha());
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    all.insert("inbox".into(), vec![json(&out)]);
     let out = b
         .command(&["show", "e27c0de"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "200")
