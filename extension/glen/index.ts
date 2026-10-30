@@ -12,7 +12,7 @@ export const OPS = ["hello", "state", "send"];
 export const RESERVED_OPS = ["abort", "list_models", "set_model", "set_thinking_level", "compact"];
 export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
 type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number };
-type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; settled: boolean };
+type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; lastTextAssistant: any; settled: boolean };
 type Endpoint = { server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
 const ENDPOINTS = new Map<number, Endpoint>();
 export function isPlainToken(id: unknown): id is string { return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id); }
@@ -102,7 +102,7 @@ function closeSpan(e: Endpoint) {
     for (const r of batch) {
         const m = r.lastAssistant, stop = m?.stopReason ?? null;
         const warnings = batch.length > 1 ? [{ code: "batched", message: `omp consumed this request in a batch with ${batch.filter(other => other !== r).map(jobHandle).join(", ")}; they share the reply span` }] : [];
-        terminal(e, r, "settled", { status: stop === "aborted" ? "aborted" : stop === "error" ? "error" : "completed", assistant_text: m ? textOf(m) || null : null, stop_reason: stop, error_message: typeof m?.errorMessage === "string" ? m.errorMessage : null, warnings });
+        terminal(e, r, "settled", { status: stop === "aborted" ? "aborted" : stop === "error" ? "error" : "completed", assistant_text: textOf(r.lastTextAssistant) || null, stop_reason: stop, error_message: typeof m?.errorMessage === "string" ? m.errorMessage : null, warnings });
     }
     e.spanHasOutput = false; e.spanHasActivity = false;
 }
@@ -184,7 +184,7 @@ function connection(e: Endpoint, conn: net.Socket) {
             if (typeof a?.text !== "string" || !a.text.trim() || Buffer.byteLength(a.text) > LIMITS.maxText || !["auto", "steer", "follow_up"].includes(a.deliver_as) || (a.job_id != null && typeof a.job_id !== "string") || (a.expect_session_id != null && typeof a.expect_session_id !== "string")) { error(id, "bad_request", "invalid send arguments"); return; }
             if (a.expect_session_id != null && a.expect_session_id !== e.sessionId) { error(id, "session_mismatch", "session identity changed", { session_id: e.sessionId }); return; }
             const idle = e.ctx.isIdle(), deliveredAs = idle ? "prompt" : a.deliver_as === "steer" ? "steer" : "follow_up";
-            const r: Request = { id, sessionId: e.sessionId, jobId: a.job_id ?? null, text: a.text, deliveredAs, conn, ackSeq: e.seq, acked: false, outbox: [], consumed: false, consumptionSeq: null, lastAssistant: null, settled: false };
+            const r: Request = { id, sessionId: e.sessionId, jobId: a.job_id ?? null, text: a.text, deliveredAs, conn, ackSeq: e.seq, acked: false, outbox: [], consumed: false, consumptionSeq: null, lastAssistant: null, lastTextAssistant: null, settled: false };
             e.requests.push(r);
             conn.on("close", () => { r.conn = null; });
             try { if (idle) e.pi.sendUserMessage(a.text); else e.pi.sendUserMessage(a.text, { deliverAs: deliveredAs === "steer" ? "steer" : "followUp" }); }
@@ -299,7 +299,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
                 const r = pendingRequest(e, p.message);
                 if (r) { r.consumed = true; r.consumptionSeq = e.seq; if (e.active.length === 0) e.spanStart = e.lastStart; e.active.push(r); if (r.deliveryTimer !== undefined) e.ctx.clearTimer(r.deliveryTimer); event(r, "consumed"); }
             }
-        } else if (p.message?.role === "assistant") { e.spanHasActivity = true; if (textOf(p.message)) e.spanHasOutput = true; for (const r of e.active) r.lastAssistant = p.message; }
+        } else if (p.message?.role === "assistant") { e.spanHasActivity = true; const hasText = !!textOf(p.message); if (hasText) e.spanHasOutput = true; for (const r of e.active) { r.lastAssistant = p.message; if (hasText) r.lastTextAssistant = p.message; } }
     });
     on("agent_start", (_p, _ctx, e) => { if (e) e.lastStart = e.seq; });
     on("agent_end", (p, _ctx, e) => { if (e && !p.willContinue && !p.awaitingAsyncWork) settle(e); });

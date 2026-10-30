@@ -179,6 +179,28 @@ test("notices after assistant text close the span at start or the end-only fallb
         } finally { await f.close(); }
     }
 });
+test("notices after a tool-only assistant message preserve earlier assistant text and the latest stop metadata", async () => {
+    for (const starts of [true, false]) {
+        const f = await fixture();
+        try {
+            await f.start(); const c = await send(f, "answered", "answer me");
+            await f.emit("message_end", { message: user("answer me") });
+            await f.emit("message_end", { message: assistant("last answer") });
+            await f.emit("message_end", { message: { role: "assistant", content: [{ type: "tool_use", id: "call", name: "bash", input: {} }], stopReason: "error", errorMessage: "tool failed" } });
+            const notice = { role: "custom", content: "notice" };
+            if (starts) await f.emit("message_start", { message: notice });
+            else await f.emit("message_end", { message: notice });
+            await c.until(() => c.ended);
+            const settled = c.frames.at(-1);
+            assert.equal(settled.event, "settled");
+            assert.equal(settled.assistant_text, "last answer");
+            assert.equal(settled.status, "error");
+            assert.equal(settled.stop_reason, "error");
+            assert.equal(settled.error_message, "tool failed");
+            assert.equal(c.frames.filter(r => r.event === "settled").length, 1);
+        } finally { await f.close(); }
+    }
+});
 test("failed asynchronous submission times out not_delivered and never adopts an unrelated run", async () => {
     const f = await fixture(); f.deps.deliveryMs = 150;
     try {

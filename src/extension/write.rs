@@ -166,7 +166,15 @@ impl Guard {
             if !self.unchanged() {
                 return Ok(false);
             }
-            at::renameat(&dir, &temp, &dir, name)?;
+            if self.entries[0].1.is_none() {
+                match at::renameat_with(&dir, &temp, &dir, name, at::RenameFlags::NOREPLACE) {
+                    Ok(()) => {}
+                    Err(rustix::io::Errno::EXIST) => return Ok(false),
+                    Err(e) => return Err(e.into()),
+                }
+            } else {
+                at::renameat(&dir, &temp, &dir, name)?;
+            }
             at::fsync(&dir)?;
             Ok(true)
         })();
@@ -219,6 +227,17 @@ impl Guard {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    #[test]
+    fn competing_create_never_clobbers_the_appeared_file() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("extensions/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("index.ts");
+        let mut guard = Guard::inspect(&path).unwrap();
+        fs::write(&path, b"external").unwrap();
+        assert!(!guard.apply(&path, Some(b"replacement")).unwrap());
+        assert_eq!(fs::read(&path).unwrap(), b"external");
+    }
     #[test]
     fn competing_edits_replacements_and_symlinks_never_publish_or_unlink() {
         for remove in [false, true] {
