@@ -85,15 +85,24 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                         State::Failed => "✗ failed".into(),
                         State::Lost => "✗ lost".into(),
                     },
-                    j.session_handle.clone().unwrap_or_else(|| {
-                        format!(
-                            "@new → {}",
-                            s.actual_session_id
-                                .as_deref()
-                                .map(session_handle)
-                                .unwrap_or_default()
-                        )
-                    }),
+                    j.session_handle
+                        .clone()
+                        .map(|h| {
+                            if j.route == crate::jobs::Route::Live {
+                                format!("● {h}")
+                            } else {
+                                h
+                            }
+                        })
+                        .unwrap_or_else(|| {
+                            format!(
+                                "@new → {}",
+                                s.actual_session_id
+                                    .as_deref()
+                                    .map(session_handle)
+                                    .unwrap_or_default()
+                            )
+                        }),
                     text::age(
                         SystemTime::now(),
                         j.created_at
@@ -142,7 +151,7 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
             .map(|i| text::truncate(labels[*i], budgets[*i]))
             .collect();
         table.header(&headers.iter().map(String::as_str).collect::<Vec<_>>());
-        for ((_, s), r) in rows.iter().zip(plain) {
+        for ((job, s), r) in rows.iter().zip(plain) {
             table.row(
                 columns
                     .iter()
@@ -152,6 +161,7 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                         ctx.painter.paint(
                             match i {
                                 0 => Token::Focus,
+                                2 if job.route == crate::jobs::Route::Live => Token::Focus,
                                 1 => match s.status {
                                     State::Failed | State::Lost => Token::Danger,
                                     State::Aborted => Token::Warning,

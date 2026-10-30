@@ -77,8 +77,9 @@ pub struct GlenError {
     pub code: ErrorCode,
     pub message: String,
     pub hint: Option<String>,
-    pub details: Option<serde_json::Value>,
+    pub details: Option<Box<serde_json::Value>>,
     pub report: Option<String>,
+    pub warnings: Vec<Warning>,
 }
 impl GlenError {
     pub fn read(path: &std::path::Path, error: std::io::Error) -> Self {
@@ -98,6 +99,7 @@ impl GlenError {
             hint: None,
             details: None,
             report: None,
+            warnings: vec![],
         }
     }
     pub fn with_hint(mut self, hint: impl Into<String>) -> Self {
@@ -105,7 +107,7 @@ impl GlenError {
         self
     }
     pub fn with_details(mut self, details: serde_json::Value) -> Self {
-        self.details = Some(details);
+        self.details = Some(Box::new(details));
         self
     }
     pub fn with_report(mut self, report: impl Into<String>) -> Self {

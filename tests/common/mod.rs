@@ -304,6 +304,146 @@ pub fn poll<T>(timeout: std::time::Duration, mut f: impl FnMut() -> Option<T>) -
 }
 pub const A_ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
 
+pub fn fake_ext_bin() -> PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
+        let dir = bin.parent().unwrap();
+        let mut c = Command::new(env!("CARGO"));
+        c.current_dir(env!("CARGO_MANIFEST_DIR")).args([
+            "build",
+            "--example",
+            "fake_ext",
+            "--offline",
+            "--locked",
+        ]);
+        if dir.file_name().unwrap() == "release" {
+            c.arg("--release");
+        }
+        let out = c.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        dir.join("examples/fake_ext")
+    })
+    .clone()
+}
+pub struct LiveBox {
+    pub rpc: RpcBox,
+    ext: Vec<std::process::Child>,
+    pub log: PathBuf,
+    _short: tempfile::TempDir,
+}
+impl LiveBox {
+    pub fn new() -> Self {
+        let mut rpc = RpcBox::new();
+        let short = tempfile::Builder::new()
+            .prefix("gle-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        rpc.omp.glen_home = short.path().join("g");
+        let log = short.path().join("ext.ndjson");
+        Self {
+            rpc,
+            ext: vec![],
+            log,
+            _short: short,
+        }
+    }
+    pub fn start_ext(&mut self, id: &str, scenario: &str, vars: &[(&str, &str)]) -> u32 {
+        use std::io::BufRead;
+        let mut c = Command::new(fake_ext_bin());
+        c.args([
+            "--home",
+            self.rpc.omp.glen_home.to_str().unwrap(),
+            "--session-id",
+            id,
+        ])
+        .env_clear()
+        .env("FAKE_EXT_SCENARIO", scenario)
+        .env("FAKE_EXT_LOG", &self.log)
+        .env("FAKE_EXT_CWD", self.rpc.omp.alpha())
+        .envs(vars.iter().copied())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        if id == A_ID {
+            c.arg("--session-file").arg(self.rpc.omp.session('A'));
+        }
+        let mut child = c.spawn().unwrap();
+        let stdout = child.stdout.take().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let result = std::io::BufReader::new(stdout)
+                .read_line(&mut line)
+                .map(|_| line);
+            let _ = tx.send(result);
+        });
+        let ready = rx.recv_timeout(std::time::Duration::from_secs(10));
+        if !matches!(&ready,Ok(Ok(line)) if line=="ready\n") {
+            let _ = child.kill();
+            let out = child.wait_with_output().unwrap();
+            panic!(
+                "fake_ext not ready: {ready:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let pid = child.id();
+        self.ext.push(child);
+        pid
+    }
+    pub fn registry(&self, id: &str) -> PathBuf {
+        glen::live::registry::path(
+            &glen::glen_home::GlenHome {
+                root: self.rpc.omp.glen_home.clone(),
+            },
+            id,
+        )
+    }
+    pub fn kill_ext(&mut self, signal: i32) {
+        for child in &mut self.ext {
+            if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+                let sig = rustix::process::Signal::from_named_raw(signal).unwrap();
+                let _ = rustix::process::kill_process(pid, sig);
+            }
+            let _ = child.wait();
+        }
+        self.ext.clear();
+    }
+    pub fn ext_log(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect()
+    }
+    pub fn write_registry(&self, id: &str, pid: u32, socket: &std::path::Path) {
+        let r = serde_json::json!({"v":1,"pid":pid,"session_id":id,"socket":socket,"session_file":self.rpc.omp.session('A'),"protocol":1,"mode":"tui","started_at":"2026-10-30T00:00:00Z"});
+        let path = self.registry(id);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, r.to_string()).unwrap();
+    }
+}
+impl Drop for LiveBox {
+    fn drop(&mut self) {
+        for c in &mut self.ext {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+}
+pub fn dead_pid() -> u32 {
+    let mut c = Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
+
 /// Only backticked error codes count; statuses in successful rows are prose.
 pub fn exit_code_errors(text: &str, column: usize) -> Vec<String> {
     use std::collections::{BTreeMap, BTreeSet};

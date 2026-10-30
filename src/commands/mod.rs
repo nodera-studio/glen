@@ -1,5 +1,7 @@
 pub mod completions;
 pub mod doctor;
+pub mod inbox;
+pub mod install_extension;
 pub mod install_skill;
 pub mod jobs;
 pub mod ls;
@@ -16,6 +18,8 @@ use crate::{
 };
 pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     match &cli.command {
+        Command::Inbox(a) => inbox::run(cli, a, env, ctx),
+        Command::InstallExtension(a) => install_extension::run(cli, a, env, ctx),
         Command::Send(a) => send::run(cli, a, env, ctx),
         Command::Wait(a) => wait::run(cli, a, env, ctx),
         Command::Jobs(a) => jobs::run(cli, a, env, ctx),

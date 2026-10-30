@@ -706,7 +706,7 @@ pub struct Stream {
 }
 
 impl Stream {
-    fn spawn(mut cmd: Command, desc: String) -> Stream {
+    pub fn spawn(mut cmd: Command, desc: String) -> Stream {
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         let mut child = cmd
             .spawn()

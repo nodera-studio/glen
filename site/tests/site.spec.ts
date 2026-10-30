@@ -151,17 +151,17 @@ test.describe('hero terminal player', () => {
   await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/?term=at:5300');
   await expect(visibleRow(page, 'w', 'b', '❯ user · 12:04')).toBeVisible();
   const spin = page.locator('.term-v[data-v=w] [data-p=a] .tl.on[data-k=spin]');
-  await expect(spin).toContainText('waiting for the reply');
+  await expect(spin).toContainText('delivered as prompt; omp is working');
   expect('⠁⠉⠙⠚⠒⠂⠲⠴⠤⠄⠠⠦⠖⠐⠓⠋⠈').toContain(await spin.locator('.sp').textContent());
   await expect(page.locator('.term-title')).toHaveText('~/work/alpha — glen');
   await expect(page.locator('.term-tab[data-p=b]')).toHaveAttribute('aria-selected', 'true');
  });
- test('the spinner message follows glen send: sending, starting omp, waiting for the reply', async ({ page }) => {
+ test('the spinner message follows glen send on the live route: delivering, then delivered as prompt', async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/?term=at:0');
   const spinAt = Number(await page.locator('.term-v[data-v=w] [data-p=a] .tl[data-k=spin]').getAttribute('data-at'));
   const msgs = (JSON.parse((await page.locator('#term').getAttribute('data-cues'))!) as [number, string, string][]).filter(c => c[1] === 'msg');
-  expect(msgs.map(c => c[2])).toEqual(['starting omp', 'waiting for the reply']);
-  for (const [at, text] of [[spinAt, 'sending to e27c0de · ja3c9f41'], ...msgs.map(([at, , v]) => [at, v] as const)] as const) {
+  expect(msgs.map(c => c[2])).toEqual(['delivered as prompt; omp is working']);
+  for (const [at, text] of [[spinAt, 'delivering to e27c0de (live) · ja3c9f41'], ...msgs.map(([at, , v]) => [at, v] as const)] as const) {
    await page.goto(`/?term=at:${at + 20}`);
    await expect(page.locator('.term-v[data-v=w] [data-p=a] .tl.on[data-k=spin] .sm')).toHaveText(text);
   }
@@ -390,7 +390,7 @@ test('how it works: four cards, 2×2 at 1280, each stage ends on its final frame
  await expect(page.locator('[data-stage=hear] [data-before]')).toBeHidden();
  await expect(page.locator('[data-stage=hear]')).toContainText('↩ Added the index. All 12 tests pass. ✓');
  await expect(page.locator('[data-stage=hear]')).toContainText('✓ completed · ja3c9f41 · e27c0de · 41s');
- expect(await page.locator('[data-stage=hear] [data-before]').textContent()).toContain('waiting for the reply');
+ expect(await page.locator('[data-stage=hear] [data-before]').textContent()).toContain('delivered as prompt; omp is working');
  await expect(page.locator('[data-stage=find]')).toContainText('3 sessions · 1 live');
  await page.waitForTimeout(800);
  expect(await page.locator('[data-stage] [data-row], [data-stage] [data-chip], [data-stage] [data-after]').evaluateAll(els => els.every(e => getComputedStyle(e).opacity === '1'))).toBe(true);

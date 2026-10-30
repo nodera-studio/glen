@@ -491,8 +491,9 @@ pub fn assert_job_view(job: &Value) {
         .contains(&status),
         "job.status {status:?}: {job}"
     );
+    // §A7 (W3): routes are `rpc|new|live`.
     assert!(
-        ["rpc", "new"].contains(&job["route"].as_str().unwrap_or("")),
+        ["rpc", "new", "live"].contains(&job["route"].as_str().unwrap_or("")),
         "{job}"
     );
     assert!(

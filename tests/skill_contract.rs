@@ -509,13 +509,20 @@ fn ac404_numeric_defaults() {
 #[test]
 fn cycle1_skill_sandbox_guard_exit_guidance_and_plain_command_example() {
     let text = skill::render_current(Agent::Claude).unwrap();
-    assert!(!text.contains("support live sessions"));
+    assert_eq!(
+        text.contains("support live sessions"),
+        skill::visible_commands().contains("install-extension")
+    );
     assert!(text.contains("Only non-empty `CODEX_SANDBOX` marks a sandbox"));
     assert!(text.contains("`CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends"));
     assert!(text.contains("done; read `data`, then use `data.forked.to_handle`"));
     assert!(text.contains("send/wait: `glen wait <job>`; tail -f: stream ended"));
     assert!(text.contains("glen send <handle> -- \"-v is broken\""));
     assert!(!text.contains("< file.md"));
+    let mut without = skill::visible_commands();
+    without.remove("install-extension");
+    let past = skill::render(Agent::Claude, "0.1.0", &without).unwrap();
+    assert!(!past.contains("support live sessions"));
     let visible = skill::visible_commands()
         .into_iter()
         .chain(["install-extension".into()])

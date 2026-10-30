@@ -21,6 +21,23 @@ pub(crate) fn progress(s: &Status) -> &'static str {
         _ => s.status.as_str(),
     }
 }
+pub(crate) fn job_progress(job: &Job, s: &Status) -> String {
+    if job.route != Route::Live {
+        return progress(s).into();
+    }
+    match s.status {
+        State::Queued => format!(
+            "delivering to {} (live) · {}",
+            job.session_handle.as_deref().unwrap_or("?"),
+            job.handle
+        ),
+        State::Accepted => format!(
+            "delivered as {}; omp is working",
+            s.delivered_as.as_deref().unwrap_or("a message")
+        ),
+        _ => s.status.as_str().into(),
+    }
+}
 fn duration(ms: i64) -> String {
     let seconds = ms.max(0) / 1000;
     if seconds < 60 {
@@ -47,7 +64,7 @@ pub(crate) fn job_view(job: &Job, s: &Status, now: jiff::Timestamp) -> Value {
     json!({"id":job.id,"handle":job.handle,"status":s.status,"route":job.route,"deliver_as":job.deliver_as,"delivered_as":s.delivered_as,"session_id":job.session_id,"session_handle":job.session_handle,"actual_session_id":s.actual_session_id,"created_at":job.created_at,"updated_at":s.updated_at,"elapsed_ms":elapsed})
 }
 fn session(job: &Job, s: &Status) -> Value {
-    if job.route == Route::Rpc {
+    if job.route != Route::New {
         json!({"id":job.session_id,"handle":job.session_handle,"path":job.session_file})
     } else {
         json!({"id":s.actual_session_id,"handle":s.actual_session_id.as_deref().map(session_handle),"path":s.actual_session_file})
@@ -93,7 +110,7 @@ pub(crate) fn outcome(
             ),
         )
         .with_details(json!({"status":s.status,"job":view,"error":s.error,"forked":forked}));
-        e.hint = if code == ErrorCode::NoRoute {
+        e.hint = if error.and_then(|e| e.hint.as_ref()).is_some() {
             error.and_then(|e| e.hint.clone())
         } else {
             Some(format!(
@@ -106,6 +123,7 @@ pub(crate) fn outcome(
                     .display()
             ))
         };
+        e.warnings = s.warnings.clone();
         return Err(e);
     }
     let session = session(job, &s);
@@ -227,7 +245,7 @@ pub fn run(_cli: &Cli, args: &WaitArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
         args.timeout,
         &flag,
         None,
-        |s| spinner.set_message(progress(s)),
+        |s| spinner.set_message(&job_progress(&job, s)),
     );
     spinner.finish();
     outcome(&store, &job, waited?, ctx)
@@ -414,5 +432,23 @@ mod tests {
         assert_eq!(o.data["session"]["path"], "/new.jsonl");
         assert!(!o.human.contains('\x1b'));
         assert!(o.human.lines().all(|l| text::width(l) <= 30), "{}", o.human);
+    }
+}
+
+#[cfg(test)]
+mod live_progress_tests {
+    use super::*;
+    #[test]
+    fn live_progress_describes_delivery_without_an_omp_child() {
+        let mut job = crate::jobs::tests::job();
+        job.route = Route::Live;
+        let mut status = Status::default();
+        assert!(job_progress(&job, &status).contains("(live)"));
+        status.status = State::Accepted;
+        status.delivered_as = Some("follow_up".into());
+        assert_eq!(
+            job_progress(&job, &status),
+            "delivered as follow_up; omp is working"
+        );
     }
 }

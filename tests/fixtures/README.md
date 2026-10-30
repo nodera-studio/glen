@@ -56,6 +56,14 @@ signals, then wait for worker and omp teardown before releasing their temporary 
 W4 JSON contract runners reuse these reader fixtures and the `fake_omp` scenarios
 (ok, delayed, fork, error and hold-lease); no contract test reads a live omp home.
 
+## Fake extension peer (`fake_ext` example)
+
+`tests/support/fake_ext.rs` binds a private Unix socket and publishes a session registry under a test-owned short GLEN_HOME. It never opens an omp transcript or append gate. `LiveBox` starts it, waits for ready, and kills/reaps it at teardown.
+
+`FAKE_EXT_SCENARIO`: ok, busy, progress, slow, never_settles, aborted, error, moved, switched, shutdown, crash, mismatch, rekey, hang, no_send, v2, malformed, no_ack, queued. `FAKE_EXT_DELAY_MS` controls slow; `FAKE_EXT_VERSION` changes hello; `FAKE_EXT_KEEP_FILES=1` retains crash files; `FAKE_EXT_CWD` gives endpoint-only scope. `FAKE_EXT_LOG` logs `{t,dir,frame}` NDJSON. Like the extension, the fake writes inbox replies itself; glen must not duplicate them.
+
+The separate fake omp host in `extension/glen/test/fake-pi.ts` drives event sequences and real sockets through Node. `tests/extension_ts.rs` runs those tests from cargo; CI installs Node 26. No npm installation is needed.
+
 ## Demo tree (`tests/fixtures/demo/`)
 
 A separate synthetic catalog for the site demo golden. `tests/site_demo.rs` copies this tree

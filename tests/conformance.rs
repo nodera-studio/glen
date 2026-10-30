@@ -6,6 +6,10 @@
 //!   lease, with the shared `reader` harness.
 //! - W2 (`.claude/plans/v010-wave-2-rpc.md`, AC-201…AC-227; §A3–§A11, §A15): rpc, rpc_jobs, with
 //!   the `rpc_support` harness driving the `fake_omp` example peer through `GLEN_OMP_BIN`.
+//! - W3 (`.claude/plans/v010-wave-3-live.md`, AC-301…AC-327 incl. O1–O8, the O6 settlement
+//!   amendment and the conformance clarifications; §A3–§A11, §A15): live,
+//!   extension, inbox, w3_surface, with the `live_support` harness driving the `fake_ext` example
+//!   peer and in-test unix-socket endpoints.
 //! - W4 (`.claude/plans/v010-wave-4-agent.md`, AC-401…AC-413 and AC-419; O3, O5–O7; §A9–§A13 and
 //!   `docs/json.md`): agent. The acceptance modes (AC-414…AC-418, AC-420, AC-421) need real omp.
 //!
@@ -16,6 +20,8 @@
 //! `tests/fixtures/`. TTY-only behaviour (pretty JSON, TTY spinner, terminal width) is not
 //! covered here because the suite has no pseudo-terminal.
 
+#[path = "conformance/live_support.rs"]
+mod live_support;
 #[path = "conformance/reader.rs"]
 mod reader;
 #[path = "conformance/rpc_support.rs"]
@@ -31,10 +37,18 @@ mod cli_surface;
 mod color;
 #[path = "conformance/doctor.rs"]
 mod doctor;
+#[path = "conformance/ext_node.rs"]
+mod ext_node;
+#[path = "conformance/extension.rs"]
+mod extension;
 #[path = "conformance/fixtures.rs"]
 mod fixtures;
+#[path = "conformance/inbox.rs"]
+mod inbox;
 #[path = "conformance/lease.rs"]
 mod lease;
+#[path = "conformance/live.rs"]
+mod live;
 #[path = "conformance/ls.rs"]
 mod ls;
 #[path = "conformance/output_contract.rs"]
@@ -55,6 +69,8 @@ mod show;
 mod state;
 #[path = "conformance/tail.rs"]
 mod tail;
+#[path = "conformance/w3_surface.rs"]
+mod w3_surface;
 #[path = "conformance/width.rs"]
 mod width;
 #[path = "conformance/write_failure.rs"]

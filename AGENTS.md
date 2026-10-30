@@ -44,6 +44,7 @@ cargo run -- <args>                                 # run the CLI
 cargo test                                          # all tests
 cargo clippy --all-targets -- -D warnings           # lint (warnings fail CI)
 cargo fmt --all                                     # format
+node --experimental-strip-types --test extension/glen/test/*.test.ts  # extension tests (also cargo test)
 shellcheck -s sh install.sh scripts/package-release.sh  # lint the installer and packager
 gh workflow run release.yml --ref main              # release workflow dry run: builds, publishes nothing
 ```
@@ -71,6 +72,7 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
   omp adds entry types between releases.
 - Tests that need omp data use fixtures under `tests/fixtures/`, never a live `~/.omp`.
 - Tests that need an RPC peer use the `fake_omp` example (`tests/support/fake_omp.rs`) through `GLEN_OMP_BIN`, never a live omp.
+- The omp extension (`extension/glen/index.ts`) is one file, only `node:` imports and erasable TypeScript, no `Bun.*`; test it under Node as above (also run by `cargo test`).
 - Never mutate the process environment in code or tests (edition 2024 `set_var` is unsafe); read through `env::Env`.
 - Branch off `main`, PR into `main`. No direct pushes to `main`.
 - `site/` never imports `framer-motion`; motion comes from `motion/react` through `IslandRoot`.

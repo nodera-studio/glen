@@ -1,4 +1,4 @@
-use super::{ls::session_json, open};
+use super::open;
 use crate::{
     cli::{Cli, ShowArgs},
     env::Env,
@@ -13,7 +13,6 @@ use crate::{
     },
 };
 use serde_json::{Value, json};
-use std::time::SystemTime;
 pub fn run(cli: &Cli, args: &ShowArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let spinner = Spinner::start(ctx.mode == Mode::Human && ctx.stderr_tty, "reading session");
     let o = open::open(cli, env, &args.session)?;
@@ -21,7 +20,7 @@ pub fn run(cli: &Cli, args: &ShowArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     let mut data = Value::Null;
     let mut human = String::new();
     if ctx.mode == Mode::Json {
-        data = json!({"session":session_json(&o.summary,&o.handle,&o.lease,o.state,SystemTime::now()),"continued_from":o.continued_from,"leaf_id":o.session.leaf_id(),"skipped_lines":o.session.skipped_lines});
+        data = json!({"session":open::session_json(&o),"continued_from":o.continued_from,"leaf_id":o.session.leaf_id(),"skipped_lines":o.session.skipped_lines});
         if args.raw {
             data["entries"] = json!(items::build_raw(&branch));
         } else {
@@ -80,5 +79,12 @@ pub fn run(cli: &Cli, args: &ShowArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         }
     }
     spinner.finish();
-    Ok(Outcome::new(data, human))
+    let mut outcome = Outcome::new(data, human);
+    if o.not_yet_persisted {
+        outcome.warnings.push(crate::error::Warning {
+            code: "not_yet_persisted".into(),
+            message: "this live session has not written a transcript yet".into(),
+        });
+    }
+    Ok(outcome)
 }

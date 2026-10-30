@@ -32,3 +32,7 @@ signal-hook = "0.3.18"
 [[example]]
 name = "fake_omp"
 path = "tests/support/fake_omp.rs"
+
+[[example]]
+name = "fake_ext"
+path = "tests/support/fake_ext.rs"

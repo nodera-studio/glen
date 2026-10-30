@@ -34,15 +34,15 @@ use std::{
 };
 #[derive(Debug, thiserror::Error)]
 #[error("{error_message}")]
-struct Failure {
-    state: State,
-    code: &'static str,
-    error_message: String,
-    hint: Option<String>,
-    details: Option<Value>,
+pub(crate) struct Failure {
+    pub(crate) state: State,
+    pub(crate) code: &'static str,
+    pub(crate) error_message: String,
+    pub(crate) hint: Option<String>,
+    pub(crate) details: Option<Value>,
 }
 impl Failure {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             state: State::Failed,
             code,
@@ -51,7 +51,7 @@ impl Failure {
             details: None,
         }
     }
-    fn cancelled() -> Self {
+    pub(crate) fn cancelled() -> Self {
         Self {
             state: State::Aborted,
             ..Self::new("cancelled", "the glen job was cancelled")
@@ -68,13 +68,13 @@ impl From<std::io::Error> for Failure {
         Self::new("io", e.to_string())
     }
 }
-struct Worker {
-    store: JobStore,
-    id: JobId,
-    job: Job,
-    status: Status,
-    cancel: Arc<AtomicBool>,
-    deadline: Instant,
+pub(crate) struct Worker {
+    pub(crate) store: JobStore,
+    pub(crate) id: JobId,
+    pub(crate) job: Job,
+    pub(crate) status: Status,
+    pub(crate) cancel: Arc<AtomicBool>,
+    pub(crate) deadline: Instant,
 }
 pub fn main(arg: &str) -> ExitCode {
     let loaded = (|| -> Result<Worker, GlenError> {
@@ -140,14 +140,14 @@ pub fn main(arg: &str) -> ExitCode {
     }
 }
 impl Worker {
-    fn log(&self, phase: &str, detail: &str) {
+    pub(crate) fn log(&self, phase: &str, detail: &str) {
         eprintln!(
             "{} {} {phase}: {detail}",
             jiff::Timestamp::now(),
             self.job.handle
         );
     }
-    fn save(&mut self) -> Result<(), Failure> {
+    pub(crate) fn save(&mut self) -> Result<(), Failure> {
         self.status.updated_at = jiff::Timestamp::now().to_string();
         self.store.write_status(&self.id, &self.status)?;
         Ok(())
@@ -172,7 +172,7 @@ impl Worker {
     fn stop_requested(&self) -> bool {
         self.cancel.load(Ordering::SeqCst) || self.controls()
     }
-    fn check_stop(&self) -> Result<(), Failure> {
+    pub(crate) fn check_stop(&self) -> Result<(), Failure> {
         if self.stop_requested() {
             Err(Failure::cancelled())
         } else if Instant::now() >= self.deadline {
@@ -192,7 +192,7 @@ impl Worker {
             }
         }
     }
-    fn finish_failure(&mut self, f: Failure) -> Result<(), Failure> {
+    pub(crate) fn finish_failure(&mut self, f: Failure) -> Result<(), Failure> {
         self.status.waiting_for_lock = false;
         self.status.status = f.state;
         self.status.error = Some(JobError {
@@ -214,10 +214,18 @@ impl Worker {
             error.code = "no_route".into();
             error.message = mapped.message;
             error.hint = mapped.hint;
-            error.details = mapped.details;
+            error.details = mapped.details.map(|d| *d);
         }
     }
+    fn endpoint_probe(&self) -> Result<(), Failure> {
+        endpoint_check(
+            &self.store.home,
+            self.job.session_id.as_deref(),
+            self.job.session_handle.as_deref(),
+        )
+    }
     fn probe(&self) -> Result<(), Failure> {
+        self.endpoint_probe()?;
         let Some(id) = self.job.session_id.as_deref() else {
             return Ok(());
         };
@@ -264,7 +272,13 @@ impl Worker {
                 )
             })?;
         }
+        if self.job.route == Route::Live {
+            return crate::live::drive::run(self);
+        }
         self.check_stop()?;
+        if self.job.omp_bin.is_none() {
+            return Err(Failure::new("internal", "job has no omp binary"));
+        }
         let mut session_lock = None;
         if self.job.route == Route::Rpc {
             let id = self
@@ -355,7 +369,7 @@ impl Worker {
             self.status.actual_session_file =
                 baseline.session_file.clone().map(std::path::PathBuf::from);
             sink.set_session(baseline.session_id.clone());
-            // Startup recovery can claim our own lease. Only the pre-spawn probe is safe.
+            // Startup recovery can claim our own lease. Only the pre-spawn lease probe is safe.
             self.check_stop()?;
             self.status.delivered_as = Some(
                 if !baseline.is_streaming {
@@ -544,6 +558,9 @@ impl Worker {
         };
         let phase = Mutex::new(Submission::Pending);
         let delay = test_delay("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS");
+        let live_home = self.store.home.clone();
+        let live_id = self.job.session_id.clone();
+        let live_handle = self.job.session_handle.clone();
         let mut run = Run::default();
         let mut ack_pending = true;
         std::thread::scope(|scope| -> Result<(), Failure> {
@@ -561,6 +578,10 @@ impl Worker {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                // Startup may claim our RPC child's own lease. Check only the endpoint,
+                // on this thread so a slow hello cannot block cancellation on the worker.
+                let endpoint =
+                    endpoint_check(&live_home, live_id.as_deref(), live_handle.as_deref());
                 // Keep submission and cancellation ordered through the actual enqueue, not merely
                 // a flag checked before calling the SDK. The ack wait is capped at 100ms.
                 let mut guard = phase
@@ -569,11 +590,18 @@ impl Worker {
                 if *guard == Submission::Cancelled {
                     return;
                 }
+                if let Err(failure) = endpoint {
+                    drop(guard);
+                    if tx.send(Err(failure)).is_err() {
+                        eprintln!("worker stopped waiting for endpoint check");
+                    }
+                    return;
+                }
                 *guard = Submission::Submitted;
                 let ack = client.call(&SubmitPrompt(cmd));
                 drop(guard);
                 std::thread::sleep(test_delay("FAKE_OMP_ACK_FORWARD_DELAY_MS"));
-                if tx.send(ack).is_err() {
+                if tx.send(Ok(ack)).is_err() {
                     eprintln!("worker prompt ack receiver closed");
                 }
             });
@@ -609,10 +637,11 @@ impl Worker {
                     Err(mpsc::RecvTimeoutError::Timeout) => (),
                 }
                 match rx.try_recv() {
-                    Ok(ack) => {
+                    Ok(Ok(ack)) => {
                         ack_pending = false;
                         run.ack(ack);
                     }
+                    Ok(Err(failure)) => return self.finish_failure(failure),
                     Err(mpsc::TryRecvError::Disconnected) => ack_pending = false,
                     Err(mpsc::TryRecvError::Empty) => (),
                 }
@@ -791,6 +820,56 @@ impl Worker {
         Ok(())
     }
 }
+fn endpoint_check(
+    home: &glen_home::GlenHome,
+    id: Option<&str>,
+    handle: Option<&str>,
+) -> Result<(), Failure> {
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let fallback = || -> Failure {
+        let mut failure = Failure::new(
+            "no_route",
+            format!(
+                "session {} was opened in a live omp session after glen’s check",
+                handle.unwrap_or(id)
+            ),
+        );
+        failure.hint = Some("send again; glen will deliver through the live session".into());
+        failure
+    };
+    match crate::live::route::find(home, id, crate::live::HELLO_PROBE) {
+        crate::live::route::Endpoint::Unhealthy {
+            kind, io: Some(e), ..
+        } => {
+            let env = Env::from_process();
+            let mapped = match kind {
+                crate::live::route::Unhealthy::Unresponsive => {
+                    crate::sandbox::map_socket_failure(&env, "connect omp socket", &e)
+                }
+                crate::live::route::Unhealthy::Unreadable
+                    if crate::sandbox::restricted(&env, &e) =>
+                {
+                    Some(crate::sandbox::map_home_write(&env, "send", e))
+                }
+                _ => None,
+            };
+            match mapped {
+                Some(err) => {
+                    let mut failure = Failure::new("no_route", err.message);
+                    failure.hint = err.hint;
+                    failure.details = err.details.map(|d| *d);
+                    Err(failure)
+                }
+                None => Err(fallback()),
+            }
+        }
+        crate::live::route::Endpoint::Unhealthy { .. }
+        | crate::live::route::Endpoint::Live { .. } => Err(fallback()),
+        _ => Ok(()),
+    }
+}
 fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
     let message = match lease {
         Lease::Free => return Ok(()),
@@ -804,7 +883,7 @@ fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
                     code: "no_route",
                     error_message: e.message,
                     hint: e.hint,
-                    details: e.details,
+                    details: e.details.map(|d| *d),
                 });
             }
             let r = lease::state_detail(&unknown).unwrap_or_default();

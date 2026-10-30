@@ -44,6 +44,7 @@ impl JobId {
 pub enum Route {
     Rpc,
     New,
+    Live,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -77,7 +78,12 @@ pub struct Job {
     pub deliver_as: Deliver,
     pub text: String,
     pub cwd: PathBuf,
-    pub omp_bin: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omp_bin: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_socket: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_flag: Option<String>,
     pub owners_dir: PathBuf,
@@ -455,7 +461,9 @@ pub(crate) mod tests {
             deliver_as: Deliver::Auto,
             text: "hello".into(),
             cwd: "/fixture".into(),
-            omp_bin: "/bin/fake_omp".into(),
+            omp_bin: Some("/bin/fake_omp".into()),
+            live_socket: None,
+            live_pid: None,
             profile_flag: None,
             owners_dir: "/fixture/owners".into(),
             job_timeout_ms: 30000,
@@ -521,7 +529,7 @@ pub(crate) mod tests {
     #[test]
     fn schemas_roundtrip_and_lenient_status() {
         roundtrip(&job());
-        for route in [Route::New, Route::Rpc] {
+        for route in [Route::New, Route::Rpc, Route::Live] {
             roundtrip(&route);
         }
         for d in [Deliver::Auto, Deliver::Steer, Deliver::FollowUp] {

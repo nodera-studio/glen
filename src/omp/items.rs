@@ -11,6 +11,8 @@ pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub summary: String,
+    #[serde(skip)]
+    pub reply_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub arguments: Option<Value>,
     pub result: Option<ToolResultView>,
@@ -256,6 +258,13 @@ pub fn build(entries: &[&Entry], opts: &ItemOpts) -> Vec<Item> {
                                         id: string(block, "id").unwrap_or_default(),
                                         name: string(block, "name").unwrap_or_default(),
                                         summary: summary(&block["arguments"]),
+                                        reply_text: (block["name"] == "glen_reply")
+                                            .then(|| {
+                                                block["arguments"]["text"]
+                                                    .as_str()
+                                                    .map(str::to_owned)
+                                            })
+                                            .flatten(),
                                         arguments: matches!(opts.tools, Tools::Full)
                                             .then(|| block["arguments"].clone()),
                                         result: None,

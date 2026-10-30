@@ -102,6 +102,33 @@ fn tool(call: &ToolCall, st: &Style<'_>) -> String {
     } else {
         muted("· no result", st)
     };
+    if call.name == "glen_reply"
+        && let Some(reply) = call
+            .reply_text
+            .as_deref()
+            .or_else(|| call.arguments.as_ref().and_then(|a| a["text"].as_str()))
+    {
+        let suffix = format!(" · {}", anstream::adapter::strip_str(&status));
+        let budget = st.width.map(|w| {
+            usize::from(w).saturating_sub(text::width(&format!("  ↳ glen_reply \"\"{suffix}")))
+        });
+        let reply = text::truncate(&safe(reply), budget.unwrap_or(usize::MAX));
+        let row = format!(
+            "  ↳ {} \"{}\" · {status}",
+            p.bold("glen_reply"),
+            muted(&reply, st)
+        );
+        if st.width.is_some_and(|w| {
+            text::width(&anstream::adapter::strip_str(&row).to_string()) > usize::from(w)
+        }) {
+            return body(
+                &anstream::adapter::strip_str(row.trim_start()).to_string(),
+                None,
+                st,
+            );
+        }
+        return row;
+    }
     let plain_prefix = format!("↳ {} {}", safe(&call.name), safe(&call.summary));
     let mut s = format!(
         "  ↳ {} {} · {status}",
@@ -492,5 +519,68 @@ mod tests {
             images: 0,
         };
         assert!(render_item(&i, &mut None, &st).contains("a    b\n  \\x1b[31m"));
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+    use crate::omp::items::ToolResultView;
+    #[test]
+    fn glen_reply_row_summarizes_text_and_preserves_raw_json() {
+        let p = Painter::new(
+            crate::render::palette::ColorDepth::None,
+            crate::render::palette::Theme::Dark,
+        );
+        let args =
+            serde_json::json!({"text":"pong\u{1b}[31m and more words to truncate","final":true});
+        let call = ToolCall {
+            id: "r".into(),
+            name: "glen_reply".into(),
+            summary: args.to_string(),
+            reply_text: args["text"].as_str().map(str::to_owned),
+            arguments: Some(args.clone()),
+            result: Some(ToolResultView {
+                is_error: false,
+                text: "delivered".into(),
+                chars: 9,
+                truncated: false,
+                images: 0,
+            }),
+        };
+        let row = tool(
+            &call,
+            &Style {
+                painter: &p,
+                width: Some(50),
+                tools: Tools::Collapsed,
+                thinking: false,
+            },
+        );
+        assert!(row.contains("↳ glen_reply \"pong"));
+        assert!(row.ends_with("· ✓ delivered"));
+        assert!(text::width(&row) <= 50);
+        assert!(!row.contains("{\""));
+        assert!(!row.contains('\x1b'));
+        for width in [20, 30, 40, 80] {
+            let row = tool(
+                &call,
+                &Style {
+                    painter: &p,
+                    width: Some(width),
+                    tools: Tools::Collapsed,
+                    thinking: false,
+                },
+            );
+            assert!(
+                row.lines()
+                    .all(|line| text::width(line) <= usize::from(width)),
+                "{row}"
+            );
+        }
+
+        let json = serde_json::to_value(&call).unwrap();
+        assert_eq!(json["arguments"], args);
+        assert!(json.get("reply_text").is_none());
     }
 }

@@ -75,13 +75,25 @@ pub enum Command {
         after_help = "Examples:\n  glen jobs --active\n  glen jobs -n 0 --json"
     )]
     Jobs(JobsArgs),
-    #[command(hide = true, about = "Read replies from omp")]
+    #[command(
+        about = "Show replies omp sent back with glen_reply",
+        after_help = "Examples:
+  glen inbox
+  glen inbox --peek --session e27c0de
+  glen inbox -f"
+    )]
     Inbox(InboxArgs),
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
     Worker(WorkerArgs),
     #[command(hide = true, about = "Watch a session live")]
     Watch(WatchArgs),
-    #[command(hide = true, about = "Install the bundled omp extension")]
+    #[command(
+        about = "Install the bundled omp extension (live sessions, glen_reply)",
+        after_help = "Examples:
+  glen install-extension
+  glen install-extension --dry-run
+  glen install-extension --uninstall"
+    )]
     InstallExtension(InstallExtensionArgs),
     #[command(
         about = "Install the glen skill for Claude Code and Codex",
@@ -229,13 +241,13 @@ pub struct JobsArgs {
 }
 #[derive(Debug, Args)]
 pub struct InboxArgs {
-    #[arg(long)]
+    #[arg(long, help = "a session id or hex tail")]
     pub session: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "do not mark messages read")]
     pub peek: bool,
-    #[arg(long)]
+    #[arg(long, help = "include messages already read")]
     pub all: bool,
-    #[arg(short = 'f', long, help = "follow new items until interrupted")]
+    #[arg(short = 'f', long, help = "stream new messages as NDJSON")]
     pub follow: bool,
 }
 #[derive(Debug, Args)]
@@ -244,11 +256,11 @@ pub struct WatchArgs {
 }
 #[derive(Debug, Args)]
 pub struct InstallExtensionArgs {
-    #[arg(long)]
+    #[arg(long, help = "show what would change")]
     pub dry_run: bool,
-    #[arg(long)]
+    #[arg(long, help = "overwrite a newer, modified or foreign file")]
     pub force: bool,
-    #[arg(long)]
+    #[arg(long, help = "remove the extension")]
     pub uninstall: bool,
 }
 #[derive(Debug, Args)]

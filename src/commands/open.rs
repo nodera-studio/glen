@@ -24,7 +24,9 @@ pub(crate) struct Opened {
     pub state: State,
     pub continued_from: Vec<String>,
     pub catalog: Catalog,
-    pub metadata: Metadata,
+    pub metadata: Option<Metadata>,
+    pub not_yet_persisted: bool,
+    pub extension: Option<crate::live::client::Hello>,
 }
 pub(crate) fn load_error(path: &Path, error: LoadError) -> GlenError {
     match error {
@@ -80,12 +82,60 @@ fn open_mode(
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     // Paths need no assigned handles during resolution. Include an external
     // session in the one assignment after loading it.
-    let mut catalog = if arg.contains('/') || arg.ends_with(".jsonl") {
-        Catalog::read(&paths.sessions_dir)?
-    } else {
-        Catalog::scan(&paths.sessions_dir)?
-    };
+    let explicit_path = arg.contains('/') || arg.ends_with(".jsonl");
+    let mut catalog = Catalog::read(&paths.sessions_dir)?;
+    let home = crate::glen_home::resolve(env)?;
+    let registries = crate::live::registry::index(&home);
+    crate::live::registry::union(&mut catalog, &home, env, &registries);
+    if !explicit_path {
+        catalog.assign_handles(None);
+    }
     let path = handle::resolve(arg, &catalog, env)?;
+    if !path.exists()
+        && let Some(summary) = catalog
+            .sessions
+            .iter()
+            .find(|s| s.file.path == path)
+            .cloned()
+    {
+        let header = serde_json::json!({"type":"session","version":3,"id":summary.id,"cwd":summary.cwd,"timestamp":summary.created.map(|t|t.to_string()),"title":summary.title});
+        let session = Session::parse(&path, format!("{header}\n").as_bytes())
+            .map_err(|e| load_error(&path, e))?;
+        let lease = if probe {
+            lease::probe(&paths.session_owners_dir, &summary.id)
+        } else {
+            Lease::Unknown {
+                reason: "not probed".into(),
+                errno: None,
+            }
+        };
+        if explicit_path {
+            catalog.assign_handles(Some(&summary.id));
+        }
+        let handle = catalog.handle(&summary.id);
+        let extension = if probe {
+            endpoint_state(&registries, &summary.id)
+        } else {
+            None
+        };
+        let state = if extension.as_ref().is_some_and(|s| s.busy) {
+            State::Busy
+        } else {
+            State::Live
+        };
+        return Ok(Opened {
+            session,
+            summary,
+            handle,
+            lease,
+            state,
+            continued_from: vec![],
+            catalog,
+            metadata: None,
+            not_yet_persisted: true,
+            extension,
+        });
+    }
     let followed = continuation::follow(&path)?;
     let mut fd = File::open(&followed.path).map_err(|e| GlenError::read(&followed.path, e))?;
     let metadata = fd
@@ -122,7 +172,15 @@ fn open_mode(
             errno: None,
         }
     };
-    let state = lease::infer_state(&lease, summary.in_flight);
+    let extension = if probe {
+        endpoint_state(&registries, &session.header.id)
+    } else {
+        None
+    };
+    let state = extension.as_ref().map_or_else(
+        || lease::infer_state(&lease, summary.in_flight),
+        |s| if s.busy { State::Busy } else { State::Live },
+    );
     if !catalog.handles.contains_key(&session.header.id) {
         catalog.assign_handles(Some(&session.header.id));
     }
@@ -135,8 +193,41 @@ fn open_mode(
         state,
         continued_from: followed.from,
         catalog,
-        metadata,
+        metadata: Some(metadata),
+        not_yet_persisted: false,
+        extension,
     })
+}
+fn endpoint_state(
+    registries: &[crate::live::registry::Registry],
+    id: &str,
+) -> Option<crate::live::client::Hello> {
+    let registry = registries.iter().find(|r| r.session_id == id)?;
+    crate::live::client::state(&registry.socket, crate::live::STATE_LS)
+        .ok()
+        .filter(|s| s.session_id == id)
+}
+pub(crate) fn session_json(o: &Opened) -> serde_json::Value {
+    let mut value = super::ls::session_json(
+        &o.summary,
+        &o.handle,
+        &o.lease,
+        o.state,
+        std::time::SystemTime::now(),
+    );
+    if o.not_yet_persisted {
+        value["path"] = serde_json::Value::Null;
+    }
+    if o.not_yet_persisted || o.extension.is_some() {
+        value["state_source"] = serde_json::json!("extension");
+        value["state_detail"] = serde_json::json!(
+            o.extension
+                .as_ref()
+                .and_then(|e| e.mode.as_deref())
+                .unwrap_or("tui")
+        );
+    }
+    value
 }
 pub(crate) fn header<'a>(o: &'a Opened) -> transcript::Header<'a> {
     transcript::Header {

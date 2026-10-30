@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { existsSync, readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { plan, total, paneAt, typeDelays, mulberry32, SPINNER_TICKS, TICK_MS, ROW_KINDS, CUE_KINDS, TYPE } from './terminal-player.mjs';
-import { script, COLS, ROWS, WINDOWS, SEED, lsTable, completedBlock, items, tailHeader, lines, plain, selection, job, session, message, PROGRESS } from '../../data/demo.mjs';
+import { script, COLS, ROWS, WINDOWS, SEED, lsTable, completedBlock, showHeader, items, tailHeader, lines, plain, selection, job, session, message, LIVE_PROGRESS, deliveredAs } from '../../data/demo.mjs';
 import capture from '../../data/demo-capture.json' with { type: 'json' };
 
 const wide = plan(script, { seed: SEED });
@@ -81,16 +81,20 @@ test('rows become visible in order, and the spinner is replaced by the completio
  assert.ok(hop.at >= reply.at && hop.at < spin.end, 'the reply hops across before glen prints it');
 });
 
-test('glen send and wait output is W2’s: spinner messages in job order, then the captured outcome', () => {
+test('glen send to the live session takes W3’s live route: spinner messages in job order, then the captured outcome', () => {
  // W2 job handles are j plus 7 hex digits (src/jobs/mod.rs JobId::handle).
  assert.match(job, /^j[0-9a-f]{7}$/);
+ // The session the agent sends to is live (glen show's meta line), so send takes the live route.
+ assert.match(plain(showHeader(76)[1]), new RegExp(`^${session} · .* · ● live · `));
  const spin = wide.find(c => c.k === 'spin');
- assert.equal(spin.v, `sending to ${session} · ${job}`);
+ assert.equal(spin.v, `delivering to ${session} (live) · ${job}`);
  const msgs = wide.filter(c => c.k === 'msg');
- assert.deepEqual(msgs.map(c => c.v), ['starting omp', 'waiting for the reply']);
+ assert.deepEqual(msgs.map(c => c.v), ['delivered as prompt; omp is working']);
  for (const m of msgs) assert.ok(m.at > spin.at && m.at < spin.end, `${m.v} shows while the spinner does`);
  const user = wide.find(c => c.k === 'event' && plain(c.line).startsWith('❯ user'));
- assert.ok(msgs[1].at <= user.at, 'omp accepts the prompt before its user message shows');
+ assert.ok(msgs[0].at <= user.at, 'the extension accepts the message before omp shows it');
+ // Spinner frame, space and message fit the narrow pane, so no state's message is clipped.
+ for (const v of [spin.v, ...msgs.map(c => c.v)]) assert.ok(2 + [...v].length <= COLS.narrow.a, v);
  for (const cues of [wide, narrowCols]) {
   const done = cues.find(c => c.k === 'flush' && c.at === cues.find(x => x.k === 'spin').end);
   assert.deepEqual(done.line, [{ text: `✓ completed · ${job} · ${session} · 41s`, tone: 'success' }]);
@@ -108,9 +112,20 @@ test('the tail -f diagnostic is the one glen’s source prints to a TTY', () => 
 const w2 = fileURLToPath(new URL('../../../../src/commands/wait.rs', import.meta.url));
 test('the demo strings are the ones glen’s source prints', { skip: !existsSync(w2) && 'W2 (src/commands/wait.rs) is not on this branch yet' }, () => {
  const wait = readFileSync(w2, 'utf8'), send = readFileSync(w2.replace(/wait\.rs$/, 'send.rs'), 'utf8');
- for (const v of Object.values(PROGRESS)) assert.ok(wait.includes(`"${v}"`), v);
+ const ext = readFileSync(fileURLToPath(new URL('../../../../extension/glen/index.ts', import.meta.url)), 'utf8');
+ // send and wait drive their spinner with job_progress, from the first frame on.
+ assert.match(send, /Spinner::start\([^;]*super::wait::job_progress\(&job, /);
+ assert.ok(send.includes('spinner.set_message(&super::wait::job_progress(&job, s))'));
+ assert.ok(wait.includes('spinner.set_message(&job_progress(&job, s))'));
+ // job_progress's live arm: session handle then job handle while queued, then how omp took it.
+ const at = wait.indexOf('fn job_progress('), body = wait.slice(at, wait.indexOf('\n}', at));
+ assert.ok(at >= 0 && body.includes('if job.route != Route::Live {'), 'job_progress has a live route');
+ const literal = (/** @type {string} */ f) => `"${f.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}"`;
+ assert.match(body, new RegExp(`State::Queued => format!\\(\\s*${literal(LIVE_PROGRESS.queued)},\\s*job\\.session_handle[^,]*,\\s*job\\.handle\\s*\\)`));
+ assert.match(body, new RegExp(`State::Accepted => format!\\(\\s*${literal(LIVE_PROGRESS.accepted)},\\s*s\\.delivered_as`));
+ // The extension reports an idle session's delivery as a prompt.
+ assert.ok(ext.includes(`deliveredAs = idle ? "${deliveredAs}"`));
  for (const f of ['format!("{seconds}s")', 'format!("{}m {:02}s"', '"✓ completed · {} · {}"']) assert.ok(wait.includes(f), f);
- assert.ok(send.includes('"sending to {} · {}"'));
 });
 
 test('narrow mode turns the hop into a tab switch', () => {
