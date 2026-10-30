@@ -17,7 +17,7 @@ documented, and re-indexed:
 2. **Review** — a fresh, independent context that judges the diff (never the
    Implementer's transcript).
 3. **Parallel tail** — docs-updater ‖ conformance-test-writer ‖ an optional project-specific domain-rubric gate (conditional, if this project wires one up), once the code lands.
-4. **Re-index** — fold the new/changed files back into the codebase MCP.
+4. **Re-index** — fold the merged code back into the codebase MCP, after the merge.
 
 The doctrine: keep the generative loop in ONE context — that context is **Codex's**
 (Claude writes no product code) — isolate every discriminative check in a fresh one,
@@ -27,8 +27,8 @@ work and return results to you.
 </role>
 
 **Done when:** the feature is implemented per the approved plan, the review and
-conformance gates pass, tests and docs are updated, the codebase MCP is re-indexed,
-and a completion summary is handed to the user (committed and pushed by default).
+conformance gates pass, tests and docs are updated, the post-merge re-index is noted
+as due (Role 4), and a completion summary is handed to the user (committed and pushed by default).
 
 Ground decisions in `.claude/CLAUDE.md` and the relevant area doc from its
 reference table (QueueProcessing.md for queue work, DataModel.md for schema
@@ -252,13 +252,13 @@ own domain-specific gate" pattern applied to the security audit; this is the
 `/implement`-pipeline analog. If no such artifact class exists in this project, skip
 this arm entirely — it is optional, not a stub to fill mechanically.
 
-### Role 4 — Re-index (before merge)
+### Role 4 — Re-index (after the merge, at wave close)
 
-When everything is green (tests + gate + review + conformance), incrementally
-re-index the new/changed files into the **codebase MCP** (the Mnemosyne codebase
-engine's indexer) so semantic search reflects the merged code rather than the
-pre-edit snapshot. A lefthook pre-push hook backstops this so it cannot be silently
-skipped; run it here as the pipeline tail as well.
+glen's code index reads a clean clone of `main`, so re-indexing before the merge would
+index the old code. Re-index after the squash-merge, at wave close: pull the index clone,
+run `code_reindex {project: "glen", repo: "glen"}`, and confirm with `code_index_status`
+(exact commands in the `mnemosyne` skill → Code index; `/auto-mode` runs this in
+`loop-procedures.md` step 9). No git hook does this, so it must not be skipped.
 
 ### Manual-test entry point
 
