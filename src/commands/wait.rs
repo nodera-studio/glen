@@ -13,12 +13,33 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::time::Instant;
+pub(crate) fn progress(s: &Status) -> &'static str {
+    match s.status {
+        State::Queued if s.waiting_for_lock => "queued behind another glen job",
+        State::Queued => "starting omp",
+        State::Accepted => "waiting for the reply",
+        _ => s.status.as_str(),
+    }
+}
+fn duration(ms: i64) -> String {
+    let seconds = ms.max(0) / 1000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}m {:02}s", seconds / 60, seconds % 60)
+    }
+}
 pub(crate) fn job_view(job: &Job, s: &Status, now: jiff::Timestamp) -> Value {
     let elapsed = job
         .created_at
         .parse::<jiff::Timestamp>()
         .map(|t| {
-            now.as_millisecond()
+            let end = if s.status.is_terminal() {
+                s.updated_at.parse::<jiff::Timestamp>().unwrap_or(now)
+            } else {
+                now
+            };
+            end.as_millisecond()
                 .saturating_sub(t.as_millisecond())
                 .max(0)
         })
@@ -94,14 +115,18 @@ pub(crate) fn outcome(
         let id = JobId::parse(&job.id)
             .ok_or_else(|| GlenError::new(ErrorCode::Internal, "invalid stored job id"))?;
         let r = store.read_result(&id)?;
-        human.extend(painted_lines(
-            ctx,
-            Token::Success,
-            &format!(
-                "✓ completed · {} · {} · {}ms",
-                job.handle, session_label, view["elapsed_ms"]
-            ),
-        ));
+        let heading = format!("✓ completed · {} · {}", job.handle, session_label);
+        let elapsed = duration(view["elapsed_ms"].as_i64().unwrap_or(0));
+        let summary = format!("{heading} · {elapsed}");
+        let summary = if ctx
+            .width
+            .is_some_and(|w| text::width(&summary) > usize::from(w))
+        {
+            format!("{heading}\n  {elapsed}")
+        } else {
+            summary
+        };
+        human.extend(painted_lines(ctx, Token::Success, &summary));
         if let Some(t) = &r.assistant_text {
             human.push(String::new());
             for l in text::clean_lines(t) {
@@ -109,12 +134,20 @@ pub(crate) fn outcome(
             }
         }
         for reply in &r.replies {
+            let mut first = true;
             for l in text::clean_lines(&reply.text) {
-                human.extend(painted_lines(
-                    ctx,
-                    Token::Muted,
-                    &format!("↩ {l}{}", if reply.is_final { " ✓" } else { "" }),
-                ));
+                for part in text::wrap(
+                    &l,
+                    ctx.width.map(|w| usize::from(w).saturating_sub(4).max(1)),
+                ) {
+                    let line = if first {
+                        format!("↩ {part}{}", if reply.is_final { " ✓" } else { "" })
+                    } else {
+                        format!("  {part}")
+                    };
+                    human.push(ctx.painter.paint(Token::Muted, &line));
+                    first = false;
+                }
             }
         }
         for output in &r.command_output {
@@ -194,7 +227,7 @@ pub fn run(_cli: &Cli, args: &WaitArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
         args.timeout,
         &flag,
         None,
-        |s| spinner.set_message(s.status.as_str()),
+        |s| spinner.set_message(progress(s)),
     );
     spinner.finish();
     outcome(&store, &job, waited?, ctx)
@@ -224,6 +257,36 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn review8_progress_reports_only_observed_lock_contention() {
+        let mut s = Status::default();
+        assert_eq!(progress(&s), "starting omp");
+        s.worker_pid = Some(123);
+        s.waited_ms = Some(0);
+        assert_eq!(progress(&s), "starting omp");
+        s.waited_ms = Some(1);
+        assert_eq!(progress(&s), "starting omp");
+        s.waiting_for_lock = true;
+        assert_eq!(progress(&s), "queued behind another glen job");
+        s.status = State::Accepted;
+        assert_eq!(progress(&s), "waiting for the reply");
+    }
+    #[test]
+    fn review13_elapsed_stops_at_terminal_publication() {
+        let mut j = fixtures::job();
+        j.created_at = "2026-10-30T00:00:00Z".into();
+        let now = "2026-10-30T01:00:00Z".parse().unwrap();
+        let mut s = Status {
+            status: State::Completed,
+            updated_at: "2026-10-30T00:00:41Z".into(),
+            ..Status::default()
+        };
+        assert_eq!(job_view(&j, &s, now)["elapsed_ms"], 41000);
+        s.status = State::Accepted;
+        assert_eq!(job_view(&j, &s, now)["elapsed_ms"], 3600000);
+        assert_eq!(duration(41000), "41s");
+        assert_eq!(duration(65000), "1m 05s");
     }
     #[test]
     fn outcome_exit_and_payload_table() {

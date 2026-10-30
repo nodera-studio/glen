@@ -4,7 +4,11 @@ use crate::{
     error::{ErrorCode, GlenError, Warning},
     glen_home,
     jobs::{Job, JobError, JobId, JobStore, Route, State, lock, wait},
-    omp::{bin, lease::Lease, paths},
+    omp::{
+        bin,
+        lease::{self, Lease},
+        paths,
+    },
     output::{Mode, Outcome, OutputCtx},
     render::spinner::Spinner,
     rpc,
@@ -58,7 +62,16 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         let mut bytes = vec![];
         io::stdin()
             .take(rpc::MAX_MESSAGE_BYTES as u64 + 1)
-            .read_to_end(&mut bytes)?;
+            .read_to_end(&mut bytes)
+            .map_err(|e| {
+                GlenError::new(
+                    ErrorCode::Io,
+                    format!(
+                        "cannot read send message from stdin for {}: {e}",
+                        args.session
+                    ),
+                )
+            })?;
         if bytes.len() > rpc::MAX_MESSAGE_BYTES {
             return Err(GlenError::new(
                 ErrorCode::Usage,
@@ -86,7 +99,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     if let Some(o) = &opened
         && !lock::is_held(&home, &o.session.header.id)
     {
-        let message = match &o.lease {
+        let message = match lease::probe(&paths.session_owners_dir, &o.session.header.id) {
             Lease::Free => None,
             Lease::Held => Some(format!(
                 "session {} is open in another omp process",
@@ -159,7 +172,14 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
                 details: None,
             });
             store.write_status(&id, &s)?;
-            return Err(e.into());
+            return Err(GlenError::new(
+                ErrorCode::Io,
+                format!(
+                    "cannot spawn worker for job {} at {}: {e}",
+                    job.handle,
+                    store.dir(&id).display()
+                ),
+            ));
         }
     };
     let flag = wait::install_interrupt()?;
@@ -182,13 +202,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         },
         &flag,
         Some(&mut child),
-        |s| {
-            spinner.set_message(if s.status == State::Accepted {
-                "omp is working"
-            } else {
-                "queued behind another glen job"
-            })
-        },
+        |s| spinner.set_message(super::wait::progress(s)),
     );
     spinner.finish();
     super::wait::outcome(&store, &job, waited?, ctx)

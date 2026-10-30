@@ -141,18 +141,28 @@ pub enum DeliverAs {
 }
 #[derive(Debug, Args)]
 pub struct SendArgs {
+    #[arg(help = "session handle, @latest for this project, or @new")]
     pub session: String,
     #[arg(help = "message text, or - to read stdin (use -- before a message that starts with -)")]
     pub message: String,
-    #[arg(long, conflicts_with_all = ["deliver_as", "follow_up"])]
+    #[arg(long, help = "steer the active turn (queued jobs send a prompt)", conflicts_with_all = ["deliver_as", "follow_up"])]
     pub steer: bool,
-    #[arg(long = "follow-up", conflicts_with = "deliver_as")]
+    #[arg(
+        long = "follow-up",
+        help = "queue a follow-up after the active turn",
+        conflicts_with = "deliver_as"
+    )]
     pub follow_up: bool,
-    #[arg(long = "as", value_enum, default_value = "auto")]
+    #[arg(
+        long = "as",
+        help = "how to deliver the message",
+        value_enum,
+        default_value = "auto"
+    )]
     pub deliver_as: DeliverAs,
-    #[arg(long,default_value="90s",value_parser=parse_duration,conflicts_with="no_wait")]
+    #[arg(long,help="maximum foreground wait; the job continues afterwards",default_value="90s",value_parser=parse_duration,conflicts_with="no_wait")]
     pub wait: Duration,
-    #[arg(long)]
+    #[arg(long, help = "return the job handle immediately")]
     pub no_wait: bool,
     #[arg(
         long,
@@ -178,15 +188,16 @@ pub struct WorkerArgs {
 }
 #[derive(Debug, Args)]
 pub struct WaitArgs {
+    #[arg(help = "job handle or full job UUID")]
     pub job: String,
-    #[arg(long,default_value="90s",value_parser=parse_duration)]
+    #[arg(long,help="maximum foreground wait; the job continues afterwards",default_value="90s",value_parser=parse_duration)]
     pub timeout: Duration,
 }
 #[derive(Debug, Args)]
 pub struct JobsArgs {
     #[arg(long, help = "a session id or hex tail")]
     pub session: Option<String>,
-    #[arg(long)]
+    #[arg(long, help = "show only queued and accepted jobs")]
     pub active: bool,
     #[arg(
         short = 'n',

@@ -117,29 +117,40 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                     .max(labels[i].len())
             })
             .collect();
+        let mut columns = vec![0, 1, 2, 3, 4];
         if let Some(w) = ctx.width {
-            while budgets.iter().sum::<usize>() + 8 > usize::from(w) {
-                let Some(i) = (0..5)
-                    .filter(|i| budgets[*i] > 1)
+            while columns.iter().map(|i| budgets[*i]).sum::<usize>()
+                + 2 * columns.len().saturating_sub(1)
+                > usize::from(w)
+            {
+                let Some(i) = columns
+                    .iter()
+                    .copied()
+                    .filter(|i| *i != 2 && budgets[*i] > 1)
                     .max_by_key(|i| budgets[*i])
                 else {
+                    if let Some(pos) = columns.iter().rposition(|i| *i != 2) {
+                        columns.remove(pos);
+                        continue;
+                    }
                     break;
                 };
                 budgets[i] -= 1;
             }
         }
         let mut table = Table::new(&ctx.painter, None);
-        let headers: Vec<_> = labels
+        let headers: Vec<_> = columns
             .iter()
-            .enumerate()
-            .map(|(i, l)| text::truncate(l, budgets[i]))
+            .map(|i| text::truncate(labels[*i], budgets[*i]))
             .collect();
         table.header(&headers.iter().map(String::as_str).collect::<Vec<_>>());
         for ((_, s), r) in rows.iter().zip(plain) {
             table.row(
-                r.iter()
-                    .enumerate()
-                    .map(|(i, v)| {
+                columns
+                    .iter()
+                    .copied()
+                    .map(|i| {
+                        let v = &r[i];
                         ctx.painter.paint(
                             match i {
                                 0 => Token::Focus,
@@ -153,7 +164,11 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                                 },
                                 _ => Token::Muted,
                             },
-                            &text::truncate(v, budgets[i]),
+                            &if i == 2 {
+                                text::wrap(v, ctx.width.map(usize::from)).join("\n")
+                            } else {
+                                text::truncate(v, budgets[i])
+                            },
                         )
                     })
                     .collect(),

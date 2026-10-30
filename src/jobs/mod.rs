@@ -145,6 +145,8 @@ pub struct Status {
     pub delivered_as: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub waited_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting_for_lock: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub forked: Option<Forked>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -203,7 +205,12 @@ impl JobStore {
     pub fn create(&self, job: &Job) -> Result<(), GlenError> {
         let id = JobId::parse(&job.id)
             .ok_or_else(|| GlenError::new(ErrorCode::Internal, "invalid job id"))?;
-        self.home.ensure_dir("jobs")?;
+        self.home.ensure_dir("jobs").map_err(|e| {
+            GlenError::new(
+                ErrorCode::Io,
+                format!("cannot create {}: {e}", self.root.display()),
+            )
+        })?;
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
@@ -217,7 +224,11 @@ impl JobStore {
                 } else {
                     ErrorCode::Io
                 },
-                format!("cannot create job {}: {e}", id.as_str()),
+                format!(
+                    "cannot create job {} at {}: {e}",
+                    id.as_str(),
+                    self.dir(&id).display()
+                ),
             )
         })?;
         write_json(&self.dir(&id).join("job.json"), job)?;
@@ -241,6 +252,28 @@ impl JobStore {
         read_json(&self.dir(id).join("result.json"))
     }
     pub fn write_status(&self, id: &JobId, s: &Status) -> Result<(), GlenError> {
+        let _lock = self.status_lock(id)?;
+        write_json(&self.dir(id).join("status.json"), s)
+    }
+    pub(crate) fn status_lock(&self, id: &JobId) -> Result<fs::File, GlenError> {
+        let path = self.dir(id).join("status.lock");
+        let mut opts = OpenOptions::new();
+        opts.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let file = opts.open(&path).map_err(|e| GlenError::read(&path, e))?;
+        file.lock().map_err(|e| {
+            GlenError::new(
+                ErrorCode::Io,
+                format!("cannot lock {}: {e}", path.display()),
+            )
+        })?;
+        Ok(file)
+    }
+    pub(crate) fn write_status_locked(&self, id: &JobId, s: &Status) -> Result<(), GlenError> {
         write_json(&self.dir(id).join("status.json"), s)
     }
     pub fn write_result(&self, id: &JobId, r: &JobResult) -> Result<(), GlenError> {
@@ -342,7 +375,12 @@ pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Gle
     let mut b = serde_json::to_vec_pretty(value)
         .map_err(|e| GlenError::new(ErrorCode::Internal, e.to_string()))?;
     b.push(b'\n');
-    write_private_atomic(path, &b)?;
+    write_private_atomic(path, &b).map_err(|e| {
+        GlenError::new(
+            ErrorCode::Io,
+            format!("cannot write {}: {e}", path.display()),
+        )
+    })?;
     Ok(())
 }
 pub(crate) fn append_line(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -355,7 +393,9 @@ pub(crate) fn append_line(path: &Path, bytes: &[u8]) -> io::Result<()> {
     }
     let mut b = bytes.to_vec();
     b.push(b'\n');
-    opts.open(path)?.write_all(&b)
+    opts.open(path)
+        .and_then(|mut f| f.write_all(&b))
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot append {}: {e}", path.display())))
 }
 
 #[cfg(test)]
@@ -453,6 +493,7 @@ pub(crate) mod tests {
                 actual_session_file: Some("/actual.jsonl".into()),
                 delivered_as: Some("prompt".into()),
                 waited_ms: Some(15),
+                waiting_for_lock: true,
                 forked: Some(fork.clone()),
                 error: Some(error.clone()),
                 warnings: vec![Warning {
@@ -513,6 +554,20 @@ pub(crate) mod tests {
                 assert_eq!(fs::metadata(p).unwrap().permissions().mode() & 0o777, mode);
             }
         }
+    }
+    #[test]
+    fn review12_write_and_lock_errors_name_the_path() {
+        let t = tempfile::tempdir().unwrap();
+        let store = store(t.path());
+        let id = JobId::new();
+        let path = store.dir(&id).join("result.json");
+        let error = write_json(&path, &json!({})).unwrap_err();
+        assert!(error.message.contains(&path.display().to_string()));
+        let error = store.write_status(&id, &Status::default()).unwrap_err();
+        assert!(error.message.contains("status.lock"));
+        fs::write(&store.home.root, "blocked").unwrap();
+        let error = store.create(&job()).unwrap_err();
+        assert!(error.message.contains(&store.root.display().to_string()));
     }
     #[test]
     fn read_errors_name_the_file() {

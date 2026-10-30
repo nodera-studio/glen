@@ -102,24 +102,39 @@ pub fn is_lost(s: &Status, now: jiff::Timestamp) -> bool {
             _ => false,
         }
 }
-pub fn mark_lost(store: &JobStore, id: &JobId, mut s: Status) -> Status {
-    s.status = State::Lost;
-    s.updated_at = jiff::Timestamp::now().to_string();
-    s.error = Some(JobError {
-        code: "lost".into(),
-        message: "the glen worker exited without reporting a result".into(),
-        hint: None,
-        details: None,
-    });
-    if store.write_status(id, &s).is_err() {
-        // Best effort: report the observed lost outcome even if persistence fails.
-        return s;
+pub fn mark_lost(store: &JobStore, id: &JobId, s: Status) -> Status {
+    persist_lost(store, id, s, false)
+}
+fn persist_lost(store: &JobStore, id: &JobId, observed: Status, recheck: bool) -> Status {
+    let result = (|| -> Result<Status, crate::error::GlenError> {
+        // The worker uses the same lock for every publication. Re-read while holding it.
+        let _lock = store.status_lock(id)?;
+        let mut s = store.read_status(id)?;
+        if s.status.is_terminal() || (recheck && !is_lost(&s, jiff::Timestamp::now())) {
+            return Ok(s);
+        }
+        s.status = State::Lost;
+        s.updated_at = jiff::Timestamp::now().to_string();
+        s.error = Some(JobError {
+            code: "lost".into(),
+            message: "the glen worker exited without reporting a result".into(),
+            hint: None,
+            details: None,
+        });
+        store.write_status_locked(id, &s)?;
+        Ok(s)
+    })();
+    match result {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("cannot mark job {} lost: {e}", id.handle());
+            observed
+        }
     }
-    s
 }
 pub fn refresh(store: &JobStore, id: &JobId, s: Status) -> Status {
     if is_lost(&s, jiff::Timestamp::now()) {
-        mark_lost(store, id, s)
+        persist_lost(store, id, s, true)
     } else {
         s
     }
@@ -195,6 +210,45 @@ mod tests {
         assert!(!is_lost(&s, now));
     }
     #[test]
+    fn review3_completed_publication_wins_over_stale_lost_reader() {
+        let t = tempfile::tempdir().unwrap();
+        let store = super::super::tests::store(t.path());
+        let j = super::super::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let mut stale = store.read_status(&id).unwrap();
+        stale.status = State::Accepted;
+        stale.worker_pid = Some(std::process::id());
+        stale.worker_start = Some("dead identity".into());
+        store.write_status(&id, &stale).unwrap();
+        let lock = store.status_lock(&id).unwrap();
+        std::thread::scope(|scope| {
+            let reader = scope.spawn(|| refresh(&store, &id, stale.clone()));
+            let mut completed = stale.clone();
+            completed.status = State::Completed;
+            store.write_status_locked(&id, &completed).unwrap();
+            drop(lock);
+            assert_eq!(reader.join().unwrap().status, State::Completed);
+        });
+        assert_eq!(mark_lost(&store, &id, stale).status, State::Completed);
+        assert_eq!(store.read_status(&id).unwrap().status, State::Completed);
+    }
+    #[test]
+    fn review15_unknown_start_token_limitation_is_documented() {
+        let now = jiff::Timestamp::now();
+        let s = Status {
+            status: State::Accepted,
+            worker_pid: Some(u32::MAX),
+            worker_start: None,
+            updated_at: "2000-01-01T00:00:00Z".into(),
+            ..Status::default()
+        };
+        assert!(!is_lost(&s, now));
+        let design = include_str!("../../docs/design.md");
+        assert!(design.contains("Unsupported platforms."));
+        assert!(design.contains("readers conservatively cannot mark that job lost"));
+    }
+    #[test]
     fn refresh_persists_and_preserves_fields() {
         let t = tempfile::tempdir().unwrap();
         let store = super::super::tests::store(t.path());
@@ -205,6 +259,7 @@ mod tests {
         s.worker_pid = Some(std::process::id());
         s.worker_start = Some("wrong".into());
         s.omp_pid = Some(123);
+        store.write_status(&id, &s).unwrap();
         let s = refresh(&store, &id, s);
         assert_eq!(s.status, State::Lost);
         assert_eq!(s.omp_pid, Some(123));
