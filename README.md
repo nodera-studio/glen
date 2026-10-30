@@ -97,9 +97,8 @@ Coming in a later release.
 
 ## Website
 
-<!-- site-url: W7 Step 10 replaces the SITE_URL line below with the workers.dev URL after the first
-deploy, together with the default in site/astro.config.mjs; tests/readme.rs checks they match. -->
-SITE_URL
+<!-- site-url: keep in sync with the default in site/astro.config.mjs; tests/readme.rs checks they match. -->
+https://glen.nodera.workers.dev
 
 ## Development
 
