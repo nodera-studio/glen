@@ -1926,13 +1926,6 @@ pub(crate) mod tests {
                 .any(|s| s.contains("j1234567 · waiting for the reply"))
         );
         assert!(activity.iter().any(|s| s.starts_with("↩ ")));
-        println!(
-            "\n{}",
-            (0..buffer.area.height)
-                .map(|y| row_text(&buffer, y))
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
     }
     #[test]
     fn inbox_is_peek_only_and_help_marks_controls_unavailable() {

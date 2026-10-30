@@ -393,6 +393,11 @@ pub struct InboxSnapshot {
     pub cursors: HashMap<String, crate::inbox::Cursor>,
 }
 pub enum Msg {
+    SourceError {
+        source: &'static str,
+        error: ErrView,
+    },
+    InboxReset(Vec<String>),
     Key(KeyEvent),
     Paste(String),
     Resize(u16, u16),

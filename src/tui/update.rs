@@ -22,6 +22,37 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         return vec![];
     }
     let commands = match msg {
+        Msg::SourceError { source, error } => {
+            toast(
+                app,
+                format!(
+                    "{source}: {}{}",
+                    error.message,
+                    error
+                        .hint
+                        .map(|hint| format!(" · {hint}"))
+                        .unwrap_or_default()
+                ),
+            );
+            vec![]
+        }
+        Msg::InboxReset(sessions) => {
+            app.inbox
+                .records
+                .retain(|r| !sessions.contains(&r.session_id));
+            app.inbox
+                .positions
+                .retain(|(session, _), _| !sessions.contains(session));
+            for session in sessions {
+                app.inbox.cursors.remove(&session);
+                app.inbox.unread_by_session.remove(&session);
+            }
+            app.inbox.scroll = app
+                .inbox
+                .scroll
+                .min(app.inbox.records.len().saturating_sub(1));
+            vec![]
+        }
         Msg::Key(key) => key_update(app, key),
         Msg::Paste(s) => {
             if let Some(Overlay::Picker(p)) = &mut app.overlay {
