@@ -77,6 +77,14 @@ flags the user may include and that you should preserve in the prompt text:
 - `--write` / read-only (default: write-capable unless user wants review only)
 - `--resume` / `--fresh` (default: fresh; `--resume` continues prior Codex work)
 
+### Brief hygiene
+
+The forwarder parses flag-like tokens anywhere in the brief text, not only at the end. A
+literal `--resume` quoted from omp's CLI made it look for an earlier Codex thread and fail;
+`--fresh` and `--resume-last` are its own flags too. When a brief has to mention an omp or
+other CLI flag, write it in prose ("the resume flag") or inside a fenced code block the
+forwarder won't parse, and put `--effort high` (or any routing flag) only where you mean it.
+
 ### Example — single dispatch
 
 ```

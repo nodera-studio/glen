@@ -89,6 +89,8 @@ If a plan file exists:
 6. If modify → let the user describe changes, update the plan, then skip to Role 1
 7. If no → proceed with Steps 2-4 (generate a new plan from scratch)
 
+Under `/auto-mode`: use the plan and proceed to Role 1; announce the plan path and summary.
+
 Store the plan file path — after successful implementation it is **archived, not
 deleted** (see "Mark Plan Complete").
 
@@ -114,6 +116,8 @@ If the plan has gaps, re-dispatch the planner with specific feedback. Maximum 1 
 Present the plan to the user: files to create, files to modify, key architectural
 decisions, risks flagged by the planner. Wait for explicit approval before
 proceeding.
+
+Under `/auto-mode`: use the plan and proceed; announce the same summary.
 
 ### Step 4.5 — Advisor Gate (high-value plans only)
 
@@ -171,19 +175,26 @@ the remainder (a fresh context is the entire point of splitting). For wave plans
 dispatch one Implementer per wave. Between slices, the handoff is `progress.md` +
 the plan's `<task>` XML — never the previous Implementer's transcript.
 
-### Role 2 — Review (fresh context, triple-engine)
+### Role 2 — Review (fresh context, dual-engine by default)
 
 A fresh, independent review of the diff + spec — **never** the Implementer's
-transcript. Run the **triple-engine review block** (see
-`.claude/agents/review-implementation/orchestrator.md`): three engines review the
-diff blind to one another — the Claude comprehensive reviewer ‖ `codex review` ‖
-`coderabbit review --plain --agent` — then the Claude **synthesizer** dedupes and
-reconciles them into one provenance-labelled report + an ordered fix plan. No
-lint/type/style re-check — the deterministic gate already enforced that inside the
-Implementer; the engines hunt real bugs.
+transcript. By default run the lean **`/code-review` dual-engine gate** (see
+`.claude/commands/code-review.md`): the Claude pass (`implementation/code-review.md`)
+‖ a Codex pass (`codex:codex-rescue`) in ONE message, merged by 2-vote consensus into
+one must-fix / recommended / notes report. No lint/type/style re-check — the
+deterministic gate already enforced that inside the Implementer; the engines hunt
+real bugs.
+
+Escalate to the **triple-engine review block** (see
+`.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer
+‖ `codex review` ‖ `coderabbit review --plain --agent` → synthesizer) only when
+`command -v coderabbit` succeeds or the diff is high-risk (the risk heuristic
+`.claude/scripts/quick-classify.sh` uses: omp session writes, RPC/bridge, secrets,
+releases, dependency changes). CodeRabbit is not installed for glen today, so a
+high-risk diff runs that block with its two available engines and says so.
 
 Use the default-branch merge-base as `BASE` (no prompt — this is the in-pipeline
-path). If the synthesizer's fix plan has must-fix items, dispatch a **fresh**
+path). If the report has must-fix items, dispatch a **fresh**
 Implementer ("Fix ONLY these review findings: {fix plan}. Do not re-implement the
 plan."), then re-run the review scoped to the fixed files. Maximum 2 cycles; if
 must-fix items remain, stop and report to the user.
@@ -191,7 +202,10 @@ must-fix items remain, stop and report to the user.
 ### Role 3 — Parallel tail (docs ‖ conformance ‖ optional domain-rubric gate)
 
 Once review is green the code is final, so these run **concurrently** — dispatch
-them in ONE message. Arms 1+2 ALWAYS fire; a third, conditional arm is a SLOT for a
+them in ONE message. The docs-updater and conformance writer touch only docs and
+tests, so they may be dispatched as soon as the Role 2 fix commit exists,
+concurrently with the scoped re-review; if that re-review forces another product
+fix, re-run the conformance suite against it. Arms 1+2 ALWAYS fire; a third, conditional arm is a SLOT for a
 project-specific isolated-context grader, only if this project has wired one up (see
 below) — fire it ONLY when its trigger predicate returns non-empty:
 
@@ -276,8 +290,8 @@ Plans are **kept after implementation** — they accumulate as project history. 
   ones.** Never feed the Implementer's transcript to the reviewer — only the diff +
   spec. Split large work at slice boundaries (fresh Codex Implementer via
   `--fresh`), never mid write→test→fix loop; rework resumes Codex via `--resume-last`.
-- The user-approval gate (Step 4), the Review gate (Role 2), and the conformance
-  gate (Role 3) are mandatory — do not skip them. Any optional domain-rubric gate this
+- The user-approval gate (Step 4; announced instead under `/auto-mode`), the Review
+  gate (Role 2), and the conformance gate (Role 3) are mandatory — do not skip them. Any optional domain-rubric gate this
   project wires up (Role 3 arm 3) is mandatory *when its trigger predicate fires*; on
   persistent FAIL it BLOCKS the pipeline. Code is written only after the plan is
   approved.
