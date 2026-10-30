@@ -1,0 +1,101 @@
+{
+  "$comment": "Single source for glen's palette. `src/render/palette.rs::style()` must agree (cargo test palette_contract); `site/` reads the dark values at build. Edit both together.",
+  "tokens": [
+    {
+      "name": "muted",
+      "light": {
+        "hex": "#505050",
+        "xterm": 239
+      },
+      "dark": {
+        "hex": "#B4B5BD",
+        "xterm": 250
+      },
+      "ansi16": null
+    },
+    {
+      "name": "border",
+      "light": {
+        "hex": "#DADADA",
+        "xterm": 253
+      },
+      "dark": {
+        "hex": "#45474D",
+        "xterm": 238
+      },
+      "ansi16": "bright_black"
+    },
+    {
+      "name": "accent",
+      "light": {
+        "hex": "#5E6AD2",
+        "xterm": 62
+      },
+      "dark": {
+        "hex": "#7170FF",
+        "xterm": 63
+      },
+      "ansi16": "blue"
+    },
+    {
+      "name": "accent_2",
+      "light": {
+        "hex": "#12A594",
+        "xterm": 36
+      },
+      "dark": {
+        "hex": "#12A594",
+        "xterm": 36
+      },
+      "ansi16": "cyan"
+    },
+    {
+      "name": "success",
+      "light": {
+        "hex": "#007F3D",
+        "xterm": 29
+      },
+      "dark": {
+        "hex": "#00CA50",
+        "xterm": 41
+      },
+      "ansi16": "green"
+    },
+    {
+      "name": "warning",
+      "light": {
+        "hex": "#A66300",
+        "xterm": 130
+      },
+      "dark": {
+        "hex": "#FF9300",
+        "xterm": 208
+      },
+      "ansi16": "yellow"
+    },
+    {
+      "name": "danger",
+      "light": {
+        "hex": "#DC2626",
+        "xterm": 160
+      },
+      "dark": {
+        "hex": "#FF565F",
+        "xterm": 203
+      },
+      "ansi16": "red"
+    },
+    {
+      "name": "focus",
+      "light": {
+        "hex": "#4069FD",
+        "xterm": 12
+      },
+      "dark": {
+        "hex": "#94ADFF",
+        "xterm": 111
+      },
+      "ansi16": "bright_blue"
+    }
+  ]
+}

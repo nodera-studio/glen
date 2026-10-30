@@ -1,0 +1,16 @@
+---
+import Base from '../layouts/Base.astro';
+import Header from '../components/Header.astro';
+import Hero from '../components/Hero.astro';
+import WhatItDoes from '../components/WhatItDoes.astro';
+import Install from '../components/Install.astro';
+import Agents from '../components/Agents.astro';
+import Footer from '../components/Footer.astro';
+import FAQ from '../components/FAQ.astro';
+import ClosingCTA from '../components/ClosingCTA.astro';
+---
+<Base title="glen: let Claude Code and Codex talk to omp sessions" description="Find, read and message omp sessions from Claude Code and Codex. A small CLI that brings the reply back to the agent that asked.">
+ <Header />
+ <main id="main" data-tone="content" class="site-panel"><Hero /><WhatItDoes /><hr class="hairline-fade" /><Install /><hr class="hairline-fade" /><Agents /><hr class="hairline-fade" /><FAQ /><ClosingCTA /></main>
+ <Footer />
+</Base>

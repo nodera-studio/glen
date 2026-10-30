@@ -20,16 +20,16 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | --- | --- |
 | `{{PROJECT_NAME}}` | glen |
 | `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. A small TypeScript omp extension may come later. |
-| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; rustix (lease probe, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix). No web framework. |
-| `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked` |
-| `{{MONOREPO}}` | no: a single crate, no Cargo workspace |
-| `{{FRONTEND_DIR}}` | none |
+| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; rustix (lease probe, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix). Static Astro 7 with React 19 islands for `site/`. |
+| `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked`; npm for `site/` (`package-lock.json` committed, CI `npm ci`) |
+| `{{MONOREPO}}` | no Cargo workspace; `site/` is a separate npm project |
+| `{{FRONTEND_DIR}}` | `site/`: static Astro 7 site with React 19 islands and Tailwind v4; Node from `site/.nvmrc` |
 | `{{BACKEND_DIR}}` | `src/`: library `src/lib.rs` plus a thin binary `src/main.rs` (there is no backend service) |
 | `{{SHARED_DIR}}` | none |
-| `{{DEV_CMD}}` | `cargo run -- <args>` (no dev server, no dev stack) |
-| `{{BUILD_CMD}}` | `cargo build` (`cargo build --release` for an optimised binary) |
-| `{{TEST_CMD}}` | `cargo test` (CI form: `cargo test --locked`) |
-| `{{TYPECHECK_CMD}}` | `cargo check --all-targets` |
+| `{{DEV_CMD}}` | `cargo run -- <args>`; `npm --prefix site run dev` |
+| `{{BUILD_CMD}}` | `cargo build` (`cargo build --release` for an optimised binary); `npm --prefix site run build` |
+| `{{TEST_CMD}}` | `cargo test` (CI form: `cargo test --locked`); `npm --prefix site run test:e2e` / `npm --prefix site run test:unit` |
+| `{{TYPECHECK_CMD}}` | `cargo check --all-targets`; `npm --prefix site run check` |
 | `{{LINT_CMD}}` | `cargo clippy --all-targets -- -D warnings` |
 | `{{FORMAT_CMD}}` | `cargo fmt --all` writes; `cargo fmt --all -- --check` is the report-only form for CI-style runs |
 | `{{VCS_DEFAULT_BRANCH}}` | `main` |
@@ -41,10 +41,10 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 
 Several agent prompts were written for a TypeScript web monorepo. Apply them to glen like this:
 
-- glen has no frontend, backend service, database, ORM, queue, Docker, hosting or error tracker
-  (no Sentry). Skip any step, pass or report section about those and mark it n/a; never invent a
-  target for it.
-- Tooling: npm/pnpm means cargo; tsc or "typecheck" means `cargo check --all-targets`; eslint means
+- glen's only frontend is the static site in `site/`; it has no backend service, database, ORM,
+  queue, Docker, hosting config (W7) or error tracker. Mark those areas n/a.
+- For `site/`, npm, tsc and Playwright mean the site's own scripts.
+- For Rust tooling: npm/pnpm means cargo; tsc or "typecheck" means `cargo check --all-targets`; eslint means
   clippy; prettier means `cargo fmt`; jest/vitest filters mean `cargo test <filter>`; `npm audit`
   and `npm outdated` mean `cargo audit` and `cargo outdated` (neither is installed yet).
 - "Logs" are the CLI's own stderr and omp's files under `~/.omp`. "Runtime context" is a local
@@ -60,7 +60,7 @@ Several agent prompts were written for a TypeScript web monorepo. Apply them to 
 - The `/implement` re-index step (Role 4) applies only if `code_index_status` with project `glen`
   shows an index; otherwise skip it and say so.
 - The Implementer's deterministic gate is `.claude/scripts/quality-gate.sh` (rustfmt check +
-  clippy `-D warnings`, also for the Linux target on macOS); `/implement-quick`'s fail-safe classifier is
+  clippy `-D warnings`, also for the Linux target on macOS, plus the site checks when `site/` or `src/render/palette.json` changed); `/implement-quick`'s fail-safe classifier is
   `.claude/scripts/quick-classify.sh`. Where a prompt says `scripts/quality-gate.sh`, use these.
 - `/run-ci`, `/docs-audit`, `/tech-debt-audit`, `/error-audit` and the `/codebase-audit` scans
   (including the dependency audit) are ported to cargo and `rg`. `cargo-audit`, `cargo-outdated`,

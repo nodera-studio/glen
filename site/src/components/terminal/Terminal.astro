@@ -1,0 +1,70 @@
+---
+// The hero terminal: a two-pane window, server-rendered at its final frame (the no-JS, crawler
+// and reduced-motion state) and driven by terminal-player.mjs, minified and inlined at build.
+import { transform } from 'esbuild';
+import palette from '../../../../src/render/palette.json';
+import { script, COLS, ROWS, SEED, selection, cwd, plain, prompt } from '../../data/demo.mjs';
+import { plan, ROW_KINDS, CUE_KINDS } from './terminal-player.mjs';
+import playerSource from './terminal-player.mjs?raw';
+import { esc, spans } from './lines';
+import './terminal.css';
+
+const promptHtml = spans(prompt);
+
+function row(cue: any) {
+ const attrs = [`data-k="${cue.k}"`, `data-p="${cue.p}"`, `data-at="${cue.at}"`];
+ if (cue.end !== undefined) attrs.push(`data-end="${cue.end}"`);
+ if (cue.k === 'cmd') attrs.push(`data-commit="${cue.commit}"`, `data-ty="${cue.ty.join(',')}"`);
+ let inner = '';
+ if (cue.k === 'cmd' || cue.k === 'prompt') inner = (cue.line ? promptHtml : '') + `<span class="ty">${esc(cue.text ?? '')}</span>` + (cue.k === 'prompt' ? '<i class="cur" aria-hidden="true"></i>' : '');
+ else if (cue.k === 'spin') inner = `<i class="g sp">⠁</i> <span class="sm">${esc(cue.v)}</span>`;
+ else {
+  const text = plain(cue.line);
+  if (text.startsWith(selection)) inner = `<mark class="sel" data-n="${[...selection].length}"></mark>`;
+  if (/^ {2}↳ glen_reply/.test(text)) attrs.push('data-hop');
+  inner += spans(cue.line);
+ }
+ return `<div class="tl" ${attrs.join(' ')}>${inner}</div>`;
+}
+
+function variant(v: 'wide' | 'narrow') {
+ const cues = plan(script, { seed: SEED, cols: COLS[v] });
+ const pane = (p: 'a' | 'b') => `<div class="term-pane" data-p="${p}"><div class="term-vp"><div class="term-scroll">${cues.filter(c => c.p === p && ROW_KINDS.includes(c.k)).map(row).join('')}<div class="tl spare"></div></div></div></div>`;
+ return { cues, html: `<div class="term-v" data-v="${v[0]}" style="--rows:${ROWS[v]}" aria-hidden="true">${pane('a')}${pane('b')}</div>` };
+}
+const wide = variant('wide');
+const narrow = variant('narrow');
+const cues = wide.cues.filter(c => CUE_KINDS.includes(c.k)).map(c => [c.at, c.k, ...(c.v ?? c.p ? [c.v ?? c.p] : [])]);
+const html = wide.html + narrow.html;
+const transcript = (p: 'a' | 'b') => wide.cues.filter(c => c.p === p && c.k !== 'spin' && ROW_KINDS.includes(c.k))
+ .map(c => c.k === 'cmd' || c.k === 'prompt' ? (c.line ? `${cwd} ❯ ` : '') + (c.text ?? '') : plain(c.line ?? [])).join('\n');
+const vars = palette.tokens.map(t => `--glen-${t.name}:${t.dark.hex}`).join(';');
+// Exports dropped so tree shaking keeps only boot() and what it uses.
+const player = (await transform(`${playerSource.replace(/^export /gm, '')}\nboot(document.getElementById('term'));`, { minify: true, format: 'iife', target: 'es2022', treeShaking: true, charset: 'utf8', legalComments: 'none' })).code;
+---
+<figure id="term" class="term" data-term="static" data-cues={JSON.stringify(cues)} aria-labelledby="term-cap" style={vars}>
+ <div class="term-win">
+  <div class="term-bar">
+   <span class="term-lights" aria-hidden="true"><i></i><i></i><i></i></span>
+   <span class="term-title" aria-hidden="true"><span class="term-proc">{cwd} — zsh</span></span>
+   <span class="term-ctl">
+    <button class="term-pause focus-ring" type="button" aria-label="Pause demo" aria-pressed="false" hidden><svg class="i-pause" viewBox="0 0 16 16" aria-hidden="true"><path d="M5.5 3.5v9m5-9v9" /></svg><svg class="i-play" viewBox="0 0 16 16" aria-hidden="true"><path d="M5 3.6v8.8a.5.5 0 0 0 .76.43l7-4.4a.5.5 0 0 0 0-.86l-7-4.4A.5.5 0 0 0 5 3.6Z" /></svg></button>
+    <button class="term-replay focus-ring" type="button" aria-label="Replay demo" hidden><svg viewBox="0 0 16 16" aria-hidden="true"><path d="M3 8a5 5 0 1 0 1.6-3.7M3 2.5v2.8h2.8" /></svg></button>
+   </span>
+  </div>
+  <div class="term-tabs" role="tablist" aria-label="Terminal panes">
+   <button class="term-tab focus-ring" role="tab" type="button" data-p="a" aria-selected="true" tabindex="-1"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m3.5 5 3 3-3 3m4.5 0h4.5" /></svg>agent · zsh</button>
+   <button class="term-tab focus-ring" role="tab" type="button" data-p="b" aria-selected="false" tabindex="-1"><i class="live" aria-hidden="true"></i>omp · e27c0de</button>
+  </div>
+  <div class="term-body">
+   <Fragment set:html={html} />
+   <i class="term-dot" aria-hidden="true"></i>
+  </div>
+ </div>
+ <div class="sr-only">
+  <h2>Agent terminal</h2><pre>{transcript('a')}</pre>
+  <h2>omp session</h2><pre>{transcript('b')}</pre>
+ </div>
+ <figcaption id="term-cap">Your agent runs <code>glen send</code> on the left; the omp session works on the right and answers with <code>glen_reply</code>. Synthetic sessions, time compressed.</figcaption>
+</figure>
+<script is:inline set:html={player}></script>

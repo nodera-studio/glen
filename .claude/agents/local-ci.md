@@ -3,7 +3,7 @@ name: local-ci
 description: >
   Runs glen's local CI verification pipeline, the same cargo checks as
   .github/workflows/ci.yml (rustfmt, clippy -D warnings, tests) plus a typecheck
-  and a build. Returns a structured pass/fail report with actionable fix
+  and a build, plus the static site stage. Returns a structured pass/fail report with actionable fix
   suggestions for any failures.
 tools: Read, Bash, Grep, Glob
 model: claude-sonnet-5
@@ -45,7 +45,7 @@ Notes:
   `Cargo.lock` committed.
 - Clippy already typechecks, so step 3 rarely fails when step 2 passed; keep it for
   the "static checks only" mode and for a clear error when clippy itself is missing.
-- There is no E2E suite. Tests read omp data only from `tests/fixtures/`, never a live
+- Rust tests read omp data only from `tests/fixtures/`, never a live
   `~/.omp`, so they need no running omp.
 - CI also runs on Linux. This pipeline runs on the local host (macOS) only; a
   platform-specific failure (paths, `dirs` locations, line endings) can still appear on
@@ -53,10 +53,11 @@ Notes:
 
 Quick modes:
 
-- `all` (default) → steps 1-5
+- `all` (default) → steps 1-5 and Site when `site/node_modules` exists; otherwise report the gap.
 - `checks` → steps 1-3 (format, lint, typecheck)
 - `build` → step 4 (`cargo build --locked`; add `--release` only if asked)
 - `tests` → step 5
+- `site` → Site stage below when `site/` exists; otherwise report the gap.
 
 Typical timeouts: format and typecheck under 30s; clippy, build and tests 1-3 min on a
 cold cache. Use a 600000ms Bash timeout for clippy, build and tests.
@@ -81,6 +82,22 @@ cargo check --all-targets --locked 2>&1
 cargo build --locked 2>&1
 cargo test --locked 2>&1
 ```
+
+## Site stage
+
+For `site`, run these commands from `site/` when it exists. For `all`, include this
+stage when `site/node_modules` exists; otherwise report the dependency gap.
+
+```bash
+npm ci
+npm run verify
+npm run test:e2e
+```
+
+This mirrors the CI `site` job's check, build, timeline tests, budgets and Chromium
+smoke. Chromium must already be installed (`npx playwright install chromium` once).
+Run `npm run lhci` only on request. Report missing browsers, launch restrictions or
+omitted LHCI as gaps; never claim the site CI passed without these checks.
 
 ## Step 3 — Diagnose failures
 

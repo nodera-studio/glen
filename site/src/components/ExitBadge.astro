@@ -1,0 +1,6 @@
+---
+// Adapted from Morphin animated-status-badge-with-table-for-dashboards (static CSS port).
+interface Props { state:'success'|'warning'|'danger'|'focus'; label:string }
+const {state,label}=Astro.props;
+---
+<span class="exit-badge" style={`--state:var(--${state})`}><i aria-hidden="true"></i><i aria-hidden="true"></i><i aria-hidden="true"></i><svg aria-hidden="true" width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><circle cx="8" cy="8" r="6"/>{state==='success' ? <path d="m5 8 2 2 4-4"/> : state==='danger' ? <path d="m6 6 4 4m0-4-4 4"/> : state==='focus' ? <path d="M4 8h8m-3-3 3 3-3 3"/> : <path d="M8 4v4l2 1"/>}</svg><span>{label}</span></span>

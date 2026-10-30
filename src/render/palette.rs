@@ -103,67 +103,78 @@ pub fn clap_styles() -> clap::builder::Styles {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[derive(serde::Deserialize)]
+    struct PaletteFile {
+        tokens: Vec<Row>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Row {
+        name: String,
+        light: Shade,
+        dark: Shade,
+        ansi16: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Shade {
+        hex: String,
+        xterm: u8,
+    }
+    fn token(name: &str) -> Token {
+        match name {
+            "muted" => Token::Muted,
+            "border" => Token::Border,
+            "accent" => Token::Accent,
+            "accent_2" => Token::Accent2,
+            "success" => Token::Success,
+            "warning" => Token::Warning,
+            "danger" => Token::Danger,
+            "focus" => Token::Focus,
+            _ => panic!("unknown palette token: {name}"),
+        }
+    }
+    fn ansi(name: &str) -> AnsiColor {
+        match name {
+            "bright_black" => AnsiColor::BrightBlack,
+            "blue" => AnsiColor::Blue,
+            "cyan" => AnsiColor::Cyan,
+            "green" => AnsiColor::Green,
+            "yellow" => AnsiColor::Yellow,
+            "red" => AnsiColor::Red,
+            "bright_blue" => AnsiColor::BrightBlue,
+            _ => panic!("unknown ANSI colour: {name}"),
+        }
+    }
+    fn rgb(hex: &str) -> (u8, u8, u8) {
+        assert!(
+            hex.len() == 7
+                && hex.starts_with('#')
+                && hex[1..].bytes().all(|c| c.is_ascii_hexdigit())
+        );
+        let channel = |i| u8::from_str_radix(&hex[i..i + 2], 16).expect("validated hex");
+        (channel(1), channel(3), channel(5))
+    }
     #[test]
     fn palette_contract() {
-        let rows = [
-            (Token::Muted, (80, 80, 80), (180, 181, 189), 239, 250, None),
+        let file: PaletteFile =
+            serde_json::from_str(include_str!("palette.json")).expect("valid palette fixture");
+        let mut names: Vec<_> = file.tokens.iter().map(|r| r.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "accent", "accent_2", "border", "danger", "focus", "muted", "success", "warning"
+            ]
+        );
+        let rows = file.tokens.iter().map(|r| {
             (
-                Token::Border,
-                (218, 218, 218),
-                (69, 71, 77),
-                253,
-                238,
-                Some(AnsiColor::BrightBlack),
-            ),
-            (
-                Token::Accent,
-                (94, 106, 210),
-                (113, 112, 255),
-                62,
-                63,
-                Some(AnsiColor::Blue),
-            ),
-            (
-                Token::Accent2,
-                (18, 165, 148),
-                (18, 165, 148),
-                36,
-                36,
-                Some(AnsiColor::Cyan),
-            ),
-            (
-                Token::Success,
-                (0, 127, 61),
-                (0, 202, 80),
-                29,
-                41,
-                Some(AnsiColor::Green),
-            ),
-            (
-                Token::Warning,
-                (166, 99, 0),
-                (255, 147, 0),
-                130,
-                208,
-                Some(AnsiColor::Yellow),
-            ),
-            (
-                Token::Danger,
-                (220, 38, 38),
-                (255, 86, 95),
-                160,
-                203,
-                Some(AnsiColor::Red),
-            ),
-            (
-                Token::Focus,
-                (64, 105, 253),
-                (148, 173, 255),
-                12,
-                111,
-                Some(AnsiColor::BrightBlue),
-            ),
-        ];
+                token(&r.name),
+                rgb(&r.light.hex),
+                rgb(&r.dark.hex),
+                r.light.xterm,
+                r.dark.xterm,
+                r.ansi16.as_deref().map(ansi),
+            )
+        });
         for (token, light, dark, li, di, ansi) in rows {
             for (theme, rgb, idx) in [(Theme::Light, light, li), (Theme::Dark, dark, di)] {
                 assert_eq!(

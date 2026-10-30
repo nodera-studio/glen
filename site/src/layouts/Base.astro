@@ -1,0 +1,36 @@
+---
+import '../styles/global.css';
+import themeDark from '../styles/theme-dark.css?raw';
+import geist from '@fontsource-variable/geist/files/geist-latin-wght-normal.woff2?url';
+import mono from '@fontsource-variable/geist-mono/files/geist-mono-latin-wght-normal.woff2?url';
+interface Props { title: string; description: string }
+const { title, description } = Astro.props;
+const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : undefined;
+---
+<!doctype html>
+<html lang="en" data-theme="system">
+<head>
+<meta charset="UTF-8" /><meta name="viewport" content="width=device-width" />
+<title>{title}</title><meta name="description" content={description} /><link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+{canonical && <><link rel="canonical" href={canonical} /><meta property="og:url" content={canonical} /></>}
+<meta property="og:title" content={title} /><meta property="og:description" content={description} />
+<link rel="preload" as="font" type="font/woff2" href={geist} crossorigin /><link rel="preload" as="font" type="font/woff2" href={mono} crossorigin />
+<Fragment set:html={`<style>@font-face{font-family:Geist;font-style:normal;font-weight:100 900;font-display:swap;src:url(${geist}) format('woff2')}@font-face{font-family:'Geist Mono';font-style:normal;font-weight:100 900;font-display:swap;src:url(${mono}) format('woff2')}</style>`} />
+<Fragment set:html={`<style id="theme-dark" media="(prefers-color-scheme: dark)">${themeDark}</style>`} />
+<script is:inline>
+(() => {
+ document.documentElement.classList.add('js');
+ const valid = v => ['system','light','dark'].includes(v);
+ const apply = p => { document.documentElement.dataset.theme = p; document.getElementById('theme-dark').media = p === 'system' ? '(prefers-color-scheme: dark)' : p === 'dark' ? 'all' : 'not all'; };
+ let pref = 'system';
+ try { const saved = localStorage.getItem('glen-theme'); if (valid(saved)) pref = saved; } catch {}
+ const query = new URLSearchParams(location.search).get('theme');
+ if (valid(query)) pref = query;
+ apply(pref);
+ window.glenSetTheme = p => { if (!valid(p)) return; apply(p); try { localStorage.setItem('glen-theme', p); } catch {} };
+})();
+</script>
+<noscript><style>.theme-switch,.term-ctl,.inline-copy {display:none!important} [data-tabs] [role=tablist] {display:none} @layer base {[data-tabs] [role=tabpanel][hidden] {display:block!important}} [data-tabs] .tab-heading {position:static;width:auto;height:auto;clip:auto;margin:0 0 .5rem} [data-tabs] [role=tabpanel] + [role=tabpanel] {margin-top:6px} .term * {animation-name:none!important}</style></noscript>
+</head>
+<body><a class="sr-only focus:not-sr-only focus-ring text-frame-fg" href="#main">Skip to content</a><slot /></body>
+</html>

@@ -1,0 +1,35 @@
+{
+ "fallback_commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+ "fallback_repo": "sikkeep/morphin-registry",
+ "reason": "@morphin/cli@1.0.6 add --registry https://registry.morphin.dev/registry.json failed: 404 on files/components/lib/utils.ts",
+ "cli_added": [
+  "animated-svg-branch-connector (full)",
+  "animated-border-button (components/demo.tsx only, before the 404)"
+ ],
+ "fetched": "2026-10-30",
+ "w6_polish": {
+  "fetched": "2026-10-30",
+  "cli_added": [
+   "animated-feature-cards-for-react-tailwind-framer-motion",
+   "animated-navbar-menu-with-morphing-hover-state"
+  ],
+  "github_fallback": {
+   "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+   "repo": "sikkeep/morphin-registry",
+   "slugs": [
+    "animated-status-badge-with-table-for-dashboards",
+    "smooth-expand-accordion",
+    "text-shimmer-wave",
+    "infinite-grid-with-framer-motion"
+   ],
+   "reason": "manifests list components/lib/utils.ts; the file lives at files/lib/utils.ts, so @morphin/cli@1.0.6 add returns 404"
+  },
+  "droppedDependencies": [
+   "lucide-react",
+   "framer-motion",
+   "clsx",
+   "tailwind-merge"
+  ],
+  "adaptations": "site/morphin.json items[]"
+ }
+}
