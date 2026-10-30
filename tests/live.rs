@@ -835,3 +835,60 @@ fn live_batch_warning_is_returned_to_the_calling_agent() {
     assert_eq!(data(&o)["assistant_text"], "pong: hi");
     b.rpc.wait_worker_gone(job_id(&value["data"]));
 }
+
+/// W4 AC-410 with W3's live route: network-off sandboxes refuse before any endpoint
+/// connect; network-on sandboxes deliver live; a GLEN_HOME the sandbox cannot write is
+/// `sandboxed`, and the same failure outside a sandbox stays `io`.
+#[test]
+fn ac410_sandbox_and_the_live_route() {
+    use std::os::unix::fs::PermissionsExt;
+    let sandboxed = |b: &LiveBox, vars: &[(&str, &str)]| {
+        b.rpc
+            .glen(&["send", "e27c0de", "hi", "--json"])
+            .env("GLEN_OMP_BIN", "/nonexistent")
+            .envs(vars.iter().copied())
+            .output()
+            .unwrap()
+    };
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = sandboxed(
+        &b,
+        &[
+            ("CODEX_SANDBOX", "seatbelt"),
+            ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ],
+    );
+    assert_eq!(o.status.code(), Some(6), "{o:?}");
+    let e = &json(&o)["error"];
+    assert_eq!(e["details"]["reason"], "sandboxed");
+    assert_eq!(e["details"]["network"], false);
+    assert!(
+        b.ext_log().iter().all(|v| v["dir"] != "in"),
+        "endpoint was contacted"
+    );
+    assert!(!b.rpc.omp.glen_home.join("jobs").exists());
+    let o = sandboxed(&b, &[("CODEX_SANDBOX", "seatbelt")]);
+    assert!(o.status.success(), "{o:?}");
+    let d = data(&o);
+    assert_eq!(d["job"]["route"], "live");
+    b.rpc.wait_worker_gone(job_id(&d));
+
+    for (vars, exit) in [(&[("CODEX_SANDBOX", "seatbelt")][..], 6), (&[][..], 1)] {
+        let mut b = LiveBox::new();
+        b.start_ext(A_ID, "ok", &[]);
+        let root = b.rpc.omp.glen_home.clone();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o500)).unwrap();
+        let o = sandboxed(&b, vars);
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(o.status.code(), Some(exit), "{o:?}");
+        let e = &json(&o)["error"];
+        if exit == 6 {
+            assert_eq!(e["details"]["reason"], "sandboxed");
+            assert_eq!(e["details"]["glen_home_writable"], false);
+        } else {
+            assert_eq!(e["code"], "io");
+        }
+        assert!(!root.join("jobs").exists());
+    }
+}
