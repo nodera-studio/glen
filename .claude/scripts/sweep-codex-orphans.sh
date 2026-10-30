@@ -32,15 +32,14 @@ ROOT="$(canon "$MAIN/.claude/worktrees")"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/sweep-codex.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 SNAP="$TMP/snap" PROCS="$TMP/procs" JOBS="$TMP/jobs"
-ROOTS="$(state_roots)"
+load_roots
 snapshot_procs
 codex_procs >"$PROCS"
-# shellcheck disable=SC2086 # ROOTS is a newline-separated list of paths without spaces
-codex_jobs $ROOTS >"$JOBS"
+codex_jobs ${STATE_ROOTS[@]+"${STATE_ROOTS[@]}"} >"$JOBS"
 
 # Brokers.
 TARGETS=""
-if [ -z "$ROOTS" ]; then
+if [ ${#STATE_ROOTS[@]} -eq 0 ]; then
   echo "no companion state store exists: no broker is stopped"
 else
   while IFS="$SEP" read -r kind pid cwd _; do

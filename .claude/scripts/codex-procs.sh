@@ -9,7 +9,7 @@
 #   broker       node .../app-server-broker.mjs serve --endpoint E --cwd C --pid-file P
 #   task-worker  node .../codex-companion.mjs task-worker --cwd C --job-id J
 #   task         node .../codex-companion.mjs task ...   (argv beyond "task" is never read)
-# Jobs come from the companion's own state, in both stores companion 1.0.6 uses (state_roots).
+# Jobs come from the companion's own state, in both stores companion 1.0.6 uses (load_roots).
 #
 # Callers set SNAP (snapshot file), PROCS (codex_procs output) and JOBS (codex_jobs output).
 
@@ -97,13 +97,16 @@ codex_procs() {
   done <"$SNAP"
 }
 
-# state_roots: the companion's state stores that exist: $CLAUDE_PLUGIN_DATA/state (default
-# ~/.claude/plugins/data/codex-openai-codex/state) and its fallback os.tmpdir()/codex-companion.
-state_roots() {
+# load_roots: set the array STATE_ROOTS to the companion's state stores that exist:
+# $CLAUDE_PLUGIN_DATA/state (default ~/.claude/plugins/data/codex-openai-codex/state) and its
+# fallback os.tmpdir()/codex-companion. Paths may contain spaces: always expand it quoted, as
+# ${STATE_ROOTS[@]+"${STATE_ROOTS[@]}"} (bash 3.2 treats an empty array as unset under set -u).
+load_roots() {
   local d
+  STATE_ROOTS=()
   for d in "${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/codex-openai-codex}/state" \
     "$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd)/codex-companion"; do
-    if [ -d "$d" ]; then echo "$d"; fi
+    if [ -d "$d" ]; then STATE_ROOTS+=("$d"); fi
   done
 }
 
@@ -182,10 +185,10 @@ cancel_hint() {
   local env_part
   case "$1" in
     */codex-companion) env_part="env -u CLAUDE_PLUGIN_DATA -u CODEX_COMPANION_SESSION_ID" ;;
-    *) env_part="CLAUDE_PLUGIN_DATA=${1%/state} env -u CODEX_COMPANION_SESSION_ID" ;;
+    *) env_part="CLAUDE_PLUGIN_DATA=$(printf '%q' "${1%/state}") env -u CODEX_COMPANION_SESSION_ID" ;;
   esac
   # shellcheck disable=SC2016 # $COMPANION is printed literally, for the reader to set
-  printf '%s node "$COMPANION" cancel %s --cwd %s --json\n' "$env_part" "$2" "$3"
+  printf '%s node "$COMPANION" cancel %q --cwd %q --json\n' "$env_part" "$2" "$3"
 }
 
 # stop_set PID...: SIGTERM each still-valid PID, wait up to 10 s for all of them to exit, then

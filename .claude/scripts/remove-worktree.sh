@@ -80,16 +80,32 @@ WHY=""
 if [ -n "$BRANCH" ]; then
   [ "$WT_BRANCH" = "refs/heads/$BRANCH" ] \
     || die "refuse: $W has ${WT_BRANCH:-no branch} checked out, not refs/heads/$BRANCH"
-  if git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" origin/main 2>/dev/null; then
-    WHY="its tip is in origin/main"
-  else
-    UP="$(git -C "$MAIN" rev-parse --symbolic-full-name "$BRANCH@{upstream}" 2>/dev/null)" \
-      || die "refuse: branch $BRANCH is not in origin/main and has no upstream; push it or delete it by hand"
-    REMOTE="$(git -C "$MAIN" config "branch.$BRANCH.remote")"
-    git -C "$MAIN" fetch --quiet "$REMOTE" || die "refuse: cannot fetch $REMOTE to check branch $BRANCH"
-    git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" "$UP" \
-      || die "refuse: branch $BRANCH has commits not on its upstream $UP; push them or delete it by hand"
-    WHY="its tip is on its upstream $UP"
+  # Never trust a remote-tracking ref: ask the remote. The upstream branch must still exist
+  # there (ls-remote) and hold the tip; otherwise the tip must be in a freshly fetched
+  # origin/main.
+  TIP="$(git -C "$MAIN" rev-parse "refs/heads/$BRANCH")"
+  REMOTE="$(git -C "$MAIN" config "branch.$BRANCH.remote" || true)"
+  MERGE="$(git -C "$MAIN" config "branch.$BRANCH.merge" || true)"
+  UPSTATE="no upstream"
+  if [ -n "$REMOTE" ] && [ "$REMOTE" != . ] && [ -n "$MERGE" ]; then
+    SHA="$(git -C "$MAIN" ls-remote --exit-code "$REMOTE" "$MERGE" 2>/dev/null \
+      | awk -v r="$MERGE" '$2 == r { print $1; exit }' || true)"
+    if [ -z "$SHA" ]; then
+      UPSTATE="upstream $REMOTE $MERGE no longer exists on the remote"
+    elif ! git -C "$MAIN" fetch --quiet "$REMOTE" "$MERGE"; then
+      UPSTATE="cannot fetch $REMOTE $MERGE"
+    elif git -C "$MAIN" merge-base --is-ancestor "$TIP" "$SHA"; then
+      WHY="its tip is on $REMOTE $MERGE ($SHA, checked with ls-remote)"
+    else
+      UPSTATE="it has commits not on its upstream $REMOTE $MERGE ($SHA)"
+    fi
+  fi
+  if [ -z "$WHY" ]; then
+    git -C "$MAIN" fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main" \
+      || die "refuse: branch $BRANCH: $UPSTATE, and origin main cannot be fetched; delete it by hand"
+    git -C "$MAIN" merge-base --is-ancestor "$TIP" refs/remotes/origin/main \
+      || die "refuse: branch $BRANCH: $UPSTATE, and its tip is not in origin/main; push it or delete it by hand"
+    WHY="its tip is in freshly fetched origin/main"
   fi
 fi
 
@@ -97,14 +113,13 @@ fi
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/remove-worktree.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 SNAP="$TMP/snap" PROCS="$TMP/procs" JOBS="$TMP/jobs"
-ROOTS="$(state_roots)"
-if [ -z "$ROOTS" ] && [ "$NOSTATE" = 0 ]; then
+load_roots
+if [ ${#STATE_ROOTS[@]} -eq 0 ] && [ "$NOSTATE" = 0 ]; then
   die "refuse: no companion state store exists, so live jobs cannot be checked (--force-no-state to go on without them)"
 fi
 snapshot_procs
 codex_procs >"$PROCS"
-# shellcheck disable=SC2086 # ROOTS is a newline-separated list of paths without spaces
-codex_jobs $ROOTS >"$JOBS"
+codex_jobs ${STATE_ROOTS[@]+"${STATE_ROOTS[@]}"} >"$JOBS"
 
 LIVE="$(live_jobs_at "$W")"
 if [ -n "$LIVE" ]; then
@@ -156,8 +171,7 @@ for p in $BROKERS; do
 done
 snapshot_procs
 codex_procs >"$PROCS"
-# shellcheck disable=SC2086 # ROOTS is a newline-separated list of paths without spaces
-codex_jobs $ROOTS >"$JOBS"
+codex_jobs ${STATE_ROOTS[@]+"${STATE_ROOTS[@]}"} >"$JOBS"
 while IFS="$SEP" read -r kind pid cwd _; do
   [ "$kind" = broker ] || continue
   c="$(canon "$cwd" || true)"
