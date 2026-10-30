@@ -213,12 +213,7 @@ impl JobStore {
     pub fn create_for_send(&self, job: &Job, env: &crate::env::Env) -> Result<(), GlenError> {
         self.create_mapped(job, |path, e| {
             let mut error = crate::sandbox::map_home_write(env, "send", e);
-            error.message = format!(
-                "{} (job {} at {})",
-                error.message,
-                job.handle,
-                path.display()
-            );
+            error.message = format!("{} (write target {})", error.message, path.display());
             error
         })
     }

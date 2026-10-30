@@ -867,6 +867,8 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `skill_newer` | install-skill | newer installed version skipped |
 | `skill_modified` | install-skill | digest mismatch skipped |
 | `skill_foreign` | install-skill | foreign file, agent mismatch or symlink skipped |
+| `skill_sync_failed` | install-skill | file published successfully, but directory sync failed |
+| `changed_during_install` | install-skill | destination or ancestor changed after inspection; skipped even with --force |
 | `skill_dir_not_empty` | install-skill | removed file, retained nonempty glen directory |
 
 New visible commands and visible aliases must add a section and contract runner in their own wave.

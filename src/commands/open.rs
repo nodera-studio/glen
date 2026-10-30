@@ -117,7 +117,10 @@ fn open_mode(
     let lease = if probe {
         lease::probe(&paths.session_owners_dir, &session.header.id)
     } else {
-        Lease::Unknown("not probed".into())
+        Lease::Unknown {
+            reason: "not probed".into(),
+            errno: None,
+        }
     };
     let state = lease::infer_state(&lease, summary.in_flight);
     if !catalog.handles.contains_key(&session.header.id) {

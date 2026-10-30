@@ -58,6 +58,7 @@ fn identity(path: &Path) -> io::Result<Option<Identity>> {
 #[derive(Debug)]
 pub(crate) struct Guard {
     entries: Vec<(PathBuf, Option<Identity>)>,
+    pub(crate) sync_warning: Option<String>,
 }
 impl Guard {
     pub(crate) fn inspect(path: &Path) -> io::Result<Self> {
@@ -65,7 +66,10 @@ impl Guard {
             .ancestors()
             .map(|p| Ok((p.to_path_buf(), identity(p)?)))
             .collect::<io::Result<_>>()?;
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            sync_warning: None,
+        })
     }
     pub(crate) fn unchanged(&self) -> bool {
         for (path, before) in &self.entries {
@@ -78,9 +82,19 @@ impl Guard {
     /// False means a competing edit/replacement won. Never follow a new directory symlink.
     #[cfg(unix)]
     pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<bool> {
+        self.apply_with(path, bytes, |_, _| Ok(()))
+    }
+    #[cfg(unix)]
+    fn apply_with(
+        &mut self,
+        path: &Path,
+        bytes: Option<&[u8]>,
+        mut step: impl FnMut(&str, &Path) -> io::Result<()>,
+    ) -> io::Result<bool> {
         use rustix::fs::{self as at, AtFlags, Mode, OFlags};
         use std::io::Write;
         let mut published = false;
+        let mut created_dirs = Vec::new();
         let result = (|| {
             if !self.unchanged() {
                 return Ok(false);
@@ -116,11 +130,16 @@ impl Guard {
                 .map_err(io::Error::other)?
                 .components()
             {
-                match at::mkdirat(&dir, part.as_os_str(), Mode::from_raw_mode(0o755)) {
+                match step("mkdir", &created_path.join(part.as_os_str())).and_then(|()| {
+                    at::mkdirat(&dir, part.as_os_str(), Mode::from_raw_mode(0o755))
+                        .map_err(io::Error::from)
+                }) {
                     Ok(()) => {}
-                    Err(rustix::io::Errno::EXIST) => return Ok(false),
-                    Err(e) => return Err(e.into()),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                    Err(e) => return Err(e),
                 }
+                let created = at::statat(&dir, part.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+                created_dirs.push((rustix::io::dup(&dir)?, part.as_os_str().to_owned(), created));
                 dir = at::openat(&dir, part.as_os_str(), flags, Mode::empty())?;
                 // Only directories created by this invocation may replace an inspected absence.
                 let pinned = at::fstat(&dir)?;
@@ -159,64 +178,110 @@ impl Guard {
             )?;
             let mut file = fs::File::from(fd);
             let result = (|| {
+                step("write", path)?;
                 file.write_all(bytes)?;
                 file.sync_all()?;
+                step("revalidate", path)?;
                 if !self.unchanged() {
                     return Ok(false);
                 }
                 at::renameat(&dir, &temp, &dir, name)?;
                 published = true;
-                at::fsync(&dir)?;
+                if let Err(e) =
+                    step("fsync", path).and_then(|()| at::fsync(&dir).map_err(io::Error::from))
+                {
+                    // Rename has published the file; report success rather than claiming no write occurred.
+                    self.sync_warning = Some(format!(
+                        "installed {} but cannot sync its directory: {e}",
+                        path.display()
+                    ));
+                }
                 Ok(true)
             })();
             if !published {
                 // This unique temporary file belongs to this operation, on the pinned directory.
-                at::unlinkat(&dir, &temp, AtFlags::empty())?;
+                if let Err(e) = step("cleanup", path).and_then(|()| {
+                    at::unlinkat(&dir, &temp, AtFlags::empty()).map_err(io::Error::from)
+                }) {
+                    eprintln!("warning: cannot clean temporary skill file {temp}: {e}");
+                }
             }
             result
         })();
-        match result {
+        let result = match result {
             Err(_) if !published && !self.unchanged() => Ok(false),
             other => other,
+        };
+        if !published {
+            for (parent, name, created) in created_dirs.into_iter().rev() {
+                // Remove only this run's still-identical empty directories, through pinned parents.
+                if let Ok(now) = at::statat(&parent, &name, AtFlags::SYMLINK_NOFOLLOW)
+                    && now.st_dev == created.st_dev
+                    && now.st_ino == created.st_ino
+                    && let Err(e) = at::unlinkat(&parent, &name, AtFlags::REMOVEDIR)
+                    && e != rustix::io::Errno::NOTEMPTY
+                {
+                    eprintln!(
+                        "warning: cannot clean skill directory {}: {e}",
+                        name.to_string_lossy()
+                    );
+                }
+            }
         }
+        result
     }
     #[cfg(unix)]
     pub(crate) fn remove_empty_parent(&mut self, path: &Path) -> io::Result<bool> {
-        use rustix::fs::{self as at, AtFlags, Mode, OFlags};
-        if let Some((_, before)) = self.entries.iter_mut().find(|(p, _)| p == path) {
-            *before = None;
+        self.remove_empty_parent_with(path, || Ok(()))
+    }
+    #[cfg(unix)]
+    fn remove_empty_parent_with(
+        &mut self,
+        path: &Path,
+        step: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<bool> {
+        let result = (|| {
+            use rustix::fs::{self as at, AtFlags, Mode, OFlags};
+            if let Some((_, before)) = self.entries.iter_mut().find(|(p, _)| p == path) {
+                *before = None;
+            }
+            if !self.unchanged() {
+                return Ok(false);
+            }
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("skill has no parent"))?;
+            let grandparent = parent
+                .parent()
+                .ok_or_else(|| io::Error::other("skill has no grandparent"))?;
+            let canonical = fs::canonicalize(grandparent)?;
+            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+            let mut dir = at::open("/", flags, Mode::empty())?;
+            for part in canonical.components().skip(1) {
+                dir = at::openat(&dir, part.as_os_str(), flags, Mode::empty())?;
+            }
+            if !self.unchanged() {
+                return Ok(false);
+            }
+            let expected = fs::metadata(grandparent)?;
+            let pinned = at::fstat(&dir)?;
+            if expected.dev() != pinned.st_dev as u64 || expected.ino() != pinned.st_ino {
+                return Ok(false);
+            }
+            step()?;
+            at::unlinkat(
+                &dir,
+                parent
+                    .file_name()
+                    .ok_or_else(|| io::Error::other("skill directory has no name"))?,
+                AtFlags::REMOVEDIR,
+            )?;
+            Ok(true)
+        })();
+        match result {
+            Err(_) if !self.unchanged() => Ok(false),
+            other => other,
         }
-        if !self.unchanged() {
-            return Ok(false);
-        }
-        let parent = path
-            .parent()
-            .ok_or_else(|| io::Error::other("skill has no parent"))?;
-        let grandparent = parent
-            .parent()
-            .ok_or_else(|| io::Error::other("skill has no grandparent"))?;
-        let canonical = fs::canonicalize(grandparent)?;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-        let mut dir = at::open("/", flags, Mode::empty())?;
-        for part in canonical.components().skip(1) {
-            dir = at::openat(&dir, part.as_os_str(), flags, Mode::empty())?;
-        }
-        if !self.unchanged() {
-            return Ok(false);
-        }
-        let expected = fs::metadata(grandparent)?;
-        let pinned = at::fstat(&dir)?;
-        if expected.dev() != pinned.st_dev as u64 || expected.ino() != pinned.st_ino {
-            return Ok(false);
-        }
-        at::unlinkat(
-            &dir,
-            parent
-                .file_name()
-                .ok_or_else(|| io::Error::other("skill directory has no name"))?,
-            AtFlags::REMOVEDIR,
-        )?;
-        Ok(true)
     }
     #[cfg(not(unix))]
     pub(crate) fn remove_empty_parent(&mut self, path: &Path) -> io::Result<bool> {
@@ -250,6 +315,93 @@ impl Guard {
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
+    #[test]
+    fn cycle2_created_ancestors_cleaned_on_mkdir_failure_and_late_change() {
+        for failure in ["mkdir", "write", "revalidate"] {
+            let t = tempfile::tempdir().unwrap();
+            let root = t.path().join("scope");
+            fs::create_dir(&root).unwrap();
+            let path = root.join("skills/glen/SKILL.md");
+            let mut guard = Guard::inspect(&path).unwrap();
+            let old = t.path().join("old");
+            let result = guard.apply_with(&path, Some(b"new"), |stage, at| {
+                if stage == failure {
+                    if stage == "mkdir" && at.ends_with("glen") {
+                        return Err(io::Error::from_raw_os_error(libc::EEXIST));
+                    } else if stage == "write" {
+                        return Err(io::Error::from_raw_os_error(libc::EIO));
+                    } else if stage == "revalidate" {
+                        fs::rename(&root, &old)?;
+                        fs::create_dir(&root)?;
+                    }
+                }
+                Ok(())
+            });
+            if failure == "write" {
+                assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
+            } else {
+                assert!(!result.unwrap());
+            }
+            assert!(!root.join("skills").exists());
+            assert!(!old.join("skills").exists());
+        }
+    }
+    #[test]
+    fn cycle2_published_file_survives_directory_fsync_failure_as_success() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("SKILL.md");
+        let mut guard = Guard::inspect(&path).unwrap();
+        assert!(
+            guard
+                .apply_with(&path, Some(b"installed"), |stage, _| {
+                    if stage == "fsync" {
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .unwrap()
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"installed");
+        assert!(guard.sync_warning.as_ref().unwrap().contains("cannot sync"));
+    }
+    #[test]
+    fn cycle2_temp_cleanup_preserves_original_error() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("SKILL.md");
+        let mut guard = Guard::inspect(&path).unwrap();
+        let error = guard
+            .apply_with(&path, Some(b"new"), |stage, _| match stage {
+                "write" => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
+                "cleanup" => Err(io::Error::from_raw_os_error(libc::EACCES)),
+                _ => Ok(()),
+            })
+            .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ENOSPC));
+        assert!(!path.exists());
+    }
+    #[test]
+    fn cycle2_parent_swapped_at_unlink_is_changed_skip() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("glen");
+        fs::create_dir(&parent).unwrap();
+        let path = parent.join("SKILL.md");
+        fs::write(&path, b"old").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        assert!(guard.apply(&path, None).unwrap());
+        let outside = t.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        assert!(
+            !guard
+                .remove_empty_parent_with(&path, || {
+                    fs::rename(&parent, t.path().join("old"))?;
+                    symlink(&outside, &parent)
+                })
+                .unwrap()
+        );
+        assert!(fs::symlink_metadata(&parent).unwrap().is_symlink());
+        assert!(outside.is_dir());
+    }
     #[test]
     fn competing_edits_replacements_and_symlinks_never_publish_or_unlink() {
         for remove in [false, true] {

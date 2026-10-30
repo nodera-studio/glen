@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 pub enum Lease {
     Free,
     Held,
-    Unknown(String),
+    Unknown { reason: String, errno: Option<i32> },
 }
 #[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
 #[serde(rename_all = "snake_case")]
@@ -46,20 +46,41 @@ pub fn probe_flock(lock: &Path) -> Lease {
     ) {
         Ok(fd) => fd,
         Err(Errno::NOENT) => return Lease::Free,
-        Err(e) => return Lease::Unknown(e.to_string()),
+        Err(e) => {
+            return Lease::Unknown {
+                reason: e.to_string(),
+                errno: Some(e.raw_os_error()),
+            };
+        }
     };
     match fstat(&fd) {
         Ok(m) if FileType::from_raw_mode(m.st_mode) == FileType::RegularFile => {}
-        Ok(_) => return Lease::Unknown("not a regular file".into()),
-        Err(e) => return Lease::Unknown(e.to_string()),
+        Ok(_) => {
+            return Lease::Unknown {
+                reason: "not a regular file".into(),
+                errno: None,
+            };
+        }
+        Err(e) => {
+            return Lease::Unknown {
+                reason: e.to_string(),
+                errno: Some(e.raw_os_error()),
+            };
+        }
     }
     match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => match flock(&fd, FlockOperation::Unlock) {
             Ok(()) => Lease::Free,
-            Err(e) => Lease::Unknown(e.to_string()),
+            Err(e) => Lease::Unknown {
+                reason: e.to_string(),
+                errno: Some(e.raw_os_error()),
+            },
         },
         Err(Errno::WOULDBLOCK) => Lease::Held,
-        Err(e) => Lease::Unknown(e.to_string()),
+        Err(e) => Lease::Unknown {
+            reason: e.to_string(),
+            errno: Some(e.raw_os_error()),
+        },
     }
 }
 #[cfg(target_os = "linux")]
@@ -75,17 +96,30 @@ pub fn probe_abstract(path: &str) -> Lease {
         None,
     ) {
         Ok(fd) => fd,
-        Err(e) => return Lease::Unknown(e.to_string()),
+        Err(e) => {
+            return Lease::Unknown {
+                reason: e.to_string(),
+                errno: Some(e.raw_os_error()),
+            };
+        }
     };
     let name = memory_lock_name(path);
     let addr = match SocketAddrUnix::new_abstract_name(name.as_bytes()) {
         Ok(a) => a,
-        Err(e) => return Lease::Unknown(e.to_string()),
+        Err(e) => {
+            return Lease::Unknown {
+                reason: e.to_string(),
+                errno: Some(e.raw_os_error()),
+            };
+        }
     };
     match bind(&fd, &addr) {
         Ok(()) => Lease::Free,
         Err(Errno::ADDRINUSE) => Lease::Held,
-        Err(e) => Lease::Unknown(e.to_string()),
+        Err(e) => Lease::Unknown {
+            reason: e.to_string(),
+            errno: Some(e.raw_os_error()),
+        },
     }
 }
 #[cfg(test)]
@@ -94,13 +128,19 @@ pub fn probe(owners: &Path, id: &str) -> Lease {
     #[cfg(test)]
     PROBE_CALLS.with(|calls| calls.set(calls.get() + 1));
     let Some(path) = lock_path(owners, id) else {
-        return Lease::Unknown("session id is not a plain token".into());
+        return Lease::Unknown {
+            reason: "session id is not a plain token".into(),
+            errno: None,
+        };
     };
     #[cfg(target_os = "linux")]
     {
         match path.to_str() {
             Some(s) => probe_abstract(s),
-            None => Lease::Unknown("non-UTF-8 lock path".into()),
+            None => Lease::Unknown {
+                reason: "non-UTF-8 lock path".into(),
+                errno: None,
+            },
         }
     }
     #[cfg(all(unix, not(target_os = "linux")))]
@@ -110,7 +150,10 @@ pub fn probe(owners: &Path, id: &str) -> Lease {
     #[cfg(not(unix))]
     {
         let _ = path;
-        Lease::Unknown("unsupported platform".into())
+        Lease::Unknown {
+            reason: "unsupported platform".into(),
+            errno: None,
+        }
     }
 }
 pub fn infer_state(lease: &Lease, in_flight: bool) -> State {
@@ -118,12 +161,12 @@ pub fn infer_state(lease: &Lease, in_flight: bool) -> State {
         Lease::Free => State::Idle,
         Lease::Held if in_flight => State::Busy,
         Lease::Held => State::Live,
-        Lease::Unknown(_) => State::Unknown,
+        Lease::Unknown { .. } => State::Unknown,
     }
 }
 pub fn state_detail(lease: &Lease) -> Option<String> {
-    if let Lease::Unknown(s) = lease {
-        Some(s.clone())
+    if let Lease::Unknown { reason, .. } = lease {
+        Some(reason.clone())
     } else {
         None
     }
@@ -157,7 +200,14 @@ mod tests {
             (Lease::Free, true, State::Idle),
             (Lease::Held, true, State::Busy),
             (Lease::Held, false, State::Live),
-            (Lease::Unknown("x".into()), false, State::Unknown),
+            (
+                Lease::Unknown {
+                    reason: "x".into(),
+                    errno: None,
+                },
+                false,
+                State::Unknown,
+            ),
         ] {
             assert_eq!(infer_state(&l, b), w)
         }
@@ -176,7 +226,7 @@ mod tests {
         drop(f);
         assert!(matches!(probe_flock(&p), Lease::Free));
         assert_eq!(std::fs::read(&p).unwrap(), b"unchanged");
-        assert!(matches!(probe_flock(t.path()), Lease::Unknown(_)));
+        assert!(matches!(probe_flock(t.path()), Lease::Unknown { .. }));
     }
     #[cfg(target_os = "linux")]
     #[test]

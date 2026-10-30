@@ -201,6 +201,11 @@ fn check_skill(rendered: &str, cmd: &clap::Command) -> Vec<String> {
     let mut seen = BTreeSet::new();
     for tokens in invoked(rendered) {
         let Some(i) = subcommand_index(&tokens, cmd) else {
+            errors.extend(check_options(
+                &tokens,
+                &cmd.get_arguments().collect::<Vec<_>>(),
+                "glen",
+            ));
             continue;
         };
         errors.extend(check_options(
@@ -271,22 +276,73 @@ fn check_skill(rendered: &str, cmd: &clap::Command) -> Vec<String> {
         .get_arguments()
         .chain(cmd.get_subcommands().flat_map(|s| s.get_arguments()))
         .collect();
-    for span in spans(rendered)
-        .into_iter()
-        .filter(|s| !words(s).iter().any(|w| w.text == "glen"))
-    {
-        errors.extend(check_options(&words(&span), &all_args, "skill prose"));
-    }
+    let mut section_anchor: Option<String> = None;
+    let mut anchor: Option<String> = None;
+    let mut fence = false;
     for line in rendered.lines() {
-        // Inline code is checked above; inspect bare option references in ordinary prose too.
-        for (i, prose) in line.split('`').enumerate().filter(|(i, _)| i % 2 == 0) {
-            let _ = i;
-            let normalized = prose
-                .split_whitespace()
-                .map(|w| w.trim_matches(['(', ')', ',', ';', '.', ':']))
-                .collect::<Vec<_>>()
-                .join(" ");
-            errors.extend(check_options(&words(&normalized), &all_args, "skill prose"));
+        let heading = line.starts_with('#');
+        let table_row = line.starts_with('|');
+        if table_row {
+            anchor = section_anchor.clone();
+        }
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() {
+            anchor = section_anchor.clone();
+        }
+        let list_item = trimmed.starts_with("- ")
+            || trimmed
+                .split_once(". ")
+                .is_some_and(|(n, _)| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()));
+        if heading {
+            section_anchor = None;
+            anchor = None;
+        } else if list_item {
+            anchor = section_anchor.clone();
+        }
+        if line.starts_with("```") {
+            fence = !fence;
+            continue;
+        }
+        for (index, span) in line.split('`').enumerate() {
+            if index % 2 == 1 || fence || heading {
+                let invocations = invoked(&format!("`{span}`"));
+                if !invocations.is_empty() {
+                    for invocation in invocations {
+                        if let Some(i) = subcommand_index(&invocation, cmd)
+                            && cmd.find_subcommand(&invocation[i].text).is_some()
+                        {
+                            if table_row {
+                                continue;
+                            }
+                            anchor = Some(invocation[i].text.clone());
+                            if heading {
+                                section_anchor = anchor.clone();
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            let scoped_args;
+            let args = if let Some(sub) = anchor.as_deref().and_then(|a| cmd.find_subcommand(a)) {
+                scoped_args = sub
+                    .get_arguments()
+                    .chain(cmd.get_arguments().filter(|a| a.is_global_set()))
+                    .collect::<Vec<_>>();
+                &scoped_args
+            } else {
+                &all_args
+            };
+            let normalized = if index % 2 == 0 && !fence {
+                span.split_whitespace()
+                    .map(|w| w.trim_matches(['(', ')', ',', ';', '.', ':']))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            } else {
+                span.to_owned()
+            };
+            let context = anchor.as_deref().unwrap_or("skill prose");
+            errors.extend(check_options(&words(&normalized), args, context));
         }
     }
     for sub in cmd
@@ -468,4 +524,34 @@ fn cycle1_skill_sandbox_guard_exit_guidance_and_plain_command_example() {
     assert!(future.contains("support live sessions"));
     let faq = include_str!("../site/src/components/FAQ.astro");
     assert!(faq.contains("CODEX_SANDBOX_NETWORK_DISABLED=1</code> alone allows sending"));
+}
+
+#[test]
+fn cycle2_option_only_and_nearest_prose_anchor_mutations() {
+    let text = skill::render_current(Agent::Claude).unwrap();
+    let c = command();
+    assert!(check_skill(&text, &c).is_empty());
+    for mutation in [
+        "`glen --bogus`",
+        "`glen --color=bogus`",
+        "## `glen jobs`\nUse `--tools full`.",
+        "## glen jobs\nUse `--tools full`.",
+        "- `glen send` then `glen jobs`; use --follow-up.",
+        "- `glen jobs` takes `--as auto`.",
+    ] {
+        let errors = check_skill(&format!("{text}\n{mutation}"), &c);
+        assert!(!errors.is_empty(), "{mutation}");
+    }
+    for valid in [
+        "`glen --json`",
+        "`glen --color=auto`",
+        "## `glen show`\nUse `--tools full`.",
+        "- `glen send` then `glen jobs`; use --active.",
+        "## Options\nUse `--tools full`.",
+    ] {
+        assert!(
+            check_skill(&format!("{text}\n{valid}"), &c).is_empty(),
+            "{valid}"
+        );
+    }
 }

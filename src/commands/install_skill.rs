@@ -179,6 +179,12 @@ fn run_inspected(
                 });
             }
         }
+        if let Some(message) = guard.sync_warning.take() {
+            warnings.push(Warning {
+                code: "skill_sync_failed".into(),
+                message,
+            });
+        }
         table.row(vec![
             match action {
                 "skipped" => ctx.painter.warn(),
@@ -208,8 +214,13 @@ fn run_inspected(
     }
     let footer = if args.uninstall {
         format!(
-            "glen skill {} · uninstall complete",
-            env!("CARGO_PKG_VERSION")
+            "glen skill {} · {}",
+            env!("CARGO_PKG_VERSION"),
+            if args.dry_run {
+                "would uninstall"
+            } else {
+                "uninstall complete"
+            }
         )
     } else {
         format!(
@@ -217,7 +228,11 @@ fn run_inspected(
             env!("CARGO_PKG_VERSION")
         )
     };
-    let footer = render::text::wrap(&footer, ctx.width.map(usize::from)).join("\n");
+    let footer = footer
+        .lines()
+        .flat_map(|line| render::text::wrap(line, ctx.width.map(usize::from)))
+        .collect::<Vec<_>>()
+        .join("\n");
     let human = format!(
         "{}\n{}",
         table.render(),

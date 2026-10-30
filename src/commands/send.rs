@@ -128,13 +128,14 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
                 "session {} is open in another omp process",
                 o.handle
             )),
-            Lease::Unknown(r) => {
-                if let Some(error) = crate::sandbox::map_probe_failure(env, "send", &r) {
+            unknown @ Lease::Unknown { .. } => {
+                if let Some(error) = crate::sandbox::map_probe_failure(env, "send", &unknown) {
                     return Err(error);
                 }
                 Some(format!(
-                    "cannot tell whether another omp process owns session {} ({r})",
-                    o.handle
+                    "cannot tell whether another omp process owns session {} ({})",
+                    o.handle,
+                    lease::state_detail(&unknown).unwrap_or_default()
                 ))
             }
         };

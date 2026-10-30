@@ -43,6 +43,8 @@ pub fn describe(env: &Env, paths: &OmpPaths) -> (&'static str, Vec<String>, Stri
                 mapped,
                 "PI_CODING_AGENT_DIR" | "XDG_DATA_HOME" | "XDG_STATE_HOME"
             ) && env.non_empty(mapped).is_none()
+                && !(mapped == "PI_CODING_AGENT_DIR"
+                    && env.non_empty("OMP_CODING_AGENT_DIR").is_some())
             {
                 keys.insert(key.to_owned());
                 files.insert(path.to_string_lossy().into_owned());

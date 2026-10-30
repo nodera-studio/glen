@@ -106,6 +106,7 @@ pub fn resolve(env: &Env, profile_flag: Option<&str>) -> Result<OmpPaths, GlenEr
         .map(|p| base_config_root.join("profiles").join(p).join("agent"));
     let agent_override = env
         .non_empty("PI_CODING_AGENT_DIR")
+        .or_else(|| env.non_empty("OMP_CODING_AGENT_DIR"))
         .filter(|raw| derived.as_deref().and_then(Path::to_str) != Some(*raw));
     let (agent_dir, agent_dir_source) = if profile.is_some() {
         (default_agent.clone(), AgentDirSource::Profile)

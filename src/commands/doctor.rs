@@ -201,36 +201,43 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
                 .ok()
                 .zip(std::fs::canonicalize(&path).ok())
                 .is_some_and(|(a, b)| a == b);
-        let project = if same_copy {
-            serde_json::Value::Null
-        } else {
-            match crate::skill::inspect_scoped(&project_path, env.cwd(), agent, &rendered) {
-                Ok(i) if i.state == crate::skill::State::NotInstalled => serde_json::Value::Null,
-                Ok(i) => {
-                    if i.state != crate::skill::State::Current {
-                        status = "warn";
-                        if !detail.is_empty() {
-                            detail.push_str("; ");
-                        }
-                        detail.push_str(&format!(
-                            "project copy at {} is {}: run `glen install-skill --project`",
-                            render::tilde(&project_path, env.home()),
-                            i.state.as_str()
-                        ));
-                    }
-                    json!({"path":path_value(&project_path),"state":i.state.as_str(),"version":i.version})
-                }
-                Err(e) => {
+        // Classification must run even when a file symlink canonicalises to the user file.
+        let project_inspection =
+            crate::skill::inspect_scoped(&project_path, env.cwd(), agent, &rendered);
+        let project = match project_inspection {
+            Ok(i)
+                if project_path == path
+                    || (same_copy && !i.unsafe_path && i.state != crate::skill::State::Foreign)
+                    || (i.unsafe_path
+                        && matches!(std::fs::metadata(&project_path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)) =>
+            {
+                serde_json::Value::Null
+            }
+            Ok(i) if i.state == crate::skill::State::NotInstalled => serde_json::Value::Null,
+            Ok(i) => {
+                if i.state != crate::skill::State::Current {
                     status = "warn";
                     if !detail.is_empty() {
                         detail.push_str("; ");
                     }
                     detail.push_str(&format!(
-                        "cannot inspect project copy {}: {e}; run `glen install-skill --project`",
-                        project_path.display()
+                        "project copy at {} is {}: run `glen install-skill --project`",
+                        render::tilde(&project_path, env.home()),
+                        i.state.as_str()
                     ));
-                    json!({"path":path_value(&project_path),"state":"foreign","version":null})
                 }
+                json!({"path":path_value(&project_path),"state":i.state.as_str(),"version":i.version})
+            }
+            Err(e) => {
+                status = "warn";
+                if !detail.is_empty() {
+                    detail.push_str("; ");
+                }
+                detail.push_str(&format!(
+                    "cannot inspect project copy {}: {e}; run `glen install-skill --project`",
+                    project_path.display()
+                ));
+                json!({"path":path_value(&project_path),"state":"foreign","version":null})
             }
         };
         skills.insert(agent.as_str().into(),json!({"path":path_value(&path),"state":state,"version":installed,"current":state=="current","project":project}));

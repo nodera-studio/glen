@@ -650,3 +650,238 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
     assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
     assert_eq!(json(&out)["error"]["details"]["glen_home_writable"], false);
 }
+
+#[test]
+fn cycle2_doctor_absent_symlink_scopes_and_foreign_file_symlink() {
+    let b = OmpBox::new();
+    let home_link = b.tmp.path().join("home-link");
+    symlink(&b.home, &home_link).unwrap();
+    let out = b
+        .command(&["doctor"], &b.home)
+        .env("HOME", &home_link)
+        .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
+        .output()
+        .unwrap();
+    let v = data(&out);
+    for a in Agent::ALL {
+        assert_eq!(v["skills"][a.as_str()]["project"], Value::Null);
+    }
+    assert!(
+        !v["checks"][7]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("foreign")
+    );
+    let shared = b.tmp.path().join("shared-claude");
+    fs::create_dir(&shared).unwrap();
+    symlink(&shared, b.alpha().join(".claude")).unwrap();
+    let doctor = || {
+        data(
+            &b.command(&["doctor"], &b.alpha())
+                .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
+                .output()
+                .unwrap(),
+        )
+    };
+    assert_eq!(doctor()["skills"]["claude"]["project"], Value::Null);
+    fs::create_dir_all(shared.join("skills/glen")).unwrap();
+    fs::write(
+        shared.join("skills/glen/SKILL.md"),
+        "divergent real content",
+    )
+    .unwrap();
+    let v = doctor();
+    assert_eq!(v["skills"]["claude"]["project"]["state"], "foreign");
+    assert!(
+        v["checks"][7]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("foreign")
+    );
+    // A final-component symlink to the installed user file is still a foreign project entry.
+    install(&b, &["install-skill", "--codex"]);
+    let project = skill::project_target(&b.alpha(), Agent::Codex);
+    fs::create_dir_all(project.parent().unwrap()).unwrap();
+    symlink(user(&b, Agent::Codex), &project).unwrap();
+    let v = doctor();
+    assert_eq!(v["skills"]["codex"]["project"]["state"], "foreign");
+    assert!(
+        v["checks"][8]["detail"]
+            .as_str()
+            .unwrap()
+            .contains("foreign")
+    );
+}
+
+#[test]
+fn cycle2_newer_edit_wins() {
+    let b = OmpBox::new();
+    install(&b, &["install-skill", "--claude"]);
+    let path = user(&b, Agent::Claude);
+    let edited = format!(
+        "{}user edit",
+        skill::render(Agent::Claude, "99.0.0", &skill::visible_commands()).unwrap()
+    );
+    fs::write(&path, &edited).unwrap();
+    let out = b.glen(&["install-skill", "--claude"], &b.alpha());
+    let v = data(&out);
+    assert_eq!(v["targets"][0]["state"], "modified");
+    action(&v, 0, "skipped");
+    assert_eq!(json(&out)["warnings"][0]["code"], "skill_modified");
+    assert_eq!(fs::read_to_string(&path).unwrap(), edited);
+}
+#[test]
+fn cycle2_foreign_doctor_version_is_null() {
+    let b = OmpBox::new();
+    install(&b, &["install-skill", "--claude"]);
+    let path = user(&b, Agent::Claude);
+    fs::write(&path, skill::render_current(Agent::Codex).unwrap()).unwrap();
+    let out = b
+        .command(&["doctor"], &b.alpha())
+        .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
+        .output()
+        .unwrap();
+    let v = data(&out);
+    assert_eq!(v["skills"]["claude"]["state"], "foreign");
+    assert_eq!(v["skills"]["claude"]["version"], Value::Null);
+}
+#[test]
+fn cycle2_alias_process_environment_resolves_and_suppresses_dotenv_warning() {
+    let b = OmpBox::new();
+    fs::write(
+        b.alpha().join(".env"),
+        "PI_CODING_AGENT_DIR=/elsewhere\nOMP_CODING_AGENT_DIR=/elsewhere",
+    )
+    .unwrap();
+    let alias = b.tmp.path().join("alias-agent");
+    let out = b
+        .command(&["doctor"], &b.alpha())
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env("OMP_CODING_AGENT_DIR", &alias)
+        .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
+        .output()
+        .unwrap();
+    let v = data(&out);
+    assert_eq!(v["paths"]["agent_dir"], alias.to_str().unwrap());
+    assert_eq!(v["paths"]["agent_dir_source"], "env");
+    assert_eq!(v["checks"][6]["status"], "ok");
+}
+#[test]
+fn cycle2_refusal_precedes_missing_omp_lookup() {
+    let b = OmpBox::new();
+    let out = b
+        .command(&["send", "@new", "hi"], &b.alpha())
+        .env("CODEX_SANDBOX", "seatbelt")
+        .env("GLEN_OMP_BIN", "/missing/omp")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6));
+    assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
+    assert!(!b.glen_home.exists());
+}
+#[test]
+fn cycle2_footer_dry_run_and_line_boundaries_at_40_and_60() {
+    let b = OmpBox::new();
+    install(&b, &["install-skill"]);
+    for width in ["40", "60"] {
+        let out = b
+            .command(&["install-skill", "--human", "--dry-run"], &b.alpha())
+            .env("COLUMNS", width)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("session\nClaude Code:"), "{text}");
+        let out = b
+            .command(
+                &["install-skill", "--human", "--uninstall", "--dry-run"],
+                &b.alpha(),
+            )
+            .env("COLUMNS", width)
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let text = String::from_utf8(out.stdout).unwrap();
+        assert!(text.contains("would uninstall"), "{text}");
+        assert!(!text.contains("uninstall complete"));
+        assert!(user(&b, Agent::Claude).is_file());
+    }
+}
+#[test]
+fn cycle2_marker_only_spill_and_job_write_errors_are_truthful() {
+    let b = RpcBox::new();
+    fs::create_dir(&b.omp.glen_home).unwrap();
+    fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o500)).unwrap();
+    for args in [vec!["ls", "--all"], vec!["send", "@new", "hi"]] {
+        let out = b
+            .glen(&args)
+            .env("GLEN_HOME", b.omp.glen_home.join("blocked"))
+            .env("GLEN_MAX_OUTPUT", "1")
+            .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(6));
+        let v = json(&out);
+        let message = v["error"]["message"].as_str().unwrap();
+        assert!(message.starts_with("cannot write GLEN_HOME"), "{v}");
+        assert!(
+            !message.contains("job j")
+                && !message.contains("inside Codex")
+                && !message.contains("cannot reach omp"),
+            "{v}"
+        );
+        assert_eq!(v["error"]["details"]["reason"], "sandboxed");
+    }
+    fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o700)).unwrap();
+}
+#[test]
+fn cycle2_worker_network_failures_reach_cli_as_sandboxed() {
+    for scenario in ["network_refused", "network_dns", "network_denied"] {
+        let b = RpcBox::new();
+        let out = b
+            .glen(&["send", "@new", "hi"])
+            .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+            .env("FAKE_OMP_SCENARIO", scenario)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(6), "{out:?}");
+        let v = json(&out);
+        // wait's envelope nests the persisted worker error.
+        assert_eq!(v["error"]["code"], "no_route");
+        assert_eq!(
+            v["error"]["details"]["error"]["details"]["reason"], "sandboxed",
+            "{v}"
+        );
+        b.wait_worker_gone(v["error"]["details"]["job"]["id"].as_str().unwrap());
+    }
+}
+#[test]
+fn cycle2_changed_warning_is_in_json_contract() {
+    assert!(
+        include_str!("../docs/json.md").contains("| `changed_during_install` | install-skill |")
+    );
+}
+
+#[test]
+fn cycle2_worker_spawn_permission_failure_is_sandboxed() {
+    let b = RpcBox::new();
+    let interpreter = b.omp.tmp.path().join("denied-interpreter");
+    fs::write(&interpreter, "not executable").unwrap();
+    fs::set_permissions(&interpreter, fs::Permissions::from_mode(0o600)).unwrap();
+    let executable = b.omp.tmp.path().join("spawn-omp");
+    fs::write(&executable, format!("#!{}\n", interpreter.display())).unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = b
+        .glen(&["send", "@new", "hi"])
+        .env("GLEN_OMP_BIN", &executable)
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(6), "{out:?}");
+    let v = json(&out);
+    assert_eq!(
+        v["error"]["details"]["error"]["details"]["reason"],
+        "sandboxed"
+    );
+    b.wait_worker_gone(v["error"]["details"]["job"]["id"].as_str().unwrap());
+}
