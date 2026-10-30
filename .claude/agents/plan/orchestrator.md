@@ -158,7 +158,10 @@ Mnemosyne tools, and `codex:codex-rescue` has none.
 **Persist the reports, then anonymise them for a blind judge.** `codex:codex-rescue` returns its
 report only as its final message, so the judge cannot read it unless you save it. Save the raw
 reports to the private provenance folder, `.claude/plans/<slug>.private/arch-claude.md` and
-`.claude/plans/<slug>.private/arch-codex.md`. A background agent's final message can be pulled from
+`.claude/plans/<slug>.private/arch-codex.md`. Per-engine files always carry a prefix or suffix
+(`arch-<engine>.md`, `plan-<engine>.md`, `<engine>-review.md`), never a bare `claude.md`: on
+macOS's case-insensitive filesystem Claude Code loads any `claude.md` as a nested `CLAUDE.md`
+and injects it as project instructions. A background agent's final message can be pulled from
 its transcript with
 `jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' <output_file>`.
 

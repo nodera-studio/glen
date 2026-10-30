@@ -166,6 +166,33 @@ Run that block in the wave's worktree BEFORE dispatching the Implementer, and te
 Implementer the steps are done: verify their results (files present, lockfile updated),
 do not re-run them.
 
+**File snapshot (pre-existing files survive the Implementer).** The envelope forbids the
+Implementer to delete, move or revert files it did not create, but `touchedFiles` cannot show
+a deletion (it lists paths with no change type, a shell `rm` never appears in it, and git
+cannot see a deleted untracked file). So check it yourself. Before each Implementer dispatch,
+in the checkout it will write to:
+
+```bash
+SNAP="${TMPDIR:-/tmp}/glen-impl-snap-$(date +%s)"; mkdir -p "$SNAP"
+EXCL='^(target|site/node_modules|site/dist)/'        # build output may legitimately vanish
+{ git ls-files; git ls-files --others; } | grep -vE "$EXCL" | sort -u \
+  | while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done > "$SNAP/before.txt"
+git ls-files --others | grep -vE "$EXCL" | grep -v '/$' \
+  | tar -czf "$SNAP/untracked.tgz" -T -              # untracked incl. ignored, for restore
+```
+
+(`--others` without `--exclude-standard` includes ignored files such as `.claude/launch.json`.)
+After it returns:
+
+```bash
+while IFS= read -r f; do [ -e "$f" ] || printf '%s\n' "$f"; done < "$SNAP/before.txt"
+```
+
+Every path printed that the plan did not tell it to delete or move goes in the Report as a
+deviation, and is restored: tracked with `git restore --source=HEAD --staged --worktree -- <f>`,
+untracked with `tar -xzf "$SNAP/untracked.tgz" <f>`. Say in the Report what was restored and
+what could not be.
+
 **Claude writes no product code — Codex does.** Do NOT dispatch separate coder /
 wiring / error-handling / test-writer / test-runner / verifier agents (those files
 were deleted); those concerns are fused into the Codex Implementer. The single most
@@ -191,6 +218,25 @@ transcript. By default run the lean **`/code-review` dual-engine gate** (see
 one must-fix / recommended / notes report. No lint/type/style re-check — the
 deterministic gate already enforced that inside the Implementer; the engines hunt
 real bugs.
+
+**UI diffs are reviewed by running them.** When the diff touches rendered output
+(`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
+at the output (a browser screenshot, or real CLI/TUI output under a pty) before calling
+it correct; a code trace alone is not enough. In W6 both engines traced the terminal
+demo, approved it, and missed 2 of its 4 scenes never appearing. This is in addition to
+the Visual verification step below, not a substitute for it.
+
+**Codex capacity.** If the Codex pass fails on capacity or rate ("Selected model is at
+capacity", 429, rate limit), retry it once after a short wait (about 60 s). If the retry
+fails too, record Codex as unavailable, proceed with the Claude pass as a single-engine
+verdict, and say so in the Report. Never drop the engine silently.
+
+**Review file names.** If you save the passes to disk, name them `claude-review.md` and
+`codex-review.md` (plan files `<engine>-plan.md`), never `claude.md`: on macOS's
+case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
+`CLAUDE.md`, which injects the review as project instructions. This holds for every way
+of creating a file, including shell redirects and `mv`. The `guard-claude-md-name.sh`
+hook refuses such a name on the Write tool only.
 
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer

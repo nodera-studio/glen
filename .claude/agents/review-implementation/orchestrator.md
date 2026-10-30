@@ -87,8 +87,19 @@ mkdir -p target/reports && codex review --base "$BASE" > target/reports/codex-re
 coderabbit review --plain --agent --base "$BASE" > target/reports/coderabbit-review.txt 2>&1
 ```
 
-Collect all three when they finish. If an engine errored, capture the error and treat
-it as "did not run."
+Collect all three when they finish. If Codex failed on capacity or rate ("Selected model
+is at capacity", 429, rate limit), re-run it once after a short wait (about 60 s). If an
+engine errored (or the Codex retry failed too), capture the error and treat it as "did
+not run": the synthesizer works from the remaining engines and the report names the
+missing one.
+
+Engine outputs keep engine-qualified names (`codex-review.txt`, `coderabbit-review.txt`,
+and `claude-review.md` if you save the Claude pass), never a bare `claude.md`: on macOS's
+case-insensitive filesystem Claude Code loads any `claude.md` as a nested `CLAUDE.md`.
+
+When the diff touches rendered output (`site/`, a TUI, terminal rendering), add to the
+Claude engine's prompt: build and run it and look at the output (browser screenshot, or
+CLI/TUI output under a pty) before calling it correct; a code trace alone is not enough.
 
 ## Step 5 — Synthesize
 
