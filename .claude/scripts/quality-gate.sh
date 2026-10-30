@@ -9,7 +9,8 @@
 #      only, no linker needed. Skipped with a warning when rustup is missing or that target
 #      is not installed (`rustup target add x86_64-unknown-linux-gnu`); skipped silently on
 #      Linux hosts.
-#   4. site check, build, timeline tests, budgets when site/palette changed
+#   4. shellcheck -s sh install.sh scripts/package-release.sh (when present; warning if tool missing)
+#   5. site check, build, timeline tests, budgets when site/palette changed
 #      (Playwright and LHCI remain CI-only.)
 # Tests are run separately by the Implementer (`cargo test --locked`), so a slice can
 # report "tests red" and "gate red" as distinct states.
@@ -46,6 +47,14 @@ if [ "$(uname -s)" != "Linux" ]; then
     run_step clippy-linux cargo clippy --all-targets --locked --target "$linux_target" -- -D warnings
   else
     echo "quality-gate: WARNING clippy-linux skipped: rustup target $linux_target not installed; cfg(linux) code is unlinted (rustup target add $linux_target)" >&2
+  fi
+fi
+
+if [ -f install.sh ]; then
+  if command -v shellcheck >/dev/null 2>&1; then
+    run_step shellcheck shellcheck -s sh install.sh scripts/package-release.sh
+  else
+    echo "quality-gate: WARNING shellcheck skipped: shellcheck not installed; release scripts are unlinted" >&2
   fi
 fi
 

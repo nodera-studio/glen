@@ -1,0 +1,184 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+  pull_request:
+    paths: ['.github/workflows/release.yml', 'install.sh', 'scripts/package-release.sh']
+
+permissions:
+  contents: read
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.preflight.outputs.version }}
+      publish: ${{ steps.preflight.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: preflight
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)
+          publish=false
+          if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/tags/v* ]]; then
+            publish=true
+            [[ "$GITHUB_REF_NAME" == "v$version" ]] || { echo 'tag must match Cargo.toml version' >&2; exit 1; }
+            [[ "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$GITHUB_REF_NAME" --jq .object.type)" == tag ]] || { echo 'tag must be annotated' >&2; exit 1; }
+            git fetch origin main
+            git merge-base --is-ancestor "$GITHUB_SHA" origin/main || { echo 'tagged commit must be on origin/main' >&2; exit 1; }
+            echo "publish glen v$version" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "dry run: no release will be created (glen $version)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "publish=$publish" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: preflight
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            targets: aarch64-apple-darwin x86_64-apple-darwin
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - os: ubuntu-24.04
+            targets: x86_64-unknown-linux-musl
+            rust_targets: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            targets: aarch64-unknown-linux-musl
+            rust_targets: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust_targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          shared-key: release-${{ matrix.os }}
+          cache-targets: false
+      - shell: bash
+        env:
+          TARGETS: ${{ matrix.targets }}
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          for t in $TARGETS; do
+            cargo build --release --locked --target "$t"
+            bin="$PWD/target/$t/release/glen"
+            run_binary=true
+            runner=()
+            case "$t" in
+              *-unknown-linux-musl)
+                file "$bin" | grep -Eq 'static(-pie)? linked|statically linked'
+                ;;
+              x86_64-apple-darwin)
+                [[ "$(lipo -archs "$bin")" == x86_64 ]]
+                if arch -x86_64 /usr/bin/true 2>/dev/null; then
+                  runner=(arch -x86_64)
+                else
+                  run_binary=false
+                fi
+                ;;
+            esac
+            if [[ "$run_binary" == true ]]; then
+              [[ "$("${runner[@]}" "$bin" --version)" == "glen $VERSION" ]]
+              smoke_home=$(mktemp -d)
+              for args in 'ls --all' 'show e27c0de'; do
+                HOME="$smoke_home" TMPDIR="$smoke_home" PI_CODING_AGENT_DIR="$PWD/tests/fixtures/omp/agent" \
+                  "${runner[@]}" "$bin" --human $args
+              done
+              rm -rf "$smoke_home"
+            fi
+            sh scripts/package-release.sh "$t" "$bin" dist
+          done
+      - uses: actions/upload-artifact@v7
+        with:
+          name: glen-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-install:
+    needs: [preflight, build]
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: glen-*
+          merge-multiple: true
+          path: rel/download/v${{ needs.preflight.outputs.version }}
+      - shell: bash
+        env:
+          VERSION: ${{ needs.preflight.outputs.version }}
+        run: |
+          mkdir -p rel/latest
+          cp -R "rel/download/v$VERSION" rel/latest/download
+          export GLEN_INSTALL_BASE_URL="file://$PWD/rel" HOME="$RUNNER_TEMP/h"
+          sh install.sh --dry-run
+          sh install.sh
+          [[ "$("$RUNNER_TEMP/h/.local/bin/glen" --version)" == "glen $VERSION" ]]
+          sh install.sh --version "$VERSION" --prefix "$RUNNER_TEMP/p"
+          [[ "$("$RUNNER_TEMP/p/bin/glen" --version)" == "glen $VERSION" ]]
+
+  release:
+    needs: [preflight, build, verify-install]
+    if: needs.preflight.outputs.publish == 'true'
+    permissions:
+      contents: write
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: glen-*
+          merge-multiple: true
+          path: dist
+      - shell: bash
+        run: |
+          cd dist
+          cat > "$RUNNER_TEMP/expected-assets" <<'ASSETS'
+          glen-aarch64-apple-darwin.tar.gz
+          glen-aarch64-apple-darwin.tar.gz.sha256
+          glen-aarch64-unknown-linux-musl.tar.gz
+          glen-aarch64-unknown-linux-musl.tar.gz.sha256
+          glen-x86_64-apple-darwin.tar.gz
+          glen-x86_64-apple-darwin.tar.gz.sha256
+          glen-x86_64-unknown-linux-musl.tar.gz
+          glen-x86_64-unknown-linux-musl.tar.gz.sha256
+          ASSETS
+          LC_ALL=C ls -1A > "$RUNNER_TEMP/actual-assets"
+          diff -u "$RUNNER_TEMP/expected-assets" "$RUNNER_TEMP/actual-assets"
+          for checksum in glen-*.tar.gz.sha256; do sha256sum -c "$checksum"; done
+          sha256sum glen-*.tar.gz > SHA256SUMS
+      - shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --json isDraft > "$RUNNER_TEMP/release.json"; then
+            jq -e '.isDraft == true' "$RUNNER_TEMP/release.json" || { echo 'never overwrite a published release' >&2; exit 1; }
+            gh release upload "$GITHUB_REF_NAME" --clobber dist/*
+          else
+            prerelease=()
+            if [[ "$GITHUB_REF_NAME" == *-* ]]; then prerelease=(--prerelease); fi
+            gh release create "$GITHUB_REF_NAME" --verify-tag --draft --generate-notes \
+              --title "glen $GITHUB_REF_NAME" "${prerelease[@]}" dist/*
+          fi
+          gh release edit "$GITHUB_REF_NAME" --draft=false
