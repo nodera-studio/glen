@@ -14,17 +14,17 @@ substantial work (see Memory below).
 The bootstrap filled these values into the agent prompts, commands and skills under
 `.claude/`. This table is the reference when the stack changes. Token names that remain in
 `.claude/` are template meta only (the bootstrap agent and command, `agents/README.md`,
-`docs/Claude-Code-Setup.md`, `prompts/`, `rules/*.template`) plus the issue-key prefix below.
+`docs/Claude-Code-Setup.md`, `prompts/`, `rules/*.template`).
 
 | Token | glen |
 | --- | --- |
 | `{{PROJECT_NAME}}` | glen |
 | `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. A small TypeScript omp extension may come later. |
-| `{{FRAMEWORK}}` | clap 4 (derive) CLI with serde, serde_json, anyhow, dirs. No web framework. |
+| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; anyhow (binary/commands) + thiserror (library); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs. No web framework. |
 | `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked` |
 | `{{MONOREPO}}` | no: a single crate, no Cargo workspace |
 | `{{FRONTEND_DIR}}` | none |
-| `{{BACKEND_DIR}}` | `src/`, the crate itself (there is no backend service) |
+| `{{BACKEND_DIR}}` | `src/`: library `src/lib.rs` plus a thin binary `src/main.rs` (there is no backend service) |
 | `{{SHARED_DIR}}` | none |
 | `{{DEV_CMD}}` | `cargo run -- <args>` (no dev server, no dev stack) |
 | `{{BUILD_CMD}}` | `cargo build` (`cargo build --release` for an optimised binary) |
@@ -35,7 +35,7 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | `{{VCS_DEFAULT_BRANCH}}` | `main` |
 | `{{DOCKER}}` | none: glen does not use Docker |
 | `{{QUEUE_OR_TOPIC_1}}`, `{{QUEUE_OR_TOPIC_2}}` | none: no queues or background jobs |
-| `{{ISSUE_KEY_PREFIX}}` | **UNCONFIRMED.** Board keys are `<PREFIX>-<n>`. The owner confirmed prefixes for the eight older projects (NDX, MET, AOS, MNE, WEB, KLE, DTC, OPS; Mnemosyne decision `994bbe77`, project `mnemosyne`), but none is recorded for Glen and its board is empty. The first issue created settles it: read the key from the `document_create` response, then replace this cell and the key example under Issue tracking. |
+| `{{ISSUE_KEY_PREFIX}}` | none: the Mnemosyne workspace API exposes no keys for issues (`document_create`, `document_get` and `board_list` return only a UUID `id`). Refer to an issue by its wave label plus document id, e.g. `W0 (6e0f7c78-8d28-4a0b-9b4a-f2569545293e)`. Branch names and PR titles carry the wave label (`feat/v010-wave-0-…`, `W0: …`). |
 
 ### Reading web-shaped agent prompts against glen
 
@@ -109,8 +109,7 @@ written reason.
 
 Issues live on the Mnemosyne board of project **Glen** (project name `glen`, case-insensitive;
 workspace `projectId` `ff92abe1-da63-402d-a4f1-c8690e471be1`, taken from the 2026-10-30 handoff).
-Not Linear, not GitHub Issues. Keys look like `<PREFIX>-12`; the Glen prefix is unconfirmed until
-the first issue exists (see the profile table). Tags `shipped:main` and `released:v0.x.y` mark
+Not Linear, not GitHub Issues. Issues have no keys: refer to one as `W<n>` plus its document id; board calls take the full id. Tags `shipped:main` and `released:v0.x.y` mark
 where an issue's code is. Board operations are in
 the `mnemosyne` skill. Don't track work that belongs on the board in a TODO file.
 

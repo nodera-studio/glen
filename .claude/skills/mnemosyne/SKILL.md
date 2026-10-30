@@ -85,7 +85,6 @@ or a document id.
   glen uses `shipped:main` (merged on `main`) and `released:v0.x.y` (in that tag).
 - **Comments:** `document_comment {id, expectedRevision, markdown}`.
 - **Revisions:** every write carries the latest `revision`; on `CONFLICT`, re-read and retry.
-- **Keys:** issues have keys `<PREFIX>-<n>`. Glen's prefix is unconfirmed until its first
-  issue exists (`.claude/CLAUDE.md` → Project profile); use the key the board returns.
+- **References:** issues have no keys (the API returns only a document id). Cite `W<n>` plus the document id in PRs, commits and memories.
 - **Errors:** `FORBIDDEN` / `NOT_FOUND` is the token's boundary — report it, don't work around
   it. HTTP 401 means the token is missing or expired: tell the user.

@@ -16,7 +16,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # caches ~/.cargo/registry, ~/.cargo/git (the omp-rpc git dep from W2 is a ~1.5 GB clone) and target; saved on failure too
       - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo test --locked
