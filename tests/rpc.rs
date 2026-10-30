@@ -401,6 +401,37 @@ fn ac209_new_session_and_profile() {
     assert!(!b.omp.glen_home.exists());
 }
 #[test]
+fn w9_send_passes_profile_and_config_overlay_env() {
+    let b = RpcBox::new();
+    let cwd = b.omp.alpha();
+    let o = b
+        .glen(&[
+            "send",
+            "@new",
+            "hi",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--profile",
+            "glen-harness",
+            "--json",
+        ])
+        .env("PI_CONFIG_FILES", "/abs/policy.yml")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 0);
+    b.wait_worker_gone(&job_id(&v));
+    let start = b
+        .fake_log()
+        .into_iter()
+        .find(|v| v["event"] == "start")
+        .unwrap();
+    assert_eq!(
+        start["argv"],
+        json!(["--mode", "rpc", "--no-ui", "--profile", "glen-harness"])
+    );
+    assert_eq!(start["env"]["PI_CONFIG_FILES"], "/abs/policy.yml");
+}
+#[test]
 fn ac210_bad_reply_args_are_tool_errors() {
     let b = RpcBox::new();
     let v = send(&b, "bad_reply", &[], 0);

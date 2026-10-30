@@ -95,6 +95,10 @@
           },
           {
             "type": "command",
+            "command": ".claude/hooks/guard-omp-profile.sh"
+          },
+          {
+            "type": "command",
             "command": ".claude/hooks/steer-bash.sh"
           },
           {

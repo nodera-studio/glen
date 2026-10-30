@@ -5,9 +5,6 @@ umask 077
 
 MODE="${1:-}"
 [ "$#" -eq 0 ] || shift
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
-ENGINE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
-SCRIPT="$SCRIPT_DIR/omp-engine.sh"
 PROFILE=glen-harness
 START="$(date +%s)"
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
@@ -171,6 +168,15 @@ finish() {
 }
 trap finish EXIT
 trap 'stop timeout "dispatch interrupted; job may still be running" 5' INT TERM
+
+# The disabled probe must not pay for repository/tool discovery in a fresh TMPDIR.
+# Keep its JSON identical to other skips.
+if [ "$MODE" = probe ] && [ "$#" -eq 0 ] && [ "${GLEN_OMP_ENGINE:-}" = off ]; then
+  stop skipped 'disabled by GLEN_OMP_ENGINE=off' 3
+fi
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd -P)"
+ENGINE_ROOT="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel)"
+SCRIPT="$SCRIPT_DIR/omp-engine.sh"
 
 under() { case "$1/" in "$2/"*) return 0 ;; *) return 1 ;; esac; }
 prepare_root() {
