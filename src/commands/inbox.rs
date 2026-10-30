@@ -14,6 +14,14 @@ use std::{
     process::ExitCode,
     time::Duration,
 };
+/// The read cursor lives in GLEN_HOME; inside Codex's sandbox a denied write is the
+/// W4 `sandboxed` refusal (docs/design.md §A13), otherwise an ordinary io error.
+fn mark_error(env: &Env, stem: &str, e: std::io::Error) -> GlenError {
+    if crate::sandbox::restricted(env, &e) {
+        return crate::sandbox::map_home_write(env, "inbox", e);
+    }
+    GlenError::new(ErrorCode::Io, format!("cannot mark inbox {stem} read: {e}"))
+}
 fn message(r: &Reply) -> Value {
     let mut v = json!(r);
     v["session_handle"] = json!(crate::rpc::session_handle(&r.session_id));
@@ -154,11 +162,10 @@ pub fn run(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
             .into_iter()
             .filter(|(_, c)| c.offset > 0)
             .collect::<Vec<_>>();
+        let env = env.clone();
         outcome.after_output = Some(Box::new(move || {
             for (stem, cursor) in ends {
-                inbox::mark(&home, &stem, cursor).map_err(|e| {
-                    GlenError::new(ErrorCode::Io, format!("cannot mark inbox {stem} read: {e}"))
-                })?;
+                inbox::mark(&home, &stem, cursor).map_err(|e| mark_error(&env, &stem, e))?;
             }
             Ok(())
         }));
@@ -234,10 +241,7 @@ pub fn follow(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode
                 && let Some(offset) = prefixes.entry(stem.clone()).or_default().wrote(*end)
                 && let Err(e) = inbox::mark(&home, stem, Cursor { offset, ino: *ino })
             {
-                return stream.fail(GlenError::new(
-                    ErrorCode::Io,
-                    format!("cannot mark inbox {stem} read: {e}"),
-                ));
+                return stream.fail(mark_error(env, stem, e));
             }
         }
         for (stem, cursor) in read.ends {
@@ -245,10 +249,7 @@ pub fn follow(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode
                 && cursor.offset > 0
                 && let Err(e) = inbox::mark(&home, &stem, cursor)
             {
-                return stream.fail(GlenError::new(
-                    ErrorCode::Io,
-                    format!("cannot mark inbox {stem} read: {e}"),
-                ));
+                return stream.fail(mark_error(env, &stem, e));
             }
             cursors.insert(stem, cursor);
         }
