@@ -27,3 +27,7 @@ The empty dotfile `.2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0d
 
 Run `cargo test --locked --test fixtures_sanity` to check the slots, headers, copied entries,
 active branch, malformed lines, message shapes, handles and artifact layout.
+
+Fixture mtimes are checkout times, not conversation timestamps. Tests that depend on ordering
+copy fixtures with `tests/common::OmpBox` and set deterministic mtimes; never rewrite the checked-in fixtures.
+Fixture A has nine raw entries after its title slot and session header.

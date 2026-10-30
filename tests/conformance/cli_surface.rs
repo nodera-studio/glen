@@ -48,7 +48,7 @@ fn ac001_help_lists_exactly_the_visible_commands() {
         out.assert_exit(0);
         assert_eq!(
             listed_commands(&out.out()),
-            ["completions", "doctor", "help"],
+            ["completions", "doctor", "help", "ls", "show", "tail"],
             "{}",
             out.ctx()
         );
@@ -86,7 +86,10 @@ fn version_prints_glen_and_crate_version() {
 #[test]
 fn a9_every_command_accepts_help_and_version() {
     let sb = Sandbox::new();
-    for sub in ["doctor", "completions"].into_iter().chain(HIDDEN) {
+    for sub in ["ls", "show", "tail", "doctor", "completions"]
+        .into_iter()
+        .chain(HIDDEN)
+    {
         let help = sb.glen([sub, "--help"]).run();
         help.assert_exit(0);
         assert!(help.out().contains("Usage"), "{}", help.ctx());
@@ -114,10 +117,7 @@ fn hidden_commands_still_have_help_pages() {
 #[test]
 fn ac002_hidden_commands_exit_8_not_implemented() {
     let sb = Sandbox::new();
-    let invocations: [&[&str]; 10] = [
-        &["ls"],
-        &["show", "e27c0de"],
-        &["tail", "e27c0de"],
+    let invocations: [&[&str]; 7] = [
         &["send", "e27c0de", "hello"],
         &["wait", "j1234567"],
         &["jobs"],
@@ -141,7 +141,7 @@ fn ac002_hidden_commands_exit_8_not_implemented() {
 #[test]
 fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
     let sb = Sandbox::new();
-    let out = sb.glen(["ls", "--human"]).run();
+    let out = sb.glen(["jobs", "--human"]).run();
     out.assert_exit(8).assert_no_ansi();
     assert!(out.stdout.is_empty(), "stdout must be empty\n{}", out.ctx());
     assert!(out.err().starts_with("error:"), "{}", out.ctx());
@@ -153,13 +153,6 @@ fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
 fn a9_declared_arguments_of_hidden_commands_parse() {
     let sb = Sandbox::new();
     let valid: &[&[&str]] = &[
-        &["ls", "--all", "--cwd", "/tmp", "-n", "5", "--live"],
-        &["ls", "--limit", "3"],
-        &["show", "abc1234", "--thinking", "--tools", "full", "--raw"],
-        &["show", "abc1234", "--tools", "none"],
-        &["show", "abc1234", "--tools", "collapsed"],
-        &["tail", "abc1234", "-n", "3", "-f", "--thinking"],
-        &["tail", "abc1234", "--lines", "3", "--follow"],
         &["send", "@latest", "hi", "--as", "steer", "--cwd", "/tmp"],
         &["send", "@new", "hi", "--as", "follow-up", "--wait", "2m"],
         &["send", "abc1234", "hi", "--as", "auto", "--no-wait"],
@@ -187,8 +180,6 @@ fn a9_declared_arguments_of_hidden_commands_parse() {
             "--force",
             "--uninstall",
         ],
-        &["--profile", "work", "ls"],
-        &["ls", "--color", "never", "--json"],
     ];
     for args in valid {
         sb.glen(*args).run().error_envelope("not_implemented");
@@ -215,6 +206,8 @@ fn a9_invalid_arguments_are_usage_errors() {
         &["send", "abc1234", "hi", "--wait", "10s", "--no-wait"],
         &["wait", "j1234567", "--timeout", "25h"],
         &["ls", "-n", "abc"],
+        &["ls", "--all", "--cwd", "/tmp"],
+        &["ls", "--since", "1y"],
         &["--json", "completions"],
         &["--json", "completions", "notashell"],
         &["doctor", "unexpected-positional"],
@@ -255,6 +248,9 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "{shell} script lacks the visible commands\n{}",
             out.ctx()
         );
+        for name in ["ls", "show", "tail"] {
+            assert!(contains_command_word(&script, name), "{shell} lacks {name}");
+        }
         assert_no_hidden_commands(&script, shell);
     }
 }
@@ -303,6 +299,31 @@ fn a10_explicit_json_completions_carry_shell_and_script() {
         assert_no_hidden_commands(script, shell);
         if shell == "zsh" {
             assert!(script.starts_with("#compdef glen"), "{}", out.ctx());
+        }
+    }
+}
+
+#[test]
+fn a9_reader_arguments_parse() {
+    let sb = Sandbox::new();
+    let valid: &[&[&str]] = &[
+        &["ls", "--all", "-n", "5", "--live"],
+        &["ls", "--cwd", "/tmp", "-n", "5", "--live"],
+        &["ls", "--limit", "3"],
+        &["show", "abc1234", "--thinking", "--tools", "full", "--raw"],
+        &["show", "abc1234", "--tools", "none"],
+        &["show", "abc1234", "--tools", "collapsed"],
+        &["tail", "abc1234", "-n", "3", "-f", "--thinking"],
+        &["tail", "abc1234", "--lines", "3", "--follow"],
+        &["--profile", "work", "ls"],
+        &["ls", "--color", "never", "--json"],
+    ];
+    for args in valid {
+        let out = sb.glen(*args).run();
+        if args.contains(&"show") || args.contains(&"tail") {
+            out.error_envelope("not_found");
+        } else {
+            out.ok_data();
         }
     }
 }

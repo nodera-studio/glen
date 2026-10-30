@@ -20,11 +20,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
-/// The v0.1.0 subcommands that W0 declares but hides (AC-001).
-pub const HIDDEN: [&str; 10] = [
-    "ls",
-    "show",
-    "tail",
+/// The seven v0.1.0 subcommands still hidden after W1 (AC-101).
+pub const HIDDEN: [&str; 7] = [
     "send",
     "wait",
     "jobs",
@@ -188,6 +185,16 @@ pub struct Run {
 }
 
 impl Run {
+    /// Wrap a prepared `Command` whose environment the caller has already set (W1 `OmpBox`).
+    pub fn from_command(cmd: Command, desc: String) -> Self {
+        Run {
+            cmd,
+            desc,
+            env_desc: Vec::new(),
+            stdout: None,
+        }
+    }
+
     pub fn env(mut self, k: impl AsRef<OsStr>, v: impl AsRef<OsStr>) -> Self {
         self.env_desc.push(format!(
             "{}={:?}",

@@ -223,6 +223,16 @@ pub fn emit_to(
     }
     ExitCode::from(outcome.exit.exit_code())
 }
+pub(crate) fn error_value(error: &GlenError, warnings: &[Warning]) -> Value {
+    let mut object = json!({"code":error.code,"message":error.message});
+    if let Some(hint) = &error.hint {
+        object["hint"] = json!(hint);
+    }
+    if let Some(details) = &error.details {
+        object["details"] = details.clone();
+    }
+    with_warnings(json!({"v":1,"ok":false,"error":object}), warnings)
+}
 pub fn emit_error_to(
     ctx: &OutputCtx,
     error: GlenError,
@@ -239,17 +249,7 @@ pub fn emit_error_to(
         ctx.mode
     };
     if mode == Mode::Json {
-        let mut object = json!({"code":error.code,"message":error.message});
-        if let Some(hint) = error.hint {
-            object["hint"] = json!(hint);
-        }
-        if let Some(details) = error.details {
-            object["details"] = details;
-        }
-        let rendered = json_bytes(
-            &with_warnings(json!({"v":1,"ok":false,"error":object}), &ctx.warnings),
-            ctx.stdout_tty,
-        );
+        let rendered = json_bytes(&error_value(&error, &ctx.warnings), ctx.stdout_tty);
         match rendered {
             Ok(b) => {
                 if !write_output(ctx, &b, out, err) {
