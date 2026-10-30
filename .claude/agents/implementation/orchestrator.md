@@ -158,14 +158,12 @@ below.
 ```
 Dispatch via Agent tool:
   subagent_type: "impl-coder-codex"
-  run_in_background: true
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {absolute path in the main checkout}. The plan is git-ignored, so it is not in the worktree; that is expected."
 ```
 
-**Dispatch the Implementer in the background** (`run_in_background: true`, every Implementer
-dispatch: first run, fix, rework) and wait for its completion notification. SendMessage to
-`main`, which it uses to report failed attempts and answer status requests, works only from a
-background subagent.
+Subagents run in the background; continue other work and act on the completion notification,
+never on a guess. That is also what lets the Implementer reach `main` by SendMessage to report
+failed attempts and answer status requests.
 
 **Plan paths in briefs.** `.claude/plans/` is git-ignored, so a wave worktree never contains
 the plan. Every brief that needs a plan (Implementer, fix, conformance writer, docs updater,
@@ -559,7 +557,7 @@ Plans are **kept after implementation** — they accumulate as project history. 
   coder/wiring/error-handling/test/verifier dispatches.
 - Before stopping an Implementer, check its worktree, stashes and Codex job, ask it for a
   status and wait one reply cycle (up to 5 min); after stopping, recover its tagged stashes by
-  SHA. Dispatch Implementers with `run_in_background: true`; failed Codex attempts reach you by
+  SHA. Act on an Implementer's completion notification, never on a guess; failed Codex attempts reach you by
   SendMessage (at most 2, then at most one smaller-delta re-dispatch). Small or targeted fix briefs carry
   exact line ranges, forbid full-file reads beyond them and skip Mnemosyne recall.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
