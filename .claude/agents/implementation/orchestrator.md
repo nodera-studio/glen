@@ -92,6 +92,13 @@ If a plan file exists:
 
 Under `/auto-mode`: use the plan and proceed to Role 1; announce the plan path and summary.
 
+**Resolve the plan's conditionals before Role 1.** A plan written before an earlier wave merged
+may still say "If W4 is merged…". Check each such conditional against the repo now
+(`git log origin/main`, `gh pr view <N> --json state`, `rg`), rewrite it as an unconditional
+instruction in the plan file, and keep only those that cannot be resolved yet, labelled
+`CONDITIONAL — decided by: <the check>` (`plan/planner.md` → backward check). The Implementer
+must not spend Codex round trips on them.
+
 Store the plan file path — after successful implementation it is **archived, not
 deleted** (see "Mark Plan Complete").
 
@@ -212,12 +219,13 @@ also fails twice, stop and report to the user.
 cycle 2 was finished with only the commit left when its host was stopped, and its edits sat
 in tagged git stashes that had to be restored by SHA. Before you stop one:
 
-1. Look at the worktree (`WT` = its absolute path, `COMPANION` as in `coder-codex.md` Step 2):
+1. Look at the worktree (`WT` = its absolute path):
 
    ```bash
+   COMPANION="$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | sort -V | tail -1)scripts/codex-companion.mjs"
    git -C "$WT" status --short
    git -C "$WT" stash list --format='%H %gs'      # stashes are repo-wide: match the wave's tags
-   node "$COMPANION" status --cwd "$WT" --json
+   env -u CODEX_COMPANION_SESSION_ID node "$COMPANION" status --cwd "$WT" --json   # every session's jobs
    ```
 
 2. SendMessage the agent asking for its status (step, attempt, Codex job state, uncommitted
@@ -246,38 +254,46 @@ the check above), run the cancel path in `coder-codex.md` → "Cancelling a run"
 anything survives) and confirm the worktree has stopped changing before dispatching anything
 else into it.
 
-**Removing a worktree (stop its Codex broker first).** The companion broker
+**Removing a worktree (stop its Codex processes first).** The companion broker
 (`app-server-broker.mjs serve --cwd <worktree>`) and its app-server outlive a run that ended
 normally, and the worktree's removal: 7 brokers serving deleted glen worktrees were once killed
-by hand. The companion CLI has no broker-stop subcommand (`cancel` stops jobs, not the broker);
-the broker itself accepts a `broker/shutdown` message on its socket (what the plugin's
-SessionEnd hook sends), and its SIGTERM handler runs the same clean shutdown (closes the
-app-server, removes its socket and pid file), so the recipe sends SIGTERM. Whenever you remove
-a wave or fix worktree (after its merge, or when abandoning it):
+by hand, and a `codex-companion.mjs task` process from a finished job was still alive 8.5 h
+later. The companion CLI has no broker-stop subcommand (`cancel` stops jobs, not the broker);
+the broker's SIGTERM handler runs the same clean shutdown as the `broker/shutdown` message the
+plugin's SessionEnd hook sends, so the scripts send SIGTERM. Whenever you remove a wave, fix or
+harness worktree (after its merge, or when abandoning it), from the main checkout:
 
-1. Run `coder-codex.md` → "Cancelling a run" for that `WT`, steps 0–3, with step 2
-   **unconditional** (even when nothing is running).
-2. Only after step 3's verify is clean, `git worktree remove "$WT"`. Order matters: the step-0
-   guards need the worktree to still exist. If the worktree is already gone, step 0 refuses
-   ("not a git worktree root"); skip to the sweep, which catches its broker because its
-   `--cwd` no longer exists.
-3. Sweep orphans: stop every broker whose `--cwd` directory no longer exists, only under this
-   repo's `.claude/worktrees/` (other repos' brokers are never touched). Self-contained; run
-   it from any checkout of this repo. The subshell keeps a refusal from exiting your shell.
+`MAIN` is the main checkout (`MAIN="$(cd "$(git rev-parse --path-format=absolute
+--git-common-dir)/.." && pwd -P)"`); run both scripts from there, never from inside `$WT`. The
+scripts signal brokers only: they never cancel a job or signal a task or task-worker.
 
-```bash
-( kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill -TERM "$1" 2>/dev/null; }
-  GCD="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
-    || { echo "refuse: not in a git repo" >&2; exit 1; }
-  MAIN="$(cd "$GCD/.." && pwd -P)" && [ -n "$MAIN" ] && [ "$MAIN" != / ] \
-    || { echo "refuse: cannot resolve the main checkout" >&2; exit 1; }
-  ps -axo pid=,command= | grep -E '^ *[0-9]+ +([^ ]*/)?node [^ ]*/app-server-broker\.mjs serve ' \
-    | awk -v root="$MAIN/.claude/worktrees/" -v self="$$" -v parent="$PPID" \
-        '$1 != self && $1 != parent { for (i = 2; i < NF; i++) if ($i == "--cwd" && index($(i+1), root) == 1) print $1, $(i+1) }' \
-    | while read -r pid cwd; do
-        [ -d "$cwd" ] || { echo "stopping orphan broker $pid ($cwd)"; kill_tree "$pid"; }
-      done )
-```
+1. **Cancel the worktree's jobs first, with the companion** (`coder-codex.md` → "Cancelling a
+   run", steps 0–1, which unset `CODEX_COMPANION_SESSION_ID` so every session's jobs show).
+   Stop a leftover `task` / `task-worker` process of `$WT` only after checking it is that
+   worktree's and its job is finished or cancelled.
+2. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` lists and
+   changes nothing). It refuses unless `$WT` is a worktree registered in this repo's
+   `git worktree list --porcelain`, directly under `.claude/worktrees/` (canonical paths), and
+   your cwd is outside it. With `<branch>`, it refuses unless that branch is checked out in
+   `$WT` and its tip is an ancestor of `origin/main`, or of its upstream after a fetch (fully
+   pushed). It reads both companion state stores (`$CLAUDE_PLUGIN_DATA/state` and
+   `${TMPDIR:-/tmp}/codex-companion`) and refuses, printing each job's `cancel` command, while a
+   live job (queued, or running with a live pid) references `$WT`; it also refuses while a
+   `task` / `task-worker` process is at or under `$WT`. Then, from one process snapshot, it
+   stops the brokers whose fixed-position `--cwd` is `$WT` or below it (TERM, wait, KILL; a pid
+   whose pid, start time or command differs from the snapshot is skipped), confirms nothing is
+   left (else exit 1, nothing removed), runs `git worktree remove --force` and, with `<branch>`,
+   `git branch -D`. Removal discards uncommitted changes, so commit or push first. With neither
+   state store it refuses; `--force-no-state` goes on without the job check.
+3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"` (`--dry-run` to only list). It stops
+   only brokers whose `--cwd` under `.claude/worktrees/` no longer exists, that no live job in
+   either store references, and that no task process sits under. Tasks are report-only: it
+   lists suspected orphan `task` / `task-worker` processes and stale job records with the
+   evidence. Stop a listed task yourself only after checking it.
+
+**Wave end: sweep orphans.** At the end of every wave (after its last Implementer returns, and
+again at wave close after the merge), run step 3 even when no worktree is removed, and act on
+its task report: a `task` process can outlive its finished job in a worktree that still exists.
 
 **Host re-verification (never trust Codex's red or green).** The Implementer's sandbox
 reports failures that are not real: `EPERM` on Unix-socket bind/connect (socket tests
@@ -295,6 +311,10 @@ output; you verify it.
   or host green with your re-run red, is real: send it to a fresh Implementer as a fix.
 - If the host reports green but did not commit, or committed files beyond what Codex
   reported, treat it as a deviation and resume the Implementer to fix it; do not commit for it.
+- The host diagnoses but never writes code or tests (`coder-codex.md` → Step 6 → item 3); a
+  host-written fix (beyond `git add`/`git commit` and a network-only `cargo add`) is a
+  deviation: name it in the Report and send it back to Codex as a delta. Expect one
+  `wip: <wave> steps N–M` commit per step group of at most about 4 plan steps.
 - List every sandbox-vs-host discrepancy in the Report (the host's lines plus any of yours),
   one line each: Codex said / host showed / verdict.
 
@@ -502,6 +522,28 @@ first, have the conformance writer re-derive the affected assertions, and only t
 Implementer. An unchecked polish item that contradicted the plan's verbatim layout once went
 straight into a fix brief, and only conformance caught it.
 
+### Live smoke (test harnesses that drive real programs — required before the PR)
+
+The W4 acceptance harness hid five latent defects (screen `-p 0`, typing before omp was ready,
+SIGPIPE under `pipefail`, `dontAsk` denying Skill, checker regexes) that only live runs found,
+over 6 runs after its wave. So:
+
+- **One live smoke in the building wave.** Any test harness that drives a real TUI, a real
+  agent CLI (omp, Claude Code, Codex) or a real network service gets one live smoke run inside
+  the wave that builds it, before the PR. Fixture and fake-peer tests do not substitute. Run it
+  against a scratch omp home (`PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR` under a temp dir) and
+  scratch sessions only, never a live `~/.omp` session. Save the recording or transcript under
+  `.claude/evidence/<wave>/` and name it in the Report.
+- **Replay before re-running live.** After any checker change, replay the stored recordings
+  offline against the changed checker before doing another live run. A live run is the
+  expensive confirmation, not the debugger.
+- **Both sides of every relaxed check.** A check made more lenient (a widened regex, a longer
+  timeout, an accepted alternative) gets a fixture for its passing side and one for its failing
+  side, in the same commit.
+
+These go into the Implementer's brief as plan steps, so Codex writes the fixtures; you run the
+live smoke and the offline replay, and a defect either finds goes back as a fix brief.
+
 ### Role 4 — Re-index (after the merge, at wave close)
 
 glen's code index reads a clean clone of `main`, so re-indexing before the merge would
@@ -561,8 +603,9 @@ Plans are **kept after implementation** — they accumulate as project history. 
   SendMessage (at most 2, then at most one smaller-delta re-dispatch). Small or targeted fix briefs carry
   exact line ranges, forbid full-file reads beyond them and skip Mnemosyne recall.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
-  alone leaves Codex editing the worktree. Removing a worktree stops its broker first and
-  sweeps orphaned brokers under `.claude/worktrees/` (Role 1 → "Removing a worktree").
+  alone leaves Codex editing the worktree. Removing a worktree goes through
+  `.claude/scripts/remove-worktree.sh`, then `sweep-codex-orphans.sh` (brokers only; tasks are
+  report-only); the sweep also runs at every wave end (Role 1 → "Removing a worktree").
 - Never trust the Implementer's red or green: its host re-runs the gate and tests and is the
   single committer of Codex's work; you re-run them once more before review as a deliberate
   check and never commit Implementer output yourself. A sandbox-only failure is an artifact
@@ -575,7 +618,9 @@ Plans are **kept after implementation** — they accumulate as project history. 
   `--fresh`), never mid write→test→fix loop; rework resumes Codex via `--resume-last`.
 - The user-approval gate (Step 4; announced instead under `/auto-mode`), the Review
   gate (Role 2), the conformance gate (Role 3) and, for any change with rendered output, the
-  visual verification are mandatory — do not skip them. Any optional domain-rubric gate this
+  visual verification are mandatory — do not skip them. So is the live smoke for any test
+  harness that drives a real TUI, agent CLI or network service, with offline replay after a
+  checker change and pass/fail fixtures for every relaxed check. Any optional domain-rubric gate this
   project wires up (Role 3 arm 3) is mandatory *when its trigger predicate fires*; on
   persistent FAIL it BLOCKS the pipeline. Code is written only after the plan is
   approved.

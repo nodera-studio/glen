@@ -79,6 +79,12 @@ summary:
   built on one that does not (pinning the esbuild Vite resolves, when Vite 8 uses Rolldown)
   scores against correctness. Every new dependency must appear in the plan's Network
   pre-flight block; a missing entry is a graftable gap.
+- **Unresolved conditionals.** A step that branches on merge state or another wave ("If W4 is
+  merged…") must be resolved against the actual repo state (`git log origin/main`,
+  `gh pr view <N> --json state`, `rg`) and rewritten as an unconditional instruction in the
+  plan you return. One that cannot be resolved yet stays, labelled `CONDITIONAL — decided by:
+  <the check>`. W5's unresolved "If W4 is merged" bullets cost the Implementer five Codex
+  round trips.
 
 **Bias controls (apply every time):**
 - **Judge blind** — score content only; authorship is withheld and stays irrelevant. If a

@@ -315,6 +315,14 @@ degrades to pass-through) and say so.
 
 ### Step 7 — Review Plan (two operating paths)
 
+**First, resolve conditionals.** Before presenting or announcing the plan, scan it for steps
+that branch on merge state or on another wave ("If W4 is merged…"). Resolve each against the
+actual repo state (`git fetch`, `git log origin/main`, `gh pr view <N> --json state`, `rg`) and
+rewrite it as an unconditional instruction; one that cannot be resolved yet stays, labelled
+`CONDITIONAL — decided by: <the check>`. The planner and the judge do this too
+(`planner.md` → backward check, `judge-selector.md` → plan-step checks); this is the last pass.
+W5's plan kept "If W4 is merged" bullets and its Implementer spent five Codex round trips on them.
+
 **Manual mode (default, hard gate).** Present the plan: total steps, files to create vs. modify,
 risks or manual verification needed, and prerequisites (env vars, schema changes). Ask if it looks
 good or needs adjustments. Wait for the user. If adjustments are needed, re-dispatch the planner

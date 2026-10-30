@@ -165,6 +165,8 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    still reviews it, and the Rust crate stays with the Codex Implementer
    (`implementation/orchestrator.md` → UI implementation routing). UI waves also get the
    catalogue survey at planning and the reference-fidelity check in the visual gate.
+   **Live smoke:** a wave that builds a test harness driving a real TUI, agent CLI or network
+   service runs it live once before the PR (`implementation/orchestrator.md` → Live smoke).
    **Stopping a Codex-backed agent** (e.g. to re-brief it) first runs the check in
    `implementation/orchestrator.md` → Role 1 → "Check before stopping an Implementer"
    (worktree status, stashes, Codex job; ask the agent and wait one reply cycle), then the
@@ -211,7 +213,10 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    "glen", repo: "glen"}`, confirmed with `code_index_status`. Update the ledger. Then
    `git push origin --delete <branch>` and `git switch main && git pull --ff-only`. If the
    wave ran in a worktree (a parallel wave, or a fix worktree), remove it per "Removing a
-   worktree" below, which stops its Codex broker first.
+   worktree" below: cancel its Codex jobs, then `.claude/scripts/remove-worktree.sh`, which
+   stops its brokers before removing it. Either way, finish with
+   `bash .claude/scripts/sweep-codex-orphans.sh` and act on its task report: a finished job's
+   `task` process can outlive it in a worktree that still exists.
 10. **Advance** to the next wave without asking. 2–3 line status at wave boundaries only;
     silent during polling.
 
@@ -242,8 +247,8 @@ a wave, add a line to the state file's **Harness friction log** (and log a gap i
    workaround in the skill or agent prompt that hits them.
 4. Commit, push, PR into `main`, then poll, capture a memory and squash-merge exactly like a
    wave. Mark the fixed friction lines `fixed in PR #NN`, close the gaps, and record the batch
-   in **Harness self-improvement**. Remove the worktree after the merge, stopping its Codex
-   broker first (see "Removing a worktree" below).
+   in **Harness self-improvement**. Remove the worktree after the merge with
+   `.claude/scripts/remove-worktree.sh`, then sweep (see "Removing a worktree" below).
 
 ### Independent waves in parallel
 
@@ -293,21 +298,29 @@ resolves to the main checkout from any worktree) and says its absence from the w
 Design-heavy UI waves (the `site/`) follow the UI routing in step 3 above. After the wave's
 squash-merge (step 9), remove its worktree, and any fix worktree cut for it, as below.
 
-### Removing a worktree (stop its Codex broker)
+### Removing a worktree (stop its Codex processes)
 
 Every Codex run in a worktree leaves a codex-companion broker (`app-server-broker.mjs serve
 --cwd <worktree>`) and its app-server running after the run ends and after the worktree is
-deleted; 7 such orphans were once killed by hand. For each wave, fix or harness worktree you
+deleted; 7 such orphans were once killed by hand, and a finished job's `codex-companion.mjs
+task` process was once still alive 8.5 h later. For each wave, fix or harness worktree you
 remove, follow `implementation/orchestrator.md` → Role 1 → "Removing a worktree" with `WT` =
-its absolute path:
+its absolute path, from the main checkout
+(`MAIN="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)"`):
 
-1. The guarded cancel recipe (`implementation/coder-codex.md` → "Cancelling a run", steps
-   0–3) with step 2 unconditional. It refuses an empty `WT` or the main checkout, matches the
-   node broker only, and skips `$$`/`$PPID`.
-2. `git worktree remove "$WT"` only after step 3's verify is clean. If the worktree is already
-   gone, step 0 refuses; go straight to the sweep.
-3. The self-contained orphan sweep from that section: it stops brokers whose `--cwd` no longer
-   exists, only under this repo's `.claude/worktrees/`.
+1. Cancel `$WT`'s jobs with the companion first (`implementation/coder-codex.md` →
+   "Cancelling a run", steps 0–1). The scripts never cancel jobs or signal tasks.
+2. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` first if in
+   doubt). It refuses unless `$WT` is a registered worktree directly under `.claude/worktrees/`
+   and your cwd is outside it; with `<branch>`, unless that branch is checked out there and its
+   tip is in `origin/main` or on its fetched upstream. It refuses while a live job (in either
+   companion state store) or a task process is in `$WT`, printing the cancel commands; else it
+   stops `$WT`'s brokers (TERM, wait, KILL), confirms nothing is left, then
+   `git worktree remove --force` and `git branch -D`. Never do these steps by hand or in
+   another order.
+3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"`: stops this repo's brokers whose
+   worktree is gone, with no live job or task process referencing it; lists suspected orphan
+   tasks and stale job records without stopping them.
 
 ## Shipping tags (`shipped:main` / `released:v0.x.y`)
 

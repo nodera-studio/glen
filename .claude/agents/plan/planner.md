@@ -218,7 +218,15 @@ forward planning misses — especially wiring, error handling, and integration.
    CLI-added component, browser download) in a **Network pre-flight** block under
    Prerequisites, with the exact command, since the Codex Implementer's sandbox may have no
    network.
-7. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
+7. Resolve conditionals before the plan is final. Every conditional that depends on merge
+   state or on another wave ("If W4 is merged…", "if W3 already added the doctor check…") is
+   checked now against the actual repo state (`git fetch` then `git log origin/main`,
+   `gh pr view <N> --json state`, `rg` in the tree) and rewritten as one unconditional
+   instruction. A conditional that cannot be resolved yet stays, labelled with the check that
+   decides it: `CONDITIONAL — decided by: <command or fact>`, with both branches spelled out.
+   W5's plan kept "If W4 is merged" bullets, and the Implementer spent five Codex round trips
+   confirming plain readings.
+8. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
    caught.
 </backward_check>
 
