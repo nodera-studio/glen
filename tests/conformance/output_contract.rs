@@ -49,7 +49,7 @@ fn a10_success_envelope_shape() {
 #[test]
 fn ac010_error_envelope_carries_string_code_and_message() {
     let sb = Sandbox::new();
-    let out = sb.glen(["watch"]).run();
+    let out = sb.glen(["bogus"]).run();
     let err = out.error_envelope("usage");
     assert!(err["code"].is_string() && err["message"].is_string());
 }
@@ -162,7 +162,7 @@ fn usage_errors_in_human_mode_stay_off_stdout() {
 fn ac010_exit_codes_follow_the_design_table() {
     let sb = Sandbox::new();
     // error_envelope() checks each exit code against docs/design.md §A11.
-    sb.glen(["watch"]).run().error_envelope("usage");
+    sb.glen(["tail"]).run().error_envelope("usage");
     sb.glen(["bogus"]).run().error_envelope("usage");
     sb.glen(["doctor"])
         .fake_omp()

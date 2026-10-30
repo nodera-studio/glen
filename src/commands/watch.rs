@@ -174,14 +174,14 @@ mod tests {
         }
     }
     #[test]
-    fn hidden_watch_arguments_help_and_conflicts_match_the_entry_point() {
+    fn visible_watch_arguments_help_and_conflicts_match_the_entry_point() {
         let cli = Cli::try_parse_from(["glen", "watch", "e27c0de", "--all"]).unwrap();
         assert!(
             matches!(cli.command,Command::Watch(args) if args.all && args.session.as_deref() == Some("e27c0de"))
         );
         assert!(Cli::try_parse_from(["glen", "watch", "--all", "--cwd", "/fixture"]).is_err());
         assert!(
-            !crate::cli::public_command()
+            crate::cli::public_command()
                 .get_subcommands()
                 .any(|c| c.get_name() == "watch")
         );

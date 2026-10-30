@@ -247,7 +247,7 @@ fn ac018_invalid_limit_warns_and_uses_the_default() {
 #[test]
 fn ac018_error_envelopes_and_raw_output_are_never_spilled() {
     let sb = Sandbox::new();
-    sb.glen(["watch"])
+    sb.glen(["bogus"])
         .env("GLEN_MAX_OUTPUT", "10")
         .run()
         .error_envelope("usage");

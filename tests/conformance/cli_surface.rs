@@ -1,5 +1,5 @@
 //! The command surface: visible vs hidden subcommands, help/version, the §A9 argument
-//! surface of the hidden commands, and completions (AC-001, AC-002, AC-017; §A9, §A10).
+//! surface of the commands, and completions (AC-001, AC-002, AC-017; §A9, §A10).
 
 use crate::support::*;
 use serde_json::Value;
@@ -61,7 +61,8 @@ fn ac001_help_lists_exactly_the_visible_commands() {
                 "send",
                 "show",
                 "tail",
-                "wait"
+                "wait",
+                "watch"
             ],
             "{}",
             out.ctx()
@@ -108,6 +109,7 @@ fn a9_every_command_accepts_help_and_version() {
         "wait",
         "jobs",
         "inbox",
+        "watch",
         "install-extension",
         "install-skill",
         "doctor",
@@ -141,7 +143,7 @@ fn hidden_commands_still_have_help_pages() {
 }
 
 #[test]
-fn ac002_hidden_watch_requires_an_interactive_terminal() {
+fn ac002_watch_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let invocations: [&[&str]; 1] = [&["watch"]];
     for args in invocations {
@@ -157,7 +159,7 @@ fn ac002_hidden_watch_requires_an_interactive_terminal() {
 }
 
 #[test]
-fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
+fn ac002_watch_in_human_mode_reports_on_stderr() {
     let sb = Sandbox::new();
     let out = sb.glen(["watch", "--human"]).run();
     out.assert_exit(2).assert_no_ansi();
@@ -167,11 +169,17 @@ fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
 
 /// Watch's declared arguments parse; its non-TTY gate runs before session lookup.
 #[test]
-fn a9_declared_arguments_of_hidden_commands_parse() {
+fn a9_watch_arguments_parse_before_the_terminal_gate() {
     let sb = Sandbox::new();
-    let valid: &[&[&str]] = &[&["watch", "abc1234"]];
+    let valid: &[&[&str]] = &[&["watch", "abc1234", "--all"]];
     for args in valid {
-        sb.glen(*args).run().error_envelope("usage");
+        let err = sb.glen(*args).run().error_envelope("usage");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("interactive terminal")
+        );
     }
 }
 
@@ -279,6 +287,7 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "wait",
             "jobs",
             "inbox",
+            "watch",
             "install-extension",
             "install-skill",
         ] {
@@ -323,7 +332,7 @@ fn a10_explicit_json_completions_carry_shell_and_script() {
         (vec!["--json", "completions", "bash"], "bash"),
     ] {
         let out = sb.glen(&args).run();
-        let data = out.ok_data();
+        let data = out.ok_data_or_spilled(&sb.glen_home);
         out.assert_stderr_empty();
         assert_eq!(data["shell"], Value::from(shell), "{}", out.ctx());
         let script = data["script"].as_str().expect("data.script is a string");

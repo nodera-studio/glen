@@ -1130,7 +1130,8 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
                 "send",
                 "show",
                 "tail",
-                "wait"
+                "wait",
+                "watch"
             ],
             "{}",
             out.ctx()
@@ -1138,25 +1139,21 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
     }
 }
 
-/// Watch stays hidden until Step 8; on a pipe its interactive-terminal gate returns usage.
+/// Watch is visible; on a pipe its interactive-terminal gate returns usage.
 /// `inbox` and `install-extension` became visible with W3.
 #[test]
-fn ac401_watch_stays_hidden_and_requires_an_interactive_terminal() {
+fn ac401_watch_is_visible_and_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let listed = command_names(&sb.glen(["--help"]).run().out());
+    assert!(listed.iter().any(|name| name == "watch"), "{listed:?}");
     for name in HIDDEN {
         assert!(
             !listed.iter().any(|c| c == name),
             "{name} is listed: {listed:?}"
         );
         let out = sb.glen([name]).run();
-        out.error_envelope(if name == "watch" {
-            "usage"
-        } else {
-            "not_implemented"
-        });
-        out.assert_exit(if name == "watch" { 2 } else { 8 })
-            .assert_stderr_empty();
+        out.error_envelope("not_implemented");
+        out.assert_exit(8).assert_stderr_empty();
     }
     sb.glen(["watch", "abc1234"]).run().error_envelope("usage");
     assert!(!sb.glen_home.exists());
@@ -1194,7 +1191,10 @@ fn ac401_worker_appears_in_no_help_page_and_no_completion_script() {
             raw.out().contains("install-skill"),
             "{shell} script lacks install-skill"
         );
-        let data = sb.glen(["completions", shell, "--json"]).run().ok_data();
+        let data = sb
+            .glen(["completions", shell, "--json"])
+            .run()
+            .ok_data_or_spilled(&sb.glen_home);
         assert!(!data["script"].as_str().unwrap().contains("__worker"));
     }
 }
@@ -1449,7 +1449,11 @@ fn ac404_the_conformance_skill_checker_catches_each_mutation() {
             format!("{base}\n`glen show <handle> --tools everything`\n"),
             "everything",
         ),
-        ("hidden command", format!("{base}\n`glen watch`\n"), "watch"),
+        (
+            "hidden command",
+            format!("{base}\n`glen __worker`\n"),
+            "__worker",
+        ),
         (
             "removed visible-command reference",
             base.replace("glen doctor", "glen ls"),

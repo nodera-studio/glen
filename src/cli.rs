@@ -86,7 +86,6 @@ pub enum Command {
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
     Worker(WorkerArgs),
     #[command(
-        hide = true,
         about = "Watch sessions live: transcripts, replies and a prompt (full screen)",
         after_help = "Examples:\n  glen watch\n  glen watch e27c0de\n  glen watch --all"
     )]

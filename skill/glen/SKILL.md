@@ -89,3 +89,6 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 - Never work around a refusal: don't start omp on a session yourself or copy it. Two writers fork a session.
 - Don't send into a session someone is using unless asked; on a busy session prefer default follow-up.
 - Setup: `glen doctor`. Update: `glen install-skill`. Completions for people: `glen completions zsh`.
+<!-- glen:if watch -->
+- For people in an interactive terminal: `glen watch <handle>`; agents use `glen tail <handle> -f` and `glen inbox -f`.
+<!-- glen:end -->

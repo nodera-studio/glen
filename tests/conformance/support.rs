@@ -20,8 +20,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
-/// The one command still hidden after W3 and W4 (AC-301, AC-401).
-pub const HIDDEN: [&str; 1] = ["watch"];
+/// Unimplemented public commands still hidden; the internal worker is checked separately.
+pub const HIDDEN: [&str; 0] = [];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
 pub const DOCTOR_CHECKS: [&str; 12] = [
@@ -374,6 +374,34 @@ impl Out {
             self.ctx()
         );
         env["data"].clone()
+    }
+
+    /// Completions grow with the visible command tree and may cross the default spill limit.
+    /// Keep payload assertions independent of that size while validating the real spill contract.
+    pub fn ok_data_or_spilled(&self, home: &Path) -> Value {
+        let env = self.ok_envelope();
+        let Some(spill) = env.get("spilled") else {
+            return self.ok_data();
+        };
+        assert!(env.get("data").is_none(), "{}", self.ctx());
+        assert_eq!(spill["format"], Value::from("json"));
+        let path = Path::new(spill["path"].as_str().expect("spilled.path"));
+        assert!(path.is_absolute());
+        assert_eq!(path.parent(), Some(home.join("out").as_path()));
+        assert_eq!(path.extension(), Some(OsStr::new("json")));
+        let metadata = fs::symlink_metadata(path).expect("spill metadata");
+        assert!(metadata.is_file(), "spill must be a regular file");
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        let bytes = fs::read(path).expect("spill contents");
+        assert_eq!(spill["bytes"].as_u64(), Some(bytes.len() as u64));
+        let full = Self {
+            desc: self.desc.clone(),
+            status: self.status,
+            stdout: bytes,
+            stderr: self.stderr.clone(),
+            elapsed: self.elapsed,
+        };
+        full.ok_data()
     }
 
     /// An error envelope with `code`, whose exit code matches docs/design.md §A11 (AC-010).

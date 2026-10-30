@@ -37,6 +37,7 @@ fn ac301_help_lists_exactly_the_w3_commands() {
         "wait",
         "jobs",
         "inbox",
+        "watch",
         "install-extension",
         "install-skill",
         "doctor",
@@ -51,11 +52,7 @@ fn ac301_help_lists_exactly_the_w3_commands() {
         assert!(!out.out().contains("__worker"), "{}", out.ctx());
     }
     for name in HIDDEN {
-        let err = sb.glen([name]).run().error_envelope(if name == "watch" {
-            "usage"
-        } else {
-            "not_implemented"
-        });
+        let err = sb.glen([name]).run().error_envelope("not_implemented");
         assert!(err["message"].as_str().unwrap().contains(name), "{err}");
     }
     assert!(!sb.glen_home.exists());
@@ -68,7 +65,7 @@ fn ac301_completions_offer_inbox_and_install_extension_but_never_worker() {
         let out = sb.glen(["completions", shell]).run();
         out.assert_exit(0);
         let script = out.out();
-        for name in ["inbox", "install-extension"] {
+        for name in ["inbox", "watch", "install-extension"] {
             assert!(script.contains(name), "{shell} lacks {name}");
         }
         assert!(!script.contains("__worker"), "{shell} exposes __worker");
