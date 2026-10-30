@@ -13,7 +13,7 @@ export const RESERVED_OPS = ["abort", "list_models", "set_model", "set_thinking_
 export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
 type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number };
 type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; settled: boolean };
-type Endpoint = { server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
+type Endpoint = { server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
 const ENDPOINTS = new Map<number, Endpoint>();
 export function isPlainToken(id: unknown): id is string { return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id); }
 export function sunPathMax(platform: string) { return platform === "darwin" ? 104 : 108; }
@@ -104,23 +104,26 @@ function closeSpan(e: Endpoint) {
         const warnings = batch.length > 1 ? [{ code: "batched", message: `omp consumed this request in a batch with ${batch.filter(other => other !== r).map(jobHandle).join(", ")}; they share the reply span` }] : [];
         terminal(e, r, "settled", { status: stop === "aborted" ? "aborted" : stop === "error" ? "error" : "completed", assistant_text: m ? textOf(m) || null : null, stop_reason: stop, error_message: typeof m?.errorMessage === "string" ? m.errorMessage : null, warnings });
     }
-    e.spanHasOutput = false;
+    e.spanHasOutput = false; e.spanHasActivity = false;
 }
 function pendingRequest(e: Endpoint, message: any) {
     return message?.role === "user" ? e.requests.find(r => !r.consumed && r.text === textOf(message)) : undefined;
 }
 function boundary(e: Endpoint, message: any) {
+    // Notices only end an answered span; a waiting request keeps ownership.
+    if (message.role !== "user" && !e.spanHasOutput) { e.spanHasActivity = true; return; }
     const next = pendingRequest(e, message);
     // Only adjacent queued user messages from the same run can share a span.
-    // User input and custom/system notices always break ownership.
-    const batched = next && next.deliveredAs !== "prompt" && e.active.length > 0 && e.active.every(r => r.deliveredAs !== "prompt") && !e.spanHasOutput && e.spanStart === e.lastStart;
+    // Notices, tool-only turns and glen_reply interrupt adjacency without text.
+    // Other user input always breaks ownership, even before an answer.
+    const batched = next && next.deliveredAs !== "prompt" && e.active.length > 0 && e.active.every(r => r.deliveredAs !== "prompt") && !e.spanHasActivity && e.spanStart === e.lastStart;
     if (!batched) closeSpan(e);
 }
 function notDelivered(e: Endpoint, r: Request) {
     if (!r.consumed) terminal(e, r, "error", { error: { code: "not_delivered", message: "omp did not append this request's user message before the delivery deadline or the queue drained" } });
 }
 function isBoundary(message: any) {
-    // Unknown/custom roles cannot inherit the preceding request's span.
+    // User input always separates spans; boundary() gates notices on output.
     return typeof message?.role === "string" && message.role !== "assistant" && message.role !== "toolResult";
 }
 function settle(e: Endpoint) {
@@ -239,7 +242,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
                 } catch (err) { failure = err; }
                 let streamed = false;
                 for (const r of active) { if (event(r, "reply", { reply: record })) streamed = true; }
-                if (e && active.length > 0) e.spanHasOutput = true;
+                if (e && active.length > 0) e.spanHasActivity = true;
                 if (failure && !streamed) throw new Error(`glen_reply: cannot write the glen inbox: ${String(failure)}`);
                 return { content: [{ type: "text", text: "delivered" }] };
             } catch (error) { return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true }; }
@@ -267,7 +270,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
         fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 }); sweep(home, deps); unlink(socket);
         const server = net.createServer(conn => { try { connection(e, conn); } catch { conn.destroy(); } });
         server.on("error", err => trace(e, "server_error", { reason: String(err) }));
-        const e: Endpoint = { server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
+        const e: Endpoint = { server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanHasActivity: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
         try {
             await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, () => { server.removeListener("error", reject); resolve(); }); });
             fs.chmodSync(socket, 0o600);
@@ -284,7 +287,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
     on("message_start", (p, _ctx, e) => {
         if (!e) return;
         if (isBoundary(p.message)) { boundary(e, p.message); e.boundaryStarted = true; }
-        else if (p.message?.role === "assistant") e.spanHasOutput = true;
+        else if (p.message?.role === "assistant") e.spanHasActivity = true;
     });
     on("message_end", (p, _ctx, e) => {
         if (!e) return;
@@ -296,7 +299,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
                 const r = pendingRequest(e, p.message);
                 if (r) { r.consumed = true; r.consumptionSeq = e.seq; if (e.active.length === 0) e.spanStart = e.lastStart; e.active.push(r); if (r.deliveryTimer !== undefined) e.ctx.clearTimer(r.deliveryTimer); event(r, "consumed"); }
             }
-        } else if (p.message?.role === "assistant") { e.spanHasOutput = true; for (const r of e.active) r.lastAssistant = p.message; }
+        } else if (p.message?.role === "assistant") { e.spanHasActivity = true; if (textOf(p.message)) e.spanHasOutput = true; for (const r of e.active) r.lastAssistant = p.message; }
     });
     on("agent_start", (_p, _ctx, e) => { if (e) e.lastStart = e.seq; });
     on("agent_end", (p, _ctx, e) => { if (e && !p.willContinue && !p.awaitingAsyncWork) settle(e); });
