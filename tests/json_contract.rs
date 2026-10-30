@@ -51,6 +51,31 @@ fn shape_eq(doc: &Value, real: &Value, path: &str) -> Result<(), String> {
     match (doc, real) {
         (Value::Null, _) | (_, Value::Null) => Ok(()),
         (Value::Object(a), Value::Object(b)) => {
+            if path.ends_with(".error") {
+                for object in [a, b] {
+                    for key in ["code", "message"] {
+                        if !object.get(key).is_some_and(Value::is_string) {
+                            return Err(format!("{path}.{key}: required string"));
+                        }
+                    }
+                    for (key, value) in object {
+                        let valid = match key.as_str() {
+                            "code" | "message" | "hint" => value.is_string(),
+                            "details" => value.is_object(),
+                            _ => false,
+                        };
+                        if !valid {
+                            return Err(format!("{path}.{key}: unexpected key or type"));
+                        }
+                    }
+                }
+                for (key, value) in a {
+                    if let Some(other) = b.get(key) {
+                        shape_eq(value, other, &format!("{path}.{key}"))?;
+                    }
+                }
+                return Ok(());
+            }
             let ak: BTreeSet<_> = a.keys().collect();
             let bk: BTreeSet<_> = b.keys().collect();
             if ak != bk {
@@ -430,6 +455,38 @@ fn evidence_error_shapes() {
     let mut extra_field = call["stdout"].clone();
     extra_field["error"]["extra"] = serde_json::json!(true);
     assert!(shape_eq(example, &extra_field, "error.usage").is_err());
+    let mut invalid_details = call["stdout"].clone();
+    invalid_details["error"]["details"] = serde_json::json!("not an object");
+    assert!(shape_eq(example, &invalid_details, "error.usage").is_err());
+}
+#[test]
+fn error_shape_optional_fields_are_validated_on_both_sides() {
+    let required = serde_json::json!({"code": "usage", "message": "example"});
+    let optional = serde_json::json!({
+        "code": "usage",
+        "message": "example",
+        "hint": "try --help",
+        "details": {"text": "usage"}
+    });
+    for (doc, real) in [(&required, &optional), (&optional, &required)] {
+        assert!(shape_eq(doc, real, "error.usage.error").is_ok());
+        assert!(shape_eq(doc, real, "other").is_err());
+    }
+    for (key, value) in [
+        ("code", serde_json::json!(42)),
+        ("message", Value::Null),
+        ("hint", Value::Null),
+        ("details", serde_json::json!("not an object")),
+        ("extra", serde_json::json!(true)),
+    ] {
+        let mut invalid = required.clone();
+        invalid[key] = value;
+        assert!(shape_eq(&required, &invalid, "error.usage.error").is_err());
+        assert!(shape_eq(&invalid, &required, "error.usage.error").is_err());
+    }
+    let mut mismatched = optional.clone();
+    mismatched["details"]["text"] = serde_json::json!(42);
+    assert!(shape_eq(&optional, &mismatched, "error.usage.error").is_err());
 }
 #[test]
 #[ignore]
