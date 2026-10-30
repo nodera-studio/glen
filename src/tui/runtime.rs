@@ -160,7 +160,11 @@ fn io_error(action: &str, error: io::Error) -> GlenError {
 struct Signals(signal_hook::iterator::Handle);
 #[cfg(unix)]
 impl Signals {
-    fn start(ctx: &Ctx, hup: Arc<AtomicBool>) -> Result<Self, GlenError> {
+    fn start(
+        ctx: &Ctx,
+        hup: Arc<AtomicBool>,
+        quitting: Arc<AtomicBool>,
+    ) -> Result<Self, GlenError> {
         use signal_hook::{
             consts::{SIGHUP, SIGINT, SIGTERM},
             iterator::Signals,
@@ -173,6 +177,10 @@ impl Signals {
             .name("watch-signals".into())
             .spawn(move || {
                 for signal in signals.forever() {
+                    if quitting.load(Ordering::Acquire) {
+                        if let Err(_error) = restore_terminal() {}
+                        std::process::exit(128 + signal);
+                    }
                     if signal == SIGHUP {
                         hup.store(true, Ordering::Release);
                     }
@@ -532,11 +540,12 @@ fn terminal_error(hup: &AtomicBool, error: GlenError) -> Result<i32, GlenError> 
         Err(error)
     }
 }
+type WatchTerminal = Terminal<CrosstermBackend<Box<dyn io::Write>>>;
 fn event_loop(
     app: &mut App,
     rx: &Receiver<Msg>,
     effects: &mut Effects,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal: &mut WatchTerminal,
     hup: &AtomicBool,
 ) -> Result<i32, GlenError> {
     let size = terminal
@@ -601,26 +610,36 @@ pub(crate) fn run(
         tx,
     };
     let hup = Arc::new(AtomicBool::new(false));
+    let quitting = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
-    let signals = Signals::start(&ctx, hup.clone())?;
+    let signals = Signals::start(&ctx, hup.clone(), quitting.clone())?;
     let guard = TerminalGuard::enter().map_err(|e| io_error("enter terminal", e))?;
     let mut effects = Effects::start(ctx.clone(), &app, opened);
     let result = (|| {
-        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
-            .map_err(|e| io_error("initialise terminal", e))?;
-        start_input(&ctx)?;
-        effects.execute(Cmd::Refresh)?;
-        #[cfg(debug_assertions)]
-        if let Some(test) = PanicTest::read(&ctx.env) {
-            test.worker(&ctx)?;
-        }
-        event_loop(&mut app, &rx, &mut effects, &mut terminal, &hup)
+        let backend = CrosstermBackend::new(Box::new(io::stdout()) as Box<dyn io::Write>);
+        let mut terminal =
+            Terminal::new(backend).map_err(|e| io_error("initialise terminal", e))?;
+        let result = (|| {
+            start_input(&ctx)?;
+            effects.execute(Cmd::Refresh)?;
+            #[cfg(debug_assertions)]
+            if let Some(test) = PanicTest::read(&ctx.env) {
+                test.worker(&ctx)?;
+            }
+            event_loop(&mut app, &rx, &mut effects, &mut terminal, &hup)
+        })();
+        // ratatui-core 0.1.2's Terminal::drop uses an error-print macro when showing
+        // the cursor fails, which panics if stderr is also dead. TerminalGuard owns all real
+        // teardown; detach the failed/live output before Drop and retain the first error.
+        *terminal.backend_mut() = CrosstermBackend::new(Box::new(io::sink()));
+        result
     })();
+    quitting.store(true, Ordering::Release);
     ctx.stop.store(true, Ordering::Release);
     let restored = guard.restore().map_err(|e| io_error("restore terminal", e));
+    let finished = finish_tasks(&mut effects.tasks, Duration::from_secs(6));
     #[cfg(unix)]
     drop(signals);
-    let finished = finish_tasks(&mut effects.tasks, Duration::from_secs(6));
     match result {
         Err(error) => terminal_error(&hup, error),
         Ok(code) if code != 0 => Ok(code), // Preserve signal/draw exit codes over secondary teardown errors.

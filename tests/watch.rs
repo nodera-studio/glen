@@ -256,11 +256,18 @@ impl Pty {
             reader: Some(reader),
         }
     }
-    fn spawn(&mut self, mut cmd: Command) {
+    fn spawn(&mut self, cmd: Command) {
+        self.spawn_with_output(
+            cmd,
+            self.slave.try_clone().unwrap(),
+            self.slave.try_clone().unwrap().into(),
+        );
+    }
+    fn spawn_with_output(&mut self, mut cmd: Command, output: File, error: Stdio) {
         assert!(self.child.is_none());
         cmd.stdin(self.slave.try_clone().unwrap())
-            .stdout(self.slave.try_clone().unwrap())
-            .stderr(self.slave.try_clone().unwrap());
+            .stdout(output)
+            .stderr(error);
         let controlling = self.controlling;
         // SAFETY: after fork, only allocation-free OS calls run. Command has already duped
         // the owned slave onto fd 0; borrow_raw neither closes nor takes ownership of it.
@@ -357,6 +364,9 @@ impl Pty {
     }
     fn signal(&mut self, signal: Signal) {
         self.assert_raw_while_running();
+        self.signal_process(signal);
+    }
+    fn signal_process(&self, signal: Signal) {
         let pid = Pid::from_raw(self.child.as_ref().unwrap().0.id() as i32).unwrap();
         rustix::process::kill_process(pid, signal).unwrap();
     }
@@ -376,6 +386,12 @@ impl Pty {
     }
     fn wait_exit(&mut self, timeout: Duration) -> i32 {
         let status = self.child.as_mut().unwrap().wait(timeout);
+        self.stop_reader();
+        status
+            .code()
+            .unwrap_or_else(|| panic!("glen terminated by a signal: {status}"))
+    }
+    fn stop_reader(&mut self) {
         // Drain the final teardown bytes without relying on EOF: the parent keeps a slave open.
         self.stop.store(true, Ordering::Release);
         let reader = self.reader.take().unwrap();
@@ -383,9 +399,6 @@ impl Pty {
             reader.is_finished().then_some(())
         });
         reader.join().unwrap().unwrap();
-        status
-            .code()
-            .unwrap_or_else(|| panic!("glen terminated by a signal: {status}"))
     }
     fn assert_escape_teardown(&self) {
         let bytes = String::from_utf8_lossy(&self.bytes()).into_owned();
@@ -881,4 +894,145 @@ fn live_route_send_uses_the_existing_extension_peer() {
     pty.quit();
     assert!(b.rpc.fake_log().is_empty());
     assert!(!b.rpc.omp.glen_home.join("inbox/.read").exists());
+}
+
+#[test]
+fn failed_frame_write_with_dead_stdout_and_stderr_exits_1_without_panic() {
+    for stderr_on_tty in [true, false] {
+        let b = OmpBox::new();
+        let mut input = Pty::open(120, 40);
+        input.controlling = false; // Keep the original stdin slave inspectable on macOS.
+        let mut output = Pty::open(120, 40);
+        let error = if stderr_on_tty {
+            output.slave.try_clone().unwrap().into()
+        } else {
+            Stdio::piped()
+        };
+        input.spawn_with_output(
+            command(&b, &["watch", "e27c0de"]),
+            output.slave.try_clone().unwrap(),
+            error,
+        );
+        output.wait_for("Fix the flaky parser test", START);
+        input.assert_raw_while_running();
+        output.stop_reader();
+        drop(output); // Close every master reference; both output descriptors now fail writes.
+        input.send(b"\t");
+        let code = input.wait_exit(START);
+        let mut error = String::new();
+        if let Some(mut pipe) = input.child.as_mut().unwrap().0.stderr.take() {
+            pipe.read_to_string(&mut error).unwrap();
+        }
+        assert_eq!(code, 1, "stderr_on_tty={stderr_on_tty}; stderr: {error}");
+        assert!(!error.contains("panicked"), "{error}");
+        input.assert_raw_observed();
+        assert!(
+            termios::tcgetattr(&input.slave)
+                .unwrap()
+                .local_modes
+                .contains(LocalModes::ICANON | LocalModes::ECHO)
+        );
+        if !stderr_on_tty {
+            assert!(error.contains("cannot draw terminal frame"), "{error}");
+        }
+        b.clean();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn ui_and_worker_panics_restore_before_reporting_and_exit_101() {
+    let b = OmpBox::new();
+    for knob in ["ui:800", "worker:800"] {
+        let mut cmd = command(&b, &["watch", "e27c0de"]);
+        cmd.env("GLEN_WATCH_TEST_PANIC", knob);
+        let mut pty = Pty::start(cmd, 120, 40);
+        pty.ready();
+        assert_eq!(pty.wait_exit(START), 101, "{knob}");
+        let bytes = String::from_utf8_lossy(&pty.bytes()).into_owned();
+        let entered = bytes.rfind("\x1b[?1049h").unwrap();
+        let restored = entered + bytes[entered..].find("\x1b[?1049l").unwrap();
+        let message = bytes.find("panicked").unwrap();
+        assert!(
+            restored < message,
+            "{knob}: panic printed before restore: {bytes}"
+        );
+        assert!(bytes[message..].contains("GLEN_WATCH_TEST_PANIC"));
+        pty.assert_restored();
+        b.clean();
+    }
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn second_signal_interrupts_the_wait_for_an_in_flight_submit() {
+    let b = RpcBox::new();
+    let gate = b.omp.tmp.path().join("held-probe");
+    let ready = gate.with_file_name("held-probe.ready");
+    let mut cmd = b.glen(&["watch", "e27c0de"]);
+    cmd.env("TERM", "xterm-256color")
+        .env("FAKE_OMP_LEASE_PROBE_GATE", &gate);
+    let mut pty = Pty::start(cmd, 120, 40);
+    pty.ready();
+    pty.send(b"\tin flight\r");
+    poll(START, || ready.exists().then_some(()));
+    pty.signal(Signal::TERM);
+    poll(DATA, || {
+        (pty.bytes().windows(8).any(|b| b == b"\x1b[?1049l")
+            && termios::tcgetattr(&pty.slave)
+                .unwrap()
+                .local_modes
+                .contains(LocalModes::ICANON | LocalModes::ECHO))
+        .then_some(())
+    });
+    assert!(
+        pty.child.as_mut().unwrap().0.try_wait().unwrap().is_none(),
+        "first signal must wait for the held submit"
+    );
+    let second = Instant::now();
+    pty.signal_process(Signal::INT); // The first signal already restored cooked mode.
+    assert_eq!(pty.wait_exit(EXIT), 130);
+    assert!(
+        second.elapsed() < EXIT,
+        "second signal did not exit within 1s"
+    );
+    pty.assert_restored();
+    assert!(!gate.exists());
+    b.omp.clean();
+}
+
+#[test]
+fn hung_endpoint_keeps_focus_responsive_refuses_and_bounds_quit() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "hang", &[]);
+    let mut cmd = b.rpc.glen(&["watch", "e27c0de"]);
+    cmd.env("TERM", "xterm-256color");
+    let mut pty = Pty::start(cmd, 120, 40);
+    pty.ready();
+    let submitted = Instant::now();
+    pty.send(b"\thung route\r\t");
+    pty.wait_for("▍sessions", EXIT);
+    assert!(submitted.elapsed() < EXIT, "Tab waited for the endpoint");
+    pty.wait_for(
+        "cannot take messages",
+        Duration::from_secs(3).saturating_sub(submitted.elapsed()),
+    );
+    assert!(submitted.elapsed() < Duration::from_secs(3));
+    let hellos = || {
+        b.ext_log()
+            .iter()
+            .filter(|v| v["dir"] == "in" && v["frame"]["op"] == "hello")
+            .count()
+    };
+    let before = hellos();
+    pty.send(b"\t\t\r"); // Retry the retained draft, then quit with routing still in flight.
+    poll(EXIT, || (hellos() > before).then_some(()));
+    pty.wait_for("sending", EXIT);
+    pty.assert_raw_while_running();
+    let quitting = Instant::now();
+    pty.send(b"\x1b[Zq");
+    assert_eq!(pty.wait_exit(Duration::from_secs(7)), 0);
+    assert!(quitting.elapsed() < Duration::from_secs(7));
+    pty.assert_restored();
+    assert!(!b.rpc.omp.glen_home.join("jobs").exists());
 }
