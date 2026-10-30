@@ -237,8 +237,8 @@ separate script with its own checks, run at worktree removal and at every wave e
 below).
 
 Removing a worktree is the orchestrator's job, not yours: it runs
-`.claude/scripts/remove-worktree.sh`, then `.claude/scripts/sweep-codex-orphans.sh` (brokers
-only; tasks are report-only) (`orchestrator.md` → Role 1 → "Removing a worktree").
+`.claude/scripts/remove-worktree.sh` after cancelling the worktree's jobs, then
+`.claude/scripts/sweep-codex-orphans.sh` (both signal brokers only) (`orchestrator.md` → Role 1 → "Removing a worktree").
 
 ## Step 5 — Parse + report
 

@@ -264,29 +264,35 @@ plugin's SessionEnd hook sends, so the scripts send SIGTERM. Whenever you remove
 harness worktree (after its merge, or when abandoning it), from the main checkout:
 
 `MAIN` is the main checkout (`MAIN="$(cd "$(git rev-parse --path-format=absolute
---git-common-dir)/.." && pwd -P)"`); run both scripts from there, never from inside `$WT`.
+--git-common-dir)/.." && pwd -P)"`); run both scripts from there, never from inside `$WT`. The
+scripts signal brokers only: they never cancel a job or signal a task or task-worker.
 
-1. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` lists and
+1. **Cancel the worktree's jobs first, with the companion** (`coder-codex.md` → "Cancelling a
+   run", steps 0–1, which unset `CODEX_COMPANION_SESSION_ID` so every session's jobs show).
+   Stop a leftover `task` / `task-worker` process of `$WT` only after checking it is that
+   worktree's and its job is finished or cancelled.
+2. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` lists and
    changes nothing). It refuses unless `$WT` is a worktree registered in this repo's
    `git worktree list --porcelain`, directly under `.claude/worktrees/` (canonical paths), and
    your cwd is outside it. With `<branch>`, it refuses unless that branch is checked out in
-   `$WT` and is merged into `origin/main` or has an upstream. It then cancels every running
-   companion job of `$WT` with the companion's own `cancel` (found in the companion state, never
-   on a command line), stops that job's process and every broker and task-worker whose
-   fixed-position `--cwd` is `$WT` or below it (TERM, wait, KILL; a pid whose start time or
-   command changed since listing is skipped), confirms nothing is left (else exit 1, nothing
-   removed), runs `git worktree remove --force` and, with `<branch>`, `git branch -D`. Removal
-   discards uncommitted changes, so commit or push first. If the companion state
-   (`$CLAUDE_PLUGIN_DATA/state`) is missing it refuses; `--force-no-state` goes on without
-   cancelling jobs.
-2. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"` (`--dry-run` to only list). It stops
-   only brokers whose `--cwd` under `.claude/worktrees/` no longer exists and that no live job
-   references. Tasks are report-only: it lists suspected orphan `task` / `task-worker`
-   processes and stale job records with the evidence. Stop a listed task yourself only after
-   checking it (`coder-codex.md` → "Cancelling a run").
+   `$WT` and its tip is an ancestor of `origin/main`, or of its upstream after a fetch (fully
+   pushed). It reads both companion state stores (`$CLAUDE_PLUGIN_DATA/state` and
+   `${TMPDIR:-/tmp}/codex-companion`) and refuses, printing each job's `cancel` command, while a
+   live job (queued, or running with a live pid) references `$WT`; it also refuses while a
+   `task` / `task-worker` process is at or under `$WT`. Then, from one process snapshot, it
+   stops the brokers whose fixed-position `--cwd` is `$WT` or below it (TERM, wait, KILL; a pid
+   whose pid, start time or command differs from the snapshot is skipped), confirms nothing is
+   left (else exit 1, nothing removed), runs `git worktree remove --force` and, with `<branch>`,
+   `git branch -D`. Removal discards uncommitted changes, so commit or push first. With neither
+   state store it refuses; `--force-no-state` goes on without the job check.
+3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"` (`--dry-run` to only list). It stops
+   only brokers whose `--cwd` under `.claude/worktrees/` no longer exists, that no live job in
+   either store references, and that no task process sits under. Tasks are report-only: it
+   lists suspected orphan `task` / `task-worker` processes and stale job records with the
+   evidence. Stop a listed task yourself only after checking it.
 
 **Wave end: sweep orphans.** At the end of every wave (after its last Implementer returns, and
-again at wave close after the merge), run step 2 even when no worktree is removed, and act on
+again at wave close after the merge), run step 3 even when no worktree is removed, and act on
 its task report: a `task` process can outlive its finished job in a worktree that still exists.
 
 **Host re-verification (never trust Codex's red or green).** The Implementer's sandbox

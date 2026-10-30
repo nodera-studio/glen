@@ -127,9 +127,10 @@ processes keep running and keep editing the worktree. Whenever you stop a Codex-
 
 The broker also survives a run that ended normally and the removal of its worktree, and a
 `codex-companion.mjs task` process can outlive its finished job. Remove a worktree any Codex
-run used only with `bash "$MAIN/.claude/scripts/remove-worktree.sh" <worktree> [<branch>]`
-(`MAIN` = the main checkout; it cancels that worktree's jobs through the companion and stops
-their processes, brokers and task-workers, then removes it), then run
+run only after cancelling its jobs (steps 0–1 above), with
+`bash "$MAIN/.claude/scripts/remove-worktree.sh" <worktree> [<branch>]` (`MAIN` = the main
+checkout; it refuses while a live job or task process is in the worktree, stops its brokers,
+then removes it), then run
 `.claude/scripts/sweep-codex-orphans.sh` (stops this repo's orphaned brokers; reports suspected
 orphan tasks without stopping them):
 `implementation/orchestrator.md` → Role 1 → "Removing a worktree".

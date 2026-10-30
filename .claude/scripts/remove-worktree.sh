@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
-# remove-worktree.sh — remove a .claude/worktrees/ worktree after stopping its Codex processes.
+# remove-worktree.sh — remove a .claude/worktrees/ worktree after stopping its Codex brokers.
 #
 # Usage: bash "$MAIN/.claude/scripts/remove-worktree.sh" [--dry-run] [--force-no-state] <worktree> [<branch>]
 #
-# In this order:
+# It never cancels jobs and never signals a task or task-worker: cancel jobs first with the
+# companion (it prints the commands). In this order:
 #   1. Check the arguments.
 #   2. Refuse if the caller's cwd (pwd -P) is inside the worktree.
 #   3. Refuse unless the worktree is registered in this repo's `git worktree list --porcelain`
 #      and sits directly under .claude/worktrees/, compared on canonical paths. With <branch>,
-#      refuse unless the porcelain shows `branch refs/heads/<branch>` for this worktree and the
-#      branch is merged into origin/main or has an upstream.
-#   4. Collect, from the companion's own state ($CLAUDE_PLUGIN_DATA/state, default
-#      ~/.claude/plugins/data/codex-openai-codex/state; refuse if it is missing unless
-#      --force-no-state), every queued or running job whose workspaceRoot or cwd is the worktree
-#      or below it, and the process each one runs; plus every broker and task-worker whose
-#      fixed-position --cwd is the worktree or below it (codex-procs.sh). A plain `task`
-#      process is found only through its job, never through its command line.
-#   5. Cancel each job with the companion's own `cancel`, then SIGTERM every collected process,
-#      wait up to 10 s for all of them, SIGKILL the survivors. A process whose start time or
-#      command changed since listing is skipped.
-#   6. Confirm no matching job or process is left; otherwise exit 1 and remove nothing.
+#      refuse unless the porcelain shows `branch refs/heads/<branch>` for this worktree and its
+#      tip is an ancestor of origin/main, or of its upstream after fetching that upstream
+#      (fully pushed, nothing ahead).
+#   4. Take ONE process snapshot and read the companion state from both stores
+#      ($CLAUDE_PLUGIN_DATA/state, default ~/.claude/plugins/data/codex-openai-codex/state, and
+#      ${TMPDIR:-/tmp}/codex-companion; refuse if neither exists, unless --force-no-state).
+#      Refuse if a live job (queued, or running with a live pid) has its workspaceRoot or cwd at
+#      or below the worktree, listing each job's cancel command; refuse if a task or task-worker
+#      process (fixed-argv --cwd, or process cwd) is at or below it.
+#   5. SIGTERM every broker of the snapshot whose fixed-position --cwd is at or below the
+#      worktree, wait up to 10 s for all, SIGKILL the survivors. A pid whose pid, start time or
+#      command differs from the snapshot is skipped.
+#   6. Take a new snapshot and confirm no broker, task or live job is left; otherwise exit 1 and
+#      remove nothing.
 #   7. git worktree remove --force (discards uncommitted changes; no repo-wide prune).
 #   8. With <branch>, git branch -D.
 # --dry-run prints what would be stopped and removed, and changes nothing.
@@ -73,114 +76,97 @@ while IFS= read -r line; do
   esac
 done < <(git -C "$MAIN" worktree list --porcelain)
 [ -n "$REG" ] || die "refuse: $W is not a registered worktree of $MAIN"
+WHY=""
 if [ -n "$BRANCH" ]; then
   [ "$WT_BRANCH" = "refs/heads/$BRANCH" ] \
     || die "refuse: $W has ${WT_BRANCH:-no branch} checked out, not refs/heads/$BRANCH"
   if git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" origin/main 2>/dev/null; then
-    WHY="merged into origin/main"
-  elif UP="$(git -C "$MAIN" rev-parse --abbrev-ref --symbolic-full-name "$BRANCH@{upstream}" 2>/dev/null)"; then
-    WHY="has upstream $UP"
+    WHY="its tip is in origin/main"
   else
-    die "refuse: branch $BRANCH is not merged into origin/main and has no upstream; push it or delete it by hand"
+    UP="$(git -C "$MAIN" rev-parse --symbolic-full-name "$BRANCH@{upstream}" 2>/dev/null)" \
+      || die "refuse: branch $BRANCH is not in origin/main and has no upstream; push it or delete it by hand"
+    REMOTE="$(git -C "$MAIN" config "branch.$BRANCH.remote")"
+    git -C "$MAIN" fetch --quiet "$REMOTE" || die "refuse: cannot fetch $REMOTE to check branch $BRANCH"
+    git -C "$MAIN" merge-base --is-ancestor "refs/heads/$BRANCH" "$UP" \
+      || die "refuse: branch $BRANCH has commits not on its upstream $UP; push them or delete it by hand"
+    WHY="its tip is on its upstream $UP"
   fi
 fi
 
-# 4. Collect jobs and processes.
-DATA="${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/codex-openai-codex}"
-STATE="$DATA/state"
-if [ ! -d "$STATE" ] && [ "$NOSTATE" = 0 ]; then
-  die "refuse: companion state $STATE is missing, so running jobs cannot be found (--force-no-state to go on without them)"
-fi
+# 4. One snapshot; refuse on live jobs or task processes.
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/remove-worktree.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-SNAPS="$TMP/snaps"
-: >"$SNAPS"
+SNAP="$TMP/snap" PROCS="$TMP/procs" JOBS="$TMP/jobs"
+ROOTS="$(state_roots)"
+if [ -z "$ROOTS" ] && [ "$NOSTATE" = 0 ]; then
+  die "refuse: no companion state store exists, so live jobs cannot be checked (--force-no-state to go on without them)"
+fi
+snapshot_procs
+codex_procs >"$PROCS"
+# shellcheck disable=SC2086 # ROOTS is a newline-separated list of paths without spaces
+codex_jobs $ROOTS >"$JOBS"
 
-# Active jobs under W: "id SEP workspaceRoot SEP pid SEP startedAt".
-active_jobs() {
-  local id st ws cwd pid started c
-  codex_jobs "$STATE" | while IFS="$SEP" read -r id st ws cwd pid started; do
-    is_active "$st" || continue
-    for c in "$ws" "$cwd"; do
-      [ -n "$c" ] || continue
-      if under "$(canon "$c" || true)" "$W"; then
-        printf '%s%s%s%s%s%s%s\n' "$id" "$SEP" "$ws" "$SEP" "$pid" "$SEP" "$started"
-        break
-      fi
-    done
-  done
-}
+LIVE="$(live_jobs_at "$W")"
+if [ -n "$LIVE" ]; then
+  {
+    echo "remove-worktree: refuse: live Codex jobs in $W; cancel them first, then re-run:"
+    echo "  COMPANION=<newest ~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs>"
+    while IFS="$SEP" read -r root id ws; do
+      echo "  # job $id ($root)"
+      echo "  $(cancel_hint "$root" "$id" "$ws")"
+    done <<<"$LIVE"
+  } >&2
+  exit 1
+fi
+TASKS="$(tasks_at "$W")"
+if [ -n "$TASKS" ]; then
+  {
+    echo "remove-worktree: refuse: Codex task processes in $W (stop them after checking; never by this script):"
+    while IFS="$SEP" read -r kind pid c; do
+      echo "  $kind $pid (cwd $c): $(awk -F "$SEP" -v p="$pid" '$1 == p { print $2 " " $3; exit }' "$SNAP" | cut -c1-200)"
+    done <<<"$TASKS"
+  } >&2
+  exit 1
+fi
 
-# Brokers and task-workers under W: "kind SEP pid".
-procs_under() {
-  local kind pid cwd c
-  codex_procs | while IFS="$SEP" read -r kind pid cwd _; do
-    [ "$kind" != task ] || continue
-    c="$(canon "$cwd" || true)"
-    if [ -n "$c" ] && under "$c" "$W"; then printf '%s%s%s\n' "$kind" "$SEP" "$pid"; fi
-  done
-}
-
-# Jobs to cancel: active jobs under W that either have no process yet or whose pid is their
-# own companion process (job_proc). Any other pid is a stale record or a reused pid: the
-# companion's cancel would signal it, so such a record is reported and left alone.
-live_jobs() {
-  local id ws pid started
-  active_jobs | while IFS="$SEP" read -r id ws pid started; do
-    if [ -z "$pid" ] || job_proc "$pid" "$started"; then
-      printf '%s%s%s%s%s\n' "$id" "$SEP" "$ws" "$SEP" "$pid"
-    fi
-  done
-}
-
-TARGETS=""
-while IFS="$SEP" read -r kind pid; do
-  [ -n "$pid" ] || continue
-  remember "$pid"
-  TARGETS="$TARGETS $pid"
-  echo "process $pid ($kind): $(snap "$pid" | cut -c1-200)"
-done <<<"$(procs_under)"
-while IFS="$SEP" read -r id ws pid started; do
-  [ -n "$id" ] || continue
-  if [ -z "$pid" ]; then
-    echo "job $id (workspace $ws, no process yet): cancel"
-  elif job_proc "$pid" "$started"; then
-    echo "job $id (workspace $ws, pid $pid): cancel, then stop pid $pid"
-    case " $TARGETS " in *" $pid "*) ;; *) remember "$pid"; TARGETS="$TARGETS $pid" ;; esac
-  else
-    echo "stale job record $id (workspace $ws): pid $pid is not its companion process; left alone"
+BROKERS=""
+while IFS="$SEP" read -r kind pid cwd _; do
+  [ "$kind" = broker ] || continue
+  c="$(canon "$cwd" || true)"
+  if [ -n "$c" ] && under "$c" "$W"; then
+    BROKERS="$BROKERS $pid"
+    echo "broker $pid (cwd $cwd)"
   fi
-done <<<"$(active_jobs)"
-JOBS="$(live_jobs)"
-[ -n "${TARGETS// /}" ] || [ -n "$JOBS" ] || echo "no Codex job or process for $W"
+done <"$PROCS"
+[ -n "$BROKERS" ] || echo "no Codex broker for $W"
 
 if [ "$DRY" = 1 ]; then
-  echo "dry run: would stop:${TARGETS:- nothing}; remove worktree $REG${BRANCH:+; delete branch $BRANCH ($WHY)}"
+  echo "dry run: would stop:${BROKERS:- nothing}; remove worktree $REG${BRANCH:+; delete branch $BRANCH ($WHY)}"
   exit 0
 fi
 
-# 5. Cancel jobs through the companion, then signal the processes.
-if [ -n "$JOBS" ]; then
-  COMPANION="$(companion_path)"
-  [ -n "$COMPANION" ] || die "codex-companion.mjs not found; cannot cancel jobs; nothing removed"
-  while IFS="$SEP" read -r id ws _; do
-    CLAUDE_PLUGIN_DATA="$DATA" env -u CODEX_COMPANION_SESSION_ID \
-      node "$COMPANION" cancel "$id" --cwd "$ws" --json >/dev/null 2>&1 \
-      || echo "warning: companion cancel $id failed"
-  done <<<"$JOBS"
-fi
-# shellcheck disable=SC2086 # TARGETS is a space-separated pid list
-[ -z "${TARGETS// /}" ] || stop_set $TARGETS
+# 5. Stop the brokers.
+# shellcheck disable=SC2086 # BROKERS is a space-separated pid list
+[ -z "$BROKERS" ] || stop_set $BROKERS
 
-# 6. Confirm nothing is left.
+# 6. Confirm nothing is left, from a new snapshot.
 LEFT=""
-for p in $TARGETS; do
+for p in $BROKERS; do
   if valid "$p"; then LEFT="$LEFT $p"; fi
 done
-LEFT_PROCS="$(procs_under | tr "$SEP" ' ' | tr '\n' ';')"
-LEFT_JOBS="$(live_jobs | cut -d "$SEP" -f1 | tr '\n' ' ')"
-if [ -n "$LEFT" ] || [ -n "$LEFT_PROCS" ] || [ -n "$LEFT_JOBS" ]; then
-  die "still running for $W (pids:${LEFT:- none}; processes: ${LEFT_PROCS:-none}; jobs: ${LEFT_JOBS:-none}); nothing removed"
+snapshot_procs
+codex_procs >"$PROCS"
+# shellcheck disable=SC2086 # ROOTS is a newline-separated list of paths without spaces
+codex_jobs $ROOTS >"$JOBS"
+while IFS="$SEP" read -r kind pid cwd _; do
+  [ "$kind" = broker ] || continue
+  c="$(canon "$cwd" || true)"
+  if [ -n "$c" ] && under "$c" "$W"; then LEFT="$LEFT $pid"; fi
+done <"$PROCS"
+LEFT_TASKS="$(tasks_at "$W" | cut -d "$SEP" -f2 | tr '\n' ' ')"
+LEFT_JOBS="$(live_jobs_at "$W" | cut -d "$SEP" -f2 | tr '\n' ' ')"
+if [ -n "$LEFT" ] || [ -n "$LEFT_TASKS" ] || [ -n "$LEFT_JOBS" ]; then
+  die "still running for $W (brokers:${LEFT:- none}; tasks: ${LEFT_TASKS:-none}; jobs: ${LEFT_JOBS:-none}); nothing removed"
 fi
 
 # 7. Remove the worktree.
@@ -192,5 +178,5 @@ echo "removed worktree $REG"
 # 8. Delete the branch.
 if [ -n "$BRANCH" ]; then
   git -C "$MAIN" branch -D "$BRANCH"
-  echo "  ($BRANCH $WHY)"
+  echo "  ($BRANCH: $WHY)"
 fi

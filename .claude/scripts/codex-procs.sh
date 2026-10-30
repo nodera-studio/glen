@@ -1,13 +1,20 @@
 # codex-procs.sh — helpers shared by remove-worktree.sh and sweep-codex-orphans.sh. Source it.
 # shellcheck shell=bash
 #
-# Processes are identified only by fixed argv shapes, never by text anywhere in a command line:
+# The scripts signal brokers only; jobs, tasks and task-workers are never signalled. Ownership is
+# decided from ONE process snapshot (snapshot_procs: `ps -axww -o pid=,lstart=,command=`). Before
+# each signal the pid's current pid/lstart/command must equal its snapshot line, else it is
+# skipped. Processes are identified only by fixed argv shapes, never by text elsewhere in a
+# command line:
 #   broker       node .../app-server-broker.mjs serve --endpoint E --cwd C --pid-file P
 #   task-worker  node .../codex-companion.mjs task-worker --cwd C --job-id J
 #   task         node .../codex-companion.mjs task ...   (argv beyond "task" is never read)
-# Jobs come from the companion's own state: <state>/<slug>-<hash>/state.json and jobs/*.json.
-# Before any signal, a process's `ps -o lstart=,command=` must equal the snapshot taken when it
-# was listed (PID reuse guard). Process trees are never walked.
+# Jobs come from the companion's own state, in both stores companion 1.0.6 uses (state_roots).
+#
+# Callers set SNAP (snapshot file), PROCS (codex_procs output) and JOBS (codex_jobs output).
+
+# Field separator for every record: ASCII unit separator (a tab would collapse empty fields in read).
+SEP=$'\x1f'
 
 # canon PATH: canonical absolute path (pwd -P of the longest existing ancestor, plus the rest).
 # Fails for a relative path or a non-existing remainder containing . or .. segments.
@@ -30,13 +37,41 @@ under() {
   return 1
 }
 
-# Field separator for every record below: ASCII unit separator (a tab would collapse empty fields in read).
-SEP=$'\x1f'
+# ps_records: normalise `ps -o pid=,lstart=,command=` lines on stdin to "pid SEP lstart SEP command".
+ps_records() {
+  local pid a b c d e cmd
+  while read -r pid a b c d e cmd; do
+    if [ -n "$pid" ]; then printf '%s%s%s %s %s %s %s%s%s\n' "$pid" "$SEP" "$a" "$b" "$c" "$d" "$e" "$SEP" "$cmd"; fi
+  done
+}
 
-# codex_procs: one line per companion process, "kind SEP pid SEP cwd SEP job".
+# snapshot_procs: the single process snapshot every ownership decision is made from, into $SNAP.
+snapshot_procs() { ps -axww -o pid=,lstart=,command= | ps_records >"$SNAP"; }
+
+# valid PID: the process still has the pid, start time and command of its snapshot line.
+valid() {
+  local want now
+  want="$(awk -F "$SEP" -v p="$1" '$1 == p { print; exit }' "$SNAP")"
+  now="$(ps -ww -o pid=,lstart=,command= -p "$1" 2>/dev/null | ps_records)"
+  [ -n "$want" ] && [ "$now" = "$want" ]
+}
+
+# in_snapshot PID: PID is a process in the snapshot.
+in_snapshot() { awk -F "$SEP" -v p="$1" '$1 == p { f = 1 } END { exit !f }' "$SNAP"; }
+
+# proc_cwd PID: the process's current directory (for report and refusal checks only).
+proc_cwd() {
+  if [ -L "/proc/$1/cwd" ]; then
+    readlink "/proc/$1/cwd" 2>/dev/null || true
+  else
+    lsof -a -p "$1" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1 || true
+  fi
+}
+
+# codex_procs: companion processes of the snapshot, "kind SEP pid SEP argv-cwd SEP job SEP proc-cwd".
 codex_procs() {
-  local pid cmd
-  ps -axww -o pid=,command= | while read -r pid cmd; do
+  local pid cmd kind cwd job
+  while IFS="$SEP" read -r pid _ cmd; do
     set -f
     # shellcheck disable=SC2086 # deliberate word split of the command line into argv
     set -- $cmd
@@ -45,83 +80,112 @@ codex_procs() {
     [ "${1##*/}" = node ] || continue
     if [ $# -eq 9 ] && [ "${2##*/}" = app-server-broker.mjs ] && [ "$3" = serve ] \
       && [ "$4" = --endpoint ] && [ "$6" = --cwd ] && [ "$8" = --pid-file ]; then
-      printf 'broker%s%s%s%s%s\n' "$SEP" "$pid" "$SEP" "$7" "$SEP"
+      kind=broker cwd="$7" job=""
     elif [ $# -eq 7 ] && [ "${2##*/}" = codex-companion.mjs ] && [ "$3" = task-worker ] \
       && [ "$4" = --cwd ] && [ "$6" = --job-id ]; then
-      printf 'task-worker%s%s%s%s%s%s\n' "$SEP" "$pid" "$SEP" "$5" "$SEP" "$7"
-    elif [ "${2##*/}" = codex-companion.mjs ] && [ "$3" = task ]; then
-      printf 'task%s%s%s%s\n' "$SEP" "$pid" "$SEP" "$SEP"
+      kind=task-worker cwd="$5" job="$7"
+    elif [ "${2##*/}" = codex-companion.mjs ] && { [ "$3" = task ] || [ "$3" = task-worker ]; }; then
+      kind="$3" cwd="" job=""
+    else
+      continue
     fi
+    if [ "$kind" = broker ]; then
+      printf '%s%s%s%s%s%s%s%s\n' "$kind" "$SEP" "$pid" "$SEP" "$cwd" "$SEP" "$job" "$SEP"
+    else
+      printf '%s%s%s%s%s%s%s%s%s\n' "$kind" "$SEP" "$pid" "$SEP" "$cwd" "$SEP" "$job" "$SEP" "$(proc_cwd "$pid")"
+    fi
+  done <"$SNAP"
+}
+
+# state_roots: the companion's state stores that exist: $CLAUDE_PLUGIN_DATA/state (default
+# ~/.claude/plugins/data/codex-openai-codex/state) and its fallback os.tmpdir()/codex-companion.
+state_roots() {
+  local d
+  for d in "${CLAUDE_PLUGIN_DATA:-$HOME/.claude/plugins/data/codex-openai-codex}/state" \
+    "$(cd "${TMPDIR:-/tmp}" 2>/dev/null && pwd)/codex-companion"; do
+    if [ -d "$d" ]; then echo "$d"; fi
   done
 }
 
-# codex_jobs STATE_ROOT: every job, "id SEP status SEP workspaceRoot SEP cwd SEP pid SEP startedAt(epoch s)".
+# codex_jobs ROOT...: every job, "root SEP id SEP status SEP workspaceRoot SEP cwd SEP pid".
 # A jobs/<id>.json record overrides the state.json entry (it is written first and is fuller).
 codex_jobs() {
-  [ -d "$1" ] || return 0
-  node - "$1" <<'EOF'
+  [ $# -gt 0 ] || return 0
+  node - "$@" <<'EOF'
 const fs = require("fs");
 const path = require("path");
-const root = process.argv[2];
-const jobs = new Map();
-const add = (job) => {
-  if (job && typeof job.id === "string") jobs.set(job.id, { ...(jobs.get(job.id) || {}), ...job });
-};
 const read = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
-for (const d of fs.readdirSync(root)) {
-  const dir = path.join(root, d);
-  const state = read(path.join(dir, "state.json"));
-  for (const j of (state && Array.isArray(state.jobs) ? state.jobs : [])) add(j);
-  let files = [];
-  try { files = fs.readdirSync(path.join(dir, "jobs")).filter((f) => f.endsWith(".json")); } catch {}
-  for (const f of files) add(read(path.join(dir, "jobs", f)));
-}
 const clean = (v) => String(v ?? "").replace(/[\x1f\n\r]/g, " ");
-for (const j of jobs.values()) {
-  const started = Date.parse(j.startedAt ?? j.createdAt ?? "");
-  const cwd = (j.request && j.request.cwd) ?? j.cwd ?? "";
-  console.log([j.id, j.status, j.workspaceRoot, cwd, j.pid, Number.isFinite(started) ? Math.floor(started / 1000) : ""]
-    .map(clean).join("\x1f"));
+for (const root of process.argv.slice(2)) {
+  const jobs = new Map();
+  const add = (job) => {
+    if (job && typeof job.id === "string") jobs.set(job.id, { ...(jobs.get(job.id) || {}), ...job });
+  };
+  let dirs = [];
+  try { dirs = fs.readdirSync(root); } catch {}
+  for (const d of dirs) {
+    const dir = path.join(root, d);
+    const state = read(path.join(dir, "state.json"));
+    for (const j of (state && Array.isArray(state.jobs) ? state.jobs : [])) add(j);
+    let files = [];
+    try { files = fs.readdirSync(path.join(dir, "jobs")).filter((f) => f.endsWith(".json")); } catch {}
+    for (const f of files) add(read(path.join(dir, "jobs", f)));
+  }
+  for (const j of jobs.values()) {
+    const cwd = (j.request && j.request.cwd) ?? j.cwd ?? "";
+    console.log([root, j.id, j.status, j.workspaceRoot, cwd, j.pid].map(clean).join("\x1f"));
+  }
 }
 EOF
 }
 
-is_active() { [ "$1" = running ] || [ "$1" = queued ]; }
-
-snap() { ps -o lstart=,command= -p "$1" 2>/dev/null || true; }
-
-# remember PID: record its snapshot in $SNAPS.
-remember() { printf '%s%s%s\n' "$1" "$SEP" "$(snap "$1")" >>"$SNAPS"; }
-
-# valid PID: the process still has the start time and command recorded by remember.
-valid() {
-  local want now
-  want="$(awk -F "$SEP" -v p="$1" '$1 == p { print substr($0, length($1) + 2); exit }' "$SNAPS")"
-  now="$(snap "$1")"
-  [ -n "$want" ] && [ "$now" = "$want" ]
+# live_jobs_at PATH: live jobs (queued, or running with a pid in the snapshot) whose
+# workspaceRoot or cwd is at or below PATH, "root SEP id SEP workspaceRoot".
+live_jobs_at() {
+  local root id st ws cwd pid p c
+  while IFS="$SEP" read -r root id st ws cwd pid; do
+    case "$st" in
+      queued) ;;
+      running) if [ -z "$pid" ] || ! in_snapshot "$pid"; then continue; fi ;;
+      *) continue ;;
+    esac
+    for p in "$ws" "$cwd"; do
+      [ -n "$p" ] || continue
+      c="$(canon "$p" || true)"
+      if [ -n "$c" ] && under "$c" "$1"; then
+        printf '%s%s%s%s%s\n' "$root" "$SEP" "$id" "$SEP" "$ws"
+        break
+      fi
+    done
+  done <"$JOBS"
 }
 
-# lstart_epoch PID: the process start time in epoch seconds.
-lstart_epoch() {
-  local l
-  l="$(ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ')" || return 1
-  [ -n "$l" ] || return 1
-  date -j -f '%a %b %d %T %Y' "$l" +%s 2>/dev/null || date -d "$l" +%s 2>/dev/null
+# tasks_at PATH: task and task-worker processes whose fixed-argv cwd or process cwd is at or
+# below PATH, "kind SEP pid SEP cwd".
+tasks_at() {
+  local kind pid cwd job pcwd c
+  while IFS="$SEP" read -r kind pid cwd job pcwd; do
+    [ "$kind" != broker ] || continue
+    for c in "$cwd" "$pcwd"; do
+      [ -n "$c" ] || continue
+      c="$(canon "$c" || true)"
+      if [ -n "$c" ] && under "$c" "$1"; then
+        printf '%s%s%s%s%s\n' "$kind" "$SEP" "$pid" "$SEP" "$c"
+        break
+      fi
+    done
+  done <"$PROCS"
 }
 
-# job_proc PID STARTED: PID is a live codex-companion task or task-worker that started no later
-# than its job (STARTED, epoch s, plus 5 s). Otherwise the record is stale or the pid reused.
-job_proc() {
-  local s
-  [ -n "$1" ] && [ -n "$2" ] || return 1
-  set -f
-  # shellcheck disable=SC2046 # deliberate word split of the command line into argv
-  set -- "$1" "$2" $(ps -o command= -p "$1" 2>/dev/null || true)
-  set +f
-  [ $# -ge 5 ] && [ "${3##*/}" = node ] && [ "${4##*/}" = codex-companion.mjs ] || return 1
-  case "$5" in task | task-worker) ;; *) return 1 ;; esac
-  s="$(lstart_epoch "$1")" || return 1
-  [ -n "$s" ] && [ "$s" -le $(($2 + 5)) ]
+# cancel_hint ROOT ID WORKSPACE: the companion command that cancels a job in that store.
+cancel_hint() {
+  local env_part
+  case "$1" in
+    */codex-companion) env_part="env -u CLAUDE_PLUGIN_DATA -u CODEX_COMPANION_SESSION_ID" ;;
+    *) env_part="CLAUDE_PLUGIN_DATA=${1%/state} env -u CODEX_COMPANION_SESSION_ID" ;;
+  esac
+  # shellcheck disable=SC2016 # $COMPANION is printed literally, for the reader to set
+  printf '%s node "$COMPANION" cancel %s --cwd %s --json\n' "$env_part" "$2" "$3"
 }
 
 # stop_set PID...: SIGTERM each still-valid PID, wait up to 10 s for all of them to exit, then
@@ -132,7 +196,7 @@ stop_set() {
     if valid "$p"; then
       if kill -TERM "$p" 2>/dev/null; then sent="$sent $p"; fi
     else
-      echo "skip $p: start time or command changed since listing"
+      echo "skip $p: pid, start time or command differs from the snapshot"
     fi
   done
   for _ in 1 2 3 4 5 6 7 8 9 10; do
@@ -150,12 +214,4 @@ stop_set() {
     fi
   done
   sleep 1
-}
-
-# companion_path: the newest installed codex-companion.mjs, or nothing.
-companion_path() {
-  local d
-  d="$(find "$HOME/.claude/plugins/cache/openai-codex/codex" -mindepth 1 -maxdepth 1 -type d 2>/dev/null \
-    | sort -V | tail -1 || true)"
-  if [ -n "$d" ] && [ -f "$d/scripts/codex-companion.mjs" ]; then echo "$d/scripts/codex-companion.mjs"; fi
 }
