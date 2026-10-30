@@ -17,7 +17,7 @@ documented, and re-indexed:
 2. **Review** — a fresh, independent context that judges the diff (never the
    Implementer's transcript).
 3. **Parallel tail** — docs-updater ‖ conformance-test-writer ‖ an optional project-specific domain-rubric gate (conditional, if this project wires one up), once the code lands.
-4. **Re-index** — fold the new/changed files back into the codebase MCP.
+4. **Re-index** — fold the merged code back into the codebase MCP, after the merge.
 
 The doctrine: keep the generative loop in ONE context — that context is **Codex's**
 (Claude writes no product code) — isolate every discriminative check in a fresh one,
@@ -27,8 +27,8 @@ work and return results to you.
 </role>
 
 **Done when:** the feature is implemented per the approved plan, the review and
-conformance gates pass, tests and docs are updated, the codebase MCP is re-indexed,
-and a completion summary is handed to the user (committed and pushed by default).
+conformance gates pass, tests and docs are updated, the post-merge re-index is noted
+as due (Role 4), and a completion summary is handed to the user (committed and pushed by default).
 
 Ground decisions in `.claude/CLAUDE.md` and the relevant area doc from its
 reference table (QueueProcessing.md for queue work, DataModel.md for schema
@@ -159,6 +159,13 @@ Dispatch via Agent tool:
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {path}."
 ```
 
+**Network pre-flight.** The Codex sandbox may have no network. If the plan has network
+steps (`npm install`, CLI scaffolds, browser downloads, `cargo add` of a new crate), the
+planner lists them as a "Network pre-flight" block; if it did not, extract them yourself.
+Run that block in the wave's worktree BEFORE dispatching the Implementer, and tell the
+Implementer the steps are done: verify their results (files present, lockfile updated),
+do not re-run them.
+
 **Claude writes no product code — Codex does.** Do NOT dispatch separate coder /
 wiring / error-handling / test-writer / test-runner / verifier agents (those files
 were deleted); those concerns are fused into the Codex Implementer. The single most
@@ -223,6 +230,14 @@ fails, dispatch a fresh Implementer with the failing conformance checks (targete
 then re-run the suite. This is the one gate that catches "the tests pass because the
 Implementer wrote tests that match its own bug."
 
+**Spec ambiguity or a test that conflicts with the spec.** When the conformance writer
+flags an ambiguity, or a conformance test disagrees with the spec, settle it yourself:
+first clarify the design doc (`docs/design.md` or the plan's acceptance criteria), then
+resume the conformance writer (the suite's owner) to re-derive the assertion from the
+clarified text. The Implementer never edits conformance assertions. If a tracked test the
+Implementer wrote has to change to match the clarification, call that change out in the
+Report.
+
 **Optional arm 3 — wire up your own domain-rubric gate here.** If this project has a
 class of NON-NUMERIC, structural/textual artifacts whose correctness an LLM rubric can
 grade better than a property test (e.g. a regulated document format, a legal-copy
@@ -237,13 +252,13 @@ own domain-specific gate" pattern applied to the security audit; this is the
 `/implement`-pipeline analog. If no such artifact class exists in this project, skip
 this arm entirely — it is optional, not a stub to fill mechanically.
 
-### Role 4 — Re-index (before merge)
+### Role 4 — Re-index (after the merge, at wave close)
 
-When everything is green (tests + gate + review + conformance), incrementally
-re-index the new/changed files into the **codebase MCP** (the Mnemosyne codebase
-engine's indexer) so semantic search reflects the merged code rather than the
-pre-edit snapshot. A lefthook pre-push hook backstops this so it cannot be silently
-skipped; run it here as the pipeline tail as well.
+glen's code index reads a clean clone of `main`, so re-indexing before the merge would
+index the old code. Re-index after the squash-merge, at wave close: pull the index clone,
+run `code_reindex {project: "glen", repo: "glen"}`, and confirm with `code_index_status`
+(exact commands in the `mnemosyne` skill → Code index; `/auto-mode` runs this in
+`loop-procedures.md` step 9). No git hook does this, so it must not be skipped.
 
 ### Manual-test entry point
 

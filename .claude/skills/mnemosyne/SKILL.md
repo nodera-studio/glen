@@ -53,10 +53,18 @@ Never write to the `default` project. A hook refuses memory, code and secrets ca
 
 ## Code index
 
-`code_search {project: "glen", query}` → `code_symbol_lookup` → `code_graph_expand` →
-`code_get_file`. The index is a snapshot (`code_index_status` shows when); inside this repo
-the working tree is the truth, and a known string is `rg`. `code_reindex` is a write: run it
-only when asked or when `/implement`'s re-index step applies (an index exists for `glen`).
+`code_search {project: "glen", repo: "glen", query}` → `code_symbol_lookup` →
+`code_graph_expand` → `code_get_file`. Use `code_search` to orient before planning. The index
+is a snapshot (`code_index_status` shows when); inside this repo the working tree is the
+truth, and a known string is `rg`.
+
+- **How glen is indexed.** No UI or MCP tool registers a repository. glen is a row in the
+  local corpus DB pointing at a clean clone of `main` at `~/Developer/.mnemosyne-index/glen`
+  (memory `79a30160`, project `glen`). Never commit or check out branches in that clone.
+- **After every merged PR:** `git -C ~/Developer/.mnemosyne-index/glen pull --ff-only`, then
+  `code_reindex {project: "glen", repo: "glen"}`, and confirm with `code_index_status`.
+  `code_reindex` is a write: run it at that point, when asked, or for `/implement`'s re-index
+  step.
 
 ## Secrets
 
@@ -88,3 +96,18 @@ or a document id.
 - **References:** issues have no keys (the API returns only a document id). Cite `W<n>` plus the document id in PRs, commits and memories.
 - **Errors:** `FORBIDDEN` / `NOT_FOUND` is the token's boundary — report it, don't work around
   it. HTTP 401 means the token is missing or expired: tell the user.
+
+## Queues
+
+`queue_item_add` / `queue_item_update` accept a `documentId` only for Ideas, Notes and
+Research. **Never pass a board issue id as `documentId`.** The server answers
+`INVALID_REQUEST` but still persists a broken row (documentKind `issues`) that makes
+`queue_get` and the web queue page fail; the only recovery found was deleting and recreating
+the queue. Put the issue's wave label and id in the item title instead (`W3 — <summary>
+(<issue id>)`). This is a Mnemosyne server bug; the rule is the workaround until it is fixed.
+
+## Ideas, Research, Notes
+
+Ideas hold owner intent, Research holds cited findings, Notes hold working summaries. Use
+Notes for per-wave plan summaries, wave-end handoffs and run checkpoints (`document_create
+{projectId, kind: "notes", title, markdown}`), not memories and not a local file.

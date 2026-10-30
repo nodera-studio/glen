@@ -101,8 +101,11 @@ Per wave, in order — this sequence is the spine of the mode:
    hook blocks `gh pr merge` until you do) → `gh pr merge <N> --squash`. Don't pass
    `--delete-branch`; delete the branch at wave close.
 9. **Close the wave** — flip the board issue → `done`, add the tag `shipped:main`, post
-   the wave-end comment (files / commit / PR / tests), update the ledger, then delete the
-   wave branch (`git push origin --delete <branch>`).
+   the wave-end comment (files / commit / PR / tests), write the wave-end Note, mark the
+   wave's queue item `done`, refresh the code-index clone and `code_reindex`, update the
+   ledger, then delete the wave branch (`git push origin --delete <branch>`). The harness
+   self-improvement batch and any independent wave run in their own worktrees alongside
+   (references → Parallel work).
 10. **Advance** to the next wave without asking. 2–3 line status at boundaries only;
     silent during polling.
 11. **Release only if the goal asks for one** — when every wave is merged: status

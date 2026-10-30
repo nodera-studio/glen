@@ -85,6 +85,13 @@ literal `--resume` quoted from omp's CLI made it look for an earlier Codex threa
 other CLI flag, write it in prose ("the resume flag") or inside a fenced code block the
 forwarder won't parse, and put `--effort high` (or any routing flag) only where you mean it.
 
+The codex-companion app-server has an inactivity watchdog of about 180 s: a run that streams
+nothing for that long ends with "Codex app-server produced no activity for 180s … Treating as
+stalled" and exit 1. Long, high-effort final answers (a big plan after many file reads) trip
+it. Ask for a COMPACT result (about 120 lines at most) and, when the context is already local,
+no web search; that avoided the stall. After two stalls on the same task, stop retrying:
+degrade to the Claude engine alone and say so in the report.
+
 ### Example — single dispatch
 
 ```

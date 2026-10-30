@@ -125,7 +125,9 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            Produce 2-3 concrete approaches for THIS codebase, each with how it works,
            files affected, trade-offs, complexity, risk, and a recommendation. Attack the
            assumptions and failure modes a single model would miss. Approaches only —
-           no code changes. Return the analysis as your final message."
+           no code changes. Keep it compact (about 120 lines at most); no web fetches —
+           the research is already in the reports above. Return the analysis as your
+           final message."
 ```
 
 Each architect returns 2-3 approaches, so the judge sees a **4-candidate pool** — the move from a
@@ -144,7 +146,10 @@ If `gemini` is absent, log "high-stakes spec; 3rd architect (Gemini) unavailable
 and continue. A 4th rarely pays; stay at 2 for ordinary specs (diminishing returns).
 
 If Codex is unavailable (`codex login` needed), note it and proceed with the Claude
-architect alone — the judge step degrades to a pass-through.
+architect alone — the judge step degrades to a pass-through. The same applies after two
+stalls on the same pass (the codex-companion ~180 s inactivity watchdog, see the `codex`
+skill → Brief hygiene): don't retry a third time; proceed with the Claude engine alone and
+say so.
 
 Briefs cite local file paths (research files under `.claude/research/`, plan files, the explorer
 and researcher reports once saved) rather than Mnemosyne IDs alone: not every agent has the
@@ -237,12 +242,15 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            Explorer report: {explorer output}
            Researcher report: {researcher output}
            Return ordered steps with files-to-create vs modify, verification per step, and
-           prerequisites. Plan only — no code. Return the plan as your final message."
+           prerequisites. Plan only — no code. Keep it compact (about 120 lines at most);
+           no web fetches — the research is already in the reports above. Return the plan
+           as your final message."
 ```
 Persist both plans as in Step 4 (`.claude/plans/<slug>.claude.md` and `.claude/plans/<slug>.codex.md`),
 then dispatch the judge-selector with those two paths (select the stronger plan, graft separable
-steps); its output is the plan presented at Step 7. If Codex is unavailable, proceed with the Claude plan alone
-(judge degrades to pass-through).
+steps); its output is the plan presented at Step 7. If Codex is unavailable, or stalls twice on
+the planner pass (the two-stall rule in Step 4), proceed with the Claude plan alone (judge
+degrades to pass-through) and say so.
 
 ### Step 7 — Review Plan (two operating paths)
 
