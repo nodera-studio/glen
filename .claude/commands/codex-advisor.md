@@ -32,6 +32,7 @@ Question / material: $ARGUMENTS
               worst-first and STEELMAN the alternative you would choose. State what you
               CANNOT assess from the material. End with VERDICT: endorse |
               endorse-with-changes | reject. Material: {brief}. Constraints: {constraints}.
+              Do NOT write any file: return the full critique as your final message text.
               --wait. Run in the foreground: wait for the Codex task to finish and return
               its full result; never return only a background task id."
    ```

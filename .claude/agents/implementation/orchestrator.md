@@ -199,30 +199,57 @@ the cancel path in `coder-codex.md` → "Cancelling a run" (companion `cancel`, 
 worktree's `app-server-broker.mjs serve --cwd <worktree>` tree if anything survives) and
 confirm the worktree has stopped changing before dispatching anything else into it.
 
-**Removing a worktree stops its broker.** The companion broker (`app-server-broker.mjs serve
---cwd <worktree>`) and its app-server outlive a finished run and the worktree itself; 7
-orphans serving deleted glen worktrees were once killed by hand. Whenever you remove a wave
-or fix worktree (after its merge, or when abandoning it), first run `coder-codex.md` →
-"Removing a worktree" (the guarded cancel recipe, step 2 unconditional), then `git worktree
-remove`, then its orphan sweep (brokers whose `--cwd` no longer exists, only under this repo's
-`.claude/worktrees/`).
+**Removing a worktree (stop its Codex broker first).** The companion broker
+(`app-server-broker.mjs serve --cwd <worktree>`) and its app-server outlive a run that ended
+normally, and the worktree's removal: 7 brokers serving deleted glen worktrees were once killed
+by hand. The companion CLI has no broker-stop subcommand (`cancel` stops jobs, not the broker);
+the broker itself accepts a `broker/shutdown` message on its socket (what the plugin's
+SessionEnd hook sends), and its SIGTERM handler runs the same clean shutdown (closes the
+app-server, removes its socket and pid file), so the recipe sends SIGTERM. Whenever you remove
+a wave or fix worktree (after its merge, or when abandoning it):
+
+1. Run `coder-codex.md` → "Cancelling a run" for that `WT`, steps 0–3, with step 2
+   **unconditional** (even when nothing is running).
+2. Only after step 3's verify is clean, `git worktree remove "$WT"`. Order matters: the step-0
+   guards need the worktree to still exist. If the worktree is already gone, step 0 refuses
+   ("not a git worktree root"); skip to the sweep, which catches its broker because its
+   `--cwd` no longer exists.
+3. Sweep orphans: stop every broker whose `--cwd` directory no longer exists, only under this
+   repo's `.claude/worktrees/` (other repos' brokers are never touched). Self-contained; run
+   it from any checkout of this repo. The subshell keeps a refusal from exiting your shell.
+
+```bash
+( kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill -TERM "$1" 2>/dev/null; }
+  GCD="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" \
+    || { echo "refuse: not in a git repo" >&2; exit 1; }
+  MAIN="$(cd "$GCD/.." && pwd -P)" && [ -n "$MAIN" ] && [ "$MAIN" != / ] \
+    || { echo "refuse: cannot resolve the main checkout" >&2; exit 1; }
+  ps -axo pid=,command= | grep -E '^ *[0-9]+ +([^ ]*/)?node [^ ]*/app-server-broker\.mjs serve ' \
+    | awk -v root="$MAIN/.claude/worktrees/" -v self="$$" -v parent="$PPID" \
+        '$1 != self && $1 != parent { for (i = 2; i < NF; i++) if ($i == "--cwd" && index($(i+1), root) == 1) print $1, $(i+1) }' \
+    | while read -r pid cwd; do
+        [ -d "$cwd" ] || { echo "stopping orphan broker $pid ($cwd)"; kill_tree "$pid"; }
+      done )
+```
 
 **Host re-verification (never trust Codex's red or green).** The Implementer's sandbox
 reports failures that are not real: `EPERM` on Unix-socket bind/connect (socket tests
 "fail"), a denied `.git/worktrees/<wt>/index.lock` (no `git add`, no commit), no network (no
 Mnemosyne writes). It happened in every Codex Implementer run of one session. `coder-codex.md`
-→ Step 6 has the host re-run the gate and tests outside the sandbox and commit on Codex's
-behalf. Do not take its report on faith either: before Role 2, in the same worktree,
-independently run `bash .claude/scripts/quality-gate.sh` and `cargo test --locked`.
+→ Step 6 owns the protocol: its Claude host re-runs the gate and tests outside the sandbox,
+classifies each Codex failure, and is the **single committer** of Codex's work (it stages
+exactly the files Codex reported and commits on its behalf). You do not commit Implementer
+output; you verify it.
+- **Deliberate second check.** Before Role 2, in the same worktree, re-run
+  `bash .claude/scripts/quality-gate.sh` and `cargo test --locked` yourself. It is cheap, and
+  it checks the host's report the way the host checks Codex's.
 - A Codex failure is a sandbox artifact only when it is one of those sandbox-only shapes AND
-  the host re-run is green. Anything else, or any failure the host reproduces, is real: send
-  it back to a fresh Implementer as a fix.
-- Codex green but host red is real too.
-- On a green host re-run with Codex unable to commit, stage exactly the files Codex reported
-  (`touchedFiles` and the `COMPLETION` block), by path, and commit on its behalf; an
-  unreported file in `git status` is a deviation, not staged.
-- List every sandbox-vs-host discrepancy in the Report, one line each: Codex said / host
-  showed / verdict.
+  the host re-run is green. Anything else, any failure the host or you reproduce, and Codex
+  or host green with your re-run red, is real: send it to a fresh Implementer as a fix.
+- If the host reports green but did not commit, or committed files beyond what Codex
+  reported, treat it as a deviation and resume the Implementer to fix it; do not commit for it.
+- List every sandbox-vs-host discrepancy in the Report (the host's lines plus any of yours),
+  one line each: Codex said / host showed / verdict.
 
 **Network pre-flight.** The Codex sandbox may have no network. If the plan has network
 steps (`npm install`, CLI scaffolds, browser downloads, `cargo add` of a new crate), the
@@ -287,7 +314,7 @@ real bugs.
 
 **Codex runs in the foreground.** The `codex:codex-rescue` forwarder picks background mode
 for any task that looks long unless the brief says `--wait`. So every codex-rescue brief
-(review, advisor, fix verification) ends with: "--wait. Run in the foreground: wait for the
+(review, advisor) ends with: "--wait. Run in the foreground: wait for the
 Codex task to finish and return its full result as your final message. Never return only a
 background task id." A codex-rescue pass once returned at once with a task id and "file
 doesn't exist yet", and the orchestrator had to poll for the output. If one still comes back with only a task id, fetch the
@@ -297,7 +324,7 @@ never merge a pass you have not read.
 **Codex returns the review as text.** The codex-rescue sandbox writes only inside its own cwd
 (your shell's directory at dispatch, often a worktree) and does not escalate, so a brief that
 names an output path elsewhere fails on the write. Every codex-rescue brief here (review,
-advisor, fix verification) says "do NOT write any file; return the full review as your final
+advisor) says "do NOT write any file; return the full review as your final
 message text" and names no output path; you save it (see Review file names) if it must be on
 disk.
 
@@ -471,10 +498,11 @@ Plans are **kept after implementation** — they accumulate as project history. 
   coder/wiring/error-handling/test/verifier dispatches.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
   alone leaves Codex editing the worktree. Removing a worktree stops its broker first and
-  sweeps orphaned brokers under `.claude/worktrees/`.
-- Never trust the Implementer's red or green: re-run the gate and tests on the host; a
-  sandbox-only failure is an artifact only when the host re-run is green; report every
-  discrepancy.
+  sweeps orphaned brokers under `.claude/worktrees/` (Role 1 → "Removing a worktree").
+- Never trust the Implementer's red or green: its host re-runs the gate and tests and is the
+  single committer of Codex's work; you re-run them once more before review as a deliberate
+  check and never commit Implementer output yourself. A sandbox-only failure is an artifact
+  only when the host re-run is green; report every discrepancy.
 - codex-rescue briefs never name an output path; Codex returns its review as final-message
   text.
 - **Generative loop in ONE context (Codex's); discriminative checks in fresh Claude

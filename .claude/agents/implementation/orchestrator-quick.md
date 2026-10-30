@@ -88,7 +88,8 @@ Agent tool (subagent_type: codex:codex-rescue):
            at tests/fixtures or a scratch dir under $TMPDIR, or use the fake omp via
            GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch the model of a live
            omp session.
-           Do NOT edit. --wait. Run in the foreground: wait for the Codex task to finish
+           Do NOT edit or write any file: return the full review as your final message
+           text. --wait. Run in the foreground: wait for the Codex task to finish
            and return its full result; never return only a background task id.
            Diff:\n{git diff of the change}"
 ```

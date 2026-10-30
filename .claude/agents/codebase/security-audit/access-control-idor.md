@@ -43,7 +43,7 @@ error-disclosure gaps are listed.
 Claude pass (this file) + a Codex pass (`codex:codex-rescue` with this brief, or
 `codex review` scoped to the auth/controller files) — never `codex exec`. The codex-rescue
 brief ends with
-"--wait. Run in the foreground: wait for the Codex task to finish and return its full result;
+"Do NOT write any file: return the full result as your final message text. --wait. Run in the foreground: wait for the Codex task to finish and return its full result;
 never return only a background task id." Union the
 candidate findings; the synthesizer demands evidence and dedupes. Coverage over selectivity:
 report every gap with a confidence tag + the call chain you traced. Report only — do not fix.

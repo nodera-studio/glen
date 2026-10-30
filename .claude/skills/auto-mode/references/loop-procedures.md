@@ -264,11 +264,16 @@ squash-merge (step 9), remove its worktree, and any fix worktree cut for it, as 
 Every Codex run in a worktree leaves a codex-companion broker (`app-server-broker.mjs serve
 --cwd <worktree>`) and its app-server running after the run ends and after the worktree is
 deleted; 7 such orphans were once killed by hand. For each wave, fix or harness worktree you
-remove: run `implementation/coder-codex.md` → "Removing a worktree" with `WT` = its absolute
-path (the guarded cancel recipe with step 2 unconditional: refuses an empty `WT` or the main
-checkout, matches the node broker only, skips `$$`/`$PPID`), then `git worktree remove "$WT"`,
-then that section's orphan sweep (brokers whose `--cwd` no longer exists, only under this
-repo's `.claude/worktrees/`).
+remove, follow `implementation/orchestrator.md` → Role 1 → "Removing a worktree" with `WT` =
+its absolute path:
+
+1. The guarded cancel recipe (`implementation/coder-codex.md` → "Cancelling a run", steps
+   0–3) with step 2 unconditional. It refuses an empty `WT` or the main checkout, matches the
+   node broker only, and skips `$$`/`$PPID`.
+2. `git worktree remove "$WT"` only after step 3's verify is clean. If the worktree is already
+   gone, step 0 refuses; go straight to the sweep.
+3. The self-contained orphan sweep from that section: it stops brokers whose `--cwd` no longer
+   exists, only under this repo's `.claude/worktrees/`.
 
 ## Shipping tags (`shipped:main` / `released:v0.x.y`)
 

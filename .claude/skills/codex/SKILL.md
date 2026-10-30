@@ -126,8 +126,8 @@ processes keep running and keep editing the worktree. Whenever you stop a Codex-
 
 The broker also survives a run that ended normally and the removal of its worktree. Before
 removing a worktree any Codex run used, stop its broker and then sweep orphans (brokers whose
-`--cwd` no longer exists, only under this repo's `.claude/worktrees/`): `coder-codex.md` →
-"Removing a worktree".
+`--cwd` no longer exists, only under this repo's `.claude/worktrees/`):
+`implementation/orchestrator.md` → Role 1 → "Removing a worktree".
 
 Resolve `COMPANION` as in `coder-codex.md` Step 2:
 

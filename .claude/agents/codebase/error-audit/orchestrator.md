@@ -90,7 +90,7 @@ read every file under src/, not a sample. Report findings only -- no fixes.
 
 Dispatch through the `codex:codex-rescue` agent, read-only (say so in the prompt), in the
 foreground: end the prompt with
-"--wait. Run in the foreground: wait for the Codex task to finish and return its full result;
+"Do NOT write any file: return the full result as your final message text. --wait. Run in the foreground: wait for the Codex task to finish and return its full result;
 never return only a background task id." Never
 use `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook blocks both.
 
