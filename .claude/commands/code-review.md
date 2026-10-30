@@ -29,11 +29,33 @@ Steps:
      "Independent full-category code review (security, architecture, data flow,
      performance, accessibility, error handling, test coverage) of these
      changes: {diff scope + changed file list}. Conventions are in CLAUDE.md and
-     `.claude/rules/*`. Report severity + category + file:line + issue + impact
+     `.claude/rules/*`. If the diff touches rendered output (`site/`, a TUI,
+     terminal rendering), build and run it and look at the output before calling
+     it correct: screenshot the built page (`npx playwright screenshot` against
+     `npx astro preview --host 127.0.0.1 --port <a random free port of your own>`
+     run in the background in `site/` and stopped afterwards, across the full
+     length of any animation), or run the CLI under a pty (`script -q /dev/null sh
+     -c 'stty cols 60; cargo run -- <args>'`); a code trace alone is not enough,
+     and if you cannot run it say the UI is unverified. Against the real ~/.omp
+     run only read verbs (list, show, tail); for anything else point
+     PI_CODING_AGENT_DIR at tests/fixtures or a scratch dir under $TMPDIR, or use
+     the fake omp via GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch
+     the model of a live omp session. Report severity + category + file:line + issue + impact
      - fix + confidence. Read-only — report only, do not fix. --effort high".
    - If `codex:codex-rescue` is unavailable, fall back per
      `.claude/skills/codex/SKILL.md`; if Codex is unreachable, run the Claude
      pass alone and note the degraded (single-engine) gate.
+   - If the Codex pass fails on capacity or rate ("Selected model is at
+     capacity", 429, rate limit), retry it once after a short wait (about 60 s).
+     If the retry fails too, record Codex as unavailable and merge the Claude pass
+     alone as a single-engine verdict, saying so in the report. Never drop the
+     engine silently.
+   - If you save either pass to a file, name it `claude-review.md` /
+     `codex-review.md`, never `claude.md`: on macOS's case-insensitive filesystem
+     Claude Code loads any `claude.md` as a nested `CLAUDE.md`, so the review
+     would be injected as project instructions. This holds for every way of
+     creating the file, including shell redirects and `mv` (the guard hook covers
+     the Write tool only).
 
 3. Merge by 2-vote consensus and present ONE report:
    - Both engines raise it → **HIGH — must fix**.

@@ -18,7 +18,8 @@ approval.
 `/orchestrate` mode logs a gap (via `.claude/scripts/orchestrator/record-gap.mjs`) every
 time it dispatches a scoped one-off agent instead of an existing harness agent. Each record
 has: `task_summary`, `closest_existing_agent`, `why_no_fit`, `adhoc_agent_base`,
-`adhoc_prompt_gist`, `tags`, `status` (`open` | `promoted`). A single gap is noise — the same
+`adhoc_prompt_gist`, `tags`, `status` (`open` | `promoted` | `resolved`, the last for a gap a
+harness batch fixed without a new agent, with `resolved_ref`). A single gap is noise — the same
 *kind* of gap recurring is signal that a permanent agent would pay for itself.
 </context>
 
