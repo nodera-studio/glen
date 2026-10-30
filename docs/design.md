@@ -131,6 +131,13 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 - **Cleanup:** shutdown emits `error shutdown`, closes the server and unlinks its socket and pid-owned registry synchronously within omp's 2s budget. A synchronous process exit backstop repeats the unlinks. Raw callbacks are guarded, socket/server errors have listeners, timers use the managed ctx API (socket idle timeout is the Node socket API). No terminal output; TUI notices use `ctx.ui.notify`.
 - `GLEN_EXT_TRACE=<absolute file>` appends guarded NDJSON event/flags/idle/queue/request state snapshots. Step 14 was **run on the host — see evidence** in `.claude/evidence/v010-wave-3-live/README.md`, `05-trace.ndjson` and `05-transcript.txt`. Step 5 failed attribution under the original idle-only rule; the O6 amendment above supersedes it. Re-run Step 5 on the host after this fix; fake-host replay is regression evidence, not live acceptance.
 
+**Watch (W5)**
+- Four long-lived readers own their I/O and caches and send messages to the UI; the reducer and view do no I/O. Sessions refresh every 2s, or immediately on refresh/scope changes. Follow polls every 250ms. Jobs refresh active statuses every 250ms and list the store every 1s. Inbox reads new records every 500ms and re-reads persisted cursors every 1s.
+- **Probe on change.** A disk row with a previously free lease skips the next probe while its device, inode, size and mtime are unchanged. Changed files, held leases and unknown leases are probed again; matching extension-backed rows are never probed. Head and refined-tail caches avoid rescanning unchanged files.
+- **Shared cores.** Watch reuses `tail -f`'s `Follower` and `send`'s `submit` path; the extraction preserves CLI output byte-for-byte and retains the same routing/refusal behavior. The transcript updates per persisted entry, not per token; partial lines wait for their newline.
+- **Peek-only inbox.** Watch never marks replies read or writes `inbox/.read`; persisted cursors only inform unread counts.
+- **Controls gate.** W3b has not landed in this base: `controls::AVAILABLE = false`, and the controls adapter is a stub. Unavailable controls show “session controls are not in this build”.
+
 ## §A4 Routing (`glen send`)
 1. Resolve the target including endpoint-only sessions, follow continuations, read/validate text. Target resolution for send does **not** probe the lease. `@new` always uses RPC.
 2. Before consulting either lock, inspect `run/live/<lock_key(id)>.json`. A 2s matching hello with protocol 1 and send in ops selects live; no omp binary or owner-lease probe is needed. If the glen session lock is also held, refuse exit 6 with `glen jobs --active --session <handle>` guidance. Extension version mismatch warns with both versions and still routes live.
@@ -226,7 +233,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | `glen wait <job> [--timeout DUR]` | Keep waiting for a job (default 90s) | W2 | W2 |
 | `glen jobs [--session S] [--active] [-n N]` | List glen's jobs | W2 | W2 |
 | `glen inbox [--session S] [--peek] [--all] [-f]` | Messages omp sent back with `glen_reply` | W3 | W3 |
-| `glen watch [<session>]` | Full-screen live view (ratatui) | W5 | hidden |
+| `glen watch [<session>] [--all] [--cwd DIR]` | Full-screen sessions, transcript, replies and prompt; Tab changes focus, arrows navigate, Enter sends from the prompt, Ctrl-T cycles delivery, G follows, q quits from a pane | W5 | visible |
 | `glen install-extension [--dry-run] [--force] [--uninstall]` | Install the bundled omp extension for the effective agent dir/profile | W3 | W3 |
 | `glen install-skill [--claude] [--codex] [--project] [--dry-run] [--force] [--uninstall]` | Write SKILL.md for Claude Code and/or Codex; defaults to both, --project means cwd | W4 | visible |
 | `glen doctor` | omp binary/version, paths, glen home, extension and endpoints, .env, skills, sandbox | W0 (extended W3/W4) | visible |
@@ -299,9 +306,10 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   3. `CLICOLOR_FORCE` with any non-empty literal value other than `"0"` (including whitespace) → on
   4. `CLICOLOR=0` → off
   5. TTY and (`TERM` set and not `dumb`, or `CLICOLOR` set and not `0`, or `CI` set)
-  - Every write goes through `anstream::AutoStream`.
+  - Line-oriented command output goes through `anstream::AutoStream`.
 - **Depth:** `COLORTERM` truecolor/24bit → 24-bit; `TERM` containing `256color` → 256; otherwise 16.
 - **Theme:** `GLEN_THEME=dark|light`, then the last semicolon-separated integer in `COLORFGBG` (0–6 or 8 → dark; 7 or 9–15 → light), then dark.
+- **Full-screen mode.** `watch` requires interactive stdin and stdout, refuses JSON mode and `TERM=dumb`, and returns `usage` (exit 2) before touching the terminal when the gate fails. Ratatui cells use foreground colours only, with no background fills. The same colour precedence applies: when colour is disabled (including by `NO_COLOR`), modifiers such as bold and dim are dropped too. `GLEN_THEME=light|dark` selects the full-screen palette.
 - **Palette.** Foreground only; body text keeps the terminal's default colour. Sourced from the Nodex redesign content tone (research `93cec9de` rev 2). The values live in `src/render/palette.json`. `palette_contract` (tests only) checks them against `style()`, and the site reads the dark values at build. This table mirrors that file:
 
 | Token | Light hex | Dark hex | xterm L/D | ANSI-16 |
@@ -350,7 +358,10 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | 8 | `not_implemented` | subcommand declared but not in this build |
 | 10 | (ok) `running` | wait bound elapsed; job continues; use `glen wait <job>` |
 | 11 | (ok) `forked` | omp moved the session to a continuation; use the new handle |
-| 130 | — | interrupted (SIGINT); send/wait print a running document with `interrupted:true`; a detached job keeps running |
+| 101 | — | watch panic; terminal teardown runs before the panic report |
+| 129 | — | watch received SIGHUP |
+| 130 | — | interrupted (SIGINT), including watch; send/wait print a running document with `interrupted:true`; a detached job keeps running |
+| 143 | — | watch received SIGTERM |
 
 ## §A12 omp path resolution (port of `packages/utils/src/dirs.ts` @ v18.14.0)
 1. **home** = `$HOME` if non-empty, else the passwd entry. If neither exists → `invalid_env`.
@@ -407,6 +418,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - W4 acceptance harness: `tests/acceptance/` (not CI), evidence `.claude/evidence/w4-acceptance/<UTC>/`. The recording wrapper guards every mutating target against its manifest and records argv, exit, duration and stdout. Person mode uses the real binary on a pty. Step 11 is deferred until W3; c2 requires owner consent and byte-identical config restoration.
 - Final O1: acceptance uses a fresh cwd under $TMPDIR with normal omp credentials, never copies credentials. Only new session files in its own scratch bucket(s) may differ in the owner sessions snapshot (names/mtimes/sizes); evidence lists those buckets. Missing credentials/model access blocks setup. Extension installation alone uses a scratch agent dir; TUIs explicitly load that copy. GLEN_HOME is under $TMPDIR for sandbox writes. Evidence is gitleaks-scanned; no secrets or env values are recorded.
 - Fixtures live under `tests/fixtures/` (see its README).
+- W5 uses ratatui's `TestBackend` plus insta for deterministic size/theme/depth and state snapshots. Create them with `INSTA_UPDATE=always cargo test --lib tui::view::snapshots`, review every snapshot, commit it, then rerun without `INSTA_UPDATE` to check the pinned result.
+- W5 real-binary tests in `tests/watch.rs` use rustix pty/termios and the `fake_omp`/`fake_ext` peers. Restoration checks require raw mode observed while watch is alive and cooked mode after exit on the same slave fd. On macOS, controlling-tty escape-teardown smokes are paired with non-controlling pty termios checks because session-leader exit revokes the controlling slave; Linux checks both on the controlling tty.
 - `GLEN_OMP_BIN` points to the `fake_omp` cargo example (`tests/support/fake_omp.rs`). It supports version, RPC and `hold-lease` modes. `cargo test` builds examples; `tests/common::fake_omp_bin` rebuilds it once per integration-test process so filtered runs use the current source. It is not installed by cargo install.
 - `FAKE_OMP_SCENARIO`: ok, local, progress, bad_reply, unsettled, never_settles, error, aborted, crash, hang, wedge, fork, fork_silent, moved, reject_tools, reject_filter, no_ready, delayed_state, fork_reply, local_result_unsettled, unsettled_exit, local_exit, stale_state. Timing/shape knobs: `FAKE_OMP_DELAY_MS`, `FAKE_OMP_READY_DELAY_MS`, `FAKE_OMP_SETTLE_DELAY_MS`, `FAKE_OMP_REPLY_BYTES`, `FAKE_OMP_OWNERS_DIR`, `FAKE_OMP_V2=1|partial`. `FAKE_OMP_LOG` records start, inbound/outbound frames and exits as NDJSON. `FAKE_OMP_STARTUP_RECOVERY=1` makes the fake claim its lease and append a recovery record to the copied fixture before ready. `FAKE_OMP_STATE_DELAY_MS` delays running state replies without blocking abort. `FAKE_OMP_RUN_RELEASE` holds prompt work until a test-owned file exists. `FAKE_OMP_READY_RELEASE` holds ready until a test-owned file exists (20 s bound). `FAKE_OMP_PROMPT_SUBMIT_DELAY_MS` delays the debug worker’s submission thread to exercise the cancellation gate; `FAKE_OMP_ACK_FORWARD_DELAY_MS` delays acknowledgement forwarding. Release workers ignore both. `FAKE_OMP_LEASE_PROBE_GATE` gates the debug send after the glen-lock check until a test-owned file exists (5 s bound, `<path>.ready` signals entry). `FAKE_OMP_NEVER_SETTLE=1` keeps fork scenarios unsettled; `FAKE_OMP_RESULT_RELEASE` holds the fake before its result. `FAKE_OMP_OLD_STATE_DELAY_MS` controls the stale_state scenario’s old identity response.
 - Process tests wait for terminal status, worker exit and the omp group to disappear before dropping scratch directories. The startup-abort regression delays ready by 5 s and checks terminal status/ack within 1.5 s with no prompt.
@@ -424,7 +437,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **W2** RPC driver: send/wait/jobs for sessions with no live owner, `@new`, the per-job worker, the per-session lock, the `glen_reply` host tool, fork detection, the fake RPC peer, the `omp-rpc` git dependency.
 - **W3** live route: the bundled extension, install-extension, endpoint-first routing, inbox, talk-back from the TUI.
 - **W4** agent surface: SKILL.md (two variants), install-skill, extended doctor, completions polish, acceptance runs with Claude Code and Codex.
-- **W5** `glen watch` TUI.
+- **W5** visible `glen watch` TUI: sessions, persisted-entry transcripts, a send prompt, job activity and peek-only replies; shared follower/submit cores, worker threads, TestBackend snapshots and real-binary pty tests. Session controls remain gated on W3b.
 - **W6** site: `site/`, static Astro in the Nodex-redesign look; a CSS-compiled terminal demo; morphin islands; palette from `src/render/palette.json`; CI job `site`.
 - **W7** deploy + release workflow: §A18.
 - **W8** audits + release v0.1.0.
@@ -462,7 +475,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | `x86_64-unknown-linux-musl` | `ubuntu-24.04` | runs; `file` reports a static binary |
 | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | runs; `file` reports a static binary |
 
-  - Linux binaries are static musl, so they run on any glibc (Debian 12, Ubuntu 22.04, RHEL 9). This holds while the lockfile has no C dependency; reassess musl before adding one.
+  - Linux binaries are static musl, so they run on any glibc (Debian 12, Ubuntu 22.04, RHEL 9). This holds while the built graph has no C dependency; reassess musl before adding one. Verify with `cargo tree -e build -i cc --target all` producing no dependency tree: ratatui's unbuilt optional backends can put `cc` in `Cargo.lock` without building it for any target.
 - **Assets** (D3). Versionless names, so "latest" needs no GitHub API: `glen-<target>.tar.gz`, `glen-<target>.tar.gz.sha256` (`<64 hex>  glen-<target>.tar.gz`) and `SHA256SUMS`. Each archive holds exactly `glen-<target>/glen` (0755) and `glen-<target>/LICENSE`. `scripts/package-release.sh <target> <binary> <out-dir>` builds both files. Checksums show integrity, not authenticity; binaries are not signed or notarised.
 - **`install.sh`**, POSIX `sh`, served only from `https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh` (D4):
   - flags `--version X.Y.Z` (an optional leading `v`), `--prefix DIR` (installs `DIR/bin/glen`; default `$HOME/.local/bin`), `--dry-run` (prints target, URLs and install path; no download, no write), `-h`/`--help`;

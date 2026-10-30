@@ -2,6 +2,7 @@
 
 Synthetic JSONL v3 sessions for omp 18.14.0. Never copy real session content; placeholder values only.
 Tests point PI_CODING_AGENT_DIR at `omp/agent`, with a temp HOME. No test reads live ~/.omp.
+Watch's real-binary pty tests (`tests/watch.rs`) use the `fake_omp` and `fake_ext` cargo examples.
 Buckets represent `$HOME/work/alpha` and `$HOME/work/beta`; headers use `/home/fixture/work/{alpha,beta}`.
 
 | Key | Path under sessions/ | Id | Handle | Exercises |

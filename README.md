@@ -81,6 +81,31 @@ streams one JSON object per line), and the exit code says what to do next. 0 mea
 (run `glen wait`), and 11 means omp moved the session to a new handle. The envelope and every exit
 code are in [docs/design.md](docs/design.md#a10-output-contract).
 
+## Watch sessions (`glen watch`)
+
+Watch shows the session list, the selected transcript, job activity and replies, with a prompt
+for sending messages. The transcript updates per persisted entry, not per token.
+
+```sh
+glen watch
+glen watch e27c0de
+GLEN_THEME=light glen watch e27c0de
+```
+
+Use `--all` for every project or `--cwd DIR` for one project (the flags conflict).
+
+| Key | Action |
+|---|---|
+| Tab / Shift-Tab | Next / previous focus |
+| Up / Down | Select a session or scroll the transcript |
+| Enter | Focus the prompt from the list; send from the prompt |
+| Ctrl-T | Cycle delivery: auto → steer → follow-up |
+| G | Resume following the transcript's newest entries |
+| q | Quit from the sessions or transcript pane |
+
+Watch is for humans only and needs interactive stdin and stdout. Agents use `glen tail -f <session>`
+and `glen inbox -f`. Watch only peeks at replies; it never marks them read.
+
 <!-- W3:start -->
 ## Live sessions (`glen install-extension`)
 
