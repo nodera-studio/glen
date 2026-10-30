@@ -51,6 +51,38 @@ fn read_row(mut summary: Summary, owners: &Path) -> Option<Row> {
         state,
     })
 }
+fn read_rows(
+    catalog: &Catalog,
+    candidates: Vec<&Summary>,
+    args: &LsArgs,
+    owners: &Path,
+) -> (Vec<Row>, usize, usize) {
+    let mut total_all = catalog.sessions.len();
+    let mut total = candidates.len();
+    let mut rows = vec![];
+    for s in candidates {
+        if !args.live && args.limit > 0 && rows.len() >= args.limit {
+            break;
+        }
+        let Some(mut row) = read_row(s.clone(), owners) else {
+            total = total.saturating_sub(1);
+            total_all = total_all.saturating_sub(1);
+            continue;
+        };
+        if args.live && !matches!(row.state, State::Live | State::Busy) {
+            continue;
+        }
+        row.handle = catalog.handle(&s.id);
+        rows.push(row);
+    }
+    if args.live {
+        total = rows.len();
+        if args.limit > 0 {
+            rows.truncate(args.limit)
+        }
+    }
+    (rows, total, total_all)
+}
 pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     let spinner = Spinner::start(
@@ -58,7 +90,6 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         "reading sessions",
     );
     let catalog = Catalog::scan(&paths.sessions_dir)?;
-    let total_all = catalog.sessions.len();
     let cwd = paths::absolute(
         env,
         &args.cwd.as_deref().unwrap_or(env.cwd()).to_string_lossy(),
@@ -75,28 +106,7 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
                     .is_none_or(|d| now.duration_since(s.file.mtime).unwrap_or_default() <= d)
         })
         .collect::<Vec<_>>();
-    let mut total = candidates.len();
-    let mut rows = vec![];
-    for s in candidates {
-        if !args.live && args.limit > 0 && rows.len() >= args.limit {
-            break;
-        }
-        let Some(mut row) = read_row(s.clone(), &paths.session_owners_dir) else {
-            total = total.saturating_sub(1);
-            continue;
-        };
-        if args.live && !matches!(row.state, State::Live | State::Busy) {
-            continue;
-        }
-        row.handle = catalog.handle(&s.id);
-        rows.push(row);
-    }
-    if args.live {
-        total = rows.len();
-        if args.limit > 0 {
-            rows.truncate(args.limit)
-        }
-    }
+    let (rows, total, total_all) = read_rows(&catalog, candidates, args, &paths.session_owners_dir);
     spinner.finish();
     if ctx.mode == Mode::Json {
         return Ok(Outcome::new(
@@ -116,7 +126,14 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
                 "no omp sessions for {}{}",
                 render::tilde(&cwd, env.home()),
                 if total_all > 0 {
-                    format!("\nglen ls --all lists {total_all} sessions in other projects")
+                    format!(
+                        "\nglen ls --all lists {total_all} {} in other projects",
+                        if total_all == 1 {
+                            "session"
+                        } else {
+                            "sessions"
+                        }
+                    )
                 } else {
                     String::new()
                 }
@@ -334,6 +351,35 @@ mod regression_tests {
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary.file.path, b);
+    }
+
+    #[test]
+    fn vanished_tail_rows_are_excluded_from_both_totals() {
+        let tree = fixtures::tree();
+        let catalog = Catalog::scan(tree.path()).unwrap();
+        fs::remove_file(fixtures::path(&tree, 'A')).unwrap();
+        let candidates = catalog.sessions.iter().collect::<Vec<_>>();
+        let args = LsArgs {
+            all: true,
+            cwd: None,
+            limit: 0,
+            live: false,
+            since: None,
+        };
+        let (rows, total, total_all) = read_rows(&catalog, candidates, &args, tree.path());
+        assert_eq!(rows.len(), 6);
+        assert_eq!(total, 6);
+        assert_eq!(total_all, 6);
+        let args = LsArgs { live: true, ..args };
+        let (rows, total, total_all) = read_rows(
+            &catalog,
+            catalog.sessions.iter().collect(),
+            &args,
+            tree.path(),
+        );
+        assert!(rows.is_empty());
+        assert_eq!(total, 0);
+        assert_eq!(total_all, 6);
     }
 
     #[test]

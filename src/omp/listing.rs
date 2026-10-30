@@ -1,6 +1,6 @@
 use super::{
     handle,
-    session::{Session, TurnStatus, display_name, text_of},
+    session::{LoadError, Session, TurnStatus, display_name, text_only},
 };
 use crate::error::{ErrorCode, GlenError};
 use std::{
@@ -89,23 +89,29 @@ pub struct Summary {
 }
 pub fn scan_head(file: SessionFile) -> Option<Summary> {
     let mut f = File::open(&file.path).ok()?;
+    read_head(file, &mut f).ok()
+}
+/// Use the same bounded title window for discovery and transcript headers.
+pub fn read_head(file: SessionFile, mut reader: impl Read) -> Result<Summary, LoadError> {
     let mut b = vec![];
-    Read::by_ref(&mut f).take(4096).read_to_end(&mut b).ok()?;
+    Read::by_ref(&mut reader).take(4096).read_to_end(&mut b)?;
     let parse = |b: &[u8]| {
-        let end = b.iter().rposition(|v| *v == b'\n')?;
-        Session::parse(&file.path, &b[..=end]).ok()
+        let end = b
+            .iter()
+            .rposition(|v| *v == b'\n')
+            .ok_or(LoadError::NotSession)?;
+        Session::parse(&file.path, &b[..=end])
     };
     let s = match parse(&b) {
-        Some(s) => s,
-        None => {
-            Read::by_ref(&mut f)
+        Ok(s) => s,
+        Err(_) => {
+            Read::by_ref(&mut reader)
                 .take(65536 - 4096)
-                .read_to_end(&mut b)
-                .ok()?;
+                .read_to_end(&mut b)?;
             parse(&b)?
         }
     };
-    Some(summarize(file, &s))
+    Ok(summarize(file, &s))
 }
 pub fn summarize(file: SessionFile, s: &Session) -> Summary {
     let (title, first_message) = titles(s);
@@ -125,7 +131,7 @@ pub fn summarize(file: SessionFile, s: &Session) -> Summary {
         tail_redirects_leaf: false,
     }
 }
-/// Shared title resolution for the bounded listing head and full snapshots.
+/// Resolve titles from the parsed listing head.
 pub fn titles(s: &Session) -> (Option<String>, Option<String>) {
     let title = s.title().or_else(|| {
         s.entries
@@ -139,7 +145,7 @@ pub fn titles(s: &Session) -> (Option<String>, Option<String>) {
         .entries
         .iter()
         .find(|e| e.kind == "message" && e.raw["message"]["role"] == "user")
-        .and_then(|e| display_name(&text_of(&e.raw["message"]["content"], " ")))
+        .and_then(|e| display_name(&text_only(&e.raw["message"]["content"], " ")))
         .map(|s| s.chars().take(200).collect());
     (title, first_message)
 }
@@ -250,7 +256,12 @@ impl Catalog {
         Ok(catalog)
     }
     pub(crate) fn assign_handles(&mut self, extra: Option<&str>) {
-        self.handles = handle::assign(self.sessions.iter().map(|s| s.id.as_str()).chain(extra));
+        self.handles = handle::assign_sessions(
+            self.sessions
+                .iter()
+                .map(|s| (s.id.as_str(), Some(s.file.path.as_path())))
+                .chain(extra.map(|id| (id, None))),
+        );
     }
     pub(crate) fn read(dir: &Path) -> Result<Self, GlenError> {
         let files = discover(dir).map_err(|e| {
@@ -375,6 +386,8 @@ mod regression_tests {
         let path = tree.path().join("title.jsonl");
         for (slot, want) in [
             (json!("  "), "summary"),
+            (json!("\u{feff}"), "summary"),
+            (json!("\u{0085}"), "\u{0085}"),
             (json!(""), "summary"),
             (Value::Null, "header"),
             (json!(42), "header"),

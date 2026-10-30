@@ -78,10 +78,18 @@ fn open_mode(cli: &Cli, env: &Env, arg: &str, complete_only: bool) -> Result<Ope
     };
     let path = handle::resolve(arg, &catalog, env)?;
     let followed = continuation::follow(&path)?;
-    let (session, metadata) = load_snapshot(&followed.path, complete_only)?;
+    let mut fd = File::open(&followed.path).map_err(|e| GlenError::read(&followed.path, e))?;
+    let metadata = fd
+        .metadata()
+        .map_err(|e| GlenError::read(&followed.path, e))?;
+    let session = snapshot(&followed.path, &mut fd, &metadata, complete_only)
+        .map_err(|e| load_error(&followed.path, e))?;
     let file = SessionFile::from_metadata(&followed.path, &metadata)
         .map_err(|e| GlenError::read(&followed.path, e))?;
-    let mut summary = listing::summarize(file, &session);
+    fd.seek(SeekFrom::Start(0))
+        .map_err(|e| GlenError::read(&followed.path, e))?;
+    let mut summary =
+        listing::read_head(file, &mut fd).map_err(|e| load_error(&followed.path, e))?;
     let branch = session.active_branch();
     summary.last_turn = TurnStatus::of_branch(&branch);
     summary.in_flight = in_flight_of_branch(&branch);
