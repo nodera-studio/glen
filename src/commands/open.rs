@@ -24,7 +24,8 @@ pub(crate) struct Opened {
     pub state: State,
     pub continued_from: Vec<String>,
     pub catalog: Catalog,
-    pub metadata: Metadata,
+    pub metadata: Option<Metadata>,
+    pub not_yet_persisted: bool,
 }
 pub(crate) fn load_error(path: &Path, error: LoadError) -> GlenError {
     match error {
@@ -62,21 +63,64 @@ pub(crate) fn load_snapshot(
     Ok((session, metadata))
 }
 pub(crate) fn open(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, false)
+    open_mode(cli, env, arg, false, true)
 }
 pub(crate) fn open_follow(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, true)
+    open_mode(cli, env, arg, true, true)
 }
-fn open_mode(cli: &Cli, env: &Env, arg: &str, complete_only: bool) -> Result<Opened, GlenError> {
+pub(crate) fn open_for_send(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
+    open_mode(cli, env, arg, false, false)
+}
+fn open_mode(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    complete_only: bool,
+    probe: bool,
+) -> Result<Opened, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     // Paths need no assigned handles during resolution. Include an external
     // session in the one assignment after loading it.
-    let mut catalog = if arg.contains('/') || arg.ends_with(".jsonl") {
-        Catalog::read(&paths.sessions_dir)?
-    } else {
-        Catalog::scan(&paths.sessions_dir)?
-    };
+    let explicit_path = arg.contains('/') || arg.ends_with(".jsonl");
+    let mut catalog = Catalog::read(&paths.sessions_dir)?;
+    let home = crate::glen_home::resolve(env)?;
+    let registries = crate::live::registry::index(&home);
+    crate::live::registry::union(&mut catalog, &home, env, &registries);
+    if !explicit_path {
+        catalog.assign_handles(None);
+    }
     let path = handle::resolve(arg, &catalog, env)?;
+    if !path.exists()
+        && let Some(summary) = catalog
+            .sessions
+            .iter()
+            .find(|s| s.file.path == path)
+            .cloned()
+    {
+        let header = serde_json::json!({"type":"session","version":3,"id":summary.id,"cwd":summary.cwd,"timestamp":summary.created.map(|t|t.to_string()),"title":summary.title});
+        let session = Session::parse(&path, format!("{header}\n").as_bytes())
+            .map_err(|e| load_error(&path, e))?;
+        let lease = if probe {
+            lease::probe(&paths.session_owners_dir, &summary.id)
+        } else {
+            Lease::Unknown("not probed".into())
+        };
+        if explicit_path {
+            catalog.assign_handles(Some(&summary.id));
+        }
+        let handle = catalog.handle(&summary.id);
+        return Ok(Opened {
+            session,
+            summary,
+            handle,
+            lease,
+            state: State::Unknown,
+            continued_from: vec![],
+            catalog,
+            metadata: None,
+            not_yet_persisted: true,
+        });
+    }
     let followed = continuation::follow(&path)?;
     let mut fd = File::open(&followed.path).map_err(|e| GlenError::read(&followed.path, e))?;
     let metadata = fd
@@ -105,7 +149,11 @@ fn open_mode(cli: &Cli, env: &Env, arg: &str, complete_only: bool) -> Result<Ope
                 .filter(|e| e.kind == "model_change")
                 .find_map(|e| e.raw["model"].as_str().map(str::to_owned))
         });
-    let lease = lease::probe(&paths.session_owners_dir, &session.header.id);
+    let lease = if probe {
+        lease::probe(&paths.session_owners_dir, &session.header.id)
+    } else {
+        Lease::Unknown("not probed".into())
+    };
     let state = lease::infer_state(&lease, summary.in_flight);
     if !catalog.handles.contains_key(&session.header.id) {
         catalog.assign_handles(Some(&session.header.id));
@@ -119,7 +167,8 @@ fn open_mode(cli: &Cli, env: &Env, arg: &str, complete_only: bool) -> Result<Ope
         state,
         continued_from: followed.from,
         catalog,
-        metadata,
+        metadata: Some(metadata),
+        not_yet_persisted: false,
     })
 }
 pub(crate) fn header<'a>(o: &'a Opened) -> transcript::Header<'a> {

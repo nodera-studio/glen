@@ -19,7 +19,7 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | Token | glen |
 | --- | --- |
 | `{{PROJECT_NAME}}` | glen |
-| `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. A small TypeScript omp extension may come later. |
+| `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. The TypeScript omp extension runs under omp’s Bun runtime and is tested under Node. |
 | `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; omp-rpc (git tag v18.14.0), uuid (v7 job ids), libc (Unix, process start time); rustix (lease probe and process feature, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix). Static Astro 7 with React 19 islands for `site/`. |
 | `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked`; npm for `site/` (`package-lock.json` committed, CI `npm ci`) |
 | `{{MONOREPO}}` | no Cargo workspace; `site/` is a separate npm project |
@@ -28,7 +28,7 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | `{{SHARED_DIR}}` | none |
 | `{{DEV_CMD}}` | `cargo run -- <args>`; `npm --prefix site run dev` |
 | `{{BUILD_CMD}}` | `cargo build` (`cargo build --release` for an optimised binary); `npm --prefix site run build` |
-| `{{TEST_CMD}}` | `cargo test` (CI form: `cargo test --locked`); `npm --prefix site run test:e2e` / `npm --prefix site run test:unit` |
+| `{{TEST_CMD}}` | `cargo test` (CI form: `cargo test --locked`; tests/extension_ts.rs needs Node ≥22.6); `npm --prefix site run test:e2e` / `npm --prefix site run test:unit` |
 | `{{TYPECHECK_CMD}}` | `cargo check --all-targets`; `npm --prefix site run check` |
 | `{{LINT_CMD}}` | `cargo clippy --all-targets -- -D warnings` |
 | `{{FORMAT_CMD}}` | `cargo fmt --all` writes; `cargo fmt --all -- --check` is the report-only form for CI-style runs |

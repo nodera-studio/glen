@@ -53,6 +53,8 @@ fn ac001_help_lists_exactly_the_visible_commands() {
                 "completions",
                 "doctor",
                 "help",
+                "inbox",
+                "install-extension",
                 "jobs",
                 "ls",
                 "send",
@@ -104,6 +106,8 @@ fn a9_every_command_accepts_help_and_version() {
         "send",
         "wait",
         "jobs",
+        "inbox",
+        "install-extension",
         "doctor",
         "completions",
     ]
@@ -137,12 +141,7 @@ fn hidden_commands_still_have_help_pages() {
 #[test]
 fn ac002_hidden_commands_exit_8_not_implemented() {
     let sb = Sandbox::new();
-    let invocations: [&[&str]; 4] = [
-        &["inbox"],
-        &["watch"],
-        &["install-extension"],
-        &["install-skill"],
-    ];
+    let invocations: [&[&str]; 2] = [&["watch"], &["install-skill"]];
     for args in invocations {
         let out = sb.glen(args).run();
         let err = out.error_envelope("not_implemented");
@@ -158,7 +157,7 @@ fn ac002_hidden_commands_exit_8_not_implemented() {
 #[test]
 fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
     let sb = Sandbox::new();
-    let out = sb.glen(["inbox", "--human"]).run();
+    let out = sb.glen(["watch", "--human"]).run();
     out.assert_exit(8).assert_no_ansi();
     assert!(out.stdout.is_empty(), "stdout must be empty\n{}", out.ctx());
     assert!(out.err().starts_with("error:"), "{}", out.ctx());
@@ -170,10 +169,7 @@ fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
 fn a9_declared_arguments_of_hidden_commands_parse() {
     let sb = Sandbox::new();
     let valid: &[&[&str]] = &[
-        &["inbox", "--session", "abc1234", "--peek", "--all", "-f"],
-        &["inbox", "--follow"],
         &["watch", "abc1234"],
-        &["install-extension", "--dry-run", "--force", "--uninstall"],
         &[
             "install-skill",
             "--claude",
@@ -285,7 +281,16 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "{shell} script lacks the visible commands\n{}",
             out.ctx()
         );
-        for name in ["ls", "show", "tail", "send", "wait", "jobs"] {
+        for name in [
+            "ls",
+            "show",
+            "tail",
+            "send",
+            "wait",
+            "jobs",
+            "inbox",
+            "install-extension",
+        ] {
             assert!(contains_command_word(&script, name), "{shell} lacks {name}");
         }
         assert_no_hidden_commands(&script, shell);
@@ -362,5 +367,16 @@ fn a9_reader_arguments_parse() {
         } else {
             out.ok_data();
         }
+    }
+}
+
+#[test]
+fn a9_live_arguments_parse() {
+    let sb = Sandbox::new();
+    for args in [
+        vec!["inbox", "--session", "abc1234", "--peek", "--all"],
+        vec!["install-extension", "--dry-run", "--force", "--uninstall"],
+    ] {
+        sb.glen(args).run().ok_data();
     }
 }

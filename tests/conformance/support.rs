@@ -20,17 +20,19 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
-/// The four v0.1.0 subcommands still hidden after W2 (AC-201).
-pub const HIDDEN: [&str; 4] = ["inbox", "watch", "install-extension", "install-skill"];
+/// The two commands still hidden after W3 (AC-301).
+pub const HIDDEN: [&str; 2] = ["watch", "install-skill"];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
-pub const DOCTOR_CHECKS: [&str; 6] = [
+pub const DOCTOR_CHECKS: [&str; 8] = [
     "omp_binary",
     "omp_version",
     "profile",
     "agent_dir",
     "sessions_dir",
     "glen_home",
+    "extension",
+    "live_endpoints",
 ];
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);

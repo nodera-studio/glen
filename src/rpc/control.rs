@@ -34,7 +34,15 @@ pub fn poll(job_dir: &Path) -> Vec<Request> {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok());
             let op = match value {
-                Some(v) if v["v"] == 1 && v["op"] == "abort" => Ok(ControlOp::Abort),
+                Some(v)
+                    if v["v"] == 1
+                        && matches!(
+                            crate::ops::decode(v["op"].as_str().unwrap_or(""), v.get("args")),
+                            Ok(crate::ops::Op::Abort)
+                        ) =>
+                {
+                    Ok(ControlOp::Abort)
+                }
                 Some(v) => Err(v["op"].as_str().unwrap_or("malformed").into()),
                 None => Err("malformed".into()),
             };

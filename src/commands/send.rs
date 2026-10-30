@@ -34,7 +34,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     let opened = if args.session == "@new" {
         None
     } else {
-        Some(super::open::open(
+        Some(super::open::open_for_send(
             cli,
             scoped.as_ref().unwrap_or(env),
             &args.session,
@@ -93,50 +93,86 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             "message is larger than 512 KiB",
         ));
     }
-    let omp_bin = bin::find_omp(env).map_err(|m| {
-        GlenError::new(ErrorCode::OmpUnavailable, m).with_hint("install omp or set GLEN_OMP_BIN")
-    })?;
     let home = glen_home::resolve(env)?;
-    if let Some(o) = &opened
-        && !lock::is_held(&home, &o.session.header.id)
-    {
-        #[cfg(debug_assertions)]
-        if let Some(path) = env.get("FAKE_OMP_LEASE_PROBE_GATE") {
-            let ready = format!("{path}.ready");
-            std::fs::write(&ready, b"probing").map_err(|e| {
-                GlenError::new(
-                    ErrorCode::Io,
-                    format!("cannot write probe gate {ready}: {e}"),
-                )
-            })?;
-            let end = Instant::now() + Duration::from_secs(5);
-            while !Path::new(path).exists() {
-                if Instant::now() >= end {
-                    return Err(GlenError::new(
-                        ErrorCode::Io,
-                        format!("timed out waiting for probe gate {path}"),
-                    ));
+    let mut live = None;
+    let mut route_warnings = vec![];
+    if let Some(o) = &opened {
+        match crate::live::route::find(&home, &o.session.header.id, crate::live::HELLO_SEND) {
+            crate::live::route::Endpoint::Live { reg, hello } => {
+                if lock::is_held(&home, &o.session.header.id) {
+                    return Err(GlenError::new(ErrorCode::NoRoute,format!("session {} is open in a live omp session and a glen RPC job is still running on it",o.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",o.handle)));
                 }
-                std::thread::sleep(Duration::from_millis(10));
+                if hello.ext_version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
+                    route_warnings.push(Warning{code:"extension_version_mismatch".into(),message:format!("extension version {} differs from glen {}; run `glen install-extension` and restart omp",hello.ext_version.as_deref().unwrap_or("unknown"),env!("CARGO_PKG_VERSION"))});
+                }
+                live = Some(reg);
+            }
+            crate::live::route::Endpoint::Unhealthy { reason, kind } => {
+                return Err(GlenError::new(
+                    ErrorCode::NoRoute,
+                    format!(
+                        "session {} has a glen live endpoint that cannot take messages ({reason})",
+                        o.handle
+                    ),
+                )
+                .with_hint(crate::live::route::hint(kind)));
+            }
+            _ => (),
+        }
+        if live.is_none() && o.not_yet_persisted {
+            return Err(GlenError::new(
+                ErrorCode::NoRoute,
+                "the live session has not persisted a transcript and its endpoint went away",
+            )
+            .with_hint("restart that omp session and run `glen ls`"));
+        }
+        if live.is_none() && !lock::is_held(&home, &o.session.header.id) {
+            #[cfg(debug_assertions)]
+            if let Some(path) = env.get("FAKE_OMP_LEASE_PROBE_GATE") {
+                let ready = format!("{path}.ready");
+                std::fs::write(&ready, b"probing").map_err(|e| {
+                    GlenError::new(
+                        ErrorCode::Io,
+                        format!("cannot write probe gate {ready}: {e}"),
+                    )
+                })?;
+                let end = Instant::now() + Duration::from_secs(5);
+                while !Path::new(path).exists() {
+                    if Instant::now() >= end {
+                        return Err(GlenError::new(
+                            ErrorCode::Io,
+                            format!("timed out waiting for probe gate {path}"),
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            let lease = lease::probe(&paths.session_owners_dir, &o.session.header.id);
+            if !matches!(lease, Lease::Free) && !lock::is_held(&home, &o.session.header.id) {
+                let message = match lease {
+                    Lease::Unknown(r) => format!(
+                        "cannot tell whether another omp process owns session {} ({r})",
+                        o.handle
+                    ),
+                    _ => format!("session {} is open in another omp process", o.handle),
+                };
+                let hint = if paths.extensions_dir.join("glen/index.ts").is_file() {
+                    "restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)"
+                } else {
+                    "run `glen install-extension`, then restart that omp session"
+                };
+                return Err(GlenError::new(ErrorCode::NoRoute, message).with_hint(hint));
             }
         }
-        let message = match lease::probe(&paths.session_owners_dir, &o.session.header.id) {
-            Lease::Free => None,
-            Lease::Held => Some(format!(
-                "session {} is open in another omp process",
-                o.handle
-            )),
-            Lease::Unknown(r) => Some(format!(
-                "cannot tell whether another omp process owns session {} ({r})",
-                o.handle
-            )),
-        };
-        if let Some(message) = message
-            && !lock::is_held(&home, &o.session.header.id)
-        {
-            return Err(GlenError::new(ErrorCode::NoRoute,message).with_hint("close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)"));
-        }
     }
+    let omp_bin = if live.is_none() {
+        Some(bin::find_omp(env).map_err(|m| {
+            GlenError::new(ErrorCode::OmpUnavailable, m)
+                .with_hint("install omp or set GLEN_OMP_BIN")
+        })?)
+    } else {
+        None
+    };
     let (timeout, warning) = rpc::job_timeout(env);
     let created = Instant::now();
     let now = jiff::Timestamp::now();
@@ -149,18 +185,25 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         id: id.as_str().into(),
         handle: id.handle(),
         created_at: now.to_string(),
-        route: if opened.is_some() {
+        route: if live.is_some() {
+            Route::Live
+        } else if opened.is_some() {
             Route::Rpc
         } else {
             Route::New
         },
         session_id: opened.as_ref().map(|o| o.session.header.id.clone()),
-        session_file: opened.as_ref().map(|o| o.session.path.clone()),
+        session_file: opened
+            .as_ref()
+            .filter(|o| !o.not_yet_persisted)
+            .map(|o| o.session.path.clone()),
         session_handle: opened.as_ref().map(|o| o.handle.clone()),
         deliver_as: args.deliver().into(),
         text,
         cwd,
         omp_bin,
+        live_socket: live.as_ref().map(|r| r.socket.clone()),
+        live_pid: live.as_ref().map(|r| r.pid),
         profile_flag: cli
             .global
             .profile
@@ -174,12 +217,10 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     let store = JobStore::new(home.clone());
     store.create(&job)?;
     store.prune(now);
-    if let Some(w) = warning {
+    route_warnings.extend(warning);
+    if !route_warnings.is_empty() {
         let mut s = store.read_status(&id)?;
-        s.warnings.push(Warning {
-            code: w.code,
-            message: w.message,
-        });
+        s.warnings.extend(route_warnings);
         store.write_status(&id, &s)?;
     }
     let mut child = match rpc::spawn_worker(&home, &id) {
@@ -208,11 +249,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
         ctx.mode == Mode::Human && ctx.stderr_tty,
-        &format!(
-            "sending to {} · {}",
-            job.session_handle.as_deref().unwrap_or("@new"),
-            job.handle
-        ),
+        &super::wait::job_progress(&job, &store.read_status(&id)?),
     );
     let waited = wait::observe(
         &store,
@@ -225,7 +262,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         },
         &flag,
         Some(&mut child),
-        |s| spinner.set_message(super::wait::progress(s)),
+        |s| spinner.set_message(&super::wait::job_progress(&job, s)),
     );
     spinner.finish();
     super::wait::outcome(&store, &job, waited?, ctx)

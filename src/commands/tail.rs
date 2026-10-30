@@ -40,22 +40,29 @@ pub fn run(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     );
     let start = items.len().saturating_sub(args.lines);
     items.drain(..start);
-    if ctx.mode == Mode::Json {
-        Ok(Outcome::new(
+    let mut outcome = if ctx.mode == Mode::Json {
+        Outcome::new(
             json!({"session":session_json(&o.summary,&o.handle,&o.lease,o.state,SystemTime::now()),"continued_from":o.continued_from,"leaf_id":o.session.leaf_id(),"skipped_lines":o.session.skipped_lines,"items":items}),
             "",
-        ))
+        )
     } else {
         let st = style(args, ctx);
-        Ok(Outcome::new(
+        Outcome::new(
             Value::Null,
             format!(
                 "{}\n\n{}",
                 transcript::render_header(&open::header(&o), env, &st, true),
                 transcript::render_items(&items, &st)
             ),
-        ))
+        )
+    };
+    if o.not_yet_persisted {
+        outcome.warnings.push(crate::error::Warning {
+            code: "not_yet_persisted".into(),
+            message: "this live session has not written a transcript yet".into(),
+        });
     }
+    Ok(outcome)
 }
 fn style<'a>(args: &TailArgs, ctx: &'a OutputCtx) -> Style<'a> {
     Style {
@@ -234,7 +241,7 @@ impl Drop for Signals {
     }
 }
 pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCode {
-    let o = match open::open_follow(cli, env, &args.session) {
+    let mut o = match open::open_follow(cli, env, &args.session) {
         Ok(o) => o,
         Err(e) => return output::emit_error(ctx, e),
     };
@@ -257,6 +264,12 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     let init = (|| -> std::io::Result<()> {
         stream.event("session",fields(json!({"session":session_json(&o.summary,&o.handle,&o.lease,o.state,SystemTime::now()),"continued_from":o.continued_from,"skipped_lines":o.session.skipped_lines})))?;
         stream.warnings(&ctx.warnings)?;
+        if o.not_yet_persisted {
+            stream.warnings(&[crate::error::Warning {
+                code: "not_yet_persisted".into(),
+                message: "this live session has not written a transcript yet".into(),
+            }])?;
+        }
         stream.text(&transcript::render_header(
             &open::header(&o),
             env,
@@ -273,6 +286,18 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     })();
     if init.is_err() {
         return ExitCode::from(1);
+    }
+    while o.not_yet_persisted {
+        if stop.load(Ordering::Relaxed) {
+            return stream.end(130);
+        }
+        thread::sleep(POLL);
+        match open::open_for_send(cli, env, &o.session.header.id) {
+            Ok(next) if !next.not_yet_persisted => o = next,
+            Ok(_) => (),
+            Err(e) if e.code == ErrorCode::NotFound => (),
+            Err(e) => return stream.fail(e),
+        }
     }
     let branch = o.session.active_branch();
     let emitted = branch.iter().map(|e| e.id.clone()).collect();
@@ -294,7 +319,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     }
     let mut follower = Follower {
         offset: o.session.consumed,
-        identity: identity(&o.metadata),
+        identity: o.metadata.as_ref().map(identity).unwrap_or((0, 0)),
         last_on_branch: o.session.leaf_id().map(str::to_owned),
         session: o.session,
         summary: o.summary,

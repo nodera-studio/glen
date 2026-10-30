@@ -65,7 +65,8 @@ pub fn streaming_behavior(d: Deliver) -> omp_rpc::StreamingBehavior {
     }
 }
 pub fn omp_command(job: &Job) -> Command {
-    let mut c = Command::new(&job.omp_bin);
+    // Worker validates the optional binary before entering the RPC path.
+    let mut c = Command::new(job.omp_bin.as_deref().unwrap_or(std::path::Path::new("")));
     c.args(["--mode", "rpc", "--no-ui"]);
     if let Some(p) = &job.profile_flag {
         c.args(["--profile", p])
@@ -142,7 +143,7 @@ mod tests {
             j.route = route;
             j.profile_flag = profile.map(str::to_owned);
             let c = omp_command(&j);
-            assert_eq!(c.get_program(), j.omp_bin.as_os_str());
+            assert_eq!(c.get_program(), j.omp_bin.as_ref().unwrap().as_os_str());
             assert_eq!(c.get_current_dir(), Some(j.cwd.as_path()));
             let args: Vec<_> = c
                 .get_args()

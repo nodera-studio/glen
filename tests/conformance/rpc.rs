@@ -67,6 +67,8 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
         "completions",
         "doctor",
         "help",
+        "inbox",
+        "install-extension",
         "jobs",
         "ls",
         "send",

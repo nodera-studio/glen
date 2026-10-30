@@ -13,7 +13,7 @@ use crate::{
     render::{self, Table, palette::Token, spinner::Spinner, text, transcript::state_text},
 };
 use serde_json::{Value, json};
-use std::{path::Path, time::SystemTime};
+use std::{collections::HashMap, path::Path, time::SystemTime};
 pub fn refine_held(summary: &mut Summary, lease: &Lease) {
     if matches!(lease, Lease::Held)
         && (!summary.tail_has_message || summary.tail_redirects_leaf)
@@ -38,8 +38,31 @@ struct Row {
     handle: String,
     lease: Lease,
     state: State,
+    source: &'static str,
+    detail: Option<String>,
 }
-fn read_row(mut summary: Summary, owners: &Path) -> Option<Row> {
+#[cfg(test)]
+fn read_row(summary: Summary, owners: &Path) -> Option<Row> {
+    read_endpoint_row(summary, owners, &HashMap::new())
+}
+fn read_endpoint_row(
+    mut summary: Summary,
+    owners: &Path,
+    endpoints: &HashMap<String, crate::live::client::Hello>,
+) -> Option<Row> {
+    if let Some(h) = endpoints.get(&summary.id) {
+        if summary.file.path.exists() {
+            let _ = scan_tail(&mut summary);
+        }
+        return Some(Row {
+            summary,
+            handle: String::new(),
+            lease: Lease::Unknown("extension".into()),
+            state: if h.busy { State::Busy } else { State::Live },
+            source: "extension",
+            detail: h.mode.clone(),
+        });
+    }
     scan_tail(&mut summary).ok()?;
     let lease = lease::probe(owners, &summary.id);
     refine_held(&mut summary, &lease);
@@ -49,13 +72,25 @@ fn read_row(mut summary: Summary, owners: &Path) -> Option<Row> {
         handle: String::new(),
         lease,
         state,
+        source: "disk",
+        detail: None,
     })
 }
+#[cfg(test)]
 fn read_rows(
     catalog: &Catalog,
     candidates: Vec<&Summary>,
     args: &LsArgs,
     owners: &Path,
+) -> (Vec<Row>, usize, usize) {
+    read_endpoint_rows(catalog, candidates, args, owners, &HashMap::new())
+}
+fn read_endpoint_rows(
+    catalog: &Catalog,
+    candidates: Vec<&Summary>,
+    args: &LsArgs,
+    owners: &Path,
+    endpoints: &HashMap<String, crate::live::client::Hello>,
 ) -> (Vec<Row>, usize, usize) {
     let mut total_all = catalog.sessions.len();
     let mut total = candidates.len();
@@ -64,7 +99,7 @@ fn read_rows(
         if !args.live && args.limit > 0 && rows.len() >= args.limit {
             break;
         }
-        let Some(mut row) = read_row(s.clone(), owners) else {
+        let Some(mut row) = read_endpoint_row(s.clone(), owners, endpoints) else {
             total = total.saturating_sub(1);
             total_all = total_all.saturating_sub(1);
             continue;
@@ -83,13 +118,37 @@ fn read_rows(
     }
     (rows, total, total_all)
 }
+fn row_json(r: &Row, now: SystemTime) -> Value {
+    let mut v = session_json(&r.summary, &r.handle, &r.lease, r.state, now);
+    v["state_source"] = json!(r.source);
+    if r.source == "extension" {
+        v["state_detail"] = json!(r.detail);
+    }
+    if !r.summary.file.path.exists() {
+        v["path"] = Value::Null;
+    }
+    v
+}
 pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     let spinner = Spinner::start(
         ctx.mode == Mode::Human && ctx.stderr_tty,
         "reading sessions",
     );
-    let catalog = Catalog::scan(&paths.sessions_dir)?;
+    let mut catalog = Catalog::read(&paths.sessions_dir)?;
+    let home = crate::glen_home::resolve(env).ok();
+    let endpoints = home
+        .as_ref()
+        .map(crate::live::registry::states)
+        .unwrap_or_default();
+    if let Some(home) = &home {
+        let registries = crate::live::registry::index(home)
+            .into_iter()
+            .filter(|r| endpoints.contains_key(&r.session_id))
+            .collect::<Vec<_>>();
+        crate::live::registry::union(&mut catalog, home, env, &registries);
+    }
+    catalog.assign_handles(None);
     let cwd = paths::absolute(
         env,
         &args.cwd.as_deref().unwrap_or(env.cwd()).to_string_lossy(),
@@ -106,11 +165,17 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
                     .is_none_or(|d| now.duration_since(s.file.mtime).unwrap_or_default() <= d)
         })
         .collect::<Vec<_>>();
-    let (rows, total, total_all) = read_rows(&catalog, candidates, args, &paths.session_owners_dir);
+    let (rows, total, total_all) = read_endpoint_rows(
+        &catalog,
+        candidates,
+        args,
+        &paths.session_owners_dir,
+        &endpoints,
+    );
     spinner.finish();
     if ctx.mode == Mode::Json {
         return Ok(Outcome::new(
-            json!({"scope":{"all":args.all,"cwd":(!args.all).then_some(&cwd),"bucket":bucket},"sessions_dir":catalog.sessions_dir,"total":total,"total_all":total_all,"sessions":rows.iter().map(|r|session_json(&r.summary,&r.handle,&r.lease,r.state,now)).collect::<Vec<_>>()}),
+            json!({"scope":{"all":args.all,"cwd":(!args.all).then_some(&cwd),"bucket":bucket},"sessions_dir":catalog.sessions_dir,"total":total,"total_all":total_all,"sessions":rows.iter().map(|r|row_json(r,now)).collect::<Vec<_>>()}),
             "",
         ));
     }

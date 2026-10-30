@@ -16,6 +16,7 @@ pub struct Outcome {
     pub human: String,
     pub warnings: Vec<Warning>,
     pub exit: OkExit,
+    pub after_output: Option<Box<dyn FnOnce() -> Result<(), GlenError>>>,
 }
 impl Outcome {
     pub fn new(data: Value, human: impl Into<String>) -> Self {
@@ -24,6 +25,7 @@ impl Outcome {
             human: human.into(),
             warnings: vec![],
             exit: OkExit::Done,
+            after_output: None,
         }
     }
 }
@@ -182,6 +184,7 @@ pub fn emit_to(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
+    let after_output = outcome.after_output;
     let warnings = ctx
         .warnings
         .iter()
@@ -221,6 +224,11 @@ pub fn emit_to(
     if ctx.mode != Mode::Json && human_warnings(ctx, &warnings, err).is_err() {
         return ExitCode::from(1);
     }
+    if let Some(commit) = after_output
+        && commit().is_err()
+    {
+        return ExitCode::from(1);
+    }
     ExitCode::from(outcome.exit.exit_code())
 }
 pub(crate) fn error_value(error: &GlenError, warnings: &[Warning]) -> Value {
@@ -229,9 +237,14 @@ pub(crate) fn error_value(error: &GlenError, warnings: &[Warning]) -> Value {
         object["hint"] = json!(hint);
     }
     if let Some(details) = &error.details {
-        object["details"] = details.clone();
+        object["details"] = details.as_ref().clone();
     }
-    with_warnings(json!({"v":1,"ok":false,"error":object}), warnings)
+    let warnings = warnings
+        .iter()
+        .chain(&error.warnings)
+        .cloned()
+        .collect::<Vec<_>>();
+    with_warnings(json!({"v":1,"ok":false,"error":object}), &warnings)
 }
 pub fn emit_error_to(
     ctx: &OutputCtx,
@@ -279,7 +292,15 @@ pub fn emit_error_to(
                     p.paint(Token::Muted, &format!("  hint: {}", sanitize(&hint)))
                 )?;
             }
-            human_warnings(ctx, &ctx.warnings, err)
+            human_warnings(
+                ctx,
+                &ctx.warnings
+                    .iter()
+                    .chain(&error.warnings)
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                err,
+            )
         })();
         if result.is_err() {
             return ExitCode::from(1);

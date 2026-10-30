@@ -35,6 +35,11 @@ impl EventStream {
             ctx.err_painter.clone(),
         )
     }
+    pub fn ndjson(ctx: &OutputCtx) -> Self {
+        let mut s = Self::new(ctx);
+        s.json = true;
+        s
+    }
     pub fn with_writers(
         json: bool,
         out: Box<dyn Write>,

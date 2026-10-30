@@ -247,7 +247,7 @@ fn ac018_invalid_limit_warns_and_uses_the_default() {
 #[test]
 fn ac018_error_envelopes_and_raw_output_are_never_spilled() {
     let sb = Sandbox::new();
-    sb.glen(["inbox"])
+    sb.glen(["watch"])
         .env("GLEN_MAX_OUTPUT", "10")
         .run()
         .error_envelope("not_implemented");
@@ -349,7 +349,9 @@ fn ac027_commands_do_not_create_glen_home_or_omp_dirs() {
         (&["wait", "j1234567"], false),
         (&["show", "abc1234"], false),
         (&["send", "abc1234", "hi"], false),
-        (&["install-extension"], false),
+        (&["install-extension", "--dry-run"], false),
+        (&["inbox"], false),
+        (&["inbox", "--peek"], false),
         (&["install-skill"], false),
         (&["completions", "zsh"], false),
         (&["bogus"], false),

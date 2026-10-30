@@ -40,8 +40,20 @@ pub fn run() -> ExitCode {
     {
         return commands::tail::follow(&cli, a, &env, &ctx);
     }
+    if let cli::Command::Inbox(a) = &cli.command
+        && a.follow
+    {
+        return commands::inbox::follow(&cli, a, &env, &ctx);
+    }
     match commands::dispatch(&cli, &env, &ctx) {
         Ok(o) => output::emit(&ctx, o, cli.command.name()),
         Err(e) => output::emit_error(&ctx, e),
     }
 }
+
+pub mod live;
+pub mod ops;
+
+pub mod extension;
+
+pub mod inbox;

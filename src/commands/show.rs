@@ -80,5 +80,12 @@ pub fn run(cli: &Cli, args: &ShowArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         }
     }
     spinner.finish();
-    Ok(Outcome::new(data, human))
+    let mut outcome = Outcome::new(data, human);
+    if o.not_yet_persisted {
+        outcome.warnings.push(crate::error::Warning {
+            code: "not_yet_persisted".into(),
+            message: "this live session has not written a transcript yet".into(),
+        });
+    }
+    Ok(outcome)
 }

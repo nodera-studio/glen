@@ -31,6 +31,8 @@ fn public_help() {
             "send",
             "wait",
             "jobs",
+            "inbox",
+            "install-extension",
             "doctor",
             "completions",
             "help"
@@ -39,19 +41,14 @@ fn public_help() {
 }
 #[test]
 fn hidden_commands() {
-    for args in [
-        vec!["inbox"],
-        vec!["watch"],
-        vec!["install-extension"],
-        vec!["install-skill"],
-    ] {
+    for args in [vec!["watch"], vec!["install-skill"]] {
         let o = glen(&args, &[]);
         assert_eq!(o.status.code(), Some(8), "{args:?}");
         assert_eq!(json(&o)["error"]["code"], "not_implemented");
         assert_eq!(json(&o)["v"], 1);
         assert!(o.stderr.is_empty());
     }
-    let o = glen(&["inbox", "--human"], &[]);
+    let o = glen(&["watch", "--human"], &[]);
     assert_eq!(o.status.code(), Some(8));
     assert!(o.stdout.is_empty());
     assert!(o.stderr.starts_with(b"error:"));
@@ -235,16 +232,20 @@ fn completions() {
         assert!(o.status.success(), "{o:?}");
         assert!(!o.stdout.starts_with(b"{"));
         let s = String::from_utf8(o.stdout).unwrap();
-        for visible in ["doctor", "ls", "show", "tail", "send", "wait", "jobs"] {
+        for visible in [
+            "doctor",
+            "ls",
+            "show",
+            "tail",
+            "send",
+            "wait",
+            "jobs",
+            "inbox",
+            "install-extension",
+        ] {
             assert!(s.contains(visible));
         }
-        for hidden in [
-            "__worker",
-            "install-skill",
-            "install-extension",
-            "inbox",
-            "watch",
-        ] {
+        for hidden in ["__worker", "install-skill", "watch"] {
             assert!(!s.contains(hidden), "{shell}: {hidden}");
         }
     }
