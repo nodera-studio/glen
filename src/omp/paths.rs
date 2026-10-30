@@ -70,7 +70,7 @@ fn lexical_join(base: &Path, rel: &str) -> PathBuf {
     }
     result
 }
-fn absolute(env: &Env, value: &str) -> PathBuf {
+pub(crate) fn absolute(env: &Env, value: &str) -> PathBuf {
     if Path::new(value).is_absolute() {
         lexical_join(Path::new("/"), value)
     } else {

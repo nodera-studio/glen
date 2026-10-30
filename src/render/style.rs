@@ -44,6 +44,12 @@ impl Painter {
     pub fn idle(&self) -> String {
         self.paint(Token::Muted, "○")
     }
+    pub fn busy(&self) -> String {
+        self.paint(Token::Focus, "◐")
+    }
+    pub fn unknown(&self) -> String {
+        self.paint(Token::Muted, "?")
+    }
     pub fn info(&self) -> String {
         self.paint(Token::Muted, "·")
     }

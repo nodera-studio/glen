@@ -31,8 +31,8 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 
 ## §A3 The three channels
 **Disk reader (W1)**
-- **Discovery.** Buckets are the immediate subdirectories of `sessions_dir`. Session files are `<bucket>/*.jsonl` with a valid header. Skip dotfiles (`.lock.os`, `.*.tmp`) and everything inside subdirectories.
-- **Bucket for a cwd.** Port `getDefaultSessionDirName` (`CA/session/session-paths.ts`). Canonicalise the cwd. The temp root is checked first (`-tmp-<rel>`), then home (`-<rel>`), else `--<abs>--`. Separators `/ \ :` become `-`.
+- **Discovery.** Buckets are the immediate subdirectories of `sessions_dir`. Session files are `<bucket>/*.jsonl` with a valid header. Skip dotfiles (`.lock.os`, `.*.tmp`), symlinked buckets and everything inside subdirectories. Follow symlinked regular files and deduplicate canonical paths. Header scanning falls back from 4 KiB to at most 64 KiB when no complete header fits.
+- **Bucket for a cwd.** Port `getDefaultSessionDirName` (`CA/session/session-paths.ts`). Canonicalise the cwd. Canonicalise home and the temp root too (falling back to lexical absolute paths when unavailable). The temp root (`TMPDIR` → `TMP` → `TEMP` → `/tmp`) is checked first (`-tmp-<rel>`), then home (`-<rel>`), else `--<abs>--`. Separators `/ \ :` become `-`.
 - **Listing** reads a 4 KiB head and a 32 KiB tail per file, as omp does. `show`/`tail` read the whole file.
 - **Parsing:**
   - An optional title slot on line 1 is folded into the header.
@@ -54,7 +54,12 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
   - macOS: open the file *without* `O_CREAT`. ENOENT → not live. `flock(LOCK_EX|LOCK_NB)`: EWOULDBLOCK → live; success → unlock at once → not live.
   - Linux: bind the abstract DATAGRAM socket `omp-file-lock-` + XXH64(path, seed 0x4f4d502d4c4f434b) hex16 + XXH64(path, seed 0x50492d46494c454c) hex16, where path is the UTF-8 string above. The hex is lowercase and zero-padded. EADDRINUSE → live; success → close → not live. This is a bind, never a connect, and never a stream socket.
   - Any other error → `unknown`, including EACCES/EPERM: a permission error is never evidence that the lease is free.
-- **ls status columns.** `live`/`idle`/`unknown`, plus the last-turn state `complete|interrupted|aborted|error|pending|unknown`, ported from `session-listing.ts`.
+- **State column.** `idle|live|busy|unknown`, with `state_source:"disk"` in W1 (W3 adds `"extension"`) and nullable `state_detail`. A free lease means idle; an inconclusive probe means unknown. A held lease means busy when the last active-branch message is in flight: role user, developer or toolResult, or an assistant containing a toolCall whose stopReason is neither error nor aborted. Otherwise it means live. This predicate is separate from the last-turn state `complete|interrupted|aborted|error|pending|unknown`, ported from `session-listing.ts`.
+  - If a held session's 32 KiB tail window contains no complete message, load its full active branch to determine state and last turn. Other rows retain bounded scans.
+  - Probe only displayed rows, except when `--live` needs to filter candidates. A probe briefly holds a free lease; never repeat it inside the follow loop. Linux abstract sockets are network-namespace-local: a probe in another netns cannot observe the owner's socket.
+- **Follow.** `tail -f` polls file metadata every 250 ms and complete appended lines only; a partial line waits for its newline. Check continuations every 2 s or immediately after disappearance. A missing file with no continuation for 5 s ends with `not_found`.
+  - A size shrink or changed device/inode triggers a reload and `rewritten`, including omp's stage-and-rename replacement by a larger file. Emit only unseen active-branch entry IDs after a rewrite or continuation; report `branch_switch` when the previous leaf is no longer on the branch.
+  - Polling avoids platform-specific FSEvents/inotify dependencies and survives replacement. Same-size title-slot edits intentionally do not trigger a reload. SIGINT ends the stream with `end` and exit 130; a second SIGINT exits 130 immediately.
 
 **RPC driver (W2)**
 - `omp-rpc` from git, tag `v18.14.0`.
@@ -141,7 +146,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **Resolving `<session>` arguments:**
   1. `@latest` = the newest session (by mtime) in the bucket of the cwd, or of `--cwd`.
   2. A path (contains `/` or ends `.jsonl`) = that file.
-  3. Otherwise match case-insensitively over all sessions in `sessions_dir`. Take the union of: the full id; a hex suffix of the dash-free id (at least 4 hex); an omp-style prefix of the id or file name (at least 8 chars).
+  3. Otherwise match case-insensitively over all sessions in `sessions_dir`. Take the union of: the full id; a hex suffix of the dash-free id (at least 4 hex); an omp-style prefix of the id or file name (at least 8 chars); a session whose catalog-assigned handle (as `ls` prints it, including a 7-char legacy prefix) equals the argument. Every handle `ls` prints therefore resolves back to its session.
      - One match → resolved.
      - Several → exit 4 `ambiguous`, with the candidates in `error.details.candidates`.
      - Two files whose headers carry the same session id (a copied file) are two candidates even for a full-id match. glen never picks one silently, because omp keys the lease by id and both copies share it.
@@ -150,11 +155,11 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - `@new` is valid only for `glen send`.
 
 ## §A9 Commands (v0.1.0)
-| Command | Purpose | Wave | Visible in W0 |
+| Command | Purpose | Wave | Visible |
 |---|---|---|---|
-| `glen ls [--all] [--cwd DIR] [-n N] [--live]` | List sessions for the cwd bucket (`--all`: every bucket). Columns: handle, title, status, last turn, updated ("3m ago"), model; plus cwd with `--all` | W1 | hidden |
-| `glen show <session> [--thinking] [--tools collapsed\|full\|none] [--raw]` | Active-branch transcript; `--raw` = entries as JSON | W1 | hidden |
-| `glen tail <session> [-n N] [-f] [--thinking]` | Last N transcript items; `-f` follows (NDJSON in JSON mode) | W1 | hidden |
+| `glen ls [--all] [--cwd DIR] [-n N] [--live] [--since DUR]` | List sessions for the cwd bucket (`--all`: every bucket); `--all` conflicts with `--cwd`; `-n 0` lists all. Columns: handle, state, title, last turn, updated ("3m ago"), model; plus project with `--all` | W1 | W1 |
+| `glen show <session> [--thinking] [--tools collapsed\|full\|none] [--raw]` | Active-branch transcript; `--raw` = entries as JSON | W1 | W1 |
+| `glen tail <session> [-n N] [-f] [--thinking]` | Last N transcript items; `-f` follows (NDJSON in JSON mode); `-n 0` gives no backlog | W1 | W1 |
 | `glen send <session\|@latest\|@new> <message\|-> [--as auto\|steer\|follow-up] [--wait DUR\|--no-wait] [--cwd DIR]` | Send through the live route or RPC, then wait up to the bound (default 90s) | W2 (RPC), W3 (live) | hidden |
 | `glen wait <job> [--timeout DUR]` | Keep waiting for a job (default 90s) | W2 | hidden |
 | `glen jobs [--session S] [--active] [-n N]` | List glen's jobs | W2 | hidden |
@@ -165,8 +170,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | `glen doctor` | omp binary and version, resolved paths, glen home (later: extension, skill, endpoints) | W0 (extended W3/W4) | visible |
 | `glen completions <bash\|zsh\|fish\|elvish\|powershell>` | Shell completion script (raw) | W0 | visible |
 - **Global flags:** `--json`, `--human` (mutually exclusive), `--color auto|always|never`, `--profile NAME`, `-h`, `-V`.
-- **Defaults and aliases:** `--color` defaults to `auto`; `--profile` overrides `OMP_PROFILE` and `PI_PROFILE`. `ls` and `jobs` use `-n/--limit` (default 20); `tail` uses `-n/--lines` (default 10). `tail` and `inbox` accept `-f/--follow`. `show --tools` defaults to `collapsed`; `send --as` defaults to `auto`; `send --wait` and `wait --timeout` default to `90s`. `-h/--help` and `-V/--version` are available on every command. W0's hidden commands return `not_implemented` (exit 8).
-- **Durations:** `<n>ms|s|m|h` or bare seconds, at most 24h. `--wait 0` equals `--no-wait`.
+- **Defaults and aliases:** `--color` defaults to `auto`; `--profile` overrides `OMP_PROFILE` and `PI_PROFILE`. `ls` and `jobs` use `-n/--limit` (default 20); `tail` uses `-n/--lines` (default 10). `tail` and `inbox` accept `-f/--follow`. `show --tools` defaults to `collapsed`; `send --as` defaults to `auto`; `send --wait` and `wait --timeout` default to `90s`. `-h/--help` and `-V/--version` are available on every command. Unfinished commands remain hidden and return `not_implemented` (exit 8).
+- **Durations:** `<n>ms|s|m|h` or bare seconds, at most 24h. `--wait 0` equals `--no-wait`. `ls --since` accepts `<n>s|m|h|d|w` or bare seconds, at most 3650 days.
 - **Internal:** `glen __worker <job-id>` (W2), always hidden.
 - **Considered and rejected:**
   - a `glen reply` CLI: the reply path is the `glen_reply` tool, and an omp Bash call has no job context;
@@ -188,6 +193,27 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - Pretty-printed on a TTY, compact otherwise.
   - `ok:true` holds for exits 0, 10 and 11.
 - **W0 doctor data:** `data.glen` contains `version`, `home` and `home_exists`; `data.omp` contains `bin` (path or null), `version` (string or null) and `tested_version` (`18.14.0`). `data.paths` contains the §A12 resolved paths, `profile` (name or null), `agent_dir_source` (`default|profile|env`) and `sessions_dir_source` (`agent_dir|xdg`). `data.checks` is an ordered array of `{name,status,value,detail}`, with status `ok|warn|fail|info`. `value` is the raw absolute path or check value; `detail` is the reason for the status, or an empty string when there is none. The checks are `omp_binary`, `omp_version`, `profile`, `agent_dir`, `sessions_dir`, `glen_home`. An untested version succeeds with warning `omp_version_untested`. A failed doctor returns `omp_unavailable`, with the same data under `error.details.report`, and its human table before the error line. Missing directories are reported without creating them.
+- **W1 reader documents.** `ls` returns `{scope:{all,cwd,bucket},sessions_dir,total,total_all,sessions:[]}`. Scope cwd/bucket are null with `--all`; total is after filtering but before limiting. Each session has `handle,id,path,bucket,cwd,title,first_message,created_at,updated_at,age_ms,size_bytes,model,last_turn,state,state_source,state_detail,continuation_of,parent_session`; nullable fields remain present as null. Future mtimes saturate age_ms at zero (human: `just now`).
+  - `show` and document `tail` return `{session,continued_from,leaf_id,skipped_lines,items:[]}`. `show --raw` replaces items with active-branch `entries:[]`, including unknown entry kinds. `tail -n 0` returns an empty items array.
+- **Transcript items.** Every item has `kind`, `id` and nullable UTC `timestamp`. Thinking is hidden by default; tool results are folded into matching tool calls when present in the same build.
+
+| Kind | Fields beyond the common fields |
+|---|---|
+| `user` | text, images |
+| `assistant` | text, model, stop_reason, error, has_thinking, thinking_words; thinking only with `--thinking`; nonempty tool_calls unless `--tools none` |
+| `tool_result` | tool_call_id, tool_name, is_error, text, chars, truncated, images |
+| `bash`, `python` | command/code, exit_code, cancelled, output, chars, truncated |
+| `developer` | text |
+| `custom` | custom_type, text |
+| `file_mention` | files: [{path,line_count}] |
+| `compaction` | tokens_before, tokens_after, summary |
+| `reset` | no additional fields |
+| `branch_summary` | summary |
+| `model_change` | model |
+| `thinking_level` | level |
+
+  - ToolCall carries `id,name,summary,result` and arguments only with `--tools full`. A result carries `is_error,text,chars,truncated,images`; collapsed text/output is limited to 500 characters, full retains it all. Tool summaries and first-message previews retain at most 120 and 200 characters respectively. `--tools none` omits tool calls/results and bash/python items. Unknown entry kinds stay opaque in the tree; unknown visible content blocks render `[type]`.
+  - W1 follow events are `session` (session, continued_from, skipped_lines), `item` (item), `continued` (from, to, path), `rewritten` (path), `branch_switch` (leaf_id), `warning` (code, message), and final `end`, or an error-envelope line. Streams flush each line and never spill. SIGINT writes `end` and exits 130; a second SIGINT exits immediately. A tool result whose call was already streamed appears as a standalone tool_result.
 - **Explicit JSON completions:** `data.shell` names the shell and `data.script` contains its raw script. Default redirected completions remain raw.
 - **Usage errors in JSON mode** become an envelope with code `usage` on stdout, exit 2.
 - **NDJSON streams** (`tail -f`, `inbox -f`): one compact object per line, `{"v":1,"event":"<kind>",…}`. The last line is `{"v":1,"event":"end","ok":true}` or an error envelope. Streams are never spilled.
@@ -219,9 +245,9 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **Width:** `COLUMNS` (20–1000), then the terminal width when stdout is a TTY, otherwise unbounded.
 - **Tables:** no borders, 2-space gutters, header bold + muted, no trailing whitespace.
 - **Spinner:** stderr, human mode with a TTY stderr only, braille frames at 80 ms, cleared when done.
-- **Glyphs:** ✓ ok, ! warn, ✗ fail, ● live, ○ idle, · info.
+- **Glyphs:** ✓ ok, ! warn, ✗ fail, ● live, ◐ busy, ○ idle, ? unknown, · info.
 - **Paths:** `~/…` in human output, absolute in JSON.
-- **Untrusted text.** Every string glen did not author (paths, env values, session titles, cwds, previews, model output) passes through `render::sanitize` before it is painted in human mode. Control bytes are shown escaped and never reach the terminal raw. JSON relies on serde's escaping.
+- **Untrusted text.** Every string glen did not author (paths, env values, session titles, cwds, previews, model output) passes through `render::sanitize` before it is painted in human mode. Escape controls; never silently strip them. Human single-line fields such as titles, previews and tool summaries first collapse whitespace runs (including newlines and tabs) to one space, then sanitize. A literal ESC followed by `[31m` is displayed literally as `\x1b[31m`. JSON fields retain the raw value, including controls and whitespace, with serde escaping on the wire; documented preview/result length limits still apply.
 - **Write failures.** A failed or closed stdout ends the command with exit 1 and no further stdout output. glen never panics on EPIPE and never writes a second envelope.
 - **Lazy state.** `--help`, `--version`, `doctor` and path resolution never create `GLEN_HOME`. Directories are created on first write (spill in W0; jobs, inbox and live endpoints later).
 
@@ -306,14 +332,14 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 
 ## §A17 Verify on every omp upgrade (and open items)
 - [ ] Re-read `packages/utils/src/dirs.ts` (§A12).
-- [ ] Re-check session entry types, the title slot, `resolveSessionLeafId` and `findSessionContinuation`.
+- [ ] Re-check session entry types, the title slot, `resolveSessionLeafId`, `findSessionContinuation` and `deriveSessionStatus`.
 - [ ] Re-check both `CA/session/session-storage.ts` `tryAcquireSessionLease` and `packages/utils/src/file-lock.ts` `getLockPath`.
-- [ ] Re-check the Linux abstract-socket name and datagram bind semantics.
+- [ ] Re-check the Linux abstract-socket name, datagram bind semantics and XXH64 golden vectors.
 - [ ] Re-check the RPC schema: `prompt_result`, `session_settled` and the `set_host_tools` duplicate rule.
 - [ ] Re-check the extension API: `sendUserMessage` deliverAs, `registerTool` and session events.
 - [ ] Bump `TESTED_OMP_VERSION` only after all of these checks.
 - **Open, owned by later waves:**
-  - W1: confirm the Linux probe semantics against `crates/pi-natives/src/file_lock/linux.rs`, and the `.lock` suffix against `utils/src/file-lock.ts` `getLockPath`. Add a test that the probe path for a fixture id ends in `<id>.lock`.
+  - [x] W1: confirmed Linux abstract datagram bind semantics against `crates/pi-natives/src/file_lock/linux.rs:14-22` and the `.lock` suffix against `utils/src/file-lock.ts:31-33`. Tests cover both golden names and `<id>.lock` path suffixes.
   - W2: a live pid alone does not prove the worker is alive (pids are reused). `lost` detection must check a worker identity beyond the pid, for example its process start time recorded in `status.json`.
-  - W3: confirm the extension can read busy/idle state and observe persistence continuations.
+  - W3: confirm the extension can read busy/idle state and observe persistence continuations; replace disk-inferred busy with exact extension state.
   - W4: Codex's shell timeout and output cap; the Claude Code `allowed-tools` syntax.

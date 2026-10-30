@@ -52,7 +52,7 @@ fn ac029_closed_stdout_in_human_mode() {
 #[test]
 fn ac029_closed_stdout_while_reporting_an_error() {
     let sb = Sandbox::new();
-    for args in [vec!["ls"], vec!["doctor"]] {
+    for args in [vec!["jobs"], vec!["doctor"]] {
         let out = sb.glen(&args).stdout(closed_stdout()).run();
         assert_failed_write(&out);
     }
@@ -87,4 +87,11 @@ fn ac029_closed_stdout_for_help_usage_and_version_exits_1() {
         out.assert_no_panic();
         out.assert_exit(1);
     }
+}
+
+#[test]
+fn ac029_closed_stdout_for_ls() {
+    let sb = Sandbox::new();
+    let out = sb.glen(["ls"]).stdout(closed_stdout()).run();
+    assert_failed_write(&out);
 }

@@ -1,5 +1,9 @@
-//! W0 conformance suite: behaviour derived from `.claude/plans/v010-wave-0-foundation.md`
-//! (AC-001…AC-029) and `docs/design.md` §A1–§A17, written without reading the implementation.
+//! Conformance suite: behaviour derived from the approved plans and `docs/design.md`, written
+//! without reading the implementation.
+//! - W0 (`.claude/plans/v010-wave-0-foundation.md`, AC-001…AC-029): cli_surface, color, doctor,
+//!   fixtures, output_contract, paths, repo_contracts, sanitize, state, width, write_failure.
+//! - W1 (`.claude/plans/v010-wave-1-reader.md`, AC-101…AC-126; §A3, §A8–§A11): ls, show, tail,
+//!   lease, with the shared `reader` harness.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!
@@ -8,6 +12,8 @@
 //! `tests/fixtures/`. TTY-only behaviour (pretty JSON, TTY spinner, terminal width) is not
 //! covered here because the suite has no pseudo-terminal.
 
+#[path = "conformance/reader.rs"]
+mod reader;
 #[path = "conformance/support.rs"]
 mod support;
 
@@ -19,6 +25,10 @@ mod color;
 mod doctor;
 #[path = "conformance/fixtures.rs"]
 mod fixtures;
+#[path = "conformance/lease.rs"]
+mod lease;
+#[path = "conformance/ls.rs"]
+mod ls;
 #[path = "conformance/output_contract.rs"]
 mod output_contract;
 #[path = "conformance/paths.rs"]
@@ -27,8 +37,12 @@ mod paths;
 mod repo_contracts;
 #[path = "conformance/sanitize.rs"]
 mod sanitize;
+#[path = "conformance/show.rs"]
+mod show;
 #[path = "conformance/state.rs"]
 mod state;
+#[path = "conformance/tail.rs"]
+mod tail;
 #[path = "conformance/width.rs"]
 mod width;
 #[path = "conformance/write_failure.rs"]
