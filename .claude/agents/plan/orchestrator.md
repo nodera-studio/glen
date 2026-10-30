@@ -155,26 +155,45 @@ Briefs cite local file paths (research files under `.claude/research/`, plan fil
 and researcher reports once saved) rather than Mnemosyne IDs alone: not every agent has the
 Mnemosyne tools, and `codex:codex-rescue` has none.
 
-**Persist the reports.** `codex:codex-rescue` returns its report only as its final message, so the
-judge cannot read it unless you save it. Write each architect report to
-`.claude/plans/<slug>.arch-claude.md` and `.claude/plans/<slug>.arch-codex.md` before Step 4.5. A
-background agent's final message can be pulled from its transcript with
+**Persist the reports, then anonymise them for a blind judge.** `codex:codex-rescue` returns its
+report only as its final message, so the judge cannot read it unless you save it. Save the raw
+reports to the private provenance folder, `.claude/plans/<slug>.private/arch-claude.md` and
+`.claude/plans/<slug>.private/arch-codex.md`. A background agent's final message can be pulled from
+its transcript with
 `jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' <output_file>`.
+
+The judge must not know which engine wrote which candidate (owner requirement). Before Step 4.5:
+
+1. **Flip a coin for the order:** `[ $((RANDOM % 2)) -eq 0 ] && echo "A=claude B=codex" || echo "A=codex B=claude"`.
+   With the Gemini 3rd architect, shuffle all three into A/B/C the same way.
+2. **Write anonymised copies** in that order: `.claude/plans/<slug>.arch-a.md` and
+   `.claude/plans/<slug>.arch-b.md`. Strip every authorship tell: engine and model names used
+   about the author ("Codex", "Claude", "gpt", "Gemini", "Opus"), self-references ("I ran
+   codex…", "as Claude I…"), tool-run footers, session/job IDs and agent-specific headers. Keep
+   domain mentions: glen's subject matter names Claude Code and Codex, and those stay. Leave the
+   substance and length otherwise verbatim.
+3. **Record the mapping** in `.claude/plans/<slug>.private/mapping.md` (e.g. `arch: A=codex
+   B=claude`). Never pass this folder or the mapping to the judge.
 
 ### Step 4.5 — Judge-Select (select-then-graft)
 
-Dispatch the judge-selector with the paths of BOTH architect reports, not their inline text
-(inline text bloats the orchestrator's context). A fresh context that did NOT generate either
-is the unbiased selector.
+Dispatch the judge-selector with the paths of BOTH anonymised reports, not their inline text
+(inline text bloats the orchestrator's context). A fresh context that did NOT generate either,
+and does not know who did, is the unbiased selector.
 ```
 Dispatch via Agent tool:
   prompt: "Read .claude/agents/plan/judge-selector.md and follow its instructions.
            Task: {task description}
-           Claude architect report: .claude/plans/<slug>.arch-claude.md
-           Codex architect report: .claude/plans/<slug>.arch-codex.md"
+           Candidate A: .claude/plans/<slug>.arch-a.md
+           Candidate B: .claude/plans/<slug>.arch-b.md
+           Authorship is withheld on purpose: judge on content only, and do not open
+           .claude/plans/<slug>.private/."
 ```
 The judge returns the final 2-3 approaches — the stronger spine with any *separable*
-improvements from the other grafted in — plus a recommendation. Present THAT at Step 5.
+improvements from the other grafted in — plus a recommendation, all in terms of Candidate A/B.
+**Reveal the mapping after the verdict:** translate the judge's spine and
+`[GRAFTED FROM CANDIDATE …]` markers through `mapping.md` (e.g. "Spine: Candidate A (Codex);
+1 graft from Candidate B (Claude)") and present THAT at Step 5.
 
 ### Step 5 — Select the approach (two operating paths)
 
@@ -187,7 +206,8 @@ a different approach (re-dispatch the architects with feedback).
 **Auto-mode (`/auto-mode` — no human in the loop).** The judge has already picked the base and
 applied only the *conservative* separable grafts (uncertain → left out, per the separability rule).
 Skip the gate and proceed to Step 6 with the judge's selection — but **announce** the chosen base +
-the grafts applied + the runner-up dropped, so the unattended run stays auditable. (This is exactly
+the grafts applied + the runner-up dropped, with the revealed A/B → engine mapping, so the
+unattended run stays auditable. (This is exactly
 why the separability rule must be conservative: the auto path must never splice an uncertain graft.)
 
 The winning author writes the spec single-threaded (Step 6) so one mind owns the spine — grafts are
@@ -246,9 +266,13 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            no web fetches — the research is already in the reports above. Return the plan
            as your final message."
 ```
-Persist both plans as in Step 4 (`.claude/plans/<slug>.claude.md` and `.claude/plans/<slug>.codex.md`),
-then dispatch the judge-selector with those two paths (select the stronger plan, graft separable
-steps); its output is the plan presented at Step 7. If Codex is unavailable, or stalls twice on
+Persist and anonymise both plans as in Step 4: raw plans to `.claude/plans/<slug>.private/plan-claude.md`
+and `plan-codex.md`, a fresh coin flip (independent of the Step 4 one), anonymised copies to
+`.claude/plans/<slug>.candidate-a.md` and `.claude/plans/<slug>.candidate-b.md`, and the mapping
+appended to `mapping.md` (e.g. `plan: A=claude B=codex`). Then dispatch the judge-selector with only
+those two paths, labelled "Candidate A" and "Candidate B", plus the same authorship-withheld line
+as Step 4.5 (select the stronger plan, graft separable steps). Its output is the plan presented at
+Step 7, with the mapping revealed after the verdict as in Step 4.5. If Codex is unavailable, or stalls twice on
 the planner pass (the two-stall rule in Step 4), proceed with the Claude plan alone (judge
 degrades to pass-through) and say so.
 
@@ -276,7 +300,10 @@ when one is given. Tell the user:
 - Steps 5 and 7 are hard user gates in manual mode. Never skip the user's approach choice or
   plan review outside `/auto-mode`; under `/auto-mode`, announce the choice and the plan instead.
 - Never implement. This workflow produces a PLAN only — no code changes, no file creation
-  except the plan file and the persisted architect/planner reports under `.claude/plans/`.
+  except the plan file, the anonymised candidates and the private provenance folder
+  (`<slug>.private/`) under `.claude/plans/`.
+- The judge is blind. It sees only `Candidate A` / `Candidate B` paths in a coin-flip order,
+  never engine names or the mapping; reveal the mapping only after its verdict.
 - Never override agent models. Each agent's frontmatter controls its model.
 - Explore before architecting — the architect needs real data, not assumptions.
 
