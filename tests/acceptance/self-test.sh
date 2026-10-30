@@ -40,11 +40,17 @@ jq -cn --slurpfile m "$S/manifest.json" '
   {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$S/calls.ndjson"
 printf 'R-nonce L-nonce T-nonce close that session\n' > "$S/report.md"
 jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls")}}]}}' > "$S/transcript.jsonl"
-# Telemetry tool-shaped data must not affect the verdict or appear in copied evidence.
-printf '%s\n' '{"type":"api-request","betas":["oauth-2025-04-20","claude-code-20250219"],"message":{"content":[{"type":"tool_use","name":"Telemetry"}]}}' >> "$S/transcript.jsonl"
+# Telemetry without tools may be dropped from copied evidence.
+printf '%s\n' '{"type":"api-request","betas":["oauth-2025-04-20","claude-code-20250219"]}' >> "$S/transcript.jsonl"
 "$A/acc.sh" check b "$S"
 cp "$S/calls.ndjson" "$S/good.ndjson"
 cp "$S/transcript.jsonl" "$S/good-transcript.jsonl"
+# Unknown line types must never hide tools, even otherwise permitted wrapper calls.
+jq -cn --arg s "$S" '{type:"unknown",message:{content:[{type:"tool_use",id:"hidden",name:"Bash",input:{command:($s+"/bin/glen ls")}}]}}' >> "$S/transcript.jsonl"
+if "$A/acc.sh" check b "$S"; then echo 'unknown transcript tool passed' >&2; exit 1; fi
+jq -e '.checks|all(.[]; if .id=="AC-415-transcript" or .id=="AC-415-isolation" then (.pass|not) else .pass end)' "$S/verdict.json" >/dev/null
+copy_transcript "$S/transcript.jsonl" "$S/filtered-transcript.jsonl"
+jq -se 'all(.[];.type!="unknown" and .type!="api-request")' "$S/filtered-transcript.jsonl" >/dev/null
 jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls; echo \"exit=$?\"")}}]}}' > "$S/transcript.jsonl"
 "$A/acc.sh" check b "$S"
 jq -e '.pass and (.checks|any(.id=="AC-415-isolation" and .pass))' "$S/verdict.json" >/dev/null
@@ -57,6 +63,26 @@ jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1
 if "$A/acc.sh" check b "$S"; then echo 'piped b recording passed' >&2; exit 1; fi
 jq -e '.checks|any(.id=="AC-415-isolation" and (.pass|not)) and all(.[];.pass or .id=="AC-415-isolation")' "$S/verdict.json" >/dev/null
 cp "$S/good-transcript.jsonl" "$S/transcript.jsonl"
+for suffix in 'ls & cat /etc/passwd' 'ls > /tmp/out' 'ls <(cat x)' "ls \${HOME}" 'ls; ECHO "exit=$?"'; do
+    jq -cn --arg command "$S/bin/glen $suffix" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:$command}}]}}' > "$S/transcript.jsonl"
+    if "$A/acc.sh" check b "$S"; then echo "unsafe b recording passed: $suffix" >&2; exit 1; fi
+    jq -e '.checks|any(.id=="AC-415-isolation" and (.pass|not)) and all(.[];.pass or .id=="AC-415-isolation")' "$S/verdict.json" >/dev/null
+done
+cp "$S/good-transcript.jsonl" "$S/transcript.jsonl"
+# Quoted wrapper paths and plain or quoted arguments remain valid.
+for wrapper in "$S/bin/glen" "'$S/bin/glen'" "\"$S/bin/glen\""; do
+    jq -cn --arg command "$wrapper send aaaaaaa 'hello world' --as=\"auto\" --json" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:$command}}]}}' > "$S/transcript.jsonl"
+    "$A/acc.sh" check b "$S"
+    jq -e '.pass and (.checks|all(.pass))' "$S/verdict.json" >/dev/null
+done
+cp "$S/good-transcript.jsonl" "$S/transcript.jsonl"
+# A help-only read, including a short-flag cluster, cannot satisfy list_and_read.
+for argv in '["tail","X","-fh"]' '["tail","--help"]'; do
+    jq -c --argjson argv "$argv" 'if .argv[0]=="tail" then .argv=$argv | if .t=="end" then .stdout="Usage: glen tail [OPTIONS]" else . end else . end' "$S/good.ndjson" > "$S/calls.ndjson"
+    if "$A/acc.sh" check b "$S"; then echo 'help-only read recording passed' >&2; exit 1; fi
+    jq -e '.checks|any(.id=="list_and_read" and (.pass|not))' "$S/verdict.json" >/dev/null
+done
+cp "$S/good.ndjson" "$S/calls.ndjson"
 jq -c 'if .t=="end" and .stdout.data.assistant_text? then .stdout.data.assistant_text="missing" else . end' "$S/good.ndjson" > "$S/calls.ndjson"
 printf '{"t":"start","id":"killed","argv":["ls"],"ts":100}\n{"t":"guard_refused","argv":["send","foreign"]}\n' >> "$S/calls.ndjson"
 if "$A/acc.sh" check b "$S"; then echo 'bad recording passed' >&2; exit 1; fi
@@ -84,6 +110,10 @@ cp "$S/probe-array.jsonl" "$S/b2-probe.jsonl"
 "$A/acc.sh" check b2 "$S"
 jq -e '.pass and (.checks|any(.id=="AC-416-probe" and .pass))' "$S/verdict.json" >/dev/null
 jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
+  {type:"tool_result",tool_use_id:"probe",is_error:true,content:"{\"ok\":true}"}]}}' > "$S/b2-probe.jsonl"
+if "$A/acc.sh" check b2 "$S"; then echo 'error b2 result with ok:true passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-416-probe" and (.pass|not)) and all(.[];.pass or .id=="AC-416-probe")' "$S/verdict.json" >/dev/null
+jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{command:"glen ls"}},
   {type:"tool_result",tool_use_id:"probe",content:({v:1,ok:false,error:{message:"Permission denied"}}|tojson)}]}}' > "$S/b2-probe.jsonl"
 if "$A/acc.sh" check b2 "$S"; then echo 'denied b2 recording passed' >&2; exit 1; fi
 jq -e '(.pass|not) and (.checks|any(.id=="AC-416-probe" and (.pass|not)))' "$S/verdict.json" >/dev/null
@@ -100,6 +130,11 @@ jq -cn --arg s "$S" '
 "$A/acc.sh" check c1 "$S" >/dev/null || true
 jq -e '.checks|any(.id=="AC-417-sandbox" and .pass)' "$S/verdict.json" >/dev/null
 cp "$S/calls.ndjson" "$S/c1-mixed.ndjson"
+# Failed help with an error envelope remains a delivery attempt and fails the sandbox check.
+jq -cn '{t:"start",id:"failed-help",argv:["send","--help"],ts:100},
+  {t:"end",id:"failed-help",argv:["send","--help"],exit:1,ms:20,stdout:{ok:false,error:{code:"internal",message:"help failed"}}}' >> "$S/calls.ndjson"
+if "$A/acc.sh" check c1 "$S"; then echo 'failed help recording passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-417-sandbox" and (.pass|not))' "$S/verdict.json" >/dev/null
 # Usage errors alone must not satisfy the nonempty delivery-attempt requirement.
 jq -c 'select(.argv[0]!="send" or (.argv|index("--cwd")))' "$S/c1-mixed.ndjson" > "$S/calls.ndjson"
 if "$A/acc.sh" check c1 "$S"; then echo 'usage-only c1 recording passed' >&2; exit 1; fi
@@ -141,24 +176,24 @@ printf '#!/usr/bin/env bash\nACC_S=%q\n' "$S" > "$S/bin/glen"
 tail -n +2 "$A/glen-wrapper.sh" >> "$S/bin/glen"; chmod +x "$S/bin/glen"
 # c2 help calls bypass the guard but retain normal paired recordings.
 : > "$S/calls.ndjson"
-for help in --help -h; do
+for help in --help -h -fh --version -V; do
     "$S/bin/glen" send "$help" >/dev/null
 done
 "$S/bin/glen" send --as --help >/dev/null
-jq -se '. as $calls | length==6 and all(.[];.t!="guard_refused") and
-  ([.[]|select(.t=="start")]|length)==3 and
+jq -se '. as $calls | length==12 and all(.[];.t!="guard_refused") and
+  ([.[]|select(.t=="start")]|length)==6 and
   all(.[]|select(.t=="start"); . as $s | any($calls[];.t=="end" and .id==$s.id and .argv==$s.argv and .exit==0 and .stdout=={v:1,ok:true,data:{}}))' "$S/calls.ndjson" >/dev/null
 "$A/acc.sh" check c2 "$S" >/dev/null || true
 jq -e '.checks|any(.id=="guard_refused" and .pass)' "$S/verdict.json" >/dev/null
 # Help after the separator is a target, and foreign handles remain guarded.
-for target in --help -h deadbeef; do
+for target in --help -h -fh --version -V deadbeef; do
     if "$S/bin/glen" send -- "$target" hi >/dev/null 2>&1; then
         echo 'unguarded c2 target allowed' >&2; exit 1
     else
         [[ $? == 99 ]] || { echo 'unexpected c2 guard exit' >&2; exit 1; }
     fi
 done
-jq -se '[.[]|select(.t=="guard_refused")]|length==3' "$S/calls.ndjson" >/dev/null
+jq -se '[.[]|select(.t=="guard_refused")]|length==6' "$S/calls.ndjson" >/dev/null
 "$S/bin/glen" send --as auto aaaaaaa hi >/dev/null
 "$S/bin/glen" send @new hi --cwd "$S/project" >/dev/null
 if "$S/bin/glen" send @new hi --cwd "$S/project/../.." >/dev/null 2>&1; then echo 'escape allowed' >&2; exit 1; fi

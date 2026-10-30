@@ -1,6 +1,7 @@
 # Inputs are recordings only. This checker never invokes an agent or glen.
 def check($id;$pass;$evidence): {id:$id,pass:($pass == true),evidence:$evidence};
-def is_help: .argv | .[:(index("--") // length)] | any(.[]; . == "--help" or . == "-h");
+def is_help: .exit == 0 and (.stdout|type) == "string" and
+  (.argv | .[:(index("--") // length)] | any(.[]; . == "--help" or . == "--version" or . == "-V" or test("^-[^-]*h")));
 def output: (.stdout | objects) // {};
 def cmd: [.argv[]? | select(. == "ls" or . == "show" or . == "tail" or . == "send" or . == "wait" or . == "jobs" or . == "inbox" or . == "install-extension")] | first;
 def first_positional:
@@ -27,13 +28,10 @@ def denied: (tostring|ascii_downcase|test("permission[^\n]*den|denied|not allowe
 def uses($events): [$events[] | .. | objects | select(.type? == "tool_use")];
 def results($events): [$events[] | .. | objects | select(.type? == "tool_result")];
 def probe_success:
-  . as $raw |
+  ((has("is_error")|not) or .is_error == false) and
   (try (.content | if type=="string" then fromjson
     elif type=="array" then [.[] | select(.type?=="text") | .text? | strings] | join("\n") | fromjson
-    else null end) catch null) as $parsed |
-  if $parsed == null then $raw | tostring | test("\\\"?ok\\\"?\\s*:\\s*true")
-  elif ($parsed|type)=="object" then $parsed.ok == true
-  else false end;
+    else null end) catch null | if type=="object" then .ok == true else false end);
 $m[0] as $manifest | $calls as $all |
 [$all[]|select(.t=="end")] as $ends |
 [$all[]|select(.t=="start")] as $starts |
@@ -77,10 +75,13 @@ $m[0] as $manifest | $calls as $all |
    end)
  + (if $mode=="b" then
      uses($transcript) as $tools |
-     [check("AC-415-transcript"; ($tools|length)>0 and all($tools[];.name=="Bash" or (.name=="Read" and (.input.file_path|startswith($scratch+"/")))); "required transcript: only Bash and scratch Read"),
-      check("AC-415-isolation"; all($tools[]; if .name=="Bash" then (.input.command | sub("; echo (\"exit=\\$\\?\"|exit=\\$\\?)\\z"; ""; "i") as $c |
-         (($c|startswith($scratch+"/bin/glen ")) or ($c|startswith("'"+$scratch+"/bin/glen' ")) or ($c|startswith("\""+$scratch+"/bin/glen\" "))) and
-         (["&&","||",";","\n","$(","`","|"] | all(.[];. as $token|$c|contains($token)|not))) else true end); "only plain scratch-wrapper calls; orchestrator also audits transcript")]
+     uses([$transcript[] | select(.type | IN("user","assistant","system","summary") | not)]) as $dropped_tools |
+     [check("AC-415-transcript"; ($dropped_tools|length)==0 and ($tools|length)>0 and all($tools[];.name=="Bash" or (.name=="Read" and (.input.file_path|startswith($scratch+"/")))); "required transcript: only Bash and scratch Read; no tools in dropped lines"),
+      check("AC-415-isolation"; ($dropped_tools|length)==0 and all($tools[]; if .name=="Bash" then (.input.command | sub("; echo (\"exit=\\$\\?\"|exit=\\$\\?)\\z"; "") as $c |
+         ([$scratch+"/bin/glen", "'"+$scratch+"/bin/glen'", "\""+$scratch+"/bin/glen\""] | any(.[]; . as $path |
+           ($c|startswith($path+" ")) and
+           ($c[($path|length):] | test("\\A(?:[ \\t]+(?:[A-Za-z0-9_@%+=:,./-]+|'[^'\\\\\\r\\n]*'|\"[^\"\\\\$\\r\\n]*\")+)+[ \\t]*\\z")))) and
+         (["&&","||",";","\n","$(","`","|","&",">","<","${","<("] | all(.[];. as $token|$c|contains($token)|not))) else true end); "only plain scratch-wrapper calls; orchestrator also audits transcript")]
     elif $mode=="b3" then
      uses($discovered) as $tools | results($discovered) as $results |
      [check("AC-420-loaded"; any($tools[];(.name=="Skill" and ((.input.skill // .input.name // "")|test("(^|:)glen$")) and (.id as $id | any($results[];.tool_use_id==$id and (.is_error|not) and (denied|not)))) or (.name=="Read" and (.input.file_path|endswith("/skills/glen/SKILL.md")))); "discovered skill must load"),

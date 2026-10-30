@@ -150,12 +150,8 @@ check_mode() {
         return
     fi
     # Empty optional inputs are arrays; required evidence is checked by its mode.
-    local empty transcript
+    local empty
     empty=$(mktemp "${TMPDIR:-/tmp}/ga-check.XXXXXX"); printf '' > "$empty"
-    transcript="$empty.transcript"
-    printf '' > "$transcript"
-    # Verdicts and copied evidence use the same conversation lines, excluding api-request telemetry.
-    copy_transcript "$S/transcript.jsonl" "$transcript"
     local report='' person='{}' jobs=true config=false
     [[ ! -f $S/report.md ]] || report=$(cat "$S/report.md")
     [[ ! -f $S/person-verdict.json ]] || person=$(cat "$S/person-verdict.json")
@@ -168,12 +164,12 @@ check_mode() {
     fi
     jq -n --arg mode "$mode" --arg scratch "$S" --arg report "$report" --argjson person "$person" --argjson jobs_unchanged "$jobs" --argjson config_restored "$config" \
       --slurpfile m "$S/manifest.json" --slurpfile calls "${S}/calls.ndjson" \
-      --slurpfile transcript "$transcript" \
+      --slurpfile transcript "$([[ -f $S/transcript.jsonl ]] && printf '%s' "$S/transcript.jsonl" || printf '%s' "$empty")" \
       --slurpfile discovered "$([[ -f $S/b3.jsonl ]] && printf '%s' "$S/b3.jsonl" || printf '%s' "$empty")" \
       --slurpfile probe "$([[ -f $S/b2-probe.jsonl ]] && printf '%s' "$S/b2-probe.jsonl" || printf '%s' "$empty")" \
       --slurpfile control "$([[ -f $S/b2-control.jsonl ]] && printf '%s' "$S/b2-control.jsonl" || printf '%s' "$empty")" \
       -f "$A/check.jq" > "$S/verdict.json"
-    rm -f "$empty" "$transcript"
+    rm -f "$empty"
     jq -r '.checks[]|"\(if .pass then "PASS" else "FAIL" end) \(.id): \(.evidence)"' "$S/verdict.json"
     jq -e '.pass' "$S/verdict.json" >/dev/null
 }

@@ -22,8 +22,9 @@ help=false
 for arg in "${args[@]}"; do
     case "$arg" in
         --) break ;;
-        --help|-h) help=true; break ;;
+        --help|--version|-V) help=true; break ;;
     esac
+    if [[ $arg =~ ^-[^-]*h ]]; then help=true; break; fi
 done
 i=0
 while ((i < ${#args[@]})); do
