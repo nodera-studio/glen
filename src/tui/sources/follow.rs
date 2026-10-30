@@ -116,39 +116,11 @@ impl Reader {
             self.opens += 1;
         }
         match open::open_watch(&ctx.cli, &ctx.env, &arg) {
-            Ok(opened) if opened.not_yet_persisted => {
-                self.pending_seen = true;
-                self.missing = None;
-                self.send(ctx, FollowMsg::NotYetPersisted)
-            }
             Ok(opened) => {
                 let Some(command) = self.pending.take() else {
                     return true;
                 };
-                let id = opened.session.header.id.clone();
-                let path = opened.session.path.clone();
-                let redirected = id != command.target.id;
-                self.handle = opened.handle.clone();
-                let follower = Follower::new(opened, command.opts);
-                let items = follower.backlog(usize::MAX);
-                self.follower = Some(follower);
-                self.pending_seen = false;
-                self.missing = None;
-                if !self.opened(ctx, items) {
-                    return false;
-                }
-                if redirected {
-                    self.send(
-                        ctx,
-                        FollowMsg::Continued {
-                            to_id: id,
-                            to_path: Some(path),
-                            handle: self.handle.clone(),
-                        },
-                    )
-                } else {
-                    true
-                }
+                self.seed(ctx, command, opened)
             }
             Err(e) if self.pending_seen && e.code == ErrorCode::NotFound => {
                 if self.missing.get_or_insert_with(Instant::now).elapsed() < Duration::from_secs(5)
@@ -158,6 +130,39 @@ impl Reader {
                 self.fail(ctx, e)
             }
             Err(e) => self.fail(ctx, e),
+        }
+    }
+    fn seed(&mut self, ctx: &Ctx, command: Command, opened: open::Opened) -> bool {
+        self.generation = command.r#gen;
+        self.missing = None;
+        if opened.not_yet_persisted {
+            self.pending = Some(command);
+            self.pending_seen = true;
+            return self.send(ctx, FollowMsg::NotYetPersisted);
+        }
+        let id = opened.session.header.id.clone();
+        let path = opened.session.path.clone();
+        let redirected = id != command.target.id;
+        self.pending = None;
+        self.handle = opened.handle.clone();
+        let follower = Follower::new(opened, command.opts);
+        let items = follower.backlog(usize::MAX);
+        self.follower = Some(follower);
+        self.pending_seen = false;
+        if !self.opened(ctx, items) {
+            return false;
+        }
+        if redirected {
+            self.send(
+                ctx,
+                FollowMsg::Continued {
+                    to_id: id,
+                    to_path: Some(path),
+                    handle: self.handle.clone(),
+                },
+            )
+        } else {
+            true
         }
     }
     fn fail(&mut self, ctx: &Ctx, error: GlenError) -> bool {
@@ -204,8 +209,33 @@ impl Reader {
     }
 }
 pub fn spawn(ctx: Ctx, rx_cmd: Receiver<Command>) -> Worker {
+    spawn_inner(ctx, rx_cmd, None)
+}
+/// Reuse the entry point's validated snapshot; newer queued selections still win.
+pub fn spawn_seeded(
+    ctx: Ctx,
+    rx_cmd: Receiver<Command>,
+    command: Command,
+    opened: open::Opened,
+) -> Worker {
+    spawn_inner(ctx, rx_cmd, Some((command, opened)))
+}
+fn spawn_inner(
+    ctx: Ctx,
+    rx_cmd: Receiver<Command>,
+    initial: Option<(Command, open::Opened)>,
+) -> Worker {
     std::thread::spawn(move || {
         let mut reader = Reader::default();
+        if let Some((command, opened)) = initial {
+            let running = match rx_cmd.try_recv() {
+                Ok(newer) => reader.command(&ctx, latest(&rx_cmd, newer)),
+                Err(_) => reader.seed(&ctx, command, opened),
+            };
+            if !running {
+                return;
+            }
+        }
         let mut next = Instant::now() + INTERVAL;
         while !ctx.stopped() {
             if let Ok(command) = rx_cmd.try_recv() {
@@ -449,5 +479,42 @@ mod tests {
             matches!(rx.recv().unwrap(), Msg::Follow {ev: FollowMsg::Opened {items,..},..} if items.len() == 1000)
         );
         assert_eq!(reader.opens, 1);
+    }
+    #[test]
+    fn seeded_start_uses_the_opened_snapshot_without_reopening_and_newer_commands_win() {
+        let rig = Rig::new(true);
+        let (ctx, rx) = rig.ctx();
+        let cmd = command(&rig, 'A', 1);
+        let path = cmd.target.path.clone().unwrap();
+        let opened = open::open_watch(&ctx.cli, &ctx.env, path.to_str().unwrap()).unwrap();
+        // A reopen would now fail. The seed must still publish its original complete snapshot.
+        std::fs::write(&path, "not a session\n").unwrap();
+        let (tx, commands) = mpsc::channel();
+        let worker = spawn_seeded(ctx.clone(), commands, cmd, opened);
+        assert!(
+            matches!(wait(&rx, |m| matches!(m, Msg::Follow {..})), Msg::Follow {r#gen:1,ev:FollowMsg::Opened {items,..}} if !items.is_empty())
+        );
+        stop(&ctx, worker);
+        drop(tx);
+        std::fs::write(&path, fixtures::bytes('A')).unwrap();
+        let (ctx, rx) = rig.ctx();
+        let cmd = command(&rig, 'B', 2);
+        let opened = open::open_watch(
+            &ctx.cli,
+            &ctx.env,
+            cmd.target.path.as_ref().unwrap().to_str().unwrap(),
+        )
+        .unwrap();
+        let (tx, commands) = mpsc::channel();
+        tx.send(command(&rig, 'C', 3)).unwrap();
+        let worker = spawn_seeded(ctx.clone(), commands, cmd, opened);
+        assert!(matches!(
+            wait(&rx, |m| matches!(m, Msg::Follow { .. })),
+            Msg::Follow {
+                r#gen: 3,
+                ev: FollowMsg::Opened { .. }
+            }
+        ));
+        stop(&ctx, worker);
     }
 }

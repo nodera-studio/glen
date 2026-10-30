@@ -1,4 +1,5 @@
 pub mod ansi;
+pub mod controls;
 pub mod keymap;
 pub mod layout;
 pub mod prompt;
@@ -7,5 +8,6 @@ pub mod theme;
 pub mod update;
 pub mod view;
 
-#[allow(dead_code)] // Worker entry points are connected by the event-loop slice.
 pub(crate) mod sources;
+
+pub(crate) mod runtime;

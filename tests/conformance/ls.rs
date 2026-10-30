@@ -54,7 +54,11 @@ fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
         out.ctx()
     );
     for name in HIDDEN {
-        bx.glen([name]).run().error_envelope("not_implemented");
+        bx.glen([name]).run().error_envelope(if name == "watch" {
+            "usage"
+        } else {
+            "not_implemented"
+        });
     }
     bx.assert_no_state();
 }

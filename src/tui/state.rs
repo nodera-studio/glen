@@ -56,7 +56,9 @@ impl App {
     ) -> Self {
         Self {
             theme,
-            caps: Caps { controls: false },
+            caps: Caps {
+                controls: super::controls::AVAILABLE,
+            },
             size,
             now,
             wall,

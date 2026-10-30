@@ -88,6 +88,8 @@ struct Tail {
 }
 #[derive(Default)]
 struct Reader {
+    /// A selected session may live in a bucket copied from another machine/home.
+    bucket_override: Option<(PathBuf, String)>,
     heads: HeadCache,
     head_ids: HashMap<PathBuf, (u64, u64)>,
     tails: HashMap<PathBuf, Tail>,
@@ -186,10 +188,15 @@ impl Reader {
         registry::union(&mut catalog, &ctx.home, &ctx.env, &registries);
         catalog.assign_handles(None);
         let bucket = match scope {
-            Scope::Bucket { cwd, .. } => Some(bucket_for(
-                &paths::absolute(&ctx.env, &cwd.to_string_lossy()),
-                &ctx.env,
-            )),
+            Scope::Bucket { cwd, .. } => Some(
+                self.bucket_override
+                    .as_ref()
+                    .filter(|(project, _)| project == cwd)
+                    .map(|(_, bucket)| bucket.clone())
+                    .unwrap_or_else(|| {
+                        bucket_for(&paths::absolute(&ctx.env, &cwd.to_string_lossy()), &ctx.env)
+                    }),
+            ),
             Scope::All => None,
         };
         let mut total_all = catalog.sessions.len();
@@ -304,11 +311,23 @@ impl Reader {
     }
 }
 pub fn spawn(ctx: Ctx, rx_cmd: Receiver<Command>) -> Worker {
+    let scope = Scope::Bucket {
+        cwd: ctx.env.cwd().into(),
+        label: String::new(),
+    };
+    spawn_scoped(ctx, rx_cmd, scope, None)
+}
+/// Preserve the selected session's physical bucket, even when its recorded cwd moved.
+pub fn spawn_scoped(
+    ctx: Ctx,
+    rx_cmd: Receiver<Command>,
+    mut scope: Scope,
+    bucket_override: Option<(PathBuf, String)>,
+) -> Worker {
     std::thread::spawn(move || {
-        let mut reader = Reader::default();
-        let mut scope = Scope::Bucket {
-            cwd: ctx.env.cwd().into(),
-            label: String::new(),
+        let mut reader = Reader {
+            bucket_override,
+            ..Reader::default()
         };
         let mut next = Instant::now();
         while !ctx.stopped() {
@@ -521,6 +540,45 @@ mod tests {
         let all = wait(&rx, |m| matches!(m, Msg::Sessions(s) if s.rows.len() == 7));
         assert!(matches!(all, Msg::Sessions(s) if s.total_all == 7));
         assert!(start.elapsed() < Duration::from_millis(500));
+        stop(&ctx, worker);
+    }
+    #[test]
+    fn initial_bucket_override_survives_all_toggle_and_is_bound_to_its_project() {
+        use crate::tui::sources::tests::{stop, wait};
+        use std::sync::mpsc;
+        let rig = Rig::new(true);
+        let (ctx, rx) = rig.ctx();
+        let project = PathBuf::from("/old/machine/work/beta");
+        let scope = Scope::Bucket {
+            cwd: project.clone(),
+            label: "beta".into(),
+        };
+        let (tx, commands) = mpsc::channel();
+        let worker = spawn_scoped(
+            ctx.clone(),
+            commands,
+            scope.clone(),
+            Some((project, "-work-beta".into())),
+        );
+        assert!(
+            matches!(wait(&rx,|m|matches!(m,Msg::Sessions(_))),Msg::Sessions(s) if s.rows.len() == 3)
+        );
+        tx.send(Command::Scope(Scope::All)).unwrap();
+        assert!(
+            matches!(wait(&rx,|m|matches!(m,Msg::Sessions(_))),Msg::Sessions(s) if s.rows.len() == 7)
+        );
+        tx.send(Command::Scope(scope)).unwrap();
+        assert!(
+            matches!(wait(&rx,|m|matches!(m,Msg::Sessions(_))),Msg::Sessions(s) if s.rows.len() == 3)
+        );
+        tx.send(Command::Scope(Scope::Bucket {
+            cwd: ctx.env.cwd().into(),
+            label: "alpha".into(),
+        }))
+        .unwrap();
+        assert!(
+            matches!(wait(&rx,|m|matches!(m,Msg::Sessions(_))),Msg::Sessions(s) if s.rows.len() == 4)
+        );
         stop(&ctx, worker);
     }
 }

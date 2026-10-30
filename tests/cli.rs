@@ -44,12 +44,12 @@ fn public_help() {
 fn hidden_commands() {
     // `watch` is the only command still hidden after W3 and W4.
     let o = glen(&["watch"], &[]);
-    assert_eq!(o.status.code(), Some(8));
-    assert_eq!(json(&o)["error"]["code"], "not_implemented");
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(json(&o)["error"]["code"], "usage");
     assert_eq!(json(&o)["v"], 1);
     assert!(o.stderr.is_empty());
     let o = glen(&["watch", "--human"], &[]);
-    assert_eq!(o.status.code(), Some(8));
+    assert_eq!(o.status.code(), Some(2));
     assert!(o.stdout.is_empty());
     assert!(o.stderr.starts_with(b"error:"));
     assert!(!o.stderr.contains(&27));

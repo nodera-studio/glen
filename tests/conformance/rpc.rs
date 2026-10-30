@@ -85,7 +85,11 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
     }
     for name in HIDDEN {
         let out = sb.glen([name]).run();
-        let err = out.error_envelope("not_implemented");
+        let err = out.error_envelope(if name == "watch" {
+            "usage"
+        } else {
+            "not_implemented"
+        });
         assert!(
             err["message"].as_str().unwrap().contains(name),
             "{}",

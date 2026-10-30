@@ -48,6 +48,9 @@ pub fn run() -> ExitCode {
     {
         return commands::inbox::follow(&cli, a, &env, &ctx);
     }
+    if matches!(cli.command, cli::Command::Watch(_)) {
+        return commands::watch::run(cli, &env, &ctx, &term);
+    }
     match commands::dispatch(&cli, &env, &ctx) {
         Ok(o) => output::emit(&ctx, o, cli.command.name()),
         Err(e) => output::emit_error(&ctx, e),

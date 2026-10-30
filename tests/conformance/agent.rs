@@ -1138,10 +1138,10 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
     }
 }
 
-/// AC-401 + the W4 spec change: `watch` stays hidden (exit 8); `inbox` and
-/// `install-extension` became visible with W3.
+/// Watch stays hidden until Step 8; on a pipe its interactive-terminal gate returns usage.
+/// `inbox` and `install-extension` became visible with W3.
 #[test]
-fn ac401_watch_stays_hidden_and_exits_8() {
+fn ac401_watch_stays_hidden_and_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let listed = command_names(&sb.glen(["--help"]).run().out());
     for name in HIDDEN {
@@ -1150,12 +1150,15 @@ fn ac401_watch_stays_hidden_and_exits_8() {
             "{name} is listed: {listed:?}"
         );
         let out = sb.glen([name]).run();
-        out.error_envelope("not_implemented");
-        out.assert_exit(8).assert_stderr_empty();
+        out.error_envelope(if name == "watch" {
+            "usage"
+        } else {
+            "not_implemented"
+        });
+        out.assert_exit(if name == "watch" { 2 } else { 8 })
+            .assert_stderr_empty();
     }
-    sb.glen(["watch", "abc1234"])
-        .run()
-        .error_envelope("not_implemented");
+    sb.glen(["watch", "abc1234"]).run().error_envelope("usage");
     assert!(!sb.glen_home.exists());
 }
 

@@ -141,12 +141,12 @@ fn hidden_commands_still_have_help_pages() {
 }
 
 #[test]
-fn ac002_hidden_commands_exit_8_not_implemented() {
+fn ac002_hidden_watch_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let invocations: [&[&str]; 1] = [&["watch"]];
     for args in invocations {
         let out = sb.glen(args).run();
-        let err = out.error_envelope("not_implemented");
+        let err = out.error_envelope("usage");
         out.assert_stderr_empty();
         assert!(
             err["message"].as_str().unwrap().contains(args[0]),
@@ -160,19 +160,18 @@ fn ac002_hidden_commands_exit_8_not_implemented() {
 fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
     let sb = Sandbox::new();
     let out = sb.glen(["watch", "--human"]).run();
-    out.assert_exit(8).assert_no_ansi();
+    out.assert_exit(2).assert_no_ansi();
     assert!(out.stdout.is_empty(), "stdout must be empty\n{}", out.ctx());
     assert!(out.err().starts_with("error:"), "{}", out.ctx());
 }
 
-/// Every flag §A9 declares for the hidden commands parses; the command then reports
-/// `not_implemented` (exit 8), never a usage error.
+/// Watch's declared arguments parse; its non-TTY gate runs before session lookup.
 #[test]
 fn a9_declared_arguments_of_hidden_commands_parse() {
     let sb = Sandbox::new();
     let valid: &[&[&str]] = &[&["watch", "abc1234"]];
     for args in valid {
-        sb.glen(*args).run().error_envelope("not_implemented");
+        sb.glen(*args).run().error_envelope("usage");
     }
 }
 

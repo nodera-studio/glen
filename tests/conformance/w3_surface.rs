@@ -51,7 +51,11 @@ fn ac301_help_lists_exactly_the_w3_commands() {
         assert!(!out.out().contains("__worker"), "{}", out.ctx());
     }
     for name in HIDDEN {
-        let err = sb.glen([name]).run().error_envelope("not_implemented");
+        let err = sb.glen([name]).run().error_envelope(if name == "watch" {
+            "usage"
+        } else {
+            "not_implemented"
+        });
         assert!(err["message"].as_str().unwrap().contains(name), "{err}");
     }
     assert!(!sb.glen_home.exists());
