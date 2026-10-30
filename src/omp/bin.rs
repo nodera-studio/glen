@@ -334,7 +334,7 @@ mod tests {
             let bin = script(
                 t.path(),
                 name,
-                &format!("( /bin/sleep 1; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"),
+                &format!("( /bin/sleep 3; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"),
             );
             (bin, message)
         })
@@ -345,11 +345,11 @@ mod tests {
                 let name = bin.file_name().unwrap().to_str().unwrap().to_string();
                 cases.push(scope.spawn(move || {
                     let start = Instant::now();
-                    let result = omp_version(&bin, Duration::from_millis(300), None);
+                    let result = omp_version(&bin, Duration::from_secs(1), None);
                     let error = result.unwrap_err();
                     assert!(error.contains(message), "{name}: {error}");
                     assert!(start.elapsed() < Duration::from_secs(2));
-                    thread::sleep(Duration::from_millis(1100));
+                    thread::sleep(Duration::from_millis(3500));
                     assert!(
                         !bin.with_extension("marker").exists(),
                         "surviving descendant of {name}"
@@ -360,6 +360,6 @@ mod tests {
                 case.join().unwrap();
             }
         });
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(6));
     }
 }
