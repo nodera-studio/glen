@@ -5,11 +5,11 @@ use crate::{
         continuation,
         items::{self, Item, ItemOpts},
         listing::{self, SessionFile, Summary},
-        session::{LoadError, Session},
+        session::{Entry, LoadError, Session},
     },
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
@@ -44,12 +44,44 @@ fn identity(m: &Metadata) -> (u64, u64) {
         (0, 0)
     }
 }
+#[derive(Hash, PartialEq, Eq)]
+enum Emitted {
+    Id(String),
+    Legacy { content: String, occurrence: usize },
+}
+fn branch_keys(session: &Session) -> Vec<(&Entry, Emitted)> {
+    let legacy = session.header.raw["version"].as_u64().unwrap_or(1) < 2;
+    let mut occurrences = HashMap::new();
+    session
+        .active_branch()
+        .into_iter()
+        .map(|entry| {
+            let key = if legacy {
+                let mut content = entry.raw.clone();
+                if let Some(fields) = content.as_object_mut() {
+                    fields.remove("id");
+                    fields.remove("parentId");
+                }
+                let content = content.to_string();
+                let occurrence = occurrences.entry(content.clone()).or_insert(0);
+                *occurrence += 1;
+                Emitted::Legacy {
+                    content,
+                    occurrence: *occurrence,
+                }
+            } else {
+                Emitted::Id(entry.id.clone())
+            };
+            (entry, key)
+        })
+        .collect()
+}
 pub(crate) struct Follower {
     session: Session,
     summary: Summary,
     offset: u64,
     identity: (u64, u64),
-    emitted: HashSet<String>,
+    emitted: HashSet<Emitted>,
     last_on_branch: Option<String>,
     opts: ItemOpts,
     ticks: u8,
@@ -62,11 +94,9 @@ impl Follower {
         Self {
             offset: o.session.consumed,
             identity: o.metadata.as_ref().map(identity).unwrap_or((0, 0)),
-            emitted: o
-                .session
-                .active_branch()
-                .iter()
-                .map(|e| e.id.clone())
+            emitted: branch_keys(&o.session)
+                .into_iter()
+                .map(|(_, key)| key)
                 .collect(),
             last_on_branch: o.session.leaf_id().map(str::to_owned),
             session: o.session,
@@ -138,14 +168,14 @@ impl Follower {
     }
 
     fn unseen(&mut self) -> Vec<Item> {
-        let branch = self.session.active_branch();
+        let branch = branch_keys(&self.session);
         let new = branch
             .iter()
-            .filter(|e| !self.emitted.contains(&e.id))
-            .copied()
+            .filter(|(_, key)| !self.emitted.contains(key))
+            .map(|(entry, _)| *entry)
             .collect::<Vec<_>>();
         let items = items::build(&new, &self.opts);
-        self.emitted.extend(branch.iter().map(|e| e.id.clone()));
+        self.emitted.extend(branch.into_iter().map(|(_, key)| key));
         self.last_on_branch = self.session.leaf_id().map(str::to_owned);
         items
     }
@@ -180,13 +210,28 @@ impl Follower {
         events.push(FollowEvent::Items(self.unseen()));
         Ok(true)
     }
+    fn consumed_tail_matches(&self, file: &mut File) -> Result<bool, GlenError> {
+        let tail = self.session.consumed_tail();
+        file.seek(SeekFrom::Start(self.offset - tail.len() as u64))
+            .map_err(|e| GlenError::read(&self.session.path, e))?;
+        let mut current = vec![0; tail.len()];
+        match file.read_exact(&mut current) {
+            Ok(()) => Ok(current == tail),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+            Err(e) => Err(GlenError::read(&self.session.path, e)),
+        }
+    }
     pub(crate) fn tick(
         &mut self,
         file: &mut File,
         m: &Metadata,
     ) -> Result<(bool, Vec<FollowEvent>), GlenError> {
         let mut events = vec![];
-        if self.reload_pending || m.len() < self.offset || identity(m) != self.identity {
+        if self.reload_pending
+            || m.len() < self.offset
+            || identity(m) != self.identity
+            || !self.consumed_tail_matches(file)?
+        {
             let session = match open::snapshot(&self.session.path, file, m, true) {
                 Ok(session) if session.header.id == self.session.header.id => session,
                 Ok(_) | Err(LoadError::NotSession) => {
@@ -363,6 +408,69 @@ mod poll_tests {
         assert!(matches!(&events[0], FollowEvent::Rewritten { path: p } if p == &path));
         one(&events[1..], "new");
         assert!(f.poll().unwrap().is_empty());
+    }
+    #[test]
+    fn same_inode_rewrite_at_or_above_the_consumed_length_is_not_an_append() {
+        for grows in [false, true] {
+            let tree = fixtures::tree();
+            let path = fixtures::path(&tree, 'A');
+            let mut f = follower(&tree, &path);
+            let before = fs::metadata(&path).unwrap();
+            let mut rewritten = fs::read_to_string(&path)
+                .unwrap()
+                .replace("10000007", "90000007");
+            if grows {
+                rewritten.push_str(&message("after-rewrite", "10000009"));
+            }
+            assert!(rewritten.len() as u64 >= f.offset);
+            fs::write(&path, rewritten).unwrap();
+            assert_eq!(identity(&before), identity(&fs::metadata(&path).unwrap()));
+            let events = f.poll().unwrap();
+            let [
+                FollowEvent::Rewritten { path: actual },
+                FollowEvent::Items(items),
+            ] = events.as_slice()
+            else {
+                panic!("expected a rewrite before the fresh items: {events:?}");
+            };
+            assert_eq!(actual, &path);
+            assert!(matches!(items.first(), Some(Item::Assistant { id, .. }) if id == "90000007"));
+            assert_eq!(items.len(), if grows { 2 } else { 1 });
+            if grows {
+                assert!(matches!(&items[1], Item::User { id, .. } if id == "after-rewrite"));
+            }
+            assert!(f.poll().unwrap().is_empty());
+        }
+    }
+    #[test]
+    fn v1_rewrite_reconciles_content_after_ordinal_ids_shift() {
+        let tree = fixtures::tree();
+        let path = tree.path().join("legacy.jsonl");
+        let original = include_str!("../../tests/fixtures/v1-session.jsonl");
+        fs::write(&path, original).unwrap();
+        let mut f = follower(&tree, &path);
+        let (header, entries) = original.split_once('\n').unwrap();
+        let fresh = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"fresh after rewrite\"}}\n";
+        // The extra non-message entry shifts every synthesized ordinal id.
+        let rewritten = format!("{header}\n{{\"type\":\"future_metadata\"}}\n{entries}{fresh}");
+        let staged = path.with_extension("staged");
+        fs::write(&staged, rewritten).unwrap();
+        fs::rename(staged, &path).unwrap();
+        let events = f.poll().unwrap();
+        assert!(matches!(&events[0], FollowEvent::Rewritten { .. }));
+        let [FollowEvent::Items(items)] = &events[1..] else {
+            panic!("expected fresh items: {events:?}");
+        };
+        assert!(
+            matches!(items.as_slice(), [Item::User { text, .. }] if text == "fresh after rewrite")
+        );
+        assert!(f.poll().unwrap().is_empty());
+        // A genuinely repeated message must still be emitted as a new occurrence.
+        append(&path, original.lines().nth(1).unwrap());
+        append(&path, "\n");
+        let events = f.poll().unwrap();
+        assert!(matches!(events.as_slice(), [FollowEvent::Items(items)]
+            if matches!(items.as_slice(), [Item::User { text, .. }] if text == "old prompt")));
     }
     #[test]
     fn deleted_parent_follows_new_continuation_immediately() {

@@ -733,6 +733,64 @@ fn transcript_streaming_waits_for_the_complete_line() {
 }
 
 #[test]
+fn same_inode_rewrite_is_noticed_and_fresh_content_is_visible() {
+    let b = OmpBox::new();
+    let path = b.session('A');
+    let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 40);
+    pty.ready();
+    let before = fs::metadata(&path).unwrap();
+    let mut content = fs::read_to_string(&path)
+        .unwrap()
+        .replace("10000007", "90000007")
+        .replace(
+            "The test depends on map order. Fixed.",
+            "watch rewritten answer is visible",
+        );
+    content.push_str(&format!(
+        "{}\n",
+        j!({"type":"message","id":"watch-rewrite","parentId":"10000009",
+        "message":{"role":"user","content":"after the in-place rewrite"}})
+    ));
+    assert!(content.len() as u64 >= before.len());
+    fs::write(&path, content).unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(before.ino(), fs::metadata(&path).unwrap().ino());
+    pty.wait_for("── session file rewritten ──", DATA);
+    pty.wait_for("watch rewritten answer is visible", DATA);
+    pty.wait_for("after the in-place rewrite", DATA);
+    pty.quit();
+    b.clean();
+}
+
+#[test]
+fn v1_rewrite_does_not_duplicate_messages_when_ordinals_shift() {
+    let b = OmpBox::new();
+    let path = b.session('A');
+    let original = include_str!("fixtures/v1-session.jsonl").replace("legacy-v1", A_ID);
+    fs::write(&path, &original).unwrap();
+    let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 40);
+    pty.wait_for("old answer", START);
+    pty.wait_for("old prompt", START);
+    pty.assert_raw_while_running();
+    let (header, entries) = original.split_once('\n').unwrap();
+    let fresh = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"watch fresh after rewrite\"}}\n";
+    let staged = path.with_extension("staged");
+    fs::write(
+        &staged,
+        format!("{header}\n{{\"type\":\"future_metadata\"}}\n{entries}{fresh}"),
+    )
+    .unwrap();
+    fs::rename(staged, &path).unwrap();
+    pty.wait_for("── session file rewritten ──", DATA);
+    pty.wait_for("watch fresh after rewrite", DATA);
+    let shown = pty.text_from(0);
+    assert_eq!(shown.matches("old prompt").count(), 1);
+    assert_eq!(shown.matches("old answer").count(), 1);
+    pty.quit();
+    b.clean();
+}
+
+#[test]
 fn inbox_talk_back_is_visible_without_marking_read() {
     let b = OmpBox::new();
     let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 40);

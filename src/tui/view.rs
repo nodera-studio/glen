@@ -592,6 +592,10 @@ fn empty_transcript_lines(app: &App, width: u16) -> Vec<Line<'static>> {
 }
 fn transcript(f: &mut Frame, app: &App, rect: Rect) {
     let area = layout::inner(rect);
+    if matches!(app.transcript.status, TranscriptStatus::Failed(_)) {
+        paint(f, app, area, empty_transcript_lines(app, area.width));
+        return;
+    }
     let scroll = &app.transcript.scroll;
     let height = area.height.saturating_sub(u16::from(!scroll.follow));
     let (lines, starts) = if app.transcript.width == layout::transcript_width(app) {
@@ -2119,6 +2123,55 @@ pub(crate) mod tests {
             buffer[(area.x, area.y)].fg,
             app.theme.style(Token::Danger).fg.unwrap()
         );
+    }
+    #[test]
+    fn follow_failure_overrides_cached_and_reflowed_transcript_content() {
+        for width in [60, 120] {
+            for following in [false, true] {
+                let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+                prepare(&mut app);
+                assert!(!app.transcript.lines.is_empty());
+                assert!(!app.transcript.blocks.is_empty());
+                let cached = app.transcript.lines.clone();
+                app.size.0 = width;
+                app.transcript.scroll.follow = following;
+                app.transcript.scroll.unseen = 3;
+                let r#gen = app.transcript.r#gen;
+                update::update(
+                    &mut app,
+                    Msg::Follow {
+                        r#gen,
+                        ev: FollowMsg::Failed(
+                            GlenError::new(
+                                ErrorCode::NotFound,
+                                "session file disappeared or was replaced: /fixtures/A.jsonl",
+                            )
+                            .with_hint("select another session")
+                            .into(),
+                        ),
+                    },
+                );
+                assert_eq!(app.transcript.lines, cached);
+                // Draw without preparing: exercise both the cached-width and reflow paths.
+                let mut terminal = Terminal::new(TestBackend::new(width, app.size.1)).unwrap();
+                terminal.draw(|frame| draw(frame, &app)).unwrap();
+                let area = layout::inner(layout::areas(&app).transcript.unwrap());
+                let buffer = terminal.backend().buffer();
+                let lines = region_text(buffer, area);
+                assert!(lines[0].starts_with("✗ session file disappeared or was replaced:"));
+                let shown = lines.join("\n");
+                assert!(shown.contains("select another session"));
+                assert!(!shown.contains("Message"));
+                assert!(!shown.contains("earlier items"));
+                assert!(!shown.contains("G follows"));
+                let danger = app.theme.style(Token::Danger).fg.unwrap();
+                for x in area.x
+                    ..area.x + text::width("✗ session file disappeared or was replaced:") as u16
+                {
+                    assert_eq!(buffer[(x, area.y)].fg, danger);
+                }
+            }
+        }
     }
     #[test]
     fn prompt_and_inbox_empty_placeholders_are_visible_and_muted() {
