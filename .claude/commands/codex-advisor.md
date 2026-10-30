@@ -31,7 +31,9 @@ Question / material: $ARGUMENTS
               filler. If sound, say so with your confidence; if risky, RANK the risks
               worst-first and STEELMAN the alternative you would choose. State what you
               CANNOT assess from the material. End with VERDICT: endorse |
-              endorse-with-changes | reject. Material: {brief}. Constraints: {constraints}."
+              endorse-with-changes | reject. Material: {brief}. Constraints: {constraints}.
+              --wait. Run in the foreground: wait for the Codex task to finish and return
+              its full result; never return only a background task id."
    ```
 3. **Synthesize — never just forward.** Read its answer, judge it, report back: the question
    asked + Codex's verbatim verdict + YOUR synthesis (agree / disagree / what to actually

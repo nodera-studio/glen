@@ -4,6 +4,11 @@
 # Runs the static half of .github/workflows/ci.yml from the repo root:
 #   1. cargo fmt --all -- --check                          (blocking)
 #   2. cargo clippy --all-targets --locked -- -D warnings   (blocking)
+#   3. the same clippy with --target x86_64-unknown-linux-gnu (blocking), so cfg(linux)
+#      code is linted on a macOS dev box: CI's ubuntu runner fails on it otherwise. Check
+#      only, no linker needed. Skipped with a warning when rustup is missing or that target
+#      is not installed (`rustup target add x86_64-unknown-linux-gnu`); skipped silently on
+#      Linux hosts.
 # Tests are run separately by the Implementer (`cargo test --locked`), so a slice can
 # report "tests red" and "gate red" as distinct states.
 #
@@ -30,6 +35,17 @@ run_step() {
 
 run_step fmt cargo fmt --all -- --check
 run_step clippy cargo clippy --all-targets --locked -- -D warnings
+
+linux_target=x86_64-unknown-linux-gnu
+if [ "$(uname -s)" != "Linux" ]; then
+  if ! command -v rustup >/dev/null 2>&1; then
+    echo "quality-gate: WARNING clippy-linux skipped: rustup not found, so the $linux_target target cannot be checked; cfg(linux) code is unlinted" >&2
+  elif rustup target list --installed 2>/dev/null | grep -qx "$linux_target"; then
+    run_step clippy-linux cargo clippy --all-targets --locked --target "$linux_target" -- -D warnings
+  else
+    echo "quality-gate: WARNING clippy-linux skipped: rustup target $linux_target not installed; cfg(linux) code is unlinted (rustup target add $linux_target)" >&2
+  fi
+fi
 
 if [ "$status" -eq 0 ]; then
   echo "quality-gate: clean" >&2

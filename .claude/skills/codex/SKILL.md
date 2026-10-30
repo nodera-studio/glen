@@ -17,9 +17,12 @@ argument-hint: '<task or question to dispatch to Codex>'
 
 ## PRIMARY ROLE: Product-code implementer (the fused coder)
 
-Codex is the **sole writer of product code** in this harness. Claude orchestrates,
+Codex is the **sole writer of product code** in this harness (except design-heavy UI, below). Claude orchestrates,
 plans, reviews, and writes the independent conformance tests — it does **not** write
-product code. Codex fills three roles here, in priority order:
+product code. One exception: design-heavy UI (`site/`, landing pages, web (non-Rust)
+visual components)
+goes to a Claude Opus Implementer, and Codex reviews it (`implementation/orchestrator.md` →
+UI implementation routing). Codex fills three roles here, in priority order:
 
 1. **Implementer (primary)** — the fused write → wire → harden → test → gate → fix
    loop for `/implement` (Role 1) and `/implement-quick`, run in Codex's own context
@@ -76,6 +79,45 @@ flags the user may include and that you should preserve in the prompt text:
 - `--effort high` | `medium` | `low` (default: leave unset)
 - `--write` / read-only (default: write-capable unless user wants review only)
 - `--resume` / `--fresh` (default: fresh; `--resume` continues prior Codex work)
+
+### Foreground by default for agent briefs
+
+Every harness brief to `codex:codex-rescue` (plan, implement, review, `/code-review`,
+`/implement-quick`, `/codex-advisor`, `/deep-debug` and the audit orchestrators) MUST include
+`--wait` and say: "Run in the foreground: wait for the Codex task to finish and
+return its full result as your final message; never return only a background task id." Without
+`--wait` the forwarder backgrounds any task that looks long and returns at once with a task id
+("file doesn't exist yet"), leaving the caller to poll. If a task id comes back anyway, fetch it
+(`node "$COMPANION" status <id> --wait`, then `node "$COMPANION" result <id>`) before using the
+pass. Use `--background` only when the user asks for it; a user's own `/codex` request keeps
+whatever mode they chose.
+
+### Cancelling a Codex job (TaskStop is not enough)
+
+Stopping the Claude agent that launched Codex (TaskStop on `impl-coder-codex`, or a
+`codex:codex-rescue` agent with `--write`) does not stop Codex. The companion job, its
+`app-server-broker.mjs serve --cwd <worktree>` broker, the `codex app-server` and its sandbox
+processes keep running and keep editing the worktree. Whenever you stop a Codex-backed agent:
+
+0. Guard first: `<worktree>` must be set, absolute, a worktree root (`git -C <worktree>
+   rev-parse --show-toplevel` equals it) and not the main checkout. The companion turns an
+   empty `--cwd` into its own cwd, so an unset path would cancel the main checkout's jobs. The
+   guard is step 0 of the recipe in `coder-codex.md`.
+1. `node "$COMPANION" status --cwd <worktree> --json`, then for each id in `.running[]`:
+   `node "$COMPANION" cancel <id> --cwd <worktree> --json` (interrupts the turn and kills
+   the job's process tree).
+2. If the worktree still changes, kill that worktree's broker tree only. The exact recipe
+   matches only a node process running `app-server-broker.mjs serve`, then `--cwd <worktree>
+   --pid-file` as a fixed string, so neither your own shell nor other worktrees' brokers are
+   hit. It is in `.claude/agents/implementation/coder-codex.md` → "Cancelling a run".
+3. Confirm `git -C <worktree> status --short` is unchanged 30 s later before reusing it.
+
+Resolve `COMPANION` as in `coder-codex.md` Step 2:
+
+```bash
+CODEX_ROOT="$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | sort -V | tail -1)"
+COMPANION="$CODEX_ROOT/scripts/codex-companion.mjs"
+```
 
 ### Brief hygiene
 

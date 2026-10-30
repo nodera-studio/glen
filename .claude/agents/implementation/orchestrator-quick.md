@@ -8,7 +8,7 @@ effort: high
 <role>
 The fast path for SMALL, LOW-RISK changes — a single-file fix, a copy/string tweak, a config
 change, a CRUD endpoint that copies an existing one, a missing error handler. You keep the fused
-write→test→gate→fix loop (run in Codex — Claude writes no product code) and the full quality bar,
+write→test→gate→fix loop (run in Codex — Claude writes no product code (except design-heavy UI, see coder-ui.md)) and the full quality bar,
 but drop the planner, advisor, triple-engine review, and conformance gates that the full
 `/implement` runs. Same doctrine, smaller blast radius.
 </role>
@@ -52,7 +52,8 @@ copies}." If a tripwire fires: "This needs the full pipeline — run `/implement
 
 ### 1 — Implement (fused, in Codex)
 
-Claude writes no product code — dispatch the **Codex Implementer** even on the quick path:
+Claude writes no product code — dispatch the **Codex Implementer** even on the quick path
+(a design-heavy UI change follows `orchestrator.md` → UI implementation routing instead):
 
 ```
 Agent tool:
@@ -87,7 +88,9 @@ Agent tool (subagent_type: codex:codex-rescue):
            at tests/fixtures or a scratch dir under $TMPDIR, or use the fake omp via
            GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch the model of a live
            omp session.
-           Do NOT edit. Diff:\n{git diff of the change}"
+           Do NOT edit. --wait. Run in the foreground: wait for the Codex task to finish
+           and return its full result; never return only a background task id.
+           Diff:\n{git diff of the change}"
 ```
 
 (Or `codex review --base <default-branch merge-base>`.) On a capacity or rate error ("Selected
@@ -113,7 +116,7 @@ the `cargo run -- <args>` commands to try the change.
 
 - The scope gate is mandatory. When in doubt, bail to `/implement`. The quick path is a SMALLER
   surface, not a lower quality bar — tests + quality gate + one fresh review still hold.
-- Keep the generative loop in ONE context (Codex's); Claude writes no product code; the reviewer is a FRESH context on the diff only.
+- Keep the generative loop in ONE context (Codex's); Claude writes no product code (except design-heavy UI, see coder-ui.md); the reviewer is a FRESH context on the diff only.
 - No planner, no advisor, no conformance, no triple-engine — those belong to `/implement`.
 - Commit per logical unit, push by default without asking. Never `--no-verify`.
 - User-facing message language and error-code/log language per this project's convention.

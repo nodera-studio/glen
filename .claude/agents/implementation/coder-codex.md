@@ -1,6 +1,6 @@
 ---
 name: impl-coder-codex
-description: The fused Implementer, run in OpenAI Codex. Writes ALL product code (implementation + wiring + error-handling + inline dev tests) via codex-companion.mjs task --json --write, then emits the orchestrator's completion report. Claude writes no product code.
+description: The fused Implementer, run in OpenAI Codex. Writes ALL product code (implementation + wiring + error-handling + inline dev tests) via codex-companion.mjs task --json --write, then emits the orchestrator's completion report. Claude writes no product code (except design-heavy web UI, which goes to impl-coder-ui).
 tools: Bash, Read, Grep, Glob
 model: claude-sonnet-5
 effort: low
@@ -31,6 +31,11 @@ Read the plan + `progress.md` and the files the plan names. Use Read/Grep/Glob o
 — you do NOT edit anything. Confirm the slice is coherent; if the plan is internally
 contradictory or names files that don't exist, STOP and report to the orchestrator
 rather than dispatching a doomed Codex run.
+
+The plan file itself is not one of those files. `.claude/plans/` is git-ignored, so a wave
+worktree never contains it: read the plan from the absolute main-checkout path in your brief,
+and do not report it "missing" from the worktree. Inline the plan text into the Codex prompt
+(Step 3) rather than pointing Codex at a path.
 
 ## Step 2 — Resolve the Codex runtime
 
@@ -113,6 +118,44 @@ call with `--resume-last` and a **delta-only** prompt (just the fix list — do 
 restate the whole plan). Only resume after the previous foreground run returned;
 `--resume-last` throws if a prior task is still running.
 
+## Cancelling a run (stopping this agent does not stop Codex)
+
+TaskStop on this agent ends the Claude host only. The codex-companion job, its
+`app-server-broker.mjs` broker, the `codex app-server` and the sandbox processes it spawned
+keep running, and keep editing the worktree. Whoever stops this agent (the orchestrator, or
+you on an abort) must cancel the Codex side too, with `COMPANION` resolved as in Step 2 and
+`WT` = the absolute worktree path:
+
+```bash
+# 0. Guard. The companion turns an empty --cwd into its own cwd, so an unset WT would cancel
+#    the main checkout's jobs. WT must be an absolute worktree root and not the main checkout.
+: "${WT:?set WT to the absolute worktree path}"
+case "$WT" in /*) ;; *) echo "refuse: WT must be absolute" >&2; exit 1 ;; esac
+[ "$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null)" = "$WT" ] \
+  || { echo "refuse: $WT is not a git worktree root" >&2; exit 1; }
+MAIN="$(cd "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)"
+[ "$(cd "$WT" && pwd -P)" != "$MAIN" ] || { echo "refuse: $WT is the main checkout" >&2; exit 1; }
+# 1. Interrupt the turn and kill the job's process tree (the companion's own cancel).
+for id in $(node "$COMPANION" status --cwd "$WT" --json | jq -r '.running[].id'); do
+  node "$COMPANION" cancel "$id" --cwd "$WT" --json
+done
+# 2. If anything still runs, kill the broker for THIS worktree and all its descendants.
+#    Match only a node process running the broker (not this shell, whose command line also
+#    contains the pattern), then "--cwd $WT --pid-file" as a fixed string so other
+#    worktrees' brokers survive; never this shell or its parent.
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill -TERM "$1" 2>/dev/null; }
+ps -axo pid=,command= \
+  | grep -E '^ *[0-9]+ +([^ ]*/)?node [^ ]*/app-server-broker\.mjs serve ' \
+  | grep -F -- "--cwd $WT --pid-file" \
+  | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent {print $1}' \
+  | while read -r pid; do kill_tree "$pid"; done
+# 3. Verify: no broker left for $WT, and `git -C "$WT" status --short` is unchanged 30 s later.
+```
+
+The `status` call lists only the current Claude session's jobs; if it shows nothing while
+the worktree is still changing, go straight to step 2. Never kill a broker whose `--cwd` is
+not the worktree you stopped.
+
 ## Step 5 — Parse + report
 
 The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSummary}`.
@@ -134,6 +177,8 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
   hand-write the change, never `codex exec`.
 - Foreground dispatch only; pin `--effort high`; pin `--model` via `CODEX_MODEL`
   when determinism matters.
+- Stopping this agent never stops Codex: cancel the job and the worktree's broker as in
+  "Cancelling a run".
 - Keep the read-first + STOP-and-report gate on the Claude side; everything else is
   Codex's fused loop.
 - Never `--no-verify`; never weaken a test or silence the gate (enforced in the
