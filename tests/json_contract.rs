@@ -353,8 +353,7 @@ fn evidence_shapes() {
     let text = match fs::read_to_string(&path) {
         Ok(text) => text,
         Err(err) => {
-            eprintln!("skipped: no recording at {path}: {err}");
-            return;
+            panic!("no recording at {path}: setup did not produce calls.ndjson: {err}");
         }
     };
     let docs = examples();
