@@ -180,15 +180,31 @@ SCRIPT="$SCRIPT_DIR/omp-engine.sh"
 
 under() { case "$1/" in "$2/"*) return 0 ;; *) return 1 ;; esac; }
 prepare_root() {
-  local parent home
+  local parent home metadata owner permissions
+  # Callers retain this diagnostic when preparation fails, including stat errors.
+  REASON='unsafe run root: could not resolve or inspect directory'
   parent="$(cd "${TMPDIR:-/tmp}" && pwd -P)" || return 1
   home="$(cd "$HOME" && pwd -P)" || return 1
   ROOT="$parent/glen-omp-engine"
   if [ -d "$ROOT" ]; then ROOT="$(cd "$ROOT" && pwd -P)" || return 1; fi
-  under "$ROOT" "$home" && return 1
+  # shellcheck disable=SC2016 # Diagnostic deliberately names HOME literally.
+  if under "$ROOT" "$home"; then REASON='run root under $HOME; set TMPDIR outside $HOME'; return 1; fi
   mkdir -p "$ROOT" || return 1
   ROOT="$(cd "$ROOT" && pwd -P)" || return 1
-  ! under "$ROOT" "$home"
+  if [ "$(uname -s)" = Darwin ]; then
+    metadata="$(stat -f '%u %Lp' "$ROOT")" || return 1
+  else
+    metadata="$(stat -c '%u %a' "$ROOT")" || return 1
+  fi
+  read -r owner permissions <<< "$metadata"
+  if [ "$owner" != "$(id -u)" ]; then
+    REASON="unsafe run root: $ROOT is not owned by the current user"
+    return 1
+  fi
+  if (( (8#$permissions & 0022) != 0 )); then
+    REASON="unsafe run root: $ROOT is group- or world-writable"
+    return 1
+  fi
 }
 resolve_glen() {
   local common main
@@ -228,8 +244,7 @@ probe_checks() {
   command -v omp >/dev/null 2>&1 || stop skipped 'omp not on PATH' 3
   [ -f "$HOME/${PI_CONFIG_DIR:-.omp}/profiles/$PROFILE/agent/config.yml" ] || \
     stop skipped 'glen-harness profile is not set up; run .claude/scripts/omp-profile-setup.sh' 3
-  # shellcheck disable=SC2016 # This required diagnostic names HOME, not its value.
-  prepare_root || stop skipped 'run root under $HOME; set TMPDIR outside $HOME' 3
+  prepare_root || stop skipped "$REASON" 3
   PROBE_DIR="$(mktemp -d "$ROOT/probe.XXXXXX")"
   # Provisional login signal; Step 3 must confirm this after the owner's login.
   if models="$(bounded_omp 9 models cursor --json)"; then rc=0; else rc="$?"; fi
@@ -253,8 +268,24 @@ fingerprint_source() {
   { git -C "$1" status --porcelain=v1 -z || return 1; git -C "$1" diff HEAD || return 1; } |
     shasum -a 256 | awk '{print $1}'
 }
+validate_snapshot_links() {
+  # Check every link without following directory links during traversal. abs_path
+  # resolves the full chain; unresolved (including dangling/cyclic) links fail closed.
+  perl -MCwd=abs_path -MFile::Find -e '
+    my $root = shift;
+    find({no_chdir => 1, wanted => sub {
+      return unless -l $_;
+      my $target = abs_path($_);
+      die "unsafe snapshot symlink: $_\n" unless defined($target) && -e $target &&
+        ($target eq $root || index($target, "$root/") == 0);
+      # An alias into quarantine would expose dotenv files at another cwd.
+      die "snapshot symlink aliases dotenv quarantine: $_\n" if
+        $target eq "$root/_agent-config/dotenv" || index($target, "$root/_agent-config/dotenv/") == 0;
+    }}, $root);
+  ' "$1" || stop failed 'snapshot contains unsafe symlink' 4
+}
 snapshot_command() {
-  local SRC="$1" DEST="$2" before after attempt name size path hash
+  local SRC="$1" DEST="$2" before after attempt name size path hash dotenv_ready=0 relative
   SRC="$(cd "$SRC" && pwd -P)"
   git -C "$SRC" rev-parse --show-toplevel >/dev/null
   # This command owns only an absent or empty destination, including on recapture.
@@ -262,8 +293,6 @@ snapshot_command() {
   DEST="$(cd "$DEST" && pwd -P)"
   if under "$DEST" "$SRC" || under "$SRC" "$DEST"; then stop failed 'snapshot paths overlap' 4; fi
   [ -z "$(find "$DEST" -mindepth 1 -maxdepth 1 -print -quit)" ] || stop failed 'snapshot destination is not empty' 4
-  size="$(du -sk "$SRC" | awk '{print $1}')"
-  [ "$size" -le 512000 ] || stop skipped 'snapshot over 500 MB' 3
   for attempt in 1 2; do
     before="$(fingerprint_source "$SRC")"
     (
@@ -271,7 +300,7 @@ snapshot_command() {
       git ls-files -z --cached --others --exclude-standard |
         while IFS= read -r -d '' path; do
           if [ -e "$path" ] || [ -L "$path" ]; then printf '%s\0' "$path"; fi
-        done | tar --exclude=.git --null -T - -cf - | tar -xf - -C "$DEST"
+        done | tar --exclude=.git --exclude=.wrangler --null -T - -cf - | tar -xf - -C "$DEST"
     )
     # Test-only race injection exists exclusively in this snapshot subcommand.
     if [ -n "${GLEN_OMP_ENGINE_TEST_MUTATE:-}" ]; then
@@ -283,6 +312,30 @@ snapshot_command() {
     [ "$attempt" -ne 2 ] || stop skipped 'source changed during capture' 3
     log 'source changed during capture; recapturing once'
   done
+  validate_snapshot_links "$DEST"
+  # Measure precisely the copied tree, excluding ignored build output and metadata.
+  size="$(du -sk "$DEST" | awk '{print $1}')"
+  [ "$size" -le 512000 ] || stop skipped 'snapshot over 500 MB' 3
+  # Bun reads .env, .env.local, .env.<mode>, .env.<mode>.local before settings;
+  # utils/env.ts also eagerly parses cwd/.env regardless of Bun startup flags.
+  # Glen executes omp directly, not `bun --no-env-file ...`; there is no omp
+  # dispatch switch suppressing both loaders. Reserve a fresh dotenv subtree and
+  # preserve original relative paths there, before root config relocation. Never
+  # merge with a copied subtree or overwrite evidence on a name collision.
+  while IFS= read -r -d '' path; do
+    if [ "$dotenv_ready" -eq 0 ]; then
+      [ ! -L "$DEST/_agent-config" ] || stop failed 'agent-config destination is a symlink' 4
+      mkdir -p "$DEST/_agent-config"
+      [ ! -e "$DEST/_agent-config/dotenv" ] && [ ! -L "$DEST/_agent-config/dotenv" ] || \
+        stop failed 'dotenv relocation collision' 4
+      mkdir "$DEST/_agent-config/dotenv"
+      dotenv_ready=1
+    fi
+    relative="${path#"$DEST/"}"
+    mkdir -p "$DEST/_agent-config/dotenv/$(dirname "$relative")"
+    mv "$path" "$DEST/_agent-config/dotenv/$relative"
+  done < <(find "$DEST" -path "$DEST/_agent-config/dotenv" -prune -o \
+    \( -type f -o -type l \) \( -name .env -o -name '.env.*' \) -print0)
   for name in .omp .pi .claude .codex .gemini .cursor .opencode .windsurf .vscode .agents .mcp.json mcp.json opencode.json opencode.jsonc; do
     if [ -e "$DEST/$name" ] || [ -L "$DEST/$name" ]; then
       [ ! -L "$DEST/_agent-config" ] || stop failed 'agent-config destination is a symlink' 4
@@ -294,6 +347,25 @@ snapshot_command() {
       MOVED="$(printf '%s' "$MOVED" | jq -c --arg name "$name" '. + [$name]')"
     fi
   done
+  # Moving a relative link can change its resolved target; re-check before reads.
+  validate_snapshot_links "$DEST"
+  # Match omp 18.14.0 discovery/at-imports.ts boundaries and path-leading chars.
+  # Prefix @ with a literal backslash: the preceding char is then neither a
+  # line start nor space/tab. Keep the text (also in code examples) readable.
+  # Include symlinked context files and every copilot basename, since a .github
+  # directory alias may expose a differently named directory's context file.
+  while IFS= read -r -d '' path; do
+    [ -f "$path" ] || continue
+    perl -e '
+      my $file = shift;
+      open my $in, "<", $file or die "$file: $!";
+      local $/; my $text = <$in>; close $in or die "$file: $!";
+      $text =~ s/(^|[ \t])\@(?=[.\/~A-Za-z0-9_-])/$1\\\@/mg;
+      open my $out, ">", $file or die "$file: $!";
+      print {$out} $text; close $out or die "$file: $!";
+    ' "$path"
+  done < <(find "$DEST" \( -type f -o -type l \) \
+    \( -name AGENTS.md -o -name CLAUDE.md -o -name copilot-instructions.md \) -print0)
   HEAD="$(git -C "$SRC" rev-parse HEAD)"
   SNAPSHOT_SHA256="$(
     cd "$DEST" || exit 1
@@ -367,7 +439,7 @@ TREE="$RUN_DIR/tree"
 policy "$ENGINE_ROOT" "$POLICY_PATH"
 
 # Invoke the same snapshot subcommand used by smoke tests; its JSON stays private.
-if "$SCRIPT" snapshot "$REPO" "$TREE" > "$RUN_DIR/snapshot.json"; then SNAP_RC=0; else SNAP_RC="$?"; fi
+if env -u GLEN_OMP_ENGINE_TEST_MUTATE "$SCRIPT" snapshot "$REPO" "$TREE" > "$RUN_DIR/snapshot.json"; then SNAP_RC=0; else SNAP_RC="$?"; fi
 if [ "$SNAP_RC" -ne 0 ]; then
   SNAP_REASON="$(jq -r '.reason // "snapshot failed"' "$RUN_DIR/snapshot.json")"
   if [ "$SNAP_RC" -eq 3 ]; then stop skipped "$SNAP_REASON" 3; else stop failed "$SNAP_REASON" 4; fi
@@ -402,6 +474,7 @@ cat "$ENGINE_ROOT/.claude/skills/omp/templates/$MODE.md" > "$RUN_DIR/prompt.md"
   if [ "$(wc -l < "$TREE/_review/changed-files.txt")" -gt 200 ]; then printf 'More files: see changed-files.txt.\n'; fi
   printf '\n_agent-config mapping: root names lose their leading dot; other names stay unchanged.\nMoved names:\n'
   printf '%s' "$MOVED" | jq -r '.[] | "\(.) -> _agent-config/\(ltrimstr("."))"'
+  printf 'Dotenv files: original relative path -> _agent-config/dotenv/<original relative path>.\n'
 } >> "$RUN_DIR/prompt.md"
 
 ENVELOPE="$RUN_DIR/envelope.json"
