@@ -115,6 +115,25 @@ for mode in a b b2 b3 c1 c2; do
       '(.pass|not) and ([.checks[].id]==$ids[0]) and (.checks|length>0) and all(.checks[]; (.pass|not) and (.evidence|contains($path) and contains("missing recording")))' "$S/verdict.json" >/dev/null
     cp "$S/good.ndjson" "$S/calls.ndjson"
 done
+# Help stdout is plain text and must not count as a delivery attempt or other content.
+mkdir -p "$S/c2-home/.codex"
+printf '# offline config fixture\n' > "$S/c2-home/.codex/config.toml"
+shasum -a 256 "$S/c2-home/.codex/config.toml" | cut -d ' ' -f1 > "$S/config.before.sha256"
+jq -cn --slurpfile m "$S/manifest.json" '
+  $m[0] as $m |
+  [ {a:["ls"],out:{data:{sessions:[$m.R,$m.L,$m.X]}},exit:0},
+    {a:["tail","aaaaaaa"],out:{data:{session:$m.R}},exit:0},
+    {a:["send","aaaaaaa","hi"],out:{error:{details:{reason:"sandboxed",network:true}}},exit:6},
+    {a:["send","bbbbbbb","hi"],out:{data:{job:{session_id:$m.L.id,route:"live"},assistant_text:$m.NONCE_L}},exit:0},
+    {a:["send","--help"],out:"Usage: glen send [OPTIONS]",exit:0},
+    {a:["tail","-h"],out:"Usage: glen tail [OPTIONS]",exit:0},
+    {a:["inbox","--help"],out:"Usage: glen inbox [OPTIONS]",exit:0}
+  ] | to_entries[] | .key as $i | .value as $v |
+  {t:"start",id:($i|tostring),argv:$v.a,ts:($i*10)},
+  {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$S/calls.ndjson"
+HOME="$S/c2-home" "$A/acc.sh" check c2 "$S"
+jq -e '.mode=="c2" and .pass and (.checks|all(.pass))' "$S/verdict.json" >/dev/null
+cp "$S/good.ndjson" "$S/calls.ndjson"
 # Exercise the guard with a fake binary, including --as before target and escaped cwd.
 printf '#!/usr/bin/env bash\nprintf '\''{"v":1,"ok":true,"data":{}}\\n'\''\n' > "$S/glen-bin/glen"
 chmod +x "$S/glen-bin/glen"
