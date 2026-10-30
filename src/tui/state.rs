@@ -21,6 +21,7 @@ use std::{
 };
 
 pub struct App {
+    pub dirty: bool,
     pub theme: TuiTheme,
     pub caps: Caps,
     pub size: (u16, u16),
@@ -59,6 +60,7 @@ impl App {
         wall: SystemTime,
     ) -> Self {
         Self {
+            dirty: true,
             theme,
             caps: Caps {
                 controls: super::controls::AVAILABLE,

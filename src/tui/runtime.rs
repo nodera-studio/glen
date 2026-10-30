@@ -562,10 +562,12 @@ fn event_loop(
         if panic_test.is_some_and(|test| !test.worker && started.elapsed() >= test.after) {
             panic!("GLEN_WATCH_TEST_PANIC ui");
         }
-        // Every iteration follows input/data or Tick; the first renders the initial state.
-        view::prepare(app);
-        if let Err(error) = terminal.draw(|f| view::draw(f, app)) {
-            return terminal_error(hup, io_error("draw terminal frame", error));
+        if app.dirty {
+            view::prepare(app);
+            if let Err(error) = terminal.draw(|f| view::draw(f, app)) {
+                return terminal_error(hup, io_error("draw terminal frame", error));
+            }
+            app.dirty = false;
         }
         reap(&mut effects.tasks)?;
         let msg = match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {

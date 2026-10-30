@@ -72,7 +72,6 @@ pub(crate) fn open_follow(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, Gle
 pub(crate) fn open_unprobed(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
     open_mode(cli, env, arg, false, false)
 }
-#[allow(dead_code)] // Shared with the watch view in the next slice.
 pub(crate) fn open_watch(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
     open_mode(cli, env, arg, true, false)
 }

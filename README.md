@@ -99,12 +99,17 @@ Use `--all` for every project or `--cwd DIR` for one project (the flags conflict
 | Tab / Shift-Tab | Next / previous focus |
 | Up / Down | Select a session or scroll the transcript |
 | Enter | Focus the prompt from the list; send from the prompt |
+| Alt-Enter / Ctrl-J | New line in the prompt |
 | Ctrl-T | Cycle delivery: auto → steer → follow-up |
+| ? / F1 | Help |
 | G | Resume following the transcript's newest entries |
 | q | Quit from the sessions or transcript pane |
 
 Watch is for humans only and needs interactive stdin and stdout. Agents use `glen tail -f <session>`
 and `glen inbox -f`. Watch only peeks at replies; it never marks them read.
+
+If a forced stop (such as SIGKILL) or suspension (SIGTSTP) leaves the terminal looking broken,
+run `reset` in the shell. Watch does not handle suspend/resume in this release.
 
 <!-- W3:start -->
 ## Live sessions (`glen install-extension`)

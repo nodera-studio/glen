@@ -4,7 +4,6 @@ use super::{
     keymap::{self, Action, KeymapCtx},
     prompt::Draft,
     state::*,
-    theme,
 };
 use crate::{
     cli::DeliverAs,
@@ -15,12 +14,19 @@ use ratatui::{
     crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     text::Line,
 };
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 
 pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
     if app.exit.is_some() {
         return vec![];
     }
+    app.dirty |= match &msg {
+        Msg::Tick { .. } => false,
+        Msg::Key(key) => key.kind != KeyEventKind::Release,
+        Msg::Resize(w, h) => app.size != (*w, *h),
+        Msg::Follow { r#gen, .. } => *r#gen == app.transcript.r#gen,
+        _ => true,
+    };
     let commands = match msg {
         Msg::SourceError { source, error } => {
             toast(
@@ -65,18 +71,31 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
         }
         Msg::Resize(w, h) => {
             app.size = (w, h);
-            set_viewport(app, w.saturating_sub(2), h.saturating_sub(2));
             sync_tab(app);
             vec![]
         }
         Msg::Tick { now, wall } => {
+            let animates = tick_interval(app) == Duration::from_millis(80) || !app.list.loaded;
+            let age_changed = app.list.rows.iter().any(|row| {
+                text::age_in(app.wall, row.updated, &app.timezone)
+                    != text::age_in(wall, row.updated, &app.timezone)
+            }) || matches!(app.overlay, Some(Overlay::Inbox))
+                && app.inbox.records.iter().any(|record| {
+                    record.at.parse::<jiff::Timestamp>().ok().is_some_and(|at| {
+                        text::age_in(app.wall, at.into(), &app.timezone)
+                            != text::age_in(wall, at.into(), &app.timezone)
+                    })
+                });
             app.now = now;
             app.wall = wall;
             app.frame = app.frame.wrapping_add(1);
             if app.toast.as_ref().is_some_and(|t| now >= t.until) {
                 app.toast = None;
+                app.dirty = true;
             }
+            let rows = app.jobs.rows.len();
             expire_jobs(app, false);
+            app.dirty |= animates || age_changed || rows != app.jobs.rows.len();
             vec![]
         }
         Msg::Signal(n) => quit(app, 128i32.saturating_add(n)),
@@ -691,10 +710,10 @@ fn followed(app: &mut App, ev: FollowMsg) {
             if !app.transcript.scroll.follow {
                 app.transcript.scroll.unseen = app.transcript.scroll.unseen.saturating_add(n);
             }
-            if trim_blocks(app) {
-                rerender(app);
-            } else {
-                render_new(app, start);
+            render_new(app, start);
+            let removed = trim_blocks(app);
+            if removed > 0 {
+                trim_rendered(app, removed);
             }
         }
         FollowMsg::Notice(s) => {
@@ -729,26 +748,45 @@ fn followed(app: &mut App, ev: FollowMsg) {
         FollowMsg::Failed(err) => app.transcript.status = TranscriptStatus::Failed(err),
     }
 }
-fn trim_blocks(app: &mut App) -> bool {
+fn trim_blocks(app: &mut App) -> usize {
     let mut items = app
         .transcript
         .blocks
         .iter()
         .filter(|b| matches!(b, Block::Item(_)))
         .count();
-    let mut changed = false;
+    let mut removed = 0;
     while items > 1000 {
         if let Some(b) = app.transcript.blocks.pop_front() {
             if matches!(b, Block::Item(_)) {
                 items -= 1;
                 app.transcript.dropped = app.transcript.dropped.saturating_add(1);
             }
-            changed = true;
+            removed += 1;
         } else {
             break;
         }
     }
-    changed
+    removed
+}
+/// Drop cached rows with their blocks, retaining every surviving span and the model context.
+fn trim_rendered(app: &mut App, removed: usize) {
+    let mut banner = dropped_banner(app);
+    banner.push(Line::default());
+    let prefix = banner.len();
+    let t = &mut app.transcript;
+    let cut = t.starts[removed];
+    t.lines.drain(..cut);
+    t.lines.splice(0..0, banner);
+    t.starts.drain(..removed);
+    for start in &mut t.starts {
+        *start = start.saturating_sub(cut).saturating_add(prefix);
+    }
+    t.scroll.top = t.scroll.top.saturating_sub(cut).saturating_add(prefix);
+}
+#[cfg(test)]
+thread_local! {
+    static RENDERED_BLOCKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 fn render_new(app: &mut App, start: usize) {
     let p = app.theme.painter();
@@ -760,6 +798,8 @@ fn render_new(app: &mut App, start: usize) {
         thinking: t.opts.thinking,
     };
     for block in t.blocks.iter().skip(start) {
+        #[cfg(test)]
+        RENDERED_BLOCKS.with(|count| count.set(count.get() + 1));
         if !t.lines.is_empty() {
             t.lines.push(Line::default());
         }
@@ -773,11 +813,8 @@ fn render_new(app: &mut App, start: usize) {
         t.lines.extend(ansi::lines(&rendered));
     }
 }
-fn rerender(app: &mut App) {
-    let t = &mut app.transcript;
-    t.lines.clear();
-    t.starts.clear();
-    t.prev_model = None;
+fn dropped_banner(app: &App) -> Vec<Line<'static>> {
+    let t = &app.transcript;
     if t.dropped > 0 {
         let handle = t
             .header
@@ -789,10 +826,17 @@ fn rerender(app: &mut App) {
             t.dropped,
             text::single_line(handle)
         );
-        t.lines.extend(ansi::lines(
-            &app.theme.painter().paint(Token::Muted, &banner),
-        ));
+        return ansi::lines(&app.theme.painter().paint(Token::Muted, &banner));
     }
+    vec![]
+}
+fn rerender(app: &mut App) {
+    let banner = dropped_banner(app);
+    let t = &mut app.transcript;
+    t.lines.clear();
+    t.lines.extend(banner);
+    t.starts.clear();
+    t.prev_model = None;
     render_new(app, 0);
 }
 fn follow_bottom(app: &mut App) {
@@ -800,8 +844,9 @@ fn follow_bottom(app: &mut App) {
         app.transcript.scroll.top = app.transcript.lines.len().saturating_sub(app.page());
     }
 }
-/// Supply the inner transcript area independently of the future layout/view implementation.
+/// Apply the viewport supplied by the view; a width change reflows the cache once.
 pub fn set_viewport(app: &mut App, width: u16, height: u16) {
+    app.dirty |= app.transcript.width != width.max(1) || app.transcript.height != height.max(1);
     let anchor = app
         .transcript
         .starts
@@ -930,118 +975,6 @@ fn timestamp_cmp(a: &str, b: &str) -> std::cmp::Ordering {
         .then_with(|| a.cmp(b))
 }
 
-#[derive(Clone, Debug)]
-pub struct StripLine {
-    pub text: String,
-    pub token: Token,
-    pub hint: Option<String>,
-}
-/// Job prose is prepared by the jobs worker; this only adds presentation-time data.
-pub fn strip_lines(app: &App) -> Vec<StripLine> {
-    let Some(session) = app.list.selected.as_deref() else {
-        return vec![];
-    };
-    let mut out = vec![];
-    for send in app.sends.iter().filter(|s| s.session_id == session) {
-        match &send.phase {
-            SendPhase::Routing => out.push(StripLine {
-                text: format!(
-                    "{} routing · {} · {}",
-                    theme::spinner(app.frame),
-                    text::single_line(&send.handle),
-                    elapsed(app.now.saturating_duration_since(send.started).as_millis())
-                ),
-                token: Token::Focus,
-                hint: None,
-            }),
-            SendPhase::Refused(err) => out.push(StripLine {
-                text: text::single_line(&err.message),
-                token: Token::Danger,
-                hint: err.hint.clone(),
-            }),
-            SendPhase::Job { .. } => (),
-        }
-    }
-    let mut replies: HashMap<String, crate::jobs::Reply> = HashMap::new();
-    for row in app.jobs.rows.iter().filter(|r| {
-        r.session_id.as_deref() == Some(session) || r.actual_session_id.as_deref() == Some(session)
-    }) {
-        if !row.status.status.is_terminal() {
-            let ms = row
-                .created_at
-                .parse::<jiff::Timestamp>()
-                .ok()
-                .and_then(|t| app.wall.duration_since(t.into()).ok())
-                .unwrap_or_default()
-                .as_millis();
-            out.push(StripLine {
-                text: format!(
-                    "{} {} · {} · {}",
-                    theme::spinner(app.frame),
-                    text::single_line(&row.progress),
-                    text::single_line(&row.handle),
-                    elapsed(ms)
-                ),
-                token: Token::Focus,
-                hint: None,
-            });
-        } else {
-            let (s, token, hint) = match &row.done {
-                Some(Done::Completed(s)) => (s.clone(), Token::Success, None),
-                Some(Done::Forked(s)) => (s.clone(), Token::Success, None),
-                Some(Done::Failed(e)) => (e.message.clone(), Token::Danger, e.hint.clone()),
-                None => (row.status.status.as_str().into(), Token::Muted, None),
-            };
-            out.push(StripLine {
-                text: text::single_line(&s),
-                token,
-                hint,
-            });
-        }
-        if let Some(result) = &row.result {
-            for reply in &result.replies {
-                if reply.session_id == session {
-                    replies.insert(reply.id.clone(), reply.clone());
-                }
-            }
-        }
-    }
-    // Prefer the durable inbox copy when a reply is present in both sources.
-    for msg in app.inbox.records.iter().filter(|r| r.session_id == session) {
-        replies.insert(
-            msg.id.clone(),
-            crate::jobs::Reply {
-                v: 1,
-                id: msg.id.clone(),
-                session_id: msg.session_id.clone(),
-                job_id: msg.job_id.clone(),
-                request_id: None,
-                tool_call_id: None,
-                text: msg.text.clone(),
-                is_final: msg.is_final,
-                at: msg.at.clone(),
-            },
-        );
-    }
-    let mut replies = replies.into_values().collect::<Vec<_>>();
-    replies.sort_by(|a, b| timestamp_cmp(&a.at, &b.at).then_with(|| a.id.cmp(&b.id)));
-    let n = replies.len().saturating_sub(3);
-    for reply in replies.into_iter().skip(n) {
-        out.push(StripLine {
-            text: format!(
-                "↩ {}{}",
-                text::single_line(&reply.text),
-                if reply.is_final { " ✓" } else { "" }
-            ),
-            token: Token::Muted,
-            hint: None,
-        });
-    }
-    out
-}
-fn elapsed(ms: u128) -> String {
-    crate::commands::wait::duration(ms.min(i64::MAX as u128) as i64)
-}
 pub fn tick_interval(app: &App) -> Duration {
     let animates = matches!(
         app.transcript.status,
@@ -1070,6 +1003,7 @@ mod tests {
         },
     };
     use std::{
+        collections::HashMap,
         path::PathBuf,
         time::{Instant, SystemTime},
     };
@@ -1422,6 +1356,98 @@ mod tests {
         assert_eq!(a.transcript.scroll.top, 0);
     }
     #[test]
+    fn cap_trimming_reuses_surviving_lines_and_renders_only_appended_blocks() {
+        for notice in [false, true] {
+            let mut a = app();
+            set_viewport(&mut a, 40, 6);
+            open(&mut a, vec![item(0)]);
+            if notice {
+                let r#gen = a.transcript.r#gen;
+                update(
+                    &mut a,
+                    Msg::Follow {
+                        r#gen,
+                        ev: FollowMsg::Notice("retained notice".into()),
+                    },
+                );
+            }
+            items(&mut a, (1..1000).map(item).collect());
+            a.transcript.scroll.follow = false;
+            a.transcript.scroll.top = a.transcript.starts[500] + 1;
+            for (id, removed) in [(1000, 1), (1001, if notice { 2 } else { 1 })] {
+                let cut = a.transcript.starts[removed];
+                let retained = a.transcript.lines[cut..].to_vec();
+                let starts = a.transcript.starts[removed..]
+                    .iter()
+                    .map(|s| s - cut + 2)
+                    .collect::<Vec<_>>();
+                let top = a.transcript.scroll.top;
+                RENDERED_BLOCKS.with(|count| count.set(0));
+                items(&mut a, vec![item(id)]);
+                RENDERED_BLOCKS
+                    .with(|count| assert_eq!(count.get(), 1, "trim re-rendered retained blocks"));
+                assert_eq!(&a.transcript.lines[2..2 + retained.len()], retained);
+                assert_eq!(&a.transcript.starts[..starts.len()], starts);
+                assert_eq!(a.transcript.scroll.top, top.saturating_sub(cut) + 2);
+                assert_eq!(a.transcript.starts[0], 2);
+                assert_eq!(a.transcript.dropped, id - 999);
+                assert_eq!(
+                    a.transcript.lines[0].to_string(),
+                    format!("── {} earlier items · glen show ha ──", id - 999)
+                );
+            }
+        }
+    }
+    #[test]
+    fn dirty_tracks_visual_ticks_and_resize_defers_the_viewport_to_prepare() {
+        let mut a = app();
+        open(&mut a, vec![item(0)]);
+        assert!(a.dirty);
+        a.dirty = false; // A completed draw consumes the flag.
+        let now = a.now + Duration::from_millis(250);
+        let wall = a.wall + Duration::from_millis(250);
+        update(&mut a, Msg::Tick { now, wall });
+        assert!(!a.dirty, "an idle tick must not request a draw");
+        let mut release = KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE);
+        release.kind = KeyEventKind::Release;
+        update(&mut a, Msg::Key(release));
+        assert!(!a.dirty);
+        let stale = a.transcript.r#gen.wrapping_sub(1);
+        update(
+            &mut a,
+            Msg::Follow {
+                r#gen: stale,
+                ev: FollowMsg::Items(vec![item(1)]),
+            },
+        );
+        assert!(!a.dirty);
+        let width = a.transcript.width;
+        RENDERED_BLOCKS.with(|count| count.set(0));
+        update(&mut a, Msg::Resize(120, 30));
+        assert!(a.dirty);
+        assert_eq!(a.transcript.width, width);
+        RENDERED_BLOCKS.with(|count| assert_eq!(count.get(), 0));
+        crate::tui::view::prepare(&mut a);
+        assert_eq!(a.transcript.width, 83);
+        RENDERED_BLOCKS.with(|count| assert_eq!(count.get(), 1));
+        a.dirty = false;
+        a.transcript.status = TranscriptStatus::Opening;
+        let now = a.now + Duration::from_millis(80);
+        update(&mut a, Msg::Tick { now, wall });
+        assert!(a.dirty, "spinner frames must request a draw");
+        a.transcript.status = TranscriptStatus::Ready;
+        toast(&mut a, "expires");
+        a.dirty = false;
+        let now = a.now + Duration::from_secs(3);
+        update(&mut a, Msg::Tick { now, wall });
+        assert!(a.dirty);
+        assert!(a.toast.is_none());
+        a.dirty = false;
+        let wall = SystemTime::UNIX_EPOCH + Duration::from_secs(121);
+        update(&mut a, Msg::Tick { now, wall });
+        assert!(a.dirty, "a changed session-age label must request a draw");
+    }
+    #[test]
     fn thinking_tools_and_scope_emit_only_the_expected_commands() {
         let mut a = app();
         let generation = a.transcript.r#gen;
@@ -1696,20 +1722,23 @@ mod tests {
             (JobState::Completed, "✓ completed"),
         ] {
             publish_job(&mut a, job(state));
-            let lines = strip_lines(&a);
-            assert!(lines[0].text.contains(expected));
+            let lines = crate::tui::view::activity_lines(&a);
+            assert!(lines[0].to_string().contains(expected));
             assert_eq!(a.jobs.rows[0].finished_at.is_some(), state.is_terminal());
         }
         let mut failed = job(JobState::Failed);
         failed.done = Some(Done::Failed(error()));
         publish_job(&mut a, failed);
-        let lines = strip_lines(&a);
-        assert_eq!(lines[0].text, error().message);
-        assert_eq!(lines[0].hint, error().hint);
+        let lines = crate::tui::view::activity_lines(&a);
+        assert_eq!(lines[0].to_string(), format!("✗ {}", error().message));
+        assert_eq!(lines[1].to_string(), format!("  {}", error().hint.unwrap()));
         let mut forked = job(JobState::Completed);
         forked.done = Some(Done::Forked("✓ forked → new-handle".into()));
         publish_job(&mut a, forked);
-        assert_eq!(strip_lines(&a)[0].text, "✓ forked → new-handle");
+        assert_eq!(
+            crate::tui::view::activity_lines(&a)[0].to_string(),
+            "✓ forked → new-handle"
+        );
     }
     #[test]
     fn final_reply_does_not_finish_an_accepted_job_and_newest_three_are_deduplicated() {
@@ -1738,12 +1767,12 @@ mod tests {
             ..InboxSnapshot::default()
         };
         update(&mut a, Msg::Inbox(inbox));
-        let lines = strip_lines(&a);
+        let lines = crate::tui::view::activity_lines(&a);
         assert_eq!(lines.len(), 4);
-        assert!(lines[0].text.contains("waiting for the reply"));
-        assert!(!lines.iter().any(|l| l.text.contains("✓ completed")));
-        assert!(!lines.iter().any(|l| l.text == "↩ one ✓"));
-        assert_eq!(lines[3].text, "↩ four from inbox ✓");
+        assert!(lines[0].to_string().contains("waiting for the reply"));
+        assert!(!lines.iter().any(|l| l.to_string().contains("✓ completed")));
+        assert!(!lines.iter().any(|l| l.to_string() == "↩ one ✓"));
+        assert_eq!(lines[3].to_string(), "↩ four from inbox ✓");
     }
     #[test]
     fn terminal_rows_expire_on_time_or_next_submit_and_cannot_resurrect() {
@@ -2094,6 +2123,7 @@ mod edge_tests {
         render::palette::{ColorDepth, Theme},
         tui::theme::TuiTheme,
     };
+    use std::collections::HashMap;
     use std::{
         path::PathBuf,
         time::{Instant, SystemTime},

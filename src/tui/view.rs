@@ -603,10 +603,10 @@ fn transcript(f: &mut Frame, app: &App, rect: Rect) {
     }
     let scroll = &app.transcript.scroll;
     let height = area.height.saturating_sub(u16::from(!scroll.follow));
-    let (lines, starts) = if app.transcript.width == layout::transcript_width(app) {
+    let (lines, starts) = if app.transcript.width == area.width.max(1) {
         (Cow::Borrowed(app.transcript.lines.as_slice()), None)
     } else {
-        let (lines, starts) = reflow(app, layout::transcript_width(app));
+        let (lines, starts) = reflow(app, area.width.max(1));
         (Cow::Owned(lines), Some(starts))
     };
     let mut top = if scroll.follow {
@@ -704,18 +704,6 @@ fn activity_groups(app: &App) -> Vec<Activity> {
                     ),
                     app.theme.style(Token::Focus),
                 ));
-            }
-            SendPhase::Refused(err) => {
-                lines.push(styled(
-                    format!("✗ {}", text::single_line(&err.message)),
-                    app.theme.style(Token::Danger),
-                ));
-                if let Some(hint) = &err.hint {
-                    lines.push(styled(
-                        format!("  {}", text::single_line(hint)),
-                        app.theme.style(Token::Muted),
-                    ));
-                }
             }
             _ => continue,
         }
@@ -2297,6 +2285,43 @@ pub(crate) mod tests {
         }
     }
     #[test]
+    fn submit_refusal_is_inline_only_and_stays_dismissed() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.jobs.rows.clear();
+        app.inbox.records.clear();
+        let error: ErrView = GlenError::new(ErrorCode::NoRoute, "no route for this session")
+            .with_hint("install the extension")
+            .into();
+        app.sends[0].phase = SendPhase::Refused(error.clone());
+        app.prompt.notice = Some(error);
+        assert!(activity_lines(&app).is_empty());
+        let (buffer, _, _) = screenshot(&mut app);
+        let areas = layout::areas(&app);
+        assert_eq!(areas.strip.height, 0);
+        let lines = region_text(&buffer, areas.notice);
+        assert_eq!(
+            lines,
+            ["✗ no route for this session", "  install the extension"]
+        );
+        let shown = region_text(&buffer, buffer.area).join("\n");
+        assert_eq!(shown.matches("no route for this session").count(), 1);
+        update::update(
+            &mut app,
+            Msg::Key(ratatui::crossterm::event::KeyEvent::new(
+                KeyCode::Esc,
+                KeyModifiers::NONE,
+            )),
+        );
+        assert!(app.prompt.notice.is_none());
+        assert!(activity_lines(&app).is_empty());
+        let (buffer, _, _) = screenshot(&mut app);
+        assert!(
+            !region_text(&buffer, buffer.area)
+                .join("\n")
+                .contains("no route for this session")
+        );
+    }
+    #[test]
     fn prompt_and_inbox_empty_placeholders_are_visible_and_muted() {
         let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
         app.size = (60, 20);
@@ -2652,11 +2677,15 @@ mod refinements {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         assert!(lines.last().unwrap().contains("sending \""));
-        app.sends[0].phase = SendPhase::Refused(
+        // Refused submits belong inline; failed jobs still need a strip headline and hint.
+        app.sends.clear();
+        app.jobs.rows[0].status.status = JobState::Failed;
+        app.jobs.rows[0].finished_at = Some(app.now);
+        app.jobs.rows[0].done = Some(Done::Failed(
             GlenError::new(ErrorCode::NoRoute, "no route")
                 .with_hint("a hint")
                 .into(),
-        );
+        ));
         let lines = visible_activity(&app, 1)
             .iter()
             .map(ToString::to_string)
@@ -2667,7 +2696,7 @@ mod refinements {
             .map(ToString::to_string)
             .collect::<Vec<_>>();
         assert_eq!(lines, ["✗ no route", "  a hint"]);
-        app.sends[0].started = app.now - Duration::from_secs(200);
+        app.jobs.rows[0].finished_at = Some(app.now - Duration::from_secs(200));
         assert!(
             !visible_activity(&app, 1)[0]
                 .to_string()
