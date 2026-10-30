@@ -1,0 +1,121 @@
+---
+source: src/tui/view.rs
+description: list_loading · 80x24 · Dark TrueColor
+---
+cursor: hidden
+grid 80x24
+glen watch                                                   0 sessions · 0 live
+▍sessions               │ ? · session · ? unknown
+⠁ reading sessions      │ select a session
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+                        │
+──────────────────────────────────────────────────────────────────────── auto ──
+? ❯
+⇥ next focus  ⏎ focus prompt  ↓ down  ↑ up  End last / follow  t toggle thinking
+styles (zero-based, half-open columns):
+r0 c0-4 fg=default bold
+r0 c4-10 fg=muted(#b4b5bd)
+r0 c10-61 fg=default
+r0 c61-80 fg=muted(#b4b5bd)
+r1 c0-1 fg=accent(#7170ff)
+r1 c1-9 fg=default bold
+r1 c9-24 fg=default
+r1 c24-25 fg=border(#45474d)
+r1 c25-49 fg=muted(#b4b5bd)
+r1 c49-80 fg=default
+r2 c0-18 fg=muted(#b4b5bd)
+r2 c18-24 fg=default
+r2 c24-25 fg=border(#45474d)
+r2 c25-26 fg=default
+r2 c26-42 fg=muted(#b4b5bd)
+r2 c42-80 fg=default
+r3 c0-24 fg=default
+r3 c24-25 fg=border(#45474d)
+r3 c25-80 fg=default
+r4 c0-24 fg=default
+r4 c24-25 fg=border(#45474d)
+r4 c25-80 fg=default
+r5 c0-24 fg=default
+r5 c24-25 fg=border(#45474d)
+r5 c25-80 fg=default
+r6 c0-24 fg=default
+r6 c24-25 fg=border(#45474d)
+r6 c25-80 fg=default
+r7 c0-24 fg=default
+r7 c24-25 fg=border(#45474d)
+r7 c25-80 fg=default
+r8 c0-24 fg=default
+r8 c24-25 fg=border(#45474d)
+r8 c25-80 fg=default
+r9 c0-24 fg=default
+r9 c24-25 fg=border(#45474d)
+r9 c25-80 fg=default
+r10 c0-24 fg=default
+r10 c24-25 fg=border(#45474d)
+r10 c25-80 fg=default
+r11 c0-24 fg=default
+r11 c24-25 fg=border(#45474d)
+r11 c25-80 fg=default
+r12 c0-24 fg=default
+r12 c24-25 fg=border(#45474d)
+r12 c25-80 fg=default
+r13 c0-24 fg=default
+r13 c24-25 fg=border(#45474d)
+r13 c25-80 fg=default
+r14 c0-24 fg=default
+r14 c24-25 fg=border(#45474d)
+r14 c25-80 fg=default
+r15 c0-24 fg=default
+r15 c24-25 fg=border(#45474d)
+r15 c25-80 fg=default
+r16 c0-24 fg=default
+r16 c24-25 fg=border(#45474d)
+r16 c25-80 fg=default
+r17 c0-24 fg=default
+r17 c24-25 fg=border(#45474d)
+r17 c25-80 fg=default
+r18 c0-24 fg=default
+r18 c24-25 fg=border(#45474d)
+r18 c25-80 fg=default
+r19 c0-24 fg=default
+r19 c24-25 fg=border(#45474d)
+r19 c25-80 fg=default
+r20 c0-24 fg=default
+r20 c24-25 fg=border(#45474d)
+r20 c25-80 fg=default
+r21 c0-72 fg=border(#45474d)
+r21 c72-78 fg=muted(#b4b5bd)
+r21 c78-80 fg=border(#45474d)
+r22 c0-1 fg=accent_2(#12a594)
+r22 c1-2 fg=default
+r22 c2-3 fg=accent(#7170ff)
+r22 c3-80 fg=default
+r23 c0-1 fg=default
+r23 c1-12 fg=muted(#b4b5bd)
+r23 c12-15 fg=default
+r23 c15-28 fg=muted(#b4b5bd)
+r23 c28-31 fg=default
+r23 c31-36 fg=muted(#b4b5bd)
+r23 c36-39 fg=default
+r23 c39-42 fg=muted(#b4b5bd)
+r23 c42-47 fg=default
+r23 c47-61 fg=muted(#b4b5bd)
+r23 c61-64 fg=default
+r23 c64-80 fg=muted(#b4b5bd)
+bg: none

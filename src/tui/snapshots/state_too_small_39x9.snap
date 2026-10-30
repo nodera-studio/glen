@@ -1,0 +1,27 @@
+---
+source: src/tui/view.rs
+description: too_small_39x9 · 39x9 · Dark TrueColor
+---
+cursor: hidden
+grid 39x9
+terminal too small · need 40×10
+
+
+
+
+
+
+
+
+styles (zero-based, half-open columns):
+r0 c0-31 fg=muted(#b4b5bd)
+r0 c31-39 fg=default
+r1 c0-39 fg=default
+r2 c0-39 fg=default
+r3 c0-39 fg=default
+r4 c0-39 fg=default
+r5 c0-39 fg=default
+r6 c0-39 fg=default
+r7 c0-39 fg=default
+r8 c0-39 fg=default
+bg: none

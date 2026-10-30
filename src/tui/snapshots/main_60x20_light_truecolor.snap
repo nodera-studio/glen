@@ -1,0 +1,92 @@
+---
+source: src/tui/view.rs
+description: main · 60x20 · Light TrueColor
+---
+cursor: 29,18
+grid 60x20
+glen watch               4 sessions · 2 live · ◐ 1 job · ↩ 1
+ sessions   │▍e27c0de · ◐ busy
+ · model anthropic/claude-sonnet-4-5
+
+ ❯ user · 12:00
+   Why does parser_test flake?
+
+ ◆ assistant · claude-sonnet-4-5 · 12:00
+   ∴ thinking · 4 words
+   Let me read the test.
+   ↳ read tests/parser_test.rs · ✓ fn parser_test() { … }
+
+ ◆ assistant · 12:00
+   The test depends on map order. Fixed.
+ ──────────────────────────────────────────────────────────
+ ⠁ j1234567 · waiting for the reply · 17s
+ ↩ I found the flaky assertion.
+──────────────────────────────────────────────────── auto ──
+e27c0de ❯ run the tests again
+⏎ send  ⌥⏎ new line  ⌃T auto / steer / follow-up
+styles (zero-based, half-open columns):
+r0 c0-4 fg=default bold
+r0 c4-10 fg=muted(#505050)
+r0 c10-25 fg=default
+r0 c25-60 fg=muted(#505050)
+r1 c0-9 fg=muted(#505050)
+r1 c9-12 fg=default
+r1 c12-14 fg=border(#dadada)
+r1 c14-24 fg=default
+r1 c24-30 fg=focus(#4069fd)
+r1 c30-60 fg=default
+r2 c0-1 fg=default
+r2 c1-36 fg=muted(#505050)
+r2 c36-60 fg=default
+r3 c0-60 fg=default
+r4 c0-1 fg=default
+r4 c1-7 fg=accent(#5e6ad2) bold
+r4 c7-15 fg=muted(#505050)
+r4 c15-60 fg=default
+r5 c0-60 fg=default
+r6 c0-60 fg=default
+r7 c0-1 fg=default
+r7 c1-12 fg=accent_2(#12a594) bold
+r7 c12-40 fg=muted(#505050)
+r7 c40-60 fg=default
+r8 c0-3 fg=default
+r8 c3-23 fg=muted(#505050)
+r8 c23-60 fg=default
+r9 c0-60 fg=default
+r10 c0-5 fg=default
+r10 c5-9 fg=default bold
+r10 c9-10 fg=default
+r10 c10-30 fg=muted(#505050)
+r10 c30-33 fg=default
+r10 c33-34 fg=success(#007f3d)
+r10 c34-60 fg=default
+r11 c0-60 fg=default
+r12 c0-1 fg=default
+r12 c1-12 fg=accent_2(#12a594) bold
+r12 c12-20 fg=muted(#505050)
+r12 c20-60 fg=default
+r13 c0-60 fg=default
+r14 c0-1 fg=default
+r14 c1-59 fg=border(#dadada)
+r14 c59-60 fg=default
+r15 c0-1 fg=default
+r15 c1-41 fg=focus(#4069fd)
+r15 c41-60 fg=default
+r16 c0-1 fg=default
+r16 c1-31 fg=muted(#505050)
+r16 c31-60 fg=default
+r17 c0-52 fg=border(#dadada)
+r17 c52-58 fg=muted(#505050)
+r17 c58-60 fg=border(#dadada)
+r18 c0-7 fg=accent_2(#12a594)
+r18 c7-8 fg=default
+r18 c8-9 fg=accent(#5e6ad2)
+r18 c9-60 fg=default
+r19 c0-1 fg=default
+r19 c1-6 fg=muted(#505050)
+r19 c6-10 fg=default
+r19 c10-19 fg=muted(#505050)
+r19 c19-23 fg=default
+r19 c23-48 fg=muted(#505050)
+r19 c48-60 fg=default
+bg: none

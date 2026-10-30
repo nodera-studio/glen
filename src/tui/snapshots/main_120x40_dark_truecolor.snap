@@ -1,0 +1,236 @@
+---
+source: src/tui/view.rs
+description: main · 120x40 · Dark TrueColor
+---
+cursor: 29,38
+grid 120x40
+glen watch                                                                           4 sessions · 2 live · ◐ 1 job · ↩ 1
+ sessions · ~/work/alpha          │▍e27c0de · Fix the flaky parser test · ◐ busy                       claude-sonnet-4-5
+▌◐ e27c0de              ↩1  3m ago│ · thinking level high
+▌  Fix the flaky parser test      │
+ ● f13a5b6                  7m ago│ · model anthropic/claude-sonnet-4-5
+   Continue the fixture r… pending│
+ ○ b7e2d81                  1h ago│ ❯ user · 12:00
+   Continue the fixture review    │   Why does parser_test flake?
+ ? 0a3f417                  1d ago│
+   Compact placeholder history    │ ◆ assistant · claude-sonnet-4-5 · 12:00
+                                  │   ∴ thinking · 4 words
+                                  │   Let me read the test.
+                                  │   ↳ read tests/parser_test.rs · ✓ fn parser_test() { … }
+                                  │
+                                  │ ◆ assistant · 12:00
+                                  │   The test depends on map order. Fixed.
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │ ───────────────────────────────────────────────────────────────────────────────────
+                                  │ ⠁ j1234567 · waiting for the reply · 17s
+                                  │ ↩ I found the flaky assertion.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────── auto ──
+e27c0de ❯ run the tests again
+⏎ send  ⌥⏎ new line  ⌃T auto / steer / follow-up  Esc dismiss error / transcript  ⇥ next focus  F1 help
+styles (zero-based, half-open columns):
+r0 c0-4 fg=default bold
+r0 c4-10 fg=muted(#b4b5bd)
+r0 c10-85 fg=default
+r0 c85-120 fg=muted(#b4b5bd)
+r1 c0-24 fg=muted(#b4b5bd)
+r1 c24-34 fg=default
+r1 c34-36 fg=border(#45474d)
+r1 c36-74 fg=default
+r1 c74-80 fg=focus(#94adff)
+r1 c80-103 fg=default
+r1 c103-120 fg=muted(#b4b5bd)
+r2 c0-1 fg=border(#45474d)
+r2 c1-2 fg=focus(#94adff)
+r2 c2-3 fg=default
+r2 c3-10 fg=focus(#94adff)
+r2 c10-24 fg=default
+r2 c24-28 fg=accent_2(#12a594)
+r2 c28-34 fg=muted(#b4b5bd)
+r2 c34-35 fg=border(#45474d)
+r2 c35-36 fg=default
+r2 c36-57 fg=muted(#b4b5bd)
+r2 c57-120 fg=default
+r3 c0-1 fg=border(#45474d)
+r3 c1-3 fg=default
+r3 c3-28 fg=default bold
+r3 c28-34 fg=default
+r3 c34-35 fg=border(#45474d)
+r3 c35-120 fg=default
+r4 c0-1 fg=default
+r4 c1-2 fg=success(#00ca50)
+r4 c2-3 fg=default
+r4 c3-10 fg=focus(#94adff)
+r4 c10-28 fg=default
+r4 c28-34 fg=muted(#b4b5bd)
+r4 c34-35 fg=border(#45474d)
+r4 c35-36 fg=default
+r4 c36-71 fg=muted(#b4b5bd)
+r4 c71-120 fg=default
+r5 c0-27 fg=default
+r5 c27-34 fg=warning(#ff9300)
+r5 c34-35 fg=border(#45474d)
+r5 c35-120 fg=default
+r6 c0-1 fg=default
+r6 c1-2 fg=muted(#b4b5bd)
+r6 c2-3 fg=default
+r6 c3-10 fg=focus(#94adff)
+r6 c10-28 fg=default
+r6 c28-34 fg=muted(#b4b5bd)
+r6 c34-35 fg=border(#45474d)
+r6 c35-36 fg=default
+r6 c36-42 fg=accent(#7170ff) bold
+r6 c42-50 fg=muted(#b4b5bd)
+r6 c50-120 fg=default
+r7 c0-34 fg=default
+r7 c34-35 fg=border(#45474d)
+r7 c35-120 fg=default
+r8 c0-1 fg=default
+r8 c1-2 fg=muted(#b4b5bd)
+r8 c2-3 fg=default
+r8 c3-10 fg=focus(#94adff)
+r8 c10-28 fg=default
+r8 c28-34 fg=muted(#b4b5bd)
+r8 c34-35 fg=border(#45474d)
+r8 c35-120 fg=default
+r9 c0-34 fg=default
+r9 c34-35 fg=border(#45474d)
+r9 c35-36 fg=default
+r9 c36-47 fg=accent_2(#12a594) bold
+r9 c47-75 fg=muted(#b4b5bd)
+r9 c75-120 fg=default
+r10 c0-34 fg=default
+r10 c34-35 fg=border(#45474d)
+r10 c35-38 fg=default
+r10 c38-58 fg=muted(#b4b5bd)
+r10 c58-120 fg=default
+r11 c0-34 fg=default
+r11 c34-35 fg=border(#45474d)
+r11 c35-120 fg=default
+r12 c0-34 fg=default
+r12 c34-35 fg=border(#45474d)
+r12 c35-40 fg=default
+r12 c40-44 fg=default bold
+r12 c44-45 fg=default
+r12 c45-65 fg=muted(#b4b5bd)
+r12 c65-68 fg=default
+r12 c68-69 fg=success(#00ca50)
+r12 c69-120 fg=default
+r13 c0-34 fg=default
+r13 c34-35 fg=border(#45474d)
+r13 c35-120 fg=default
+r14 c0-34 fg=default
+r14 c34-35 fg=border(#45474d)
+r14 c35-36 fg=default
+r14 c36-47 fg=accent_2(#12a594) bold
+r14 c47-55 fg=muted(#b4b5bd)
+r14 c55-120 fg=default
+r15 c0-34 fg=default
+r15 c34-35 fg=border(#45474d)
+r15 c35-120 fg=default
+r16 c0-34 fg=default
+r16 c34-35 fg=border(#45474d)
+r16 c35-120 fg=default
+r17 c0-34 fg=default
+r17 c34-35 fg=border(#45474d)
+r17 c35-120 fg=default
+r18 c0-34 fg=default
+r18 c34-35 fg=border(#45474d)
+r18 c35-120 fg=default
+r19 c0-34 fg=default
+r19 c34-35 fg=border(#45474d)
+r19 c35-120 fg=default
+r20 c0-34 fg=default
+r20 c34-35 fg=border(#45474d)
+r20 c35-120 fg=default
+r21 c0-34 fg=default
+r21 c34-35 fg=border(#45474d)
+r21 c35-120 fg=default
+r22 c0-34 fg=default
+r22 c34-35 fg=border(#45474d)
+r22 c35-120 fg=default
+r23 c0-34 fg=default
+r23 c34-35 fg=border(#45474d)
+r23 c35-120 fg=default
+r24 c0-34 fg=default
+r24 c34-35 fg=border(#45474d)
+r24 c35-120 fg=default
+r25 c0-34 fg=default
+r25 c34-35 fg=border(#45474d)
+r25 c35-120 fg=default
+r26 c0-34 fg=default
+r26 c34-35 fg=border(#45474d)
+r26 c35-120 fg=default
+r27 c0-34 fg=default
+r27 c34-35 fg=border(#45474d)
+r27 c35-120 fg=default
+r28 c0-34 fg=default
+r28 c34-35 fg=border(#45474d)
+r28 c35-120 fg=default
+r29 c0-34 fg=default
+r29 c34-35 fg=border(#45474d)
+r29 c35-120 fg=default
+r30 c0-34 fg=default
+r30 c34-35 fg=border(#45474d)
+r30 c35-120 fg=default
+r31 c0-34 fg=default
+r31 c34-35 fg=border(#45474d)
+r31 c35-120 fg=default
+r32 c0-34 fg=default
+r32 c34-35 fg=border(#45474d)
+r32 c35-120 fg=default
+r33 c0-34 fg=default
+r33 c34-35 fg=border(#45474d)
+r33 c35-120 fg=default
+r34 c0-34 fg=default
+r34 c34-35 fg=border(#45474d)
+r34 c35-36 fg=default
+r34 c36-119 fg=border(#45474d)
+r34 c119-120 fg=default
+r35 c0-34 fg=default
+r35 c34-35 fg=border(#45474d)
+r35 c35-36 fg=default
+r35 c36-76 fg=focus(#94adff)
+r35 c76-120 fg=default
+r36 c0-34 fg=default
+r36 c34-35 fg=border(#45474d)
+r36 c35-36 fg=default
+r36 c36-66 fg=muted(#b4b5bd)
+r36 c66-120 fg=default
+r37 c0-112 fg=border(#45474d)
+r37 c112-118 fg=muted(#b4b5bd)
+r37 c118-120 fg=border(#45474d)
+r38 c0-7 fg=accent_2(#12a594)
+r38 c7-8 fg=default
+r38 c8-9 fg=accent(#7170ff)
+r38 c9-120 fg=default
+r39 c0-1 fg=default
+r39 c1-6 fg=muted(#b4b5bd)
+r39 c6-10 fg=default
+r39 c10-19 fg=muted(#b4b5bd)
+r39 c19-23 fg=default
+r39 c23-48 fg=muted(#b4b5bd)
+r39 c48-53 fg=default
+r39 c53-80 fg=muted(#b4b5bd)
+r39 c80-83 fg=default
+r39 c83-94 fg=muted(#b4b5bd)
+r39 c94-98 fg=default
+r39 c98-103 fg=muted(#b4b5bd)
+r39 c103-120 fg=default
+bg: none

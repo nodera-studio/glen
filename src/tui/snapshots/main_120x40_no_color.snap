@@ -1,0 +1,88 @@
+---
+source: src/tui/view.rs
+description: main · 120x40 · Dark None
+---
+cursor: 29,38
+grid 120x40
+glen watch                                                                           4 sessions · 2 live · ◐ 1 job · ↩ 1
+ sessions · ~/work/alpha          │▍e27c0de · Fix the flaky parser test · ◐ busy                       claude-sonnet-4-5
+▌◐ e27c0de              ↩1  3m ago│ · thinking level high
+▌  Fix the flaky parser test      │
+ ● f13a5b6                  7m ago│ · model anthropic/claude-sonnet-4-5
+   Continue the fixture r… pending│
+ ○ b7e2d81                  1h ago│ ❯ user · 12:00
+   Continue the fixture review    │   Why does parser_test flake?
+ ? 0a3f417                  1d ago│
+   Compact placeholder history    │ ◆ assistant · claude-sonnet-4-5 · 12:00
+                                  │   ∴ thinking · 4 words
+                                  │   Let me read the test.
+                                  │   ↳ read tests/parser_test.rs · ✓ fn parser_test() { … }
+                                  │
+                                  │ ◆ assistant · 12:00
+                                  │   The test depends on map order. Fixed.
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │
+                                  │ ───────────────────────────────────────────────────────────────────────────────────
+                                  │ ⠁ j1234567 · waiting for the reply · 17s
+                                  │ ↩ I found the flaky assertion.
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────── auto ──
+e27c0de ❯ run the tests again
+Enter send  Alt-Enter new line  Ctrl-T auto / steer / follow-up  Esc dismiss error / transcript  Tab next focus  F1 help
+styles (zero-based, half-open columns):
+r0 c0-120 fg=default
+r1 c0-120 fg=default
+r2 c0-120 fg=default
+r3 c0-120 fg=default
+r4 c0-120 fg=default
+r5 c0-120 fg=default
+r6 c0-120 fg=default
+r7 c0-120 fg=default
+r8 c0-120 fg=default
+r9 c0-120 fg=default
+r10 c0-120 fg=default
+r11 c0-120 fg=default
+r12 c0-120 fg=default
+r13 c0-120 fg=default
+r14 c0-120 fg=default
+r15 c0-120 fg=default
+r16 c0-120 fg=default
+r17 c0-120 fg=default
+r18 c0-120 fg=default
+r19 c0-120 fg=default
+r20 c0-120 fg=default
+r21 c0-120 fg=default
+r22 c0-120 fg=default
+r23 c0-120 fg=default
+r24 c0-120 fg=default
+r25 c0-120 fg=default
+r26 c0-120 fg=default
+r27 c0-120 fg=default
+r28 c0-120 fg=default
+r29 c0-120 fg=default
+r30 c0-120 fg=default
+r31 c0-120 fg=default
+r32 c0-120 fg=default
+r33 c0-120 fg=default
+r34 c0-120 fg=default
+r35 c0-120 fg=default
+r36 c0-120 fg=default
+r37 c0-120 fg=default
+r38 c0-120 fg=default
+r39 c0-120 fg=default
+bg: none

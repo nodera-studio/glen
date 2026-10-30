@@ -2164,3 +2164,166 @@ mod confirm_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod snapshots {
+    use crate::{
+        render::palette::{ColorDepth, Theme},
+        tui::{
+            testkit::{self, SceneKind},
+            theme::TuiTheme,
+        },
+    };
+    fn pin(name: &str, kind: SceneKind, size: (u16, u16), theme: TuiTheme) {
+        let value = testkit::render(testkit::scene(kind, size, theme));
+        let mut settings = insta::Settings::clone_current();
+        settings.set_snapshot_path("snapshots");
+        settings.set_prepend_module_to_snapshot(false);
+        settings.set_omit_expression(true);
+        settings.set_description(format!(
+            "{} · {}x{} · {:?} {:?}",
+            kind.name(),
+            size.0,
+            size.1,
+            theme.theme,
+            theme.depth
+        ));
+        settings.bind(|| insta::assert_snapshot!(name, value));
+    }
+    macro_rules! snapshot {
+        ($name:ident, $kind:ident, $size:expr, $depth:ident, $theme:ident) => {
+            #[test]
+            fn $name() {
+                pin(
+                    stringify!($name),
+                    SceneKind::$kind,
+                    $size,
+                    TuiTheme {
+                        depth: ColorDepth::$depth,
+                        theme: Theme::$theme,
+                    },
+                );
+            }
+        };
+    }
+    snapshot!(main_80x24_dark_truecolor, Main, (80, 24), TrueColor, Dark);
+    snapshot!(main_80x24_light_truecolor, Main, (80, 24), TrueColor, Light);
+    snapshot!(main_80x24_no_color, Main, (80, 24), None, Dark);
+    snapshot!(main_120x40_dark_truecolor, Main, (120, 40), TrueColor, Dark);
+    snapshot!(
+        main_120x40_light_truecolor,
+        Main,
+        (120, 40),
+        TrueColor,
+        Light
+    );
+    snapshot!(main_120x40_no_color, Main, (120, 40), None, Dark);
+    snapshot!(main_60x20_dark_truecolor, Main, (60, 20), TrueColor, Dark);
+    snapshot!(main_60x20_light_truecolor, Main, (60, 20), TrueColor, Light);
+    snapshot!(main_60x20_no_color, Main, (60, 20), None, Dark);
+    snapshot!(main_80x24_dark_ansi256, Main, (80, 24), Ansi256, Dark);
+    snapshot!(main_80x24_dark_ansi16, Main, (80, 24), Ansi16, Dark);
+    snapshot!(state_empty_scope, EmptyScope, (80, 24), TrueColor, Dark);
+    snapshot!(
+        state_sessions_dir_missing,
+        SessionsDirMissing,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(state_list_loading, ListLoading, (80, 24), TrueColor, Dark);
+    snapshot!(state_opening, Opening, (80, 24), TrueColor, Dark);
+    snapshot!(
+        state_not_yet_persisted,
+        NotYetPersisted,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(state_open_failed, OpenFailed, (80, 24), TrueColor, Dark);
+    snapshot!(
+        state_no_route_inline,
+        NoRouteInline,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(
+        state_oversize_message,
+        OversizeMessage,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(state_sending, Sending, (80, 24), TrueColor, Dark);
+    snapshot!(
+        state_job_completed_replies,
+        JobCompletedReplies,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(
+        state_job_failed_no_route,
+        JobFailedNoRoute,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(state_job_forked, JobForked, (80, 24), TrueColor, Dark);
+    snapshot!(state_inbox_overlay, InboxOverlay, (80, 24), TrueColor, Dark);
+    snapshot!(
+        state_help_controls_off,
+        HelpControlsOff,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(
+        state_scrolled_with_new,
+        ScrolledWithNew,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(
+        state_narrow_60x20_transcript_tab,
+        NarrowTranscript,
+        (60, 20),
+        TrueColor,
+        Dark
+    );
+    snapshot!(state_too_small_39x9, TooSmall, (39, 9), TrueColor, Dark);
+    snapshot!(
+        state_untrusted_title,
+        UntrustedTitle,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(
+        state_multiline_prompt,
+        MultilinePrompt,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    #[test]
+    fn every_state_is_unstyled_in_both_no_color_themes_and_deterministic() {
+        for kind in std::iter::once(SceneKind::Main).chain(SceneKind::STATES) {
+            for theme in [Theme::Dark, Theme::Light] {
+                let theme = TuiTheme {
+                    depth: ColorDepth::None,
+                    theme,
+                };
+                let first = testkit::render(testkit::scene(kind, kind.size(), theme));
+                assert_eq!(
+                    first,
+                    testkit::render(testkit::scene(kind, kind.size(), theme)),
+                    "non-deterministic {}",
+                    kind.name()
+                );
+            }
+        }
+    }
+}
