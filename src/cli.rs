@@ -54,14 +54,25 @@ pub enum Command {
         after_help = "Examples:\n  glen tail @latest -n 5\n  glen tail e27c0de -f\n  glen tail e27c0de -n 0 -f --json"
     )]
     Tail(TailArgs),
-    #[command(hide = true, about = "Send a message to omp")]
+    #[command(
+        about = "Send a message to an omp session and wait for the reply (default 90s)",
+        after_help = "Examples:\n  glen send e27c0de \"run the tests\"\n  glen send @new hi --cwd ~/work/app\n  echo hi | glen send @latest - --no-wait"
+    )]
     Send(SendArgs),
-    #[command(hide = true, about = "Wait for a glen job")]
+    #[command(
+        about = "Wait for a glen job (default 90s)",
+        after_help = "Examples:\n  glen wait j1a2b3c4\n  glen wait j1a2b3c4 --timeout 2m"
+    )]
     Wait(WaitArgs),
-    #[command(hide = true, about = "List glen jobs")]
+    #[command(
+        about = "List glen jobs (newest first)",
+        after_help = "Examples:\n  glen jobs --active\n  glen jobs -n 0 --json"
+    )]
     Jobs(JobsArgs),
     #[command(hide = true, about = "Read replies from omp")]
     Inbox(InboxArgs),
+    #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
+    Worker(WorkerArgs),
     #[command(hide = true, about = "Watch a session live")]
     Watch(WatchArgs),
     #[command(hide = true, about = "Install the bundled omp extension")]
@@ -122,7 +133,7 @@ pub struct TailArgs {
     #[arg(long)]
     pub thinking: bool,
 }
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
 pub enum DeliverAs {
     Auto,
     Steer,
@@ -131,15 +142,39 @@ pub enum DeliverAs {
 #[derive(Debug, Args)]
 pub struct SendArgs {
     pub session: String,
+    #[arg(help = "message text, or - to read stdin (use -- before a message that starts with -)")]
     pub message: String,
+    #[arg(long, conflicts_with_all = ["deliver_as", "follow_up"])]
+    pub steer: bool,
+    #[arg(long = "follow-up", conflicts_with = "deliver_as")]
+    pub follow_up: bool,
     #[arg(long = "as", value_enum, default_value = "auto")]
     pub deliver_as: DeliverAs,
     #[arg(long,default_value="90s",value_parser=parse_duration,conflicts_with="no_wait")]
     pub wait: Duration,
     #[arg(long)]
     pub no_wait: bool,
-    #[arg(long, value_name = "DIR")]
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "with @new: the new session’s directory; with @latest: the project to pick from"
+    )]
     pub cwd: Option<PathBuf>,
+}
+impl SendArgs {
+    pub fn deliver(&self) -> DeliverAs {
+        if self.steer {
+            DeliverAs::Steer
+        } else if self.follow_up {
+            DeliverAs::FollowUp
+        } else {
+            self.deliver_as
+        }
+    }
+}
+#[derive(Debug, Args)]
+pub struct WorkerArgs {
+    pub job: String,
 }
 #[derive(Debug, Args)]
 pub struct WaitArgs {
@@ -149,11 +184,16 @@ pub struct WaitArgs {
 }
 #[derive(Debug, Args)]
 pub struct JobsArgs {
-    #[arg(long)]
+    #[arg(long, help = "a session id or hex tail")]
     pub session: Option<String>,
     #[arg(long)]
     pub active: bool,
-    #[arg(short = 'n', long, default_value_t = 20)]
+    #[arg(
+        short = 'n',
+        long,
+        default_value_t = 20,
+        help = "maximum rows (0 = no limit)"
+    )]
     pub limit: usize,
 }
 #[derive(Debug, Args)]
@@ -211,6 +251,7 @@ impl Command {
             Self::Wait(_) => "wait",
             Self::Jobs(_) => "jobs",
             Self::Inbox(_) => "inbox",
+            Self::Worker(_) => "__worker",
             Self::Watch(_) => "watch",
             Self::InstallExtension(_) => "install-extension",
             Self::InstallSkill(_) => "install-skill",
@@ -326,5 +367,39 @@ mod since_tests {
         for s in ["1y", "-1", "3651d", "", "+1", "18446744073709551615w"] {
             assert!(parse_since(s).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod rpc_tests {
+    use super::*;
+    #[test]
+    fn deliver_aliases_conflicts_and_private_worker() {
+        for (flags, want) in [
+            (vec!["--steer"], DeliverAs::Steer),
+            (vec!["--follow-up"], DeliverAs::FollowUp),
+            (vec!["--as", "steer"], DeliverAs::Steer),
+        ] {
+            let mut args = vec!["glen", "send", "x", "hi"];
+            args.extend(flags);
+            let c = Cli::try_parse_from(args).unwrap();
+            let Command::Send(a) = c.command else {
+                panic!("not send")
+            };
+            assert_eq!(a.deliver(), want);
+        }
+        for flags in [
+            vec!["--steer", "--follow-up"],
+            vec!["--as", "steer", "--steer"],
+        ] {
+            let mut args = vec!["glen", "send", "x", "hi"];
+            args.extend(flags);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(
+            !public_command()
+                .get_subcommands()
+                .any(|c| c.get_name() == "__worker")
+        );
     }
 }

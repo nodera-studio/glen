@@ -32,6 +32,7 @@ fn contains_command_word(hay: &str, word: &str) -> bool {
 }
 
 fn assert_no_hidden_commands(script: &str, what: &str) {
+    assert!(!script.contains("__worker"), "{what} exposes __worker");
     for name in HIDDEN {
         assert!(
             !contains_command_word(script, name),
@@ -48,7 +49,17 @@ fn ac001_help_lists_exactly_the_visible_commands() {
         out.assert_exit(0);
         assert_eq!(
             listed_commands(&out.out()),
-            ["completions", "doctor", "help", "ls", "show", "tail"],
+            [
+                "completions",
+                "doctor",
+                "help",
+                "jobs",
+                "ls",
+                "send",
+                "show",
+                "tail",
+                "wait"
+            ],
             "{}",
             out.ctx()
         );
@@ -86,9 +97,18 @@ fn version_prints_glen_and_crate_version() {
 #[test]
 fn a9_every_command_accepts_help_and_version() {
     let sb = Sandbox::new();
-    for sub in ["ls", "show", "tail", "doctor", "completions"]
-        .into_iter()
-        .chain(HIDDEN)
+    for sub in [
+        "ls",
+        "show",
+        "tail",
+        "send",
+        "wait",
+        "jobs",
+        "doctor",
+        "completions",
+    ]
+    .into_iter()
+    .chain(HIDDEN)
     {
         let help = sb.glen([sub, "--help"]).run();
         help.assert_exit(0);
@@ -117,10 +137,7 @@ fn hidden_commands_still_have_help_pages() {
 #[test]
 fn ac002_hidden_commands_exit_8_not_implemented() {
     let sb = Sandbox::new();
-    let invocations: [&[&str]; 7] = [
-        &["send", "e27c0de", "hello"],
-        &["wait", "j1234567"],
-        &["jobs"],
+    let invocations: [&[&str]; 4] = [
         &["inbox"],
         &["watch"],
         &["install-extension"],
@@ -141,7 +158,7 @@ fn ac002_hidden_commands_exit_8_not_implemented() {
 #[test]
 fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
     let sb = Sandbox::new();
-    let out = sb.glen(["jobs", "--human"]).run();
+    let out = sb.glen(["inbox", "--human"]).run();
     out.assert_exit(8).assert_no_ansi();
     assert!(out.stdout.is_empty(), "stdout must be empty\n{}", out.ctx());
     assert!(out.err().starts_with("error:"), "{}", out.ctx());
@@ -153,20 +170,6 @@ fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
 fn a9_declared_arguments_of_hidden_commands_parse() {
     let sb = Sandbox::new();
     let valid: &[&[&str]] = &[
-        &["send", "@latest", "hi", "--as", "steer", "--cwd", "/tmp"],
-        &["send", "@new", "hi", "--as", "follow-up", "--wait", "2m"],
-        &["send", "abc1234", "hi", "--as", "auto", "--no-wait"],
-        &["send", "abc1234", "-"],
-        &["send", "abc1234", "hi", "--wait", "90s"],
-        &["send", "abc1234", "hi", "--wait", "1500ms"],
-        &["send", "abc1234", "hi", "--wait", "1h"],
-        &["send", "abc1234", "hi", "--wait", "45"],
-        &["send", "abc1234", "hi", "--wait", "0"],
-        &["send", "abc1234", "hi", "--wait", "24h"],
-        &["send", "abc1234", "hi", "--wait", "86400"],
-        &["wait", "j1234567", "--timeout", "30s"],
-        &["jobs", "--session", "abc1234", "--active", "-n", "3"],
-        &["jobs", "--limit", "3"],
         &["inbox", "--session", "abc1234", "--peek", "--all", "-f"],
         &["inbox", "--follow"],
         &["watch", "abc1234"],
@@ -186,11 +189,45 @@ fn a9_declared_arguments_of_hidden_commands_parse() {
     }
 }
 
+#[test]
+fn a9_rpc_arguments_parse() {
+    let sb = Sandbox::new();
+    let valid: &[&[&str]] = &[
+        &["send", "@latest", "hi", "--as", "steer", "--cwd", "/tmp"],
+        &["send", "@new", "hi", "--as", "follow-up", "--wait", "2m"],
+        &["send", "abc1234", "hi", "--as", "auto", "--no-wait"],
+        &["send", "abc1234", "-"],
+        &["send", "abc1234", "hi", "--wait", "90s"],
+        &["send", "abc1234", "hi", "--wait", "1500ms"],
+        &["send", "abc1234", "hi", "--wait", "1h"],
+        &["send", "abc1234", "hi", "--wait", "45"],
+        &["send", "abc1234", "hi", "--wait", "0"],
+        &["send", "abc1234", "hi", "--wait", "24h"],
+        &["send", "abc1234", "hi", "--wait", "86400"],
+        &["wait", "j1234567", "--timeout", "30s"],
+        &["jobs", "--session", "abc1234", "--active", "-n", "3"],
+        &["jobs", "--limit", "3"],
+    ];
+    for args in valid {
+        let out = sb.glen(*args).run();
+        if args[0] == "jobs" {
+            out.ok_data();
+        } else if args.contains(&"@new") {
+            out.error_envelope("omp_unavailable");
+        } else {
+            out.error_envelope("not_found");
+        }
+    }
+}
+
 /// Malformed arguments are usage errors (exit 2), including the §A9 duration rules.
 #[test]
 fn a9_invalid_arguments_are_usage_errors() {
     let sb = Sandbox::new();
     let invalid: &[&[&str]] = &[
+        &["send", "abc1234", "hi", "--steer", "--follow-up"],
+        &["send", "abc1234", "hi", "--as", "steer", "--steer"],
+        &["send", "abc1234", "hi", "--cwd", "/tmp"],
         &["show"],
         &["tail"],
         &["send", "abc1234"],
@@ -248,7 +285,7 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "{shell} script lacks the visible commands\n{}",
             out.ctx()
         );
-        for name in ["ls", "show", "tail"] {
+        for name in ["ls", "show", "tail", "send", "wait", "jobs"] {
             assert!(contains_command_word(&script, name), "{shell} lacks {name}");
         }
         assert_no_hidden_commands(&script, shell);

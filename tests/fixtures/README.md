@@ -31,3 +31,24 @@ active branch, malformed lines, message shapes, handles and artifact layout.
 Fixture mtimes are checkout times, not conversation timestamps. Tests that depend on ordering
 copy fixtures with `tests/common::OmpBox` and set deterministic mtimes; never rewrite the checked-in fixtures.
 Fixture A has nine raw entries after its title slot and session header.
+
+## Fake RPC peer (`fake_omp` example)
+
+`tests/support/fake_omp.rs` is an independent JSON-lines peer built by `cargo build --example fake_omp`.
+`cargo test` builds examples; filtered integration runs build it on demand through `tests/common::fake_omp_bin`.
+Tests point `GLEN_OMP_BIN` at its absolute path. It never writes a transcript or reads live `~/.omp`.
+
+Modes: `--version`, `--mode rpc [--no-ui] [--profile NAME] [--resume FILE]`, and
+`hold-lease PATH` (prints `held`, retains an omp owner lease until stdin EOF). Unknown arguments exit 64.
+
+`FAKE_OMP_SCENARIO` selects `ok` (default), `local`, `progress`, `bad_reply`, `unsettled`,
+`never_settles`, `error`, `aborted`, `crash`, `hang`, `wedge`, `fork`, `fork_silent`, `moved`,
+`reject_tools`, `reject_filter`, or `no_ready`. `wedge` ignores abort and SIGTERM to exercise escalation.
+`FAKE_OMP_DELAY_MS` delays the reply; `FAKE_OMP_READY_DELAY_MS` delays ready (startup abort tests use 5000);
+`FAKE_OMP_SETTLE_DELAY_MS` delays settlement; `FAKE_OMP_REPLY_BYTES` sets assistant text size.
+`FAKE_OMP_OWNERS_DIR` claims the owner lease on prompt. `FAKE_OMP_V2=1` enables full negotiation;
+`partial` advertises v2 without frame limits and must stay on v1.
+
+`FAKE_OMP_LOG` appends NDJSON records with `at_ms`: `start` carries pid, pgid, argv, cwd and selected env;
+`in` / `out` carry a frame; `exit` carries the reason. Tests poll these records and status files as readiness
+signals, then wait for worker and omp teardown before releasing their temporary directories.

@@ -14,6 +14,11 @@ impl Spinner {
             None
         })
     }
+    pub fn set_message(&self, msg: &str) {
+        if let Some(bar) = &self.0 {
+            bar.set_message(msg.to_owned());
+        }
+    }
     pub fn finish(self) {
         if let Some(bar) = self.0 {
             bar.finish_and_clear();

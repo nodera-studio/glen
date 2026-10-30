@@ -153,3 +153,154 @@ pub fn data(out: &Output) -> serde_json::Value {
     assert_eq!(v["ok"], true);
     v["data"].clone()
 }
+
+pub fn fake_omp_bin() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT
+        .get_or_init(|| {
+            let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
+            let dir = bin.parent().unwrap();
+            let fake = dir.join("examples/fake_omp");
+            if !fake.exists() {
+                let mut cmd = Command::new(env!("CARGO"));
+                cmd.current_dir(env!("CARGO_MANIFEST_DIR")).args([
+                    "build",
+                    "--example",
+                    "fake_omp",
+                    "--offline",
+                    "--locked",
+                ]);
+                if dir.file_name().unwrap() == "release" {
+                    cmd.arg("--release");
+                }
+                let out = cmd.output().unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            fake
+        })
+        .clone()
+}
+pub struct RpcBox {
+    pub omp: OmpBox,
+    pub fake: PathBuf,
+    pub log: PathBuf,
+}
+impl RpcBox {
+    pub fn new() -> Self {
+        let omp = OmpBox::new();
+        let fake = fake_omp_bin();
+        let log = omp.tmp.path().join("fake.ndjson");
+        Self { omp, fake, log }
+    }
+    pub fn glen(&self, args: &[&str]) -> Command {
+        let mut c = self.omp.command(args, &self.omp.alpha());
+        c.env("GLEN_OMP_BIN", &self.fake)
+            .env("FAKE_OMP_LOG", &self.log)
+            .env("GLEN_JOB_TIMEOUT", "30s");
+        c
+    }
+    pub fn fake_log(&self) -> Vec<serde_json::Value> {
+        std::fs::read_to_string(&self.log)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|s| serde_json::from_str(s).ok())
+            .collect()
+    }
+    pub fn frames_in(&self, kind: &str) -> Vec<serde_json::Value> {
+        self.fake_log()
+            .into_iter()
+            .filter(|v| v["event"] == "in" && v["frame"]["type"] == kind)
+            .map(|v| v["frame"].clone())
+            .collect()
+    }
+    pub fn job_dir(&self, id: &str) -> PathBuf {
+        self.omp.glen_home.join("jobs").join(id)
+    }
+    pub fn job(&self, id: &str) -> (serde_json::Value, serde_json::Value) {
+        let dir = self.job_dir(id);
+        // The directory becomes visible before create() has atomically published both files.
+        poll(std::time::Duration::from_secs(3), || {
+            let read = |name| match std::fs::read(dir.join(name)) {
+                Ok(bytes) => Some(serde_json::from_slice(&bytes).unwrap()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => panic!("cannot read {name}: {e}"),
+            };
+            Some((read("job.json")?, read("status.json")?))
+        })
+    }
+    pub fn wait_terminal(&self, id: &str, timeout: std::time::Duration) -> serde_json::Value {
+        poll(timeout, || {
+            let s = self.job(id).1;
+            matches!(
+                s["status"].as_str(),
+                Some("completed" | "failed" | "aborted" | "lost")
+            )
+            .then_some(s)
+        })
+    }
+    pub fn wait_worker_gone(&self, id: &str) {
+        let s = self.wait_terminal(id, std::time::Duration::from_secs(25));
+        poll(std::time::Duration::from_secs(10), || {
+            let dead = s["worker_pid"].as_u64().is_none_or(|pid| {
+                matches!(
+                    glen::jobs::liveness::start_token(pid as u32),
+                    glen::jobs::liveness::Probe::Gone
+                )
+            });
+            let gone = s["omp_pid"].as_u64().is_none_or(|pid| {
+                rustix::process::Pid::from_raw(pid as i32).is_some_and(|pid| {
+                    rustix::process::test_kill_process_group(pid) == Err(rustix::io::Errno::SRCH)
+                })
+            });
+            (dead && gone).then_some(())
+        });
+    }
+    pub fn hold_glen_lock(&self, id: &str) -> glen::jobs::lock::SessionLock {
+        glen::jobs::lock::try_acquire(
+            &glen::glen_home::GlenHome {
+                root: self.omp.glen_home.clone(),
+            },
+            id,
+        )
+        .unwrap()
+        .unwrap()
+    }
+    pub fn owners(&self) -> PathBuf {
+        self.omp.home.join(".omp/run/session-owners")
+    }
+    pub fn hold_lease(&self, id: &str) -> std::process::Child {
+        use std::io::BufRead;
+        std::fs::create_dir_all(self.owners()).unwrap();
+        let mut child = Command::new(&self.fake)
+            .arg("hold-lease")
+            .arg(self.owners().join(format!("{id}.lock")))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line, "held\n");
+        child
+    }
+}
+pub fn poll<T>(timeout: std::time::Duration, mut f: impl FnMut() -> Option<T>) -> T {
+    let start = std::time::Instant::now();
+    loop {
+        if let Some(v) = f() {
+            return v;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "poll timed out after {timeout:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+pub const A_ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";

@@ -1,9 +1,12 @@
 pub mod completions;
 pub mod doctor;
+pub mod jobs;
 pub mod ls;
 mod open;
+pub mod send;
 pub mod show;
 pub mod tail;
+pub mod wait;
 use crate::{
     cli::{Cli, Command},
     env::Env,
@@ -12,6 +15,13 @@ use crate::{
 };
 pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     match &cli.command {
+        Command::Send(a) => send::run(cli, a, env, ctx),
+        Command::Wait(a) => wait::run(cli, a, env, ctx),
+        Command::Jobs(a) => jobs::run(cli, a, env, ctx),
+        Command::Worker(_) => Err(GlenError::new(
+            ErrorCode::Internal,
+            "__worker is dispatched before commands",
+        )),
         Command::Tail(a) => tail::run(cli, a, env, ctx),
         Command::Show(a) => show::run(cli, a, env, ctx),
         Command::Ls(a) => ls::run(cli, a, env, ctx),

@@ -3,9 +3,11 @@ pub mod commands;
 pub mod env;
 pub mod error;
 pub mod glen_home;
+pub mod jobs;
 pub mod omp;
 pub mod output;
 pub mod render;
+pub mod rpc;
 use clap::Parser;
 use std::{ffi::OsString, process::ExitCode};
 pub fn run() -> ExitCode {
@@ -16,6 +18,9 @@ pub fn run() -> ExitCode {
         Ok(c) => c,
         Err(e) => return output::clap_error(e, &argv, &env, &term),
     };
+    if let cli::Command::Worker(a) = &cli.command {
+        return rpc::worker::main(&a.job);
+    }
     let ctx = match output::OutputCtx::new(&cli.global, cli.command.output_kind(), &env, &term) {
         Ok(c) => c,
         Err(e) => {
