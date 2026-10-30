@@ -1,6 +1,6 @@
 ---
 name: impl-coder-codex
-description: The fused Implementer, run in OpenAI Codex. Writes ALL product code (implementation + wiring + error-handling + inline dev tests) via codex-companion.mjs task --json --write, then emits the orchestrator's completion report. Claude writes no product code.
+description: The fused Implementer, run in OpenAI Codex. Writes ALL product code (implementation + wiring + error-handling + inline dev tests) via codex-companion.mjs task --json --write, then emits the orchestrator's completion report. Claude writes no product code (except design-heavy web UI, which goes to impl-coder-ui).
 tools: Bash, Read, Grep, Glob
 model: claude-sonnet-5
 effort: low
@@ -127,15 +127,28 @@ you on an abort) must cancel the Codex side too, with `COMPANION` resolved as in
 `WT` = the absolute worktree path:
 
 ```bash
+# 0. Guard. The companion turns an empty --cwd into its own cwd, so an unset WT would cancel
+#    the main checkout's jobs. WT must be an absolute worktree root and not the main checkout.
+: "${WT:?set WT to the absolute worktree path}"
+case "$WT" in /*) ;; *) echo "refuse: WT must be absolute" >&2; exit 1 ;; esac
+[ "$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null)" = "$WT" ] \
+  || { echo "refuse: $WT is not a git worktree root" >&2; exit 1; }
+MAIN="$(cd "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)"
+[ "$(cd "$WT" && pwd -P)" != "$MAIN" ] || { echo "refuse: $WT is the main checkout" >&2; exit 1; }
 # 1. Interrupt the turn and kill the job's process tree (the companion's own cancel).
 for id in $(node "$COMPANION" status --cwd "$WT" --json | jq -r '.running[].id'); do
   node "$COMPANION" cancel "$id" --cwd "$WT" --json
 done
 # 2. If anything still runs, kill the broker for THIS worktree and all its descendants.
-#    Fixed-string match on "--cwd $WT --pid-file" so other worktrees' brokers survive.
+#    Match only a node process running the broker (not this shell, whose command line also
+#    contains the pattern), then "--cwd $WT --pid-file" as a fixed string so other
+#    worktrees' brokers survive; never this shell or its parent.
 kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill -TERM "$1" 2>/dev/null; }
-ps -axo pid=,command= | grep -F 'app-server-broker.mjs serve' | grep -F -- "--cwd $WT --pid-file" \
-  | awk '{print $1}' | while read -r pid; do kill_tree "$pid"; done
+ps -axo pid=,command= \
+  | grep -E '^ *[0-9]+ +([^ ]*/)?node [^ ]*/app-server-broker\.mjs serve ' \
+  | grep -F -- "--cwd $WT --pid-file" \
+  | awk -v self="$$" -v parent="$PPID" '$1 != self && $1 != parent {print $1}' \
+  | while read -r pid; do kill_tree "$pid"; done
 # 3. Verify: no broker left for $WT, and `git -C "$WT" status --short` is unchanged 30 s later.
 ```
 

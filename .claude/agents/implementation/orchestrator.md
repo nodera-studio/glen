@@ -21,7 +21,7 @@ documented, and re-indexed:
 4. **Re-index** — fold the merged code back into the codebase MCP, after the merge.
 
 The doctrine: keep the generative loop in ONE context — that context is **Codex's**
-(Claude writes no product code) — isolate every discriminative check in a fresh one,
+(Claude writes no product code, except design-heavy UI via `coder-ui.md`) — isolate every discriminative check in a fresh one,
 parallelize independent work. You run in the MAIN Claude session and dispatch each
 role via the Agent tool. Specialists cannot spawn further subagents — they do their
 work and return results to you.
@@ -162,28 +162,28 @@ Dispatch via Agent tool:
 
 **Plan paths in briefs.** `.claude/plans/` is git-ignored, so a wave worktree never contains
 the plan. Every brief that needs a plan (Implementer, fix, conformance writer, docs updater,
-reviewers) names it by absolute path in the main checkout
-(`/Users/development/Developer/Apps/tools/glen/.claude/plans/...`) and says its absence from
-the worktree is expected; without that line, Implementers reported the plan "missing".
+reviewers) names it by absolute path in the main checkout, which any worktree resolves with
+`MAIN="$(git rev-parse --path-format=absolute --git-common-dir)/.."` (plans under
+`$MAIN/.claude/plans/`), and says its absence from the worktree is expected; without that
+line, Implementers reported the plan "missing".
 
-**UI implementation routing.** Design-heavy UI (`site/`, landing pages, visual components)
-does not go to Codex: the owner judged the Codex-built landing page "meh" and moved site code
-to Claude. Route it to a Claude Implementer instead of `coder-codex.md`:
+**UI implementation routing.** Design-heavy UI (`site/`, landing pages, web (non-Rust) visual
+components) does not go to Codex: the owner judged the Codex-built landing page "meh" and moved
+site code to Claude. Route it to the Claude UI Implementer, `coder-ui.md` (Opus, with the
+`frontend-design:frontend-design` skill and a required browser self-check against the design
+reference), instead of `coder-codex.md`:
 
 ```
 Agent tool:
-  subagent_type: "general-purpose"
-  model: "opus"
-  prompt: "Load the frontend-design:frontend-design skill first. Then read
-           .claude/agents/implementation/implementer.md for the fused write → run → fix loop
-           (the site's own build/test commands from the plan replace the cargo gate) and
-           implement this plan: {plan path, absolute, main checkout; absent from the
-           worktree as expected}. Worktree: {abs path}. Design reference(s): {named reference
-           URLs/paths}. Before reporting done, verify your own work visually in a browser
-           (mcp__Claude_Browser__* or chrome-devtools) against each named reference:
-           side-by-side screenshots at ~375px and desktop, light and dark, saved under
-           .claude/evidence/, and say where it matches and where it deliberately departs."
+  subagent_type: "impl-coder-ui"
+  prompt: "Implement this plan: {plan path under $MAIN/.claude/plans/, absolute; absent from
+           the worktree as expected}. Worktree: {abs path}. Design reference(s): {named
+           reference URLs/paths}. Evidence folder: {$MAIN/.claude/evidence/<wave>/, absolute}."
 ```
+
+If `impl-coder-ui` is not in this session's agent list yet (agents load at session start),
+dispatch `general-purpose` with `model: "opus"` and the prompt "Read
+.claude/agents/implementation/coder-ui.md and follow its instructions" plus the brief above.
 
 The Rust crate (`src/`, `tests/`, `Cargo.*`) stays with the Codex Implementer; a wave that
 touches both splits into a Codex slice and a Claude UI slice. Codex still reviews the UI slice
@@ -380,7 +380,8 @@ Skip only when the diff changes no rendered output, and say so in the Report.
 **Check live-check and polish items before a fix brief.** Before you forward any item from
 this visual check, your own live check or a polish list into a fix brief, check it against the
 plan and `docs/design.md`. An item that contradicts the plan (e.g. its explicit verbatim
-layout) is a spec change, not a fix: mark it `SPEC CHANGE`, update the plan or design doc
+layout) is not a fix. Either drop it (say so in the Report, with the plan line it conflicts
+with), or treat it as a spec change: mark it `SPEC CHANGE`, update the plan or design doc
 first, have the conformance writer re-derive the affected assertions, and only then brief the
 Implementer. An unchecked polish item that contradicted the plan's verbatim layout once went
 straight into a fix brief, and only conformance caught it.
@@ -432,8 +433,8 @@ Plans are **kept after implementation** — they accumulate as project history. 
 - **Four roles, not eighteen steps.** Implementer (fused, in Codex via
   `coder-codex.md`) → Review (fresh) → tail (docs ‖ conformance ‖ optional
   project-specific domain-rubric gate) → re-index. Codex owns write+wire+harden+test+gate;
-  Claude writes no product code (except design-heavy UI, routed to a Claude Opus
-  Implementer) and does not re-introduce separate
+  Claude writes no product code (except design-heavy UI, routed to the Claude Opus
+  UI Implementer `coder-ui.md`) and does not re-introduce separate
   coder/wiring/error-handling/test/verifier dispatches.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
   alone leaves Codex editing the worktree.

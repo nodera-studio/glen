@@ -38,7 +38,8 @@ workflow below) once to adapt the templated files to that project's actual stack
 │   ├── orchestrator.md              # Pipeline manager: Codex Implementer → Review → tail → re-index
 │   ├── orchestrator-quick.md        # Fast path for small/low-risk changes — fewer gates, same quality bar
 │   ├── planner.md                   # Codebase analysis, step ordering, backward verification
-│   ├── coder-codex.md               # Role 1 — the fused Implementer, run in Codex (task --json --write); Claude writes no product code
+│   ├── coder-codex.md               # Role 1 — the fused Implementer, run in Codex (task --json --write); Claude writes no product code (except design-heavy UI, see coder-ui.md)
+│   ├── coder-ui.md                  # Role 1 for design-heavy web UI — Claude Opus Implementer, frontend-design skill, browser check vs the design reference
 │   ├── implementer.md               # Canonical fused-loop envelope coder-codex.md forwards to Codex
 │   ├── code-review.md               # Role 2 — Claude reviewer (‖ Codex via codex:codex-rescue), 2-vote
 │   ├── docs-updater.md              # Role 3 (tail) — updates docs after implementation

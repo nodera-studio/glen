@@ -266,7 +266,7 @@ aligned.
 - Keep steps in dependency order — the implementation agent follows them sequentially.
 - Every plan includes a testing step with specific scenarios.
 - Every plan checks whether documentation needs updating.
-- **UI waves** (`site/`, landing pages, visual components): choose components only from the
+- **UI waves** (`site/`, landing pages, web (non-Rust) visual components): choose components only from the
   catalogue survey the orchestrator supplies (every component of the named library rated);
   cite the survey row for each pick. Name the design reference(s) and add a verification step
   for the reference-fidelity check: side-by-side screenshots against each reference, plus a

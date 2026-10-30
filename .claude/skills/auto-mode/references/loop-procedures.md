@@ -158,9 +158,10 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    any `claude.md` as a nested `CLAUDE.md` on macOS's case-insensitive filesystem. If the
    Codex review pass hits a capacity or rate error, the gate retries once and then runs
    single-engine (see `.claude/commands/code-review.md`); record that in the wave-end note.
-   **UI routing:** design-heavy UI (`site/`, landing pages, visual components) is built by a
-   Claude Implementer (`general-purpose`, `model: opus`, `frontend-design:frontend-design`
-   skill) that verifies its own work in a browser against the named design reference; Codex
+   **UI routing:** design-heavy UI (`site/`, landing pages, web (non-Rust) visual
+   components) is built by the Claude UI Implementer (`impl-coder-ui`,
+   `implementation/coder-ui.md`: Opus, `frontend-design:frontend-design` skill), which
+   verifies its own work in a browser against the named design reference; Codex
    still reviews it, and the Rust crate stays with the Codex Implementer
    (`implementation/orchestrator.md` → UI implementation routing). UI waves also get the
    catalogue survey at planning and the reference-fidelity check in the visual gate.
@@ -168,11 +169,10 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    `implementation/coder-codex.md` → "Cancelling a run"; TaskStop alone leaves Codex editing
    the worktree.
 4. **Pre-push check.**
-   `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
-   (or `/run-ci`). Fix red before pushing; a red CI cycle costs a two-runner round trip.
-   On macOS that clippy skips `cfg(target_os = "linux")` code; `bash
-   .claude/scripts/quality-gate.sh` also lints the `x86_64-unknown-linux-gnu` target (W1's CI
-   failed on an import unused under cfg(linux)).
+   `bash .claude/scripts/quality-gate.sh && cargo test --locked` (or `/run-ci`). Fix red
+   before pushing; a red CI cycle costs a two-runner round trip. The gate runs rustfmt and
+   clippy `-D warnings` and, on macOS, clippy again for `x86_64-unknown-linux-gnu`, which
+   host clippy skips (`cfg(target_os = "linux")`; W1's CI failed on an import unused there).
 5. **Open the PR into `main`.** `git push -u origin <branch>`, then `gh pr create --base
    main --title "W<n>: <summary>" --body <scope, tests, board issue (W<n> + document id)>`.
    Flip the issue → `in_review`. Record the PR number in the ledger.
@@ -250,8 +250,9 @@ rebase the later one if the first merge conflicts with it.
 
 `.claude/plans/` is git-ignored, so the new worktree does not contain the wave's plan. Every
 brief for that wave (Implementer, fix, conformance, docs, reviewers) passes the plan by absolute
-path in the main checkout (`/Users/development/Developer/Apps/tools/glen/.claude/plans/...`) and
-says its absence from the worktree is expected; otherwise Implementers report it "missing".
+path in the main checkout
+(`"$(git rev-parse --path-format=absolute --git-common-dir)/../.claude/plans/..."`, which
+resolves to the main checkout from any worktree) and says its absence from the worktree is expected; otherwise Implementers report it "missing".
 Design-heavy UI waves (the `site/`) follow the UI routing in step 3 above.
 
 ## Shipping tags (`shipped:main` / `released:v0.x.y`)

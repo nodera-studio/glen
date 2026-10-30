@@ -28,9 +28,12 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
    context, run in **Codex**: writes the code, wires every layer, hardens error
    paths, writes unit + integration tests, runs them, runs the deterministic quality
    gate (`.claude/scripts/quality-gate.sh`: rustfmt check + clippy `-D warnings`), and fixes every failure and finding — looping
-   until tests AND the gate are green. Claude writes no product code; the context
+   until tests AND the gate are green. Claude writes no product code (except design-heavy UI, see coder-ui.md); the context
    reading a failure is the one that wrote the code, and that context is Codex's.
    `implementer.md` is the canonical envelope `coder-codex.md` forwards to Codex.
+   **UI Implementer** (`coder-ui.md`, agent `impl-coder-ui`, Opus) takes design-heavy web UI
+   instead: same fused loop with the site's build/test commands, the frontend-design skill,
+   and a required browser check against the named design reference.
 3. **Review (fresh context)** — the triple-engine review: Claude comprehensive
    reviewer ‖ `codex review` ‖ CodeRabbit, each blind to the others, folded by the
    Claude **synthesizer** into one dedup'd, provenance-labelled report + ordered fix
@@ -43,9 +46,9 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
 
 ## The fused Implementer runs in Codex
 
-Claude writes no product code, except design-heavy UI (`site/`, landing pages, visual
-components), which goes to a Claude Opus Implementer (`orchestrator.md` → UI implementation
-routing). The fused write→wire→harden→test→gate→fix loop runs in
+Claude writes no product code, except design-heavy UI (`site/`, landing pages, web (non-Rust)
+visual components), which goes to a Claude Opus Implementer (`orchestrator.md` → UI implementation
+routing; `coder-ui.md`). The fused write→wire→harden→test→gate→fix loop runs in
 **Codex** via `coder-codex.md` (`codex-companion.mjs task --json --write`), which
 forwards the `implementer.md` envelope + the repo-root `AGENTS.md` conventions. The
 former per-concern agents (`coder.md`, `wiring.md`, `error-handling.md`,

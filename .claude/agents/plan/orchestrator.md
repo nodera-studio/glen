@@ -51,6 +51,9 @@ and compatibility concerns." For integrating a new external service, adopting a 
 library, a feature with no existing pattern, or a major architectural change.
 </depth>
 
+A UI wave that names a component library or design reference runs at least **standard**, even
+when the other signals say minimal: the researcher owns the catalogue survey (Step 3).
+
 Announce the decision before dispatching: "Triage: **{depth}** — {one-sentence reason}."
 </triage_protocol>
 
@@ -92,9 +95,10 @@ Dispatch via Agent tool (parallel):
            Task: {task description}"
 ```
 
-**UI waves: survey the catalogue before anyone picks components.** For a wave with design-heavy
-UI (`site/`, landing pages, visual components) that names a component library or design
-reference, the researcher brief adds: "Survey the WHOLE catalogue of {library}: list every
+**UI waves: survey the catalogue before anyone picks components.** For a wave with
+design-heavy UI (`site/`, landing pages, web (non-Rust) visual components) that names a
+component library or design reference (triaged at least standard, Step 2), the researcher
+brief adds: "Survey the WHOLE catalogue of {library}: list every
 component with a fit rating for this page (use / maybe / no) and a one-line reason, and inventory
 the design reference(s) — tokens (type scale, colours, spacing, radii, motion) and signature
 patterns — with `path:line` or URL + selector citations." The site plan picked components without
