@@ -19,6 +19,7 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
 <Fragment set:html={`<style id="theme-dark" media="(prefers-color-scheme: dark)">${themeDark}</style>`} />
 <script is:inline>
 (() => {
+ document.documentElement.classList.add('js');
  const valid = v => ['system','light','dark'].includes(v);
  const apply = p => { document.documentElement.dataset.theme = p; document.getElementById('theme-dark').media = p === 'system' ? '(prefers-color-scheme: dark)' : p === 'dark' ? 'all' : 'not all'; };
  let pref = 'system';
@@ -29,7 +30,7 @@ const canonical = Astro.site ? new URL(Astro.url.pathname, Astro.site).href : un
  window.glenSetTheme = p => { if (!valid(p)) return; apply(p); try { localStorage.setItem('glen-theme', p); } catch {} };
 })();
 </script>
-<noscript><style>.theme-switch, .t-controls { display: none !important } [data-tabs] [role=tablist] { display: none } @layer base { [data-tabs] [role=tabpanel][hidden] { display: block !important } } [data-tabs] .tab-heading { position: static; width: auto; height: auto; clip: auto; margin: 0 0 .5rem } .terminal *, .t-window::before, .t-window::after { animation: none !important } .terminal .t-window { height: auto } .terminal .t-scroll { transform: none }</style></noscript>
+<noscript><style>.theme-switch,.t-controls,.inline-copy {display:none!important} [data-tabs] [role=tablist] {display:none} @layer base {[data-tabs] [role=tabpanel][hidden] {display:block!important}} [data-tabs] .tab-heading {position:static;width:auto;height:auto;clip:auto;margin:0 0 .5rem} .terminal *, .reveal {animation-name:none!important} .terminal .term-pane {height:auto;overflow:auto} .terminal .term-scroll {transform:none} .terminal .term-panes {display:block} .terminal .term-pane {display:block!important} .terminal .t-cursor {display:none}</style></noscript>
 </head>
 <body><a class="sr-only focus:not-sr-only focus-ring text-frame-fg" href="#main">Skip to content</a><slot /></body>
 </html>

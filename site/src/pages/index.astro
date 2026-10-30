@@ -6,9 +6,11 @@ import WhatItDoes from '../components/WhatItDoes.astro';
 import Install from '../components/Install.astro';
 import Agents from '../components/Agents.astro';
 import Footer from '../components/Footer.astro';
+import FAQ from '../components/FAQ.astro';
+import ClosingCTA from '../components/ClosingCTA.astro';
 ---
 <Base title="glen: let Claude Code and Codex talk to omp sessions" description="Find, read and message omp sessions from Claude Code and Codex. A small CLI that brings the reply back to the agent that asked.">
  <Header />
- <main id="main" data-tone="content" class="mx-1.5 rounded-xl bg-content px-4 sm:mx-2 sm:px-8 lg:mx-3 lg:px-12"><div class="mx-auto max-w-[1344px]"><Hero /><WhatItDoes /><Install /><Agents /></div></main>
+ <main id="main" data-tone="content" class="site-panel"><Hero /><WhatItDoes /><hr class="hairline-fade" /><Install /><hr class="hairline-fade" /><Agents /><hr class="hairline-fade" /><FAQ /><ClosingCTA /></main>
  <Footer />
 </Base>

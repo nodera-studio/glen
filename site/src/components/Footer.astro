@@ -1,8 +1,5 @@
 ---
-import { site } from '../data/site';
+import {site} from '../data/site';
+const columns=[['Product',[['How it works','#how'],['Install','#install'],['Agents','#agents'],['FAQ','#faq']]],['Project',[['GitHub',site.repoUrl],['Releases',site.releasesUrl],['MIT licence',site.repoUrl+'/blob/main/LICENSE']]],['Credits',[['omp','https://github.com/can1357/oh-my-pi'],['Morphin (MIT)','https://github.com/sikkeep/morphin-registry'],['Nodex design','https://nodex.ro']]]] as const;
 ---
-<footer data-tone="shell" class="mx-auto flex max-w-[1440px] flex-col gap-2 px-5 py-7 text-body-sm text-frame-fg-subdued sm:px-8 lg:px-12">
- <p>glen is open source under the MIT licence. <a class="focus-ring text-frame-fg underline" href={site.repoUrl}>GitHub</a></p>
- <p>Motion components adapted from <a class="focus-ring text-frame-fg underline" href="https://github.com/sikkeep/morphin-registry">Morphin (MIT)</a>.</p>
- <p>Tested with omp {site.testedOmp}.</p>
-</footer>
+<footer data-tone="shell"><div class="footer-inner"><div class="footer-grid"><div class="footer-brand"><a class="wordmark focus-ring" href="/">glen</a><p>Let Claude Code and Codex talk to omp.</p></div>{columns.map(([title,links])=><nav aria-label={title}><h2>{title}</h2><ul>{links.map(([label,url])=><li><a class="focus-ring" href={url}>{label}</a></li>)}</ul></nav>)}</div><div class="footer-bottom"><span>Tested with omp 18.14.0</span><span>v0.1.0</span></div></div></footer>

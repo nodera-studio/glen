@@ -1,10 +1,15 @@
 ---
+// Adapted from Morphin animated-navbar-menu-with-morphing-hover-state (CSS port).
 import ThemeSwitch from './ThemeSwitch.astro';
-import { site } from '../data/site';
+import {site} from '../data/site';
+const links=[['how','How it works'],['install','Install'],['agents','Agents'],['faq','FAQ']];
 ---
-<header data-tone="shell" class="mx-auto flex h-[52px] max-w-[1440px] items-center gap-4 px-5 text-frame-fg sm:px-8 lg:px-12">
- <a class="focus-ring text-heading-xs font-extrabold tracking-tight" href="/">glen</a>
- <nav aria-label="Sections" class="ml-6 hidden items-center gap-6 text-ui sm:flex"><a class="focus-ring hover:underline" href="#how">How it works</a><a class="focus-ring hover:underline" href="#install">Install</a><a class="focus-ring hover:underline" href="#agents">Agents</a></nav>
- <a class="focus-ring ml-auto flex size-7 items-center justify-center" href={site.repoUrl} aria-label="glen on GitHub"><svg aria-hidden="true" viewBox="0 0 24 24" class="size-5" fill="currentColor"><path d="M12 2a10 10 0 0 0-3.16 19.49c.5.09.68-.22.68-.48v-1.86c-2.78.6-3.37-1.18-3.37-1.18-.45-1.16-1.11-1.47-1.11-1.47-.91-.62.07-.61.07-.61 1 .07 1.53 1.03 1.53 1.03.89 1.53 2.34 1.09 2.91.83.09-.65.35-1.09.64-1.34-2.22-.25-4.56-1.11-4.56-4.94 0-1.09.39-1.99 1.03-2.69-.1-.25-.45-1.27.1-2.65 0 0 .84-.27 2.75 1.03A9.6 9.6 0 0 1 12 6.82a9.6 9.6 0 0 1 2.5.34c1.91-1.3 2.75-1.03 2.75-1.03.55 1.38.2 2.4.1 2.65.64.7 1.03 1.6 1.03 2.69 0 3.84-2.34 4.69-4.57 4.94.36.31.68.92.68 1.85v2.75c0 .26.18.58.69.48A10 10 0 0 0 12 2Z"/></svg></a>
- <ThemeSwitch />
+<header class="header-glass" data-tone="shell">
+ <div class="header-bar"><a class="wordmark focus-ring" href="/">glen</a><span class="version-chip">v0.1.0</span>
+  <nav class="desktop-nav" aria-label="Sections">{links.map(([id,label])=><a class="nav-item focus-ring" href={`#${id}`}><i aria-hidden="true"></i><i aria-hidden="true"></i><span>{label}</span><span aria-hidden="true">{label}</span></a>)}</nav>
+  <span class="nav-divider" aria-hidden="true"></span>
+  <a class="github-pill focus-ring" href={site.repoUrl} aria-label="glen on GitHub"><svg aria-hidden="true" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 19c-4 1-4-2-6-2m12 5v-4c0-1-.5-2-1-2.5 4-.5 7-2 7-6.5 0-1.5-.5-3-1.5-4 .4-1 .4-2.5 0-3-1.5-.5-3 0-4.5 1a15 15 0 0 0-6 0C7.5 2 6 1.5 4.5 2c-.4.5-.4 2 0 3C3.5 6 3 7.5 3 9c0 4.5 3 6 7 6.5-.5.5-1 1.5-1 2.5v4"/></svg></a>
+  <ThemeSwitch /><a class="header-install focus-ring" href="#install">Install</a>
+ </div>
+ <nav class="mobile-nav" aria-label="Mobile sections">{links.map(([id,label])=><a class="nav-item focus-ring" href={`#${id}`}><i aria-hidden="true"></i><i aria-hidden="true"></i><span>{label}</span><span aria-hidden="true">{label}</span></a>)}</nav>
 </header>

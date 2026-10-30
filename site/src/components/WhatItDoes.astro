@@ -1,16 +1,10 @@
 ---
+import SectionHead from './SectionHead.astro';
+import HowCards from './islands/HowCards';
 import Topology from './islands/Topology';
-const steps = [
- ['Find','glen ls','Lists the omp sessions for this folder, live or idle, with short handles.'],
- ['Read','glen show / glen tail -f',"Prints a session's transcript, or follows it as it grows."],
- ['Send','glen send','Delivers a message into a session, whether it is open in omp or idle, or starts a new one with @new.'],
- ['Hear back','glen_reply, then glen inbox',"The omp model answers with the glen_reply tool. glen returns that answer to your agent, and keeps anything later in glen inbox."],
-];
 ---
-<section id="how" aria-labelledby="how-h" class="section">
- <h2 id="how-h">How it works</h2>
- <div class="grid min-w-0 gap-10 lg:grid-cols-2 lg:items-center">
-  <ol class="space-y-7">{steps.map(([title,command,description],i)=><li class="flex gap-4"><span aria-hidden="true" class="flex size-7 shrink-0 items-center justify-center rounded-full border border-line-strong text-ui text-ink-subdued">{i+1}</span><div class="min-w-0"><h3 class="text-heading-xs text-ink-heading">{title}</h3><code class="mt-1 block text-[13px] text-ink-subdued">{command}</code><p class="mt-2 max-w-[64ch] text-body-sm text-ink-subdued">{description}</p></div></li>)}</ol>
-  <figure class="min-w-0"><Topology client:visible /><figcaption class="mt-4 text-body-sm text-ink-subdued">Live sessions use the glen extension; idle sessions use omp RPC; <code>@new</code> starts a session.</figcaption></figure>
- </div>
-</section>
+<section id="how" aria-labelledby="how-h" class="section band"><div class="wrap">
+ <SectionHead id="how-h" eyebrow="01 / How it works" strong="Four verbs." rest="One reply comes back." lead="glen finds, reads and messages omp sessions, then hands the answer to the agent that asked." />
+ <HowCards client:visible />
+ <figure class="topology-card reveal"><div class="topology-grid"><Topology client:visible /></div><figcaption>Live sessions use the glen extension; idle sessions use omp RPC; <code>@new</code> starts a session.</figcaption></figure>
+</div></section>
