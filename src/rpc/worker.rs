@@ -17,16 +17,17 @@ use crate::{
     },
 };
 use omp_rpc::{
-    AbortCommand, Client, ClientOptions, Event, GetStateCommand, PromptCommand, PromptStatus,
-    PromptTurn, RpcAgentEvent, RpcNotification, SetEventFilterCommand,
+    AbortCommand, AgentMessage, AssistantContent, Client, ClientOptions, Command, Event,
+    GetStateCommand, PromptAck, PromptCommand, PromptStatus, PromptTurn, RpcAgentEvent,
+    RpcNotification, SetEventFilterCommand,
 };
 use serde_json::{Value, json};
 use std::{
     process::ExitCode,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, Sender},
+        mpsc::{self, Receiver},
     },
     time::{Duration, Instant},
 };
@@ -82,10 +83,12 @@ pub fn main(arg: &str) -> ExitCode {
             .ok_or_else(|| GlenError::new(ErrorCode::Usage, "invalid worker job id"))?;
         let job = store.read_job(&id)?;
         let status = store.read_status(&id)?;
-        let deadline = job
-            .deadline_at
-            .parse::<jiff::Timestamp>()
-            .map_err(|e| GlenError::new(ErrorCode::Internal, e.to_string()))?;
+        let deadline = job.deadline_at.parse::<jiff::Timestamp>().map_err(|e| {
+            GlenError::new(
+                ErrorCode::Internal,
+                format!("invalid deadline for job {}: {e}", job.handle),
+            )
+        })?;
         let left = deadline
             .as_millisecond()
             .saturating_sub(jiff::Timestamp::now().as_millisecond())
@@ -236,7 +239,15 @@ impl Worker {
             signal_hook::consts::SIGINT,
             signal_hook::consts::SIGHUP,
         ] {
-            signal_hook::flag::register(sig, self.cancel.clone())?;
+            signal_hook::flag::register(sig, self.cancel.clone()).map_err(|e| {
+                Failure::new(
+                    "io",
+                    format!(
+                        "cannot register signal {sig} for job {}: {e}",
+                        self.job.handle
+                    ),
+                )
+            })?;
         }
         self.check_stop()?;
         let mut session_lock = None;
@@ -245,14 +256,22 @@ impl Worker {
                 .job
                 .session_id
                 .as_deref()
-                .ok_or_else(|| Failure::new("internal", "resumed job has no session id"))?;
+                .ok_or_else(|| Failure::new("internal", "resumed job has no session id"))?
+                .to_owned();
             self.log("lock", "waiting for glen session lock");
-            match lock::acquire(&self.store.home, id, self.deadline, &|| {
+            if lock::is_held(&self.store.home, &id) {
+                self.status.waited_ms = Some(1);
+                self.status.waiting_for_lock = true;
+                self.save()?;
+            }
+            match lock::acquire(&self.store.home, &id, self.deadline, &|| {
                 self.stop_requested()
             })? {
                 lock::Acquired::Locked { lock, waited } => {
                     session_lock = Some(lock);
                     self.status.waited_ms = Some(waited.as_millis().min(u64::MAX as u128) as u64);
+                    self.status.waiting_for_lock = false;
+                    self.save()?;
                     if self.job.deliver_as == Deliver::Steer && waited >= rpc::TICK {
                         self.status.warnings.push(Warning{code:"steer_queued".into(),message:"another glen job held the session, so the steer message waited and was sent as a prompt".into()});
                     }
@@ -271,7 +290,12 @@ impl Worker {
                 .session_file
                 .as_deref()
                 .ok_or_else(|| Failure::new("internal", "resumed job has no session file"))?;
-            let followed = continuation::follow(path)?;
+            let followed = continuation::follow(path).map_err(|e| {
+                Failure::new(
+                    "io",
+                    format!("cannot follow session {}: {e}", path.display()),
+                )
+            })?;
             let s = Session::load(&followed.path).map_err(|e| Failure::new("io", e.to_string()))?;
             if Some(&s.header.id) != self.job.session_id.as_ref() {
                 return Err(self.moved(&s.header.id));
@@ -300,15 +324,6 @@ impl Worker {
         self.save()?;
         // Drain at the source before adding a forwarder, so buffered startup frames cannot lag into the run.
         for _ in events.try_iter() {}
-        let (tx, rx) = mpsc::channel();
-        let forward = tx.clone();
-        std::thread::spawn(move || {
-            for ev in events {
-                if forward.send(WorkerMsg::Rpc(Box::new(ev))).is_err() {
-                    break;
-                }
-            }
-        });
         let result = (|| -> Result<(), Failure> {
             if self.job.route == Route::Rpc
                 && Some(&baseline.session_id) != self.job.session_id.as_ref()
@@ -325,11 +340,8 @@ impl Worker {
             self.status.actual_session_file =
                 baseline.session_file.clone().map(std::path::PathBuf::from);
             sink.set_session(baseline.session_id.clone());
-            if self.job.route == Route::Rpc {
-                self.probe()?;
-            }
+            // Startup recovery can claim our own lease. Only the pre-spawn probe is safe.
             self.check_stop()?;
-            for _ in rx.try_iter() {}
             self.status.delivered_as = Some(
                 if !baseline.is_streaming {
                     "prompt"
@@ -341,7 +353,7 @@ impl Worker {
                 .into(),
             );
             self.log("prompt", "sending message");
-            self.drive(&client, &rx, tx, &sink, &baseline.session_id)
+            self.drive(&client, &events, &sink, &baseline.session_id)
         })();
         // Terminal state must precede teardown, and the session lock stays held through close.
         let result = match result {
@@ -403,53 +415,77 @@ impl Worker {
             result
         })
     }
-    fn recheck(&mut self, client: &Client, baseline: &str) {
-        match client.call(&GetStateCommand {}) {
-            Ok(s) => {
-                if s.session_id != baseline {
-                    self.status.forked = Some(Forked {
-                        from: baseline.into(),
-                        to: s.session_id.clone(),
-                    });
-                }
-                self.status.actual_session_id = Some(s.session_id);
-                self.status.actual_session_file = s.session_file.map(std::path::PathBuf::from);
-            }
-            Err(e) => self.log("get_state", &e.to_string()),
+    fn apply_state(&mut self, s: omp_rpc::SessionState, baseline: &str, sink: &ReplySink) {
+        if s.session_id != baseline {
+            self.status.forked = Some(Forked {
+                from: baseline.into(),
+                to: s.session_id.clone(),
+            });
         }
+        sink.set_session(s.session_id.clone());
+        self.status.actual_session_id = Some(s.session_id);
+        self.status.actual_session_file = s.session_file.map(std::path::PathBuf::from);
     }
     fn event(
         &mut self,
-        client: &Client,
         ev: Event,
         run: &mut Run,
         baseline: &str,
+        sink: &ReplySink,
     ) -> Result<(), Failure> {
         match ev {
             Event::Notification(RpcNotification::RpcAgentEvent(ev)) => {
                 self.accept()?;
-                if let RpcAgentEvent::Notice(n) = ev
+                if let RpcAgentEvent::Notice(n) = &ev
                     && n.source.as_deref() == Some("session-persistence")
                 {
-                    self.recheck(client, baseline);
+                    run.recheck_requested = true;
                     if n.level.as_str() == "error" {
                         self.status.warnings.push(Warning {
                             code: "persistence_error".into(),
-                            message: n.message,
+                            message: n.message.clone(),
                         });
                     }
                 }
+                run.events.push(ev);
+            }
+            Event::Notification(RpcNotification::PromptResult(r)) => {
+                run.prompt = Some(collected_turn(std::mem::take(&mut run.events), Some(r)));
+                run.completed_at = Some(Instant::now());
+                self.accept()?;
             }
             Event::Notification(RpcNotification::SessionSettled(_)) => run.settled_seen = true,
             Event::Notification(RpcNotification::SessionInfoUpdate(u))
                 if Some(&u.session_id) != self.status.actual_session_id.as_ref() =>
             {
-                self.recheck(client, baseline)
+                run.recheck_requested = true;
             }
             Event::Notification(RpcNotification::CommandOutput(c)) => {
                 run.command_output.push(c.text)
             }
-            Event::Undecodable { error, .. } => self.log("decode", &error),
+            Event::UnmatchedResponse(r) if r.command == "get_state" && r.success => {
+                if let Ok(s) = GetStateCommand::decode(r.data) {
+                    self.apply_state(s, baseline, sink);
+                }
+            }
+            Event::UnmatchedResponse(r) if r.command == "prompt" => {
+                if r.success {
+                    run.ack(PromptCommand::decode(r.data).map_err(omp_rpc::Error::Json));
+                } else {
+                    run.prompt = Some(Err(omp_rpc::Error::Command {
+                        command: r.command,
+                        error: r.error.unwrap_or_default(),
+                        code: r.code,
+                    }));
+                }
+            }
+            Event::Undecodable { raw, error } => {
+                if raw["type"] == "prompt_result" {
+                    run.prompt = Some(Err(omp_rpc::Error::Protocol(error)));
+                } else {
+                    self.log("decode", &error);
+                }
+            }
             _ => (),
         }
         Ok(())
@@ -464,8 +500,7 @@ impl Worker {
     fn drive(
         &mut self,
         client: &Client,
-        rx: &Receiver<WorkerMsg>,
-        tx: Sender<WorkerMsg>,
+        events: &Receiver<Event>,
         sink: &ReplySink,
         baseline: &str,
     ) -> Result<(), Failure> {
@@ -474,39 +509,89 @@ impl Worker {
             images: None,
             streaming_behavior: Some(rpc::streaming_behavior(self.job.deliver_as)),
         };
-        let timeout = self.deadline.saturating_duration_since(Instant::now()) + rpc::PROMPT_GRACE;
+        let phase = Mutex::new(Submission::Pending);
+        let delay = Env::from_process()
+            .get("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n <= 20_000)
+            .map(Duration::from_millis)
+            .unwrap_or_default();
         let mut run = Run::default();
-        let terminal = std::thread::scope(|scope| -> Result<Terminal, Failure> {
-            scope.spawn(|| {
-                if tx
-                    .send(WorkerMsg::Prompt(Box::new(
-                        client.prompt_and_wait(&cmd, timeout),
-                    )))
-                    .is_err()
-                {
-                    eprintln!("worker prompt result receiver closed");
+        std::thread::scope(|scope| -> Result<(), Failure> {
+            let (tx, rx) = mpsc::channel();
+            let phase = &phase;
+            scope.spawn(move || {
+                let end = Instant::now() + delay;
+                while Instant::now() < end {
+                    if *phase
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        == Submission::Cancelled
+                    {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                // Keep submission and cancellation ordered through the actual enqueue, not merely
+                // a flag checked before calling the SDK. The ack wait is capped at 100ms.
+                let mut guard = phase
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if *guard == Submission::Cancelled {
+                    return;
+                }
+                *guard = Submission::Submitted;
+                let ack = client.call(&SubmitPrompt(cmd));
+                drop(guard);
+                if tx.send(ack).is_err() {
+                    eprintln!("worker prompt ack receiver closed");
                 }
             });
-            // A persistence error still must drain the scoped prompt thread. Stop and escalate first.
+            let (state_tx, state_rx) =
+                mpsc::channel::<Result<omp_rpc::SessionState, omp_rpc::Error>>();
+            let mut state_pending = false;
+            let mut final_query = false;
+            let mut final_checked = false;
+            // Terminal status is published before joining any outstanding state call.
             let mut persistence_failure = None;
             loop {
-                match rx.recv_timeout(rpc::TICK) {
-                    Ok(WorkerMsg::Rpc(ev)) => {
-                        if let Err(e) = self.event(client, *ev, &mut run, baseline) {
+                // Read the SDK receiver directly. Output preceding an ack is already queued
+                // here when the ack arrives; there is no asynchronous forwarder to overtake.
+                match events.recv_timeout(Duration::from_millis(50)) {
+                    Ok(ev) => {
+                        if let Err(e) = self.event(ev, &mut run, baseline, sink) {
                             persistence_failure = Some(e);
                             run.stop = Some(StopReason::Cancelled);
                         }
                     }
-                    Ok(WorkerMsg::Prompt(outcome)) => {
-                        run.prompt = Some(*outcome);
-                        if let Err(e) = self.accept() {
-                            persistence_failure = Some(e);
-                        }
-                    }
-                    Err(mpsc::RecvTimeoutError::Timeout) => (),
-                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(mpsc::RecvTimeoutError::Disconnected) if run.prompt.is_none() => {
                         run.prompt = Some(Err(omp_rpc::Error::Closed))
                     }
+                    Err(_) => (),
+                }
+                if let Ok(ack) = rx.try_recv() {
+                    run.ack(ack);
+                }
+                if let Ok(state) = state_rx.try_recv() {
+                    state_pending = false;
+                    match state {
+                        Ok(s) => self.apply_state(s, baseline, sink),
+                        Err(e) => self.log("get_state", &e.to_string()),
+                    }
+                    if final_query {
+                        final_checked = true;
+                    }
+                }
+                if run.recheck_requested && !state_pending {
+                    run.recheck_requested = false;
+                    state_pending = true;
+                    let tx = state_tx.clone();
+                    let left = self.deadline.saturating_duration_since(Instant::now());
+                    scope.spawn(move || {
+                        if tx.send(query_state(client, left)).is_err() {
+                            eprintln!("worker state receiver closed");
+                        }
+                    });
                 }
                 if self.stop_requested() {
                     run.stop = Some(StopReason::Cancelled);
@@ -514,12 +599,21 @@ impl Worker {
                 if Instant::now() >= self.deadline && run.prompt.is_none() && run.stop.is_none() {
                     run.stop = Some(StopReason::Timeout);
                 }
+                if run.stop.is_some() {
+                    let mut guard = phase
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    if *guard == Submission::Pending {
+                        *guard = Submission::Cancelled;
+                        run.prompt = Some(Err(omp_rpc::Error::Closed));
+                    }
+                }
                 match next(&run, Instant::now(), self.deadline) {
                     Next::Wait => (),
                     Next::SendAbort => {
                         self.log("abort", "aborting omp");
                         run.abort_sent_at = Some(Instant::now());
-                        if let Err(e) = client.call(&AbortCommand {}) {
+                        if let Err(e) = client.call(&PollAbort(AbortCommand {})) {
                             self.log("abort", &e.to_string());
                         }
                     }
@@ -532,29 +626,52 @@ impl Worker {
                         run.killed = true;
                     }
                     Next::Finish(t) => {
-                        for msg in rx.try_iter() {
-                            if let WorkerMsg::Rpc(ev) = msg
-                                && let Err(e) = self.event(client, *ev, &mut run, baseline)
-                            {
+                        // Source drain is the completion barrier, including command_output
+                        // emitted immediately before a local ack.
+                        for ev in events.try_iter() {
+                            if let Err(e) = self.event(ev, &mut run, baseline, sink) {
                                 persistence_failure = Some(e);
                             }
                         }
-                        return if let Some(e) = persistence_failure {
-                            Err(e)
-                        } else {
-                            Ok(t)
-                        };
+                        if !run.killed && run.stop.is_none() && !final_checked {
+                            if !state_pending {
+                                final_query = true;
+                                state_pending = true;
+                                let tx = state_tx.clone();
+                                let left = self.deadline.saturating_duration_since(Instant::now());
+                                scope.spawn(move || {
+                                    if tx.send(query_state(client, left)).is_err() {
+                                        eprintln!("worker final state receiver closed");
+                                    }
+                                });
+                            }
+                            continue;
+                        }
+                        if let Some(e) = persistence_failure {
+                            return self.finish_failure(e);
+                        }
+                        return self.finish_run(&run, t, sink);
                     }
                 }
             }
-        })?;
-        if !run.killed {
-            self.recheck(client, baseline);
-        }
+        })
+    }
+    fn finish_run(
+        &mut self,
+        run: &Run,
+        terminal: Terminal,
+        sink: &ReplySink,
+    ) -> Result<(), Failure> {
         if terminal.settle_timeout {
             self.status.warnings.push(Warning {
-                code: "settle_timeout".into(),
-                message: "omp completed but did not settle before the job deadline".into(),
+                code: if run.stop == Some(StopReason::Cancelled) {
+                    "settle_cancelled"
+                } else {
+                    "settle_timeout"
+                }
+                .into(),
+                message: "omp completed but the settlement wait ended before the session settled"
+                    .into(),
             });
         }
         let turn = run.prompt.as_ref().and_then(|r| r.as_ref().ok());
@@ -566,7 +683,7 @@ impl Worker {
             agent_invoked: turn.is_none_or(|t| t.result.as_ref().is_some_and(|r| r.agent_invoked)),
             assistant_text: turn.and_then(|t| t.assistant_text.clone()),
             replies: sink.replies(),
-            command_output: run.command_output,
+            command_output: run.command_output.clone(),
             stop_reason: turn
                 .and_then(|t| t.assistant_message.as_ref())
                 .and_then(|m| m.stop_reason)
@@ -589,9 +706,13 @@ impl Worker {
 fn route_probe(lease: Lease, handle: &str) -> Result<(), Failure> {
     let message = match lease {
         Lease::Free => return Ok(()),
-        Lease::Held => format!("session {handle} is open in another omp process"),
+        Lease::Held => {
+            format!("before spawning omp: session {handle} is open in another omp process")
+        }
         Lease::Unknown(r) => {
-            format!("cannot tell whether another omp process owns session {handle} ({r})")
+            format!(
+                "before spawning omp: cannot tell whether another omp process owns session {handle} ({r})"
+            )
         }
     };
     let mut f = Failure::new("no_route", message);
@@ -688,9 +809,135 @@ impl Started {
         })
     }
 }
-enum WorkerMsg {
-    Rpc(Box<Event>),
-    Prompt(Box<Result<PromptTurn, omp_rpc::Error>>),
+// These calls must not hold the polling thread (or submission gate) for CALL_TIMEOUT.
+macro_rules! polling_command {
+    ($name:ident, $inner:ty, $timeout:expr) => {
+        #[derive(serde::Serialize)]
+        #[serde(transparent)]
+        struct $name($inner);
+        impl Command for $name {
+            const NAME: &'static str = <$inner as Command>::NAME;
+            const TIMEOUT_MS: Option<u64> = Some($timeout);
+            type Output = <$inner as Command>::Output;
+            fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+                <$inner as Command>::decode(data)
+            }
+        }
+    };
+}
+polling_command!(SubmitPrompt, PromptCommand, 100);
+polling_command!(PollState, GetStateCommand, 100);
+polling_command!(StateSecond, GetStateCommand, 1000);
+fn query_state(client: &Client, left: Duration) -> Result<omp_rpc::SessionState, omp_rpc::Error> {
+    if left >= rpc::CALL_TIMEOUT {
+        client.call(&GetStateCommand {})
+    } else if left >= Duration::from_secs(1) {
+        client.call(&StateSecond(GetStateCommand {}))
+    } else if left >= Duration::from_millis(100) {
+        client.call(&PollState(GetStateCommand {}))
+    } else {
+        Err(omp_rpc::Error::Timeout {
+            command: "get_state".into(),
+        })
+    }
+}
+polling_command!(PollAbort, AbortCommand, 100);
+#[derive(PartialEq, Eq)]
+enum Submission {
+    Pending,
+    Submitted,
+    Cancelled,
+}
+
+// Keep the SDK's terminal-message semantics while collecting from its ordered event receiver.
+fn collected_turn(
+    events: Vec<RpcAgentEvent>,
+    result: Option<omp_rpc::PromptResultEvent>,
+) -> Result<PromptTurn, omp_rpc::Error> {
+    let mut messages = Vec::new();
+    if let Some(end) = events
+        .iter()
+        .rposition(|e| matches!(e, RpcAgentEvent::AgentEnd(_)))
+        && let RpcAgentEvent::AgentEnd(terminal) = &events[end]
+    {
+        messages = terminal.messages.clone();
+        if let Some(count) = terminal
+            .message_count
+            .and_then(|n| usize::try_from(n).ok())
+            .filter(|n| *n > messages.len())
+        {
+            let start = events[..end]
+                .iter()
+                .rposition(|e| matches!(e, RpcAgentEvent::AgentStart(_)))
+                .map_or(0, |i| i + 1);
+            let streamed: Vec<_> = events[start..end]
+                .iter()
+                .filter_map(|e| {
+                    if let RpcAgentEvent::MessageEnd(m) = e {
+                        Some(m.message.clone())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            let prefix = count - messages.len();
+            if prefix > streamed.len() {
+                return Err(omp_rpc::Error::Protocol(
+                    "compacted agent_end references missing streamed messages".into(),
+                ));
+            }
+            messages = streamed.into_iter().take(prefix).chain(messages).collect();
+        }
+    }
+    let assistant_message = messages
+        .iter()
+        .rev()
+        .find_map(|m| {
+            if let AgentMessage::Assistant(a) = m {
+                Some(a.clone())
+            } else {
+                None
+            }
+        })
+        .or_else(|| {
+            events.iter().rev().find_map(|e| {
+                let m = match e {
+                    RpcAgentEvent::MessageStart(e) => &e.message,
+                    RpcAgentEvent::MessageUpdate(e) => &e.message,
+                    RpcAgentEvent::MessageEnd(e) => &e.message,
+                    RpcAgentEvent::TurnEnd(e) => &e.message,
+                    _ => return None,
+                };
+                if let AgentMessage::Assistant(a) = m {
+                    Some(a.clone())
+                } else {
+                    None
+                }
+            })
+        });
+    let assistant_text = assistant_message
+        .as_ref()
+        .map(|m| {
+            m.content
+                .iter()
+                .flatten()
+                .filter_map(|b| {
+                    if let AssistantContent::Text(t) = b {
+                        t.text.as_deref()
+                    } else {
+                        None
+                    }
+                })
+                .collect::<String>()
+        })
+        .filter(|s| !s.is_empty());
+    Ok(PromptTurn {
+        events,
+        messages,
+        assistant_message,
+        assistant_text,
+        result,
+    })
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StopReason {
@@ -700,11 +947,26 @@ enum StopReason {
 #[derive(Default)]
 struct Run {
     prompt: Option<Result<PromptTurn, omp_rpc::Error>>,
+    events: Vec<RpcAgentEvent>,
+    completed_at: Option<Instant>,
+    recheck_requested: bool,
     settled_seen: bool,
     stop: Option<StopReason>,
     abort_sent_at: Option<Instant>,
     killed: bool,
     command_output: Vec<String>,
+}
+impl Run {
+    fn ack(&mut self, ack: Result<PromptAck, omp_rpc::Error>) {
+        match ack {
+            Ok(a) if a.agent_invoked == Some(false) && self.prompt.is_none() => {
+                self.prompt = Some(collected_turn(std::mem::take(&mut self.events), None));
+            }
+            Err(omp_rpc::Error::Timeout { .. }) | Ok(_) => (), // A late ack/result still arrives on events.
+            Err(e) if self.prompt.is_none() => self.prompt = Some(Err(e)),
+            Err(_) => (),
+        }
+    }
 }
 struct Terminal {
     state: State,
@@ -761,10 +1023,14 @@ fn next(run: &Run, now: Instant, deadline: Instant) -> Next {
                     PromptStatus::Completed => {
                         if r.session_settled || run.settled_seen {
                             Terminal::completed(true)
-                        } else if now >= deadline {
+                        } else if now >= deadline
+                            || run.stop.is_some()
+                            || (!r.agent_invoked
+                                && run.completed_at.is_some_and(|t| {
+                                    now.saturating_duration_since(t) >= rpc::ABORT_GRACE
+                                }))
+                        {
                             Terminal::completed(false)
-                        } else if run.stop.is_some() {
-                            stopped(run.stop)
                         } else {
                             return Next::Wait;
                         }
@@ -845,6 +1111,61 @@ mod tests {
                 }),
             }),
         }
+    }
+    #[test]
+    fn review11_refusal_identifies_pre_spawn_phase() {
+        for lease in [Lease::Held, Lease::Unknown("denied".into())] {
+            let e = route_probe(lease, "e27c0de").unwrap_err();
+            assert_eq!(e.code, "no_route");
+            assert!(e.error_message.starts_with("before spawning omp:"));
+            assert!(e.error_message.contains("e27c0de"));
+        }
+        assert!(route_probe(Lease::Free, "e27c0de").is_ok());
+    }
+    #[test]
+    fn review9_completed_result_cancellation_table() {
+        let now = Instant::now();
+        let run = Run {
+            prompt: Some(Ok(turn(Some(PromptStatus::Completed), false))),
+            stop: Some(StopReason::Cancelled),
+            ..Run::default()
+        };
+        let Next::Finish(t) = next(&run, now, now + Duration::from_secs(3600)) else {
+            panic!("not terminal")
+        };
+        assert_eq!(t.state, State::Completed);
+        assert!(!t.settled);
+        assert!(t.settle_timeout);
+        assert!(t.error.is_none());
+    }
+    #[test]
+    fn review10_local_result_settlement_bound_table() {
+        let now = Instant::now();
+        let mut t = turn(Some(PromptStatus::Completed), false);
+        t.result.as_mut().unwrap().agent_invoked = false;
+        let mut run = Run {
+            prompt: Some(Ok(t)),
+            completed_at: Some(now),
+            ..Run::default()
+        };
+        assert!(matches!(
+            next(&run, now, now + Duration::from_secs(3600)),
+            Next::Wait
+        ));
+        let Next::Finish(t) = next(
+            &run,
+            now + rpc::ABORT_GRACE,
+            now + Duration::from_secs(3600),
+        ) else {
+            panic!("not bounded")
+        };
+        assert_eq!(t.state, State::Completed);
+        assert!(!t.settled);
+        run.settled_seen = true;
+        assert!(matches!(
+            next(&run, now, now + Duration::from_secs(3600)),
+            Next::Finish(Terminal { settled: true, .. })
+        ));
     }
     #[test]
     fn completion_and_settlement_table() {

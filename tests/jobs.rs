@@ -210,3 +210,85 @@ fn ac223_send_prunes_only_old_terminal_jobs() {
     assert!(b.wait_terminal(id, Duration::from_secs(1))["status"] == "completed");
     assert!(fs::metadata(s.dir(&JobId::parse(id).unwrap())).is_ok());
 }
+
+#[test]
+fn review13_human_duration_multiline_replies_and_session_handle() {
+    let b = RpcBox::new();
+    let id = make(&b, State::Completed, None);
+    let store = store(&b);
+    let mut j = store.read_job(&id).unwrap();
+    j.created_at = "2026-10-30T00:00:00Z".into();
+    j.route = glen::jobs::Route::New;
+    j.session_handle = None;
+    glen::glen_home::write_private_atomic(
+        &store.dir(&id).join("job.json"),
+        &serde_json::to_vec(&j).unwrap(),
+    )
+    .unwrap();
+    let mut s = store.read_status(&id).unwrap();
+    s.updated_at = "2026-10-30T00:01:05Z".into();
+    store.write_status(&id, &s).unwrap();
+    let mut r = store.read_result(&id).unwrap();
+    r.replies = vec![glen::jobs::Reply {
+        v: 1,
+        id: "reply".into(),
+        session_id: s.actual_session_id.clone().unwrap(),
+        job_id: Some(j.id.clone()),
+        request_id: None,
+        tool_call_id: None,
+        text: "first line\nsecond line wraps with enough words for a narrow terminal".into(),
+        is_final: true,
+        at: s.updated_at,
+    }];
+    store.write_result(&id, &r).unwrap();
+    let v = run(&b, &["wait", id.as_str(), "--json"], 0);
+    assert_eq!(v["data"]["job"]["elapsed_ms"], 65000);
+    let o = b
+        .glen(&["wait", id.as_str(), "--human"])
+        .env("COLUMNS", "40")
+        .output()
+        .unwrap();
+    assert!(o.status.success());
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains("1m 05s"), "{text}");
+    let lines: Vec<_> = text.lines().collect();
+    let first = lines.iter().position(|s| s.starts_with("↩ ")).unwrap();
+    assert_eq!(lines[first], "↩ first line ✓");
+    assert!(
+        lines[first + 1..]
+            .iter()
+            .all(|s| s.starts_with("  ") && !s.contains('↩') && !s.contains('✓'))
+    );
+    assert_eq!(text.matches('↩').count(), 1);
+    assert!(lines.iter().all(|s| glen::render::text::width(s) <= 40));
+    for width in ["20", "30", "40", "60", "100"] {
+        let o = b
+            .glen(&["jobs", "--human"])
+            .env("COLUMNS", width)
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        let text = String::from_utf8(o.stdout).unwrap();
+        assert!(text.contains("bcdef01"), "{width}: {text}");
+        assert!(
+            text.lines()
+                .all(|s| glen::render::text::width(s) <= width.parse::<usize>().unwrap()),
+            "{width}: {text}"
+        );
+    }
+}
+#[test]
+fn review13_all_rpc_options_have_help() {
+    use clap::CommandFactory;
+    for name in ["send", "wait", "jobs"] {
+        let mut cmd = glen::cli::Cli::command();
+        let sub = cmd.find_subcommand_mut(name).unwrap();
+        for arg in sub.get_arguments() {
+            assert!(
+                arg.get_help().is_some(),
+                "{name}: {} lacks help",
+                arg.get_id()
+            );
+        }
+    }
+}

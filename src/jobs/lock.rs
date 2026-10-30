@@ -24,17 +24,34 @@ pub struct SessionLock {
     pub path: PathBuf,
 }
 pub fn try_acquire(home: &GlenHome, id: &str) -> io::Result<Option<SessionLock>> {
-    home.ensure_dir("run/locks")?;
+    home.ensure_dir("run/locks").map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot create {}: {e}",
+                home.root.join("run/locks").display()
+            ),
+        )
+    })?;
     let path = lock_path(home, id);
     let fd = open(
         &path,
         OFlags::RDWR | OFlags::CLOEXEC | OFlags::CREATE,
         Mode::from_raw_mode(0o600),
-    )?;
+    )
+    .map_err(|e| {
+        io::Error::new(
+            io::Error::from(e).kind(),
+            format!("cannot open lock {}: {e}", path.display()),
+        )
+    })?;
     match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(Some(SessionLock { fd, path })),
         Err(Errno::WOULDBLOCK) => Ok(None),
-        Err(e) => Err(e.into()),
+        Err(e) => Err(io::Error::other(format!(
+            "cannot lock {}: {e}",
+            path.display()
+        ))),
     }
 }
 pub enum Acquired {

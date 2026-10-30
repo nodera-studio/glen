@@ -1,4 +1,4 @@
-//! Independent JSON-lines omp peer. Never creates an omp transcript.
+//! Independent JSON-lines omp peer. Only startup_recovery appends to a test fixture transcript.
 use serde_json::{Value, json};
 #[cfg(not(target_os = "linux"))]
 use std::fs::File;
@@ -143,6 +143,23 @@ fn run() -> io::Result<u8> {
     if scenario == "moved" {
         id = format!("{}beef", &id[..id.len().saturating_sub(4)]);
     }
+    let mut lease = None;
+    if knob("FAKE_OMP_STARTUP_RECOVERY").as_deref() == Some("1") {
+        if let Some(owners) = knob("FAKE_OMP_OWNERS_DIR") {
+            fs::create_dir_all(&owners)?;
+            lease = Some(hold(&Path::new(&owners).join(format!("{id}.lock")))?);
+        }
+        if let Some(path) = &resume {
+            let mut file = OpenOptions::new().append(true).open(path)?;
+            writeln!(
+                file,
+                "{}",
+                json!({"type":"message","id":"fake-recovery","message":{"role":"assistant","content":[],"stopReason":"aborted"}})
+            )?;
+            file.sync_all()?;
+            log(json!({"event":"startup_recovery"}))?;
+        }
+    }
     let mut session_file = resume;
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -159,6 +176,15 @@ fn run() -> io::Result<u8> {
     });
     // Delay ready independently of prompt work to exercise cancellation during startup.
     std::thread::sleep(ms("FAKE_OMP_READY_DELAY_MS", 0));
+    if let Some(release) = knob("FAKE_OMP_READY_RELEASE") {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !Path::new(&release).exists() {
+            if Instant::now() >= deadline {
+                return Err(io::Error::other("ready release timed out"));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     if scenario != "no_ready" {
         out(match knob("FAKE_OMP_V2").as_deref() {
             Some("1") => {
@@ -171,7 +197,6 @@ fn run() -> io::Result<u8> {
     let mut prompt: Option<Value> = None;
     let mut due = None;
     let mut stage = 0;
-    let mut lease = None;
     let mut replies: Vec<Value> = vec![];
     let mut reply_index = 0;
     loop {
@@ -193,10 +218,24 @@ fn run() -> io::Result<u8> {
                         reject(&f, "fake filter rejected")?
                     }
                     "set_event_filter" => response(&f, json!({"events":f["events"]}))?,
-                    "get_state" => response(
-                        &f,
-                        json!({"sessionId":id,"sessionFile":session_file,"isStreaming":false,"isSettled":stage==0||stage==4,"messageCount":0}),
-                    )?,
+                    "get_state" => {
+                        let data = json!({"sessionId":id,"sessionFile":session_file,"isStreaming":false,"isSettled":stage==0||stage==4,"messageCount":0});
+                        let delay = if stage != 0 {
+                            ms("FAKE_OMP_STATE_DELAY_MS", 0)
+                        } else {
+                            Duration::ZERO
+                        };
+                        if delay.is_zero() {
+                            response(&f, data)?;
+                        } else {
+                            std::thread::spawn(move || {
+                                std::thread::sleep(delay);
+                                if let Err(e) = response(&f, data) {
+                                    eprintln!("fake delayed state: {e}");
+                                }
+                            });
+                        }
+                    }
                     "abort" => {
                         response(&f, json!({}))?;
                         if scenario != "wedge"
@@ -215,13 +254,23 @@ fn run() -> io::Result<u8> {
                     }
                     "prompt" if prompt.is_some() => reject(&f, "second prompt")?,
                     "prompt" => {
+                        if scenario == "local_result_unsettled" {
+                            response(&f, json!({}))?;
+                            out(
+                                json!({"type":"prompt_result","id":f["id"],"agentInvoked":false,"status":"completed","sessionSettled":false}),
+                            )?;
+                            prompt = Some(f);
+                            continue;
+                        }
                         if scenario == "local" {
                             out(json!({"type":"command_output","text":"fake command output"}))?;
                             response(&f, json!({"agentInvoked":false}))?;
                             prompt = Some(f);
                             continue;
                         }
-                        if let Some(owners) = knob("FAKE_OMP_OWNERS_DIR") {
+                        if lease.is_none()
+                            && let Some(owners) = knob("FAKE_OMP_OWNERS_DIR")
+                        {
                             let path = Path::new(&owners).join(format!("{id}.lock"));
                             if let Some(parent) = path.parent() {
                                 fs::create_dir_all(parent)?;
@@ -245,8 +294,22 @@ fn run() -> io::Result<u8> {
                             log(json!({"event":"exit","reason":"crash"}))?;
                             return Ok(3);
                         }
-                        if !matches!(scenario.as_str(), "hang" | "wedge") {
-                            due = Some(Instant::now() + ms("FAKE_OMP_DELAY_MS", 0));
+                        if scenario == "delayed_state" || scenario == "fork_reply" {
+                            if scenario == "fork_reply" {
+                                id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
+                            }
+                            out(
+                                json!({"type":"notice","level":"warning","message":"persistence changed","source":"session-persistence"}),
+                            )?;
+                        }
+                        if !matches!(scenario.as_str(), "hang" | "wedge" | "delayed_state") {
+                            due = Some(
+                                Instant::now()
+                                    + ms(
+                                        "FAKE_OMP_DELAY_MS",
+                                        if scenario == "fork_reply" { 500 } else { 0 },
+                                    ),
+                            );
                         }
                         stage = 1;
                         prompt = Some(f);
@@ -273,6 +336,10 @@ fn run() -> io::Result<u8> {
         let Some(p) = &prompt else { continue };
         match stage {
             1 => {
+                if knob("FAKE_OMP_RUN_RELEASE").is_some_and(|p| !Path::new(&p).exists()) {
+                    due = Some(Instant::now() + Duration::from_millis(10));
+                    continue;
+                }
                 replies = match scenario.as_str() {
                     "bad_reply" => vec![
                         json!({}),

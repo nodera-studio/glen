@@ -64,7 +64,15 @@ impl ReplySink {
         };
         self.store.append_reply(&self.job_id, &reply)?;
         let inbox = (|| -> Result<(), GlenError> {
-            let dir = self.home.ensure_dir("inbox")?;
+            let dir = self.home.ensure_dir("inbox").map_err(|e| {
+                GlenError::new(
+                    ErrorCode::Io,
+                    format!(
+                        "cannot create {}: {e}",
+                        self.home.root.join("inbox").display()
+                    ),
+                )
+            })?;
             let key = crate::jobs::lock::lock_key(&session_id);
             append_line(
                 &dir.join(format!("{key}.ndjson")),

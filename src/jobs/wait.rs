@@ -57,9 +57,9 @@ pub fn observe(
         if started.elapsed() >= bound {
             return Ok(Waited::Running(s));
         }
-        if previous != Some(s.status) {
+        if previous != Some((s.status, s.waiting_for_lock, s.omp_pid)) {
             on_change(&s);
-            previous = Some(s.status);
+            previous = Some((s.status, s.waiting_for_lock, s.omp_pid));
         }
         std::thread::sleep(if started.elapsed() < Duration::from_secs(2) {
             Duration::from_millis(100)

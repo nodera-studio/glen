@@ -88,7 +88,10 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let log = opts.open(home.root.join("jobs").join(id.as_str()).join("worker.log"))?;
+    let path = home.root.join("jobs").join(id.as_str()).join("worker.log");
+    let log = opts
+        .open(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot open {}: {e}", path.display())))?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["__worker", id.as_str()])
         .stdin(Stdio::null())
@@ -104,7 +107,16 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
             cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
         }
     }
-    cmd.spawn()
+    cmd.spawn().map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!(
+                "cannot spawn worker for {} (log {}): {e}",
+                id.handle(),
+                path.display()
+            ),
+        )
+    })
 }
 pub fn session_handle(id: &str) -> String {
     let simple: String = id.chars().filter(|c| *c != '-').collect();

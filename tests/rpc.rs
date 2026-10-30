@@ -151,14 +151,17 @@ fn ac203_send_completes_with_reply() {
 #[test]
 fn ac204_bounded_wait_then_wait() {
     let b = RpcBox::new();
+    let release = b.omp.home.join("release-run");
     let o = b
         .glen(&["send", "e27c0de", "hello", "--wait", "300ms", "--json"])
-        .env("FAKE_OMP_DELAY_MS", "1500")
+        .env("FAKE_OMP_RUN_RELEASE", &release)
         .output()
         .unwrap();
     let v = envelope(&o, 10);
     assert_eq!(v["data"]["status"], "running");
-    assert_eq!(v["data"]["job"]["status"], "accepted");
+    accepted(&b, &job_id(&v));
+    assert_eq!(b.job(&job_id(&v)).1["status"], "accepted");
+    fs::write(release, "go").unwrap();
     wait(&b, &v, 0);
     let start = Instant::now();
     let v = launch(&b, "ok", "1500");
@@ -209,31 +212,35 @@ fn ac207_worker_probe_before_spawn() {
     owner.wait().unwrap();
 }
 #[test]
-fn ac207_worker_probe_before_prompt() {
+fn ac207_startup_recovery_lease_does_not_refuse_our_child() {
     let b = RpcBox::new();
+    let before = fs::read(b.omp.session('A')).unwrap();
     let o = b
-        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_READY_DELAY_MS", "1500")
+        .glen(&["send", "e27c0de", "hi", "--json"])
+        .env("FAKE_OMP_STARTUP_RECOVERY", "1")
+        .env("FAKE_OMP_OWNERS_DIR", b.owners())
         .output()
         .unwrap();
-    let v = envelope(&o, 10);
-    poll(Duration::from_secs(3), || {
-        (!b.fake_log().is_empty()).then_some(())
-    });
-    let mut owner = b.hold_lease(A_ID);
-    wait(&b, &v, 6);
+    let v = envelope(&o, 0);
+    b.wait_worker_gone(&job_id(&v));
+    assert!(fs::read(b.omp.session('A')).unwrap().starts_with(&before));
+    assert!(
+        b.fake_log()
+            .iter()
+            .any(|v| v["event"] == "startup_recovery")
+    );
     assert!(!b.frames_in("set_host_tools").is_empty());
-    assert!(b.frames_in("prompt").is_empty());
-    drop(owner.stdin.take());
-    owner.wait().unwrap();
+    assert_eq!(b.frames_in("prompt").len(), 1);
+    assert!(v["data"]["forked"].is_null());
 }
 #[test]
 fn ac208_queue_serialises() {
     let b = RpcBox::new();
+    let release = b.omp.home.join("release-run");
     let launch = || {
         let o = b
             .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-            .env("FAKE_OMP_DELAY_MS", "1000")
+            .env("FAKE_OMP_RUN_RELEASE", &release)
             .env("FAKE_OMP_OWNERS_DIR", b.owners())
             .output()
             .unwrap();
@@ -243,6 +250,7 @@ fn ac208_queue_serialises() {
     accepted(&b, &job_id(&one));
     let two = launch();
     assert_eq!(two["data"]["job"]["status"], "queued");
+    fs::write(release, "go").unwrap();
     wait(&b, &one, 0);
     wait(&b, &two, 0);
     let log = b.fake_log();
@@ -381,7 +389,7 @@ fn ac213_failures() {
 #[test]
 fn ac214_lost_worker() {
     let b = RpcBox::new();
-    let v = launch(&b, "ok", "5000");
+    let v = launch(&b, "hang", "0");
     let id = job_id(&v);
     accepted(&b, &id);
     let pid = b.job(&id).1["worker_pid"].as_u64().unwrap();
@@ -460,9 +468,10 @@ fn ac216_teardown() {
 #[test]
 fn ac217_sigint_foreground_keeps_job() {
     let b = RpcBox::new();
+    let release = b.omp.home.join("release-run");
     let child = b
         .glen(&["send", "e27c0de", "hi", "--wait", "30s", "--json"])
-        .env("FAKE_OMP_DELAY_MS", "2000")
+        .env("FAKE_OMP_RUN_RELEASE", &release)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -482,6 +491,7 @@ fn ac217_sigint_foreground_keeps_job() {
     .unwrap();
     let v = envelope(&child.wait_with_output().unwrap(), 130);
     assert_eq!(v["data"]["interrupted"], true);
+    fs::write(release, "go").unwrap();
     wait(&b, &v, 0);
 }
 #[test]
@@ -830,4 +840,233 @@ fn ac202_latest_scope_and_continuation() {
         b.wait_worker_gone(&job_id(&value));
         assert_eq!(value["data"]["session"]["path"], json!(expected));
     }
+}
+
+#[test]
+fn review1_abort_in_prompt_submission_gap_never_sends_prompt() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        .env("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS", "5000")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 10);
+    let id = job_id(&v);
+    poll(Duration::from_secs(5), || {
+        fs::read_to_string(b.job_dir(&id).join("worker.log"))
+            .ok()
+            .filter(|s| s.contains("prompt: sending message"))
+    });
+    let start = Instant::now();
+    control(&b, &id, "gap", json!({"v":1,"op":"abort"}));
+    let s = b.wait_terminal(&id, Duration::from_millis(1500));
+    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert_eq!(s["status"], "aborted");
+    assert_eq!(s["error"]["code"], "cancelled");
+    wait(&b, &v, 7);
+    assert!(b.frames_in("prompt").is_empty());
+    let done: Value =
+        serde_json::from_slice(&fs::read(b.job_dir(&id).join("control/gap.done.json")).unwrap())
+            .unwrap();
+    assert_eq!(done, json!({"v":1,"ok":true}));
+}
+#[test]
+fn review4_output_immediately_before_ack_is_preserved() {
+    let b = RpcBox::new();
+    // Force the ack to be ready before the worker resumes reading its event receiver.
+    for _ in 0..8 {
+        let v = send(&b, "local", &[], 0);
+        assert_eq!(v["data"]["command_output"], json!(["fake command output"]));
+        let stored: Value =
+            serde_json::from_slice(&fs::read(b.job_dir(&job_id(&v)).join("result.json")).unwrap())
+                .unwrap();
+        assert_eq!(stored["command_output"], json!(["fake command output"]));
+    }
+}
+#[test]
+fn review5_delayed_state_query_does_not_delay_abort() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        .env("FAKE_OMP_SCENARIO", "delayed_state")
+        .env("FAKE_OMP_STATE_DELAY_MS", "5000")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 10);
+    let id = job_id(&v);
+    poll(Duration::from_secs(5), || {
+        (b.frames_in("get_state").len() >= 2).then_some(())
+    });
+    let start = Instant::now();
+    control(&b, &id, "slow-state", json!({"v":1,"op":"abort"}));
+    let s = b.wait_terminal(&id, Duration::from_millis(1500));
+    assert_eq!(s["status"], "aborted");
+    assert_eq!(s["error"]["code"], "cancelled");
+    assert!(start.elapsed() < Duration::from_millis(1500));
+    wait(&b, &v, 7);
+    assert!(!b.frames_in("abort").is_empty());
+}
+#[test]
+fn review6_stdin_routing_reprobes_after_predecessor_releases_lease() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "first", "--no-wait", "--json"])
+        .env("FAKE_OMP_DELAY_MS", "2000")
+        .env("FAKE_OMP_OWNERS_DIR", b.owners())
+        .output()
+        .unwrap();
+    let first = envelope(&o, 10);
+    accepted(&b, &job_id(&first));
+    assert!(matches!(
+        glen::omp::lease::probe(&b.owners(), A_ID),
+        glen::omp::lease::Lease::Held
+    ));
+    let mut second = b
+        .glen(&["send", "e27c0de", "-", "--json"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    wait(&b, &first, 0);
+    second.stdin.take().unwrap().write_all(b"second").unwrap();
+    let v = envelope(&second.wait_with_output().unwrap(), 0);
+    b.wait_worker_gone(&job_id(&v));
+    assert_eq!(v["data"]["assistant_text"], "pong: second");
+}
+#[test]
+fn review8_queue_marker_distinguishes_waiting_from_startup() {
+    let b = RpcBox::new();
+    let lock = b.hold_glen_lock(A_ID);
+    let release = b.omp.home.join("release-queued-startup");
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        .env("FAKE_OMP_READY_RELEASE", &release)
+        .output()
+        .unwrap();
+    let v = envelope(&o, 10);
+    let id = job_id(&v);
+    poll(Duration::from_secs(5), || {
+        b.job(&id).1["waited_ms"].as_u64().filter(|n| *n > 0)
+    });
+    assert_eq!(b.job(&id).1["status"], "queued");
+    assert_eq!(b.job(&id).1["waiting_for_lock"], true);
+    drop(lock);
+    poll(Duration::from_secs(5), || {
+        (!b.fake_log().is_empty()).then_some(())
+    });
+    assert_eq!(b.job(&id).1["status"], "queued");
+    assert_ne!(b.job(&id).1["waiting_for_lock"], true);
+    fs::write(release, "ready").unwrap();
+    wait(&b, &v, 0);
+    assert!(b.job(&id).1["waited_ms"].is_u64());
+    assert_ne!(b.job(&id).1["waiting_for_lock"], true);
+    let b = RpcBox::new();
+    let release = b.omp.home.join("release-ready");
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        .env("FAKE_OMP_READY_RELEASE", &release)
+        .output()
+        .unwrap();
+    let v = envelope(&o, 10);
+    let id = job_id(&v);
+    poll(Duration::from_secs(5), || {
+        (!b.fake_log().is_empty()).then_some(())
+    });
+    assert_eq!(b.job(&id).1["status"], "queued");
+    assert_ne!(b.job(&id).1["waiting_for_lock"], true);
+    fs::write(release, "ready").unwrap();
+    wait(&b, &v, 0);
+}
+#[test]
+fn review9_abort_after_completed_result_preserves_answer() {
+    let b = RpcBox::new();
+    let v = launch(&b, "never_settles", "0");
+    let id = job_id(&v);
+    poll(Duration::from_secs(5), || {
+        b.fake_log()
+            .iter()
+            .any(|v| v["event"] == "out" && v["frame"]["type"] == "prompt_result")
+            .then_some(())
+    });
+    control(&b, &id, "settle", json!({"v":1,"op":"abort"}));
+    let v = wait(&b, &v, 0);
+    assert_eq!(v["data"]["assistant_text"], "pong: hello");
+    assert_eq!(v["data"]["session_settled"], false);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "settle_cancelled")
+    );
+    assert!(b.frames_in("abort").is_empty());
+}
+#[test]
+fn review10_local_result_has_bounded_settle_wait() {
+    let b = RpcBox::new();
+    let start = Instant::now();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--json"])
+        .env("GLEN_JOB_TIMEOUT", "60m")
+        .env("FAKE_OMP_SCENARIO", "local_result_unsettled")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 0);
+    assert!(start.elapsed() < Duration::from_secs(15));
+    b.wait_worker_gone(&job_id(&v));
+    assert_eq!(v["data"]["session_settled"], false);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "settle_timeout")
+    );
+    let r: Value =
+        serde_json::from_slice(&fs::read(b.job_dir(&job_id(&v)).join("result.json")).unwrap())
+            .unwrap();
+    assert_eq!(r["agent_invoked"], false);
+    assert!(b.frames_in("abort").is_empty());
+}
+#[test]
+fn review14_replies_after_fork_use_current_session_inbox() {
+    let b = RpcBox::new();
+    let v = send(&b, "fork_reply", &[], 11);
+    let new = v["data"]["forked"]["to"].as_str().unwrap();
+    assert_eq!(v["data"]["replies"][0]["session_id"], new);
+    let record: Value = serde_json::from_str(
+        fs::read_to_string(b.omp.glen_home.join("inbox").join(format!("{new}.ndjson")))
+            .unwrap()
+            .trim(),
+    )
+    .unwrap();
+    assert_eq!(record["session_id"], new);
+    assert!(
+        !b.omp
+            .glen_home
+            .join("inbox")
+            .join(format!("{A_ID}.ndjson"))
+            .exists()
+    );
+}
+
+#[test]
+fn review5_delayed_final_state_still_detects_silent_fork() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--json"])
+        .env("FAKE_OMP_SCENARIO", "fork_silent")
+        .env("FAKE_OMP_STATE_DELAY_MS", "500")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 11);
+    b.wait_worker_gone(&job_id(&v));
+    assert_eq!(v["data"]["forked"]["from"], A_ID);
+    assert!(
+        v["data"]["forked"]["to"]
+            .as_str()
+            .unwrap()
+            .ends_with("f0f0")
+    );
 }
