@@ -2,10 +2,24 @@
 # Offline verification: recordings and fake executables only. Never runs setup/person/teardown.
 set -euo pipefail
 A=$(cd -- "$(dirname -- "$0")" && pwd -P)
+# shellcheck source=tests/acceptance/acc.sh
+source "$A/acc.sh"
 S=$(mktemp -d "${TMPDIR:-/tmp}/ga-fixture.XXXXXX")
 S=$(cd -- "$S" && pwd -P)
 trap 'rm -rf "$S"' EXIT # This script owns every file beneath its newly created directory.
 mkdir -p "$S/project" "$S/bin" "$S/glen-bin"
+# Large help output must finish writing before either required-command check exits early.
+cat > "$S/help-glen" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ ${1-} == --help ]]
+printf '  inbox ...\n  install-extension ...\n'
+perl -e 'print "x" x 1024, "\n" for 1..200;'
+EOF
+chmod +x "$S/help-glen"
+for iteration in {1..20}; do
+    (require_w3_surface "$S/help-glen") || die "large help gate failed on iteration $iteration"
+done
 jq -n --arg s "$S" '{scratch:$s,project:($s+"/project"),R:{id:"11111111-1111-1111-1111-11111aaaaaaa",handle:"aaaaaaa"},L:{id:"22222222-2222-2222-2222-22222bbbbbbb",handle:"bbbbbbb"},X:{id:"33333333-3333-3333-3333-33333ccccccc",handle:"ccccccc"},NONCE_R:"R-nonce",NONCE_L:"L-nonce",NONCE_T:"T-nonce"}' > "$S/manifest.json"
 jq -cn --slurpfile m "$S/manifest.json" '
   $m[0] as $m |

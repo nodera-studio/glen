@@ -32,6 +32,12 @@ tui_ready() {
         ((SECONDS<deadline)) || die "$name: omp TUI not ready"; sleep 0.2
     done
 }
+require_w3_surface() {
+    local binary=$1 help
+    help=$("$binary" --help) || die 'acceptance needs W3'
+    grep -Eq '^  inbox[[:space:]]' <<< "$help" || die 'acceptance needs W3'
+    grep -Eq '^  install-extension[[:space:]]' <<< "$help" || die 'acceptance needs W3'
+}
 setup() {
     local mode=$1
     [[ $mode =~ ^(a|b|b2|b3|c1|c2)$ ]] || die 'mode must be a, b, b2, b3, c1 or c2'
@@ -40,8 +46,7 @@ setup() {
     if [[ $mode == c2 && ${ACC_C2_CONSENT-} != yes ]]; then die 'c2 owner-pending: explicit owner consent required (ACC_C2_CONSENT=yes)'; fi
     (cd "$ROOT" && cargo build --release --locked) >&2
     local binary="$ROOT/target/release/glen"
-    "$binary" --help | grep -Eq '^  inbox[[:space:]]' || die 'acceptance needs W3'
-    "$binary" --help | grep -Eq '^  install-extension[[:space:]]' || die 'acceptance needs W3'
+    require_w3_surface "$binary"
     need omp
     [[ $(omp --version) == 'omp/18.14.0' ]] || die 'acceptance needs omp/18.14.0'
     local S P G report sessions agent probe R L X ext suffix screen_l screen_x deadline out
@@ -179,7 +184,7 @@ teardown() {
     done
     local status=0 sessions
     sessions=$(jq -r .sessions_dir "$S/manifest.json")
-    if [[ -d $S/home/run/live ]] && find "$S/home/run/live" -type f -print -quit | grep -q .; then printf 'FAIL live endpoints remain\n' >&2; status=1; fi
+    if [[ -d $S/home/run/live ]] && [[ -n $(find "$S/home/run/live" -type f -print -quit) ]]; then printf 'FAIL live endpoints remain\n' >&2; status=1; fi
     snapshot "$sessions" > "$S/owner-sessions.after.json"
     if ! jq -en --slurpfile before "$S/owner-sessions.before.json" --slurpfile after "$S/owner-sessions.after.json" --slurpfile m "$S/manifest.json" '
       all($before[0][]; . as $old | any($after[0][]; .==$old)) and
@@ -201,6 +206,7 @@ teardown() {
     # O1: no credential store was copied; never delete agent.db or omp session files.
     return "$status"
 }
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 case "${1-}" in
     setup) [[ $# == 2 ]] || die 'usage: acc.sh setup MODE'; setup "$2" ;;
     person) [[ $# == 2 ]] || die 'usage: acc.sh person S'; safe_scratch "$2"; expect "$A/person.exp" "$2" ;;
