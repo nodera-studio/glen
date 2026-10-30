@@ -10,10 +10,10 @@ const BAKED_GLEN_HOME = "__GLEN_HOME__";
 export const PROTOCOL = 1;
 export const OPS = ["hello", "state", "send"];
 export const RESERVED_OPS = ["abort", "list_models", "set_model", "set_thinking_level", "compact"];
-export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxReply: 65536, idleMs: 5000 };
-type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number };
-type Request = { id: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; delivered: boolean; startedAfterAck: boolean; consumed: boolean; lastAssistant: any; settled: boolean };
-type Endpoint = { server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
+export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
+type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number };
+type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; settled: boolean };
+type Endpoint = { server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
 const ENDPOINTS = new Map<number, Endpoint>();
 export function isPlainToken(id: unknown): id is string { return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id); }
 export function sunPathMax(platform: string) { return platform === "darwin" ? 104 : 108; }
@@ -33,9 +33,22 @@ function quietly(fn: () => void) { try { fn(); } catch { /* best effort cleanup/
 function unlink(file: string) { quietly(() => fs.unlinkSync(file)); }
 function version() { return GLEN_VERSION.startsWith("__") ? "dev" : GLEN_VERSION; }
 function registry(e: Endpoint, id = e.sessionId) { return path.join(e.home, "run/live", `${id}.json`); }
+export function removeRegistryIfUnchanged(file: string, expected: string): boolean {
+    const tombstone = path.join(path.dirname(file), `.${path.basename(file)}.${crypto.randomUUID()}.stale`);
+    try { fs.renameSync(file, tombstone); } catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return false; throw err; }
+    if (fs.readFileSync(tombstone, "utf8") !== expected) {
+        // link is create-only: restoring an unexpected registry must not overwrite
+        // a concurrent publisher. In that case retain the hidden tombstone.
+        try { fs.linkSync(tombstone, file); fs.unlinkSync(tombstone); }
+        catch (err) { if ((err as NodeJS.ErrnoException).code !== "EEXIST") throw err; }
+        return false;
+    }
+    fs.unlinkSync(tombstone);
+    return true;
+}
 function removeRegistry(e: Endpoint, id = e.sessionId) {
     if (!isPlainToken(id)) return;
-    quietly(() => { const file = registry(e, id); if (JSON.parse(fs.readFileSync(file, "utf8")).pid === e.deps.pid) fs.unlinkSync(file); });
+    quietly(() => { const file = registry(e, id), bytes = fs.readFileSync(file, "utf8"); if (JSON.parse(bytes).pid === e.deps.pid) removeRegistryIfUnchanged(file, bytes); });
 }
 function publish(e: Endpoint, id: string, file: string | null) {
     if (!isPlainToken(id)) return;
@@ -46,7 +59,7 @@ function publish(e: Endpoint, id: string, file: string | null) {
 }
 function trace(e: Endpoint | undefined, event: string, payload: any = {}) {
     if (!e || !path.isAbsolute(e.deps.env.GLEN_EXT_TRACE ?? "")) return;
-    quietly(() => fs.appendFileSync(e.deps.env.GLEN_EXT_TRACE!, JSON.stringify({ t: new Date().toISOString(), event, reason: payload.reason, willContinue: payload.willContinue, awaitingAsyncWork: payload.awaitingAsyncWork, idle: e.ctx.isIdle(), queued: e.ctx.hasPendingMessages(), requests: e.requests.map(r => ({ id: r.id, deliveredAs: r.deliveredAs, delivered: r.delivered, startedAfterAck: r.startedAfterAck, consumed: r.consumed })) }) + "\n", { mode: 0o600 }));
+    quietly(() => fs.appendFileSync(e.deps.env.GLEN_EXT_TRACE!, JSON.stringify({ t: new Date().toISOString(), event, reason: payload.reason, willContinue: payload.willContinue, awaitingAsyncWork: payload.awaitingAsyncWork, idle: e.ctx.isIdle(), queued: e.ctx.hasPendingMessages(), requests: e.requests.map(r => ({ id: r.id, deliveredAs: r.deliveredAs, consumptionSeq: r.consumptionSeq, consumed: r.consumed })) }) + "\n", { mode: 0o600 }));
 }
 function notify(ctx: any, message: string) { quietly(() => { if (ctx.hasUI) ctx.ui.notify(message, "info"); }); }
 function write(conn: net.Socket | null, frame: object): boolean {
@@ -64,6 +77,8 @@ function event(r: Request, kind: string, body: object = {}): boolean {
 function terminal(e: Endpoint, r: Request, kind: string, body: object) {
     if (r.settled) return;
     event(r, kind, body); r.settled = true;
+    if (r.deliveryTimer !== undefined) e.ctx.clearTimer(r.deliveryTimer);
+    e.active = e.active.filter(x => x !== r);
     if (r.acked && r.conn) { const conn = r.conn; quietly(() => conn.end(() => quietly(() => conn.destroy()))); }
     e.settledIds.add(r.id);
     if (e.settledIds.size > 4096) e.settledIds.delete(e.settledIds.values().next().value!);
@@ -77,13 +92,37 @@ function identity(e: Endpoint, reason = "moved") {
     removeRegistry(e); e.sessionId = id; e.sessionFile = file;
     for (const r of [...e.requests]) {
         event(r, "session_changed", { from, to: id, reason });
-        if (!isPlainToken(id) || reason === "new" || reason === "resume") terminal(e, r, "error", { error: { code: "session_switched", message: "the omp session switched conversations" } });
+        if (!isPlainToken(id)) terminal(e, r, "error", { error: { code: "session_switched", message: "the omp session switched conversations" } });
     }
 }
-function consumed(e: Endpoint) {
-    for (const r of e.requests) if (!r.consumed && (r.delivered || (r.deliveredAs === "prompt" && r.startedAfterAck))) { r.consumed = true; event(r, "consumed"); }
-}
 function textOf(message: any): string { return typeof message?.content === "string" ? message.content : (Array.isArray(message?.content) ? message.content.filter((b: any) => b?.type === "text" && typeof b.text === "string").map((b: any) => b.text).join("\n") : ""); }
+function jobHandle(r: Request) { return r.jobId ? "j" + r.jobId.replaceAll("-", "").slice(-7) : r.id; }
+function closeSpan(e: Endpoint) {
+    const batch = [...e.active];
+    for (const r of batch) {
+        const m = r.lastAssistant, stop = m?.stopReason ?? null;
+        const warnings = batch.length > 1 ? [{ code: "batched", message: `omp consumed this request in a batch with ${batch.filter(other => other !== r).map(jobHandle).join(", ")}; they share the reply span` }] : [];
+        terminal(e, r, "settled", { status: stop === "aborted" ? "aborted" : stop === "error" ? "error" : "completed", assistant_text: m ? textOf(m) || null : null, stop_reason: stop, error_message: typeof m?.errorMessage === "string" ? m.errorMessage : null, warnings });
+    }
+    e.spanHasOutput = false;
+}
+function pendingRequest(e: Endpoint, message: any) {
+    return message?.role === "user" ? e.requests.find(r => !r.consumed && r.text === textOf(message)) : undefined;
+}
+function boundary(e: Endpoint, message: any) {
+    const next = pendingRequest(e, message);
+    // Only adjacent queued user messages from the same run can share a span.
+    // User input and custom/system notices always break ownership.
+    const batched = next && next.deliveredAs !== "prompt" && e.active.length > 0 && e.active.every(r => r.deliveredAs !== "prompt") && !e.spanHasOutput && e.spanStart === e.lastStart;
+    if (!batched) closeSpan(e);
+}
+function notDelivered(e: Endpoint, r: Request) {
+    if (!r.consumed) terminal(e, r, "error", { error: { code: "not_delivered", message: "omp did not append this request's user message before the delivery deadline or the queue drained" } });
+}
+function isBoundary(message: any) {
+    // Unknown/custom roles cannot inherit the preceding request's span.
+    return typeof message?.role === "string" && message.role !== "assistant" && message.role !== "toolResult";
+}
 function settle(e: Endpoint) {
     if (e.timer !== undefined) e.ctx.clearTimer(e.timer);
     const endSeq = e.seq, started = Date.now();
@@ -91,10 +130,8 @@ function settle(e: Endpoint) {
         try {
             if (!ENDPOINTS.has(e.deps.pid) || e.lastStart > endSeq || e.ctx.hasPendingMessages() || Date.now() - started >= 30000) { trace(e, "poll_stopped"); return; }
             if (!e.ctx.isIdle()) { e.timer = e.ctx.setTimeout(poll, 50); return; }
-            for (const r of [...e.requests]) if (r.ackSeq < endSeq && (r.consumed || r.deliveredAs !== "prompt")) {
-                const m = r.lastAssistant, stop = m?.stopReason ?? null;
-                terminal(e, r, "settled", { status: stop === "aborted" ? "aborted" : stop === "error" ? "error" : "completed", assistant_text: m ? textOf(m) : null, stop_reason: stop, error_message: typeof m?.errorMessage === "string" ? m.errorMessage : null });
-            }
+            closeSpan(e);
+            for (const r of [...e.requests]) if (r.ackSeq < endSeq) notDelivered(e, r);
             trace(e, "quiescent");
         } catch (error) { trace(e, "poll_error", { reason: String(error) }); }
     };
@@ -144,13 +181,14 @@ function connection(e: Endpoint, conn: net.Socket) {
             if (typeof a?.text !== "string" || !a.text.trim() || Buffer.byteLength(a.text) > LIMITS.maxText || !["auto", "steer", "follow_up"].includes(a.deliver_as) || (a.job_id != null && typeof a.job_id !== "string") || (a.expect_session_id != null && typeof a.expect_session_id !== "string")) { error(id, "bad_request", "invalid send arguments"); return; }
             if (a.expect_session_id != null && a.expect_session_id !== e.sessionId) { error(id, "session_mismatch", "session identity changed", { session_id: e.sessionId }); return; }
             const idle = e.ctx.isIdle(), deliveredAs = idle ? "prompt" : a.deliver_as === "steer" ? "steer" : "follow_up";
-            const r: Request = { id, jobId: a.job_id ?? null, text: a.text, deliveredAs, conn, ackSeq: e.seq, acked: false, outbox: [], delivered: false, startedAfterAck: false, consumed: false, lastAssistant: null, settled: false };
+            const r: Request = { id, sessionId: e.sessionId, jobId: a.job_id ?? null, text: a.text, deliveredAs, conn, ackSeq: e.seq, acked: false, outbox: [], consumed: false, consumptionSeq: null, lastAssistant: null, settled: false };
             e.requests.push(r);
             conn.on("close", () => { r.conn = null; });
             try { if (idle) e.pi.sendUserMessage(a.text); else e.pi.sendUserMessage(a.text, { deliverAs: deliveredAs === "steer" ? "steer" : "followUp" }); }
             catch (err) { e.requests = e.requests.filter(x => x !== r); error(id, "send_failed", String(err)); return; }
             write(conn, { v: PROTOCOL, id, ok: true, data: { delivered_as: deliveredAs, session_id: e.sessionId, request_id: id } });
             r.acked = true; r.ackSeq = e.seq;
+            if (!r.consumed && !r.settled) r.deliveryTimer = e.ctx.setTimeout(() => notDelivered(e, r), e.deps.deliveryMs ?? LIMITS.deliveryMs);
             for (const frame of r.outbox) write(conn, frame);
             r.outbox = [];
             if (r.settled) conn.end(() => quietly(() => conn.destroy()));
@@ -169,7 +207,7 @@ function sweep(home: string, deps: Deps) {
     const dir = path.join(home, "run/live");
     for (const name of fs.readdirSync(dir)) {
         if (name.startsWith(".")) continue;
-        if (name.endsWith(".json")) quietly(() => { const r = JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")); if (Number.isInteger(r.pid) && r.pid > 0 && !deps.isAlive(r.pid)) { unlink(path.join(dir, name)); unlink(path.join(dir, `${r.pid}.sock`)); } });
+        if (name.endsWith(".json")) quietly(() => { const file = path.join(dir, name), bytes = fs.readFileSync(file, "utf8"), r = JSON.parse(bytes); if (Number.isInteger(r.pid) && r.pid > 0 && !deps.isAlive(r.pid) && removeRegistryIfUnchanged(file, bytes)) unlink(path.join(dir, `${r.pid}.sock`)); });
         const m = /^(\d+)\.sock$/.exec(name);
         if (m && !deps.isAlive(Number(m[1]))) unlink(path.join(dir, name));
     }
@@ -177,16 +215,21 @@ function sweep(home: string, deps: Deps) {
 export function createGlen(pi: ExtensionAPI, deps: Deps) {
     const handle = { managed: deps.env.GLEN_MANAGED === "1", endpoint: () => { const e = ENDPOINTS.get(deps.pid); return e ? { socket: e.socket, registry: registry(e), sessionId: e.sessionId } : null; }, requests: () => ENDPOINTS.get(deps.pid)?.requests ?? [] };
     if (handle.managed) return handle;
-    let notified = false;
     const z = pi.zod;
     pi.registerTool({ name: "glen_reply", label: "glen reply", description: "Send a message back to the agent that contacted you through glen (Claude Code or Codex). Use it to answer a glen request or report progress.", loadMode: "essential", approval: "read", parameters: z.object({ text: z.string().describe("The message for the calling agent."), final: z.boolean().optional().describe("true when this is your final answer to the request.") }).strict(),
         async execute(toolCallId: string, params: any, _signal: any, _onUpdate: any, ctx: any) {
             try {
                 const args = parseReplyArgs(params), e = ENDPOINTS.get(deps.pid);
-                if (e && (ctx.agent?.kind ?? "main") === "main") { e.ctx = ctx; identity(e); }
-                const active = e?.requests.filter(r => r.consumed && !r.settled).at(-1);
+                if (e && (ctx.agent?.kind ?? "main") === "main") {
+                    e.ctx = ctx;
+                    try { identity(e); } catch (err) { trace(e, "registry_error", { reason: String(err) }); notify(ctx, `glen: registry refresh failed: ${String(err)}`); }
+                }
+                const active = (ctx.agent?.kind ?? "main") === "main" ? e?.active ?? [] : [];
                 const id = e?.sessionId ?? ctx.sessionManager.getSessionId();
-                const record = { v: 1, id: crypto.randomUUID(), session_id: id, job_id: active?.jobId ?? null, request_id: active?.id ?? null, tool_call_id: toolCallId ?? null, text: args.text, final: args.final, at: new Date().toISOString() };
+                // One tool call is one durable inbox record. A shared batch has
+                // no single owning job; every observer receives this same record.
+                const owner = active.length === 1 ? active[0] : null;
+                const record = { v: 1, id: crypto.randomUUID(), session_id: id, job_id: owner?.jobId ?? null, request_id: owner?.id ?? null, tool_call_id: toolCallId ?? null, text: args.text, final: args.final, at: new Date().toISOString() };
                 let failure: unknown;
                 try {
                     if (!isPlainToken(id)) throw new Error("invalid session id");
@@ -194,7 +237,9 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
                     fs.mkdirSync(path.join(home, "inbox"), { recursive: true, mode: 0o700 });
                     fs.appendFileSync(path.join(home, "inbox", `${id}.ndjson`), JSON.stringify(record) + "\n", { mode: 0o600 });
                 } catch (err) { failure = err; }
-                const streamed = active ? event(active, "reply", { reply: record }) : false;
+                let streamed = false;
+                for (const r of active) { if (event(r, "reply", { reply: record })) streamed = true; }
+                if (e && active.length > 0) e.spanHasOutput = true;
                 if (failure && !streamed) throw new Error(`glen_reply: cannot write the glen inbox: ${String(failure)}`);
                 return { content: [{ type: "text", text: "delivered" }] };
             } catch (error) { return { content: [{ type: "text", text: error instanceof Error ? error.message : String(error) }], isError: true }; }
@@ -205,7 +250,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
             if ((ctx.agent?.kind ?? "main") !== "main") return;
             const e = ENDPOINTS.get(deps.pid);
             try {
-                if (e) { e.ctx = ctx; e.seq++; identity(e, name === "session_switch" ? payload.reason : "moved"); trace(e, name, payload); }
+                if (e) { e.ctx = ctx; e.seq++; try { identity(e, name === "session_switch" ? payload.reason : "moved"); } catch (err) { trace(e, "registry_error", { reason: String(err) }); } trace(e, name, payload); }
                 await fn(payload, ctx, e);
             } catch (err) { trace(e, "handler_error", { reason: String(err) }); }
         });
@@ -214,15 +259,15 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
         if (ctx.mode !== "tui" || existing) return;
         let home: string;
         try { home = resolveGlenHome(deps.env, BAKED_GLEN_HOME, deps.homedir); }
-        catch (err) { if (!notified) notify(ctx, `glen: ${String(err)}`); notified = true; return; }
+        catch (err) { notify(ctx, `glen: ${String(err)}`); return; }
         const id = ctx.sessionManager.getSessionId();
         if (!isPlainToken(id)) return;
         const socket = path.join(home, "run/live", `${deps.pid}.sock`);
-        if (Buffer.byteLength(socket) >= sunPathMax(deps.platform)) { if (!notified) notify(ctx, "glen: GLEN_HOME is too long for a unix socket; live delivery is off"); notified = true; return; }
+        if (Buffer.byteLength(socket) >= sunPathMax(deps.platform)) { notify(ctx, "glen: GLEN_HOME is too long for a unix socket; live delivery is off"); return; }
         fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 }); sweep(home, deps); unlink(socket);
         const server = net.createServer(conn => { try { connection(e, conn); } catch { conn.destroy(); } });
         server.on("error", err => trace(e, "server_error", { reason: String(err) }));
-        const e: Endpoint = { server, connections: new Set(), socket, home, sessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
+        const e: Endpoint = { server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
         try {
             await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, () => { server.removeListener("error", reject); resolve(); }); });
             fs.chmodSync(socket, 0o600);
@@ -234,16 +279,34 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
             trace(e, "session_start");
         } catch (err) { shutdown(e); notify(ctx, `glen: cannot start live delivery: ${String(err)}`); }
     });
-    on("before_agent_start", (p, _ctx, e) => { if (e && p.reason === "prompt" && typeof p.prompt === "string") { for (const r of e.requests) if (!r.delivered && p.prompt.includes(r.text.trim())) r.delivered = true; consumed(e); } });
+    on("before_agent_start", () => {});
+    on("turn_end", () => {});
+    on("message_start", (p, _ctx, e) => {
+        if (!e) return;
+        if (isBoundary(p.message)) { boundary(e, p.message); e.boundaryStarted = true; }
+        else if (p.message?.role === "assistant") e.spanHasOutput = true;
+    });
     on("message_end", (p, _ctx, e) => {
         if (!e) return;
-        if (p.message?.role === "user") { const r = e.requests.find(r => !r.delivered && r.text.trim() === textOf(p.message).trim()); if (r) r.delivered = true; consumed(e); }
-        if (p.message?.role === "assistant") for (const r of e.requests) if (r.acked) r.lastAssistant = p.message;
+        if (isBoundary(p.message)) {
+            if (!e.boundaryStarted) boundary(e, p.message);
+            e.boundaryStarted = false;
+            if (p.message.role === "user") {
+                // sendUserMessage returns void. Match one pending injection, in submission order.
+                const r = pendingRequest(e, p.message);
+                if (r) { r.consumed = true; r.consumptionSeq = e.seq; if (e.active.length === 0) e.spanStart = e.lastStart; e.active.push(r); if (r.deliveryTimer !== undefined) e.ctx.clearTimer(r.deliveryTimer); event(r, "consumed"); }
+            }
+        } else if (p.message?.role === "assistant") { e.spanHasOutput = true; for (const r of e.active) r.lastAssistant = p.message; }
     });
-    on("turn_end", (p, _ctx, e) => { if (e && p.message?.role === "assistant") for (const r of e.requests) if (r.acked) r.lastAssistant = p.message; });
-    on("agent_start", (_p, _ctx, e) => { if (e) { e.lastStart = e.seq; for (const r of e.requests) { /* Prompt-start fallback applies only after acknowledgement. */ if (r.acked) r.startedAfterAck = true; } consumed(e); } });
+    on("agent_start", (_p, _ctx, e) => { if (e) e.lastStart = e.seq; });
     on("agent_end", (p, _ctx, e) => { if (e && !p.willContinue && !p.awaitingAsyncWork) settle(e); });
-    on("session_switch", () => {});
+    on("session_switch", (p, _ctx, e) => {
+        // A hello/state may already have refreshed identity in the pre-event gap.
+        if (e && (p.reason === "new" || p.reason === "resume")) {
+            for (const r of [...e.requests]) if (r.sessionId !== e.ctx.sessionManager.getSessionId() || e.eventSessionId === e.ctx.sessionManager.getSessionId()) terminal(e, r, "error", { error: { code: "session_switched", message: "the omp session switched conversations" } });
+        }
+        if (e) e.eventSessionId = e.ctx.sessionManager.getSessionId();
+    });
     on("session_branch", () => {});
     on("session_shutdown", (_p, _ctx, e) => { if (e) shutdown(e); });
     return handle;

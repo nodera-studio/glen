@@ -18,7 +18,7 @@ test("AC305/308 endpoint lifecycle, private registry and state", async () => {
 });
 test("AC305 exclusions and utf8 sun_path boundary", async () => {
     for (const opts of [{ mode: "rpc" }, { mode: "print" }, { agentKind: "sub" }, { sessionId: "../bad" }]) { const f = await fixture(opts); try { assert.equal(await f.start(), null); assert.equal(f.tools.length, 1); assert.deepEqual(fs.readdirSync(f.home), []); } finally { await f.close(); } }
-    for (const home of ["relative", "/" + "x".repeat(200), "/" + "é".repeat(60)]) { const f = await fixture({}, { GLEN_HOME: home }); try { await f.start(); await f.start(); assert.equal(f.handle.endpoint(), null); assert.equal(f.notes.length, 1); } finally { await f.close(); } }
+    for (const home of ["relative", "/" + "x".repeat(200), "/" + "é".repeat(60)]) { const f = await fixture({}, { GLEN_HOME: home }); try { await f.start(); await f.start(); assert.equal(f.handle.endpoint(), null); assert.equal(f.notes.length, 2); } finally { await f.close(); } }
     assert.equal(resolveGlenHome({ GLEN_HOME: "~/g" }, "__dev", "/h"), "/h/g"); assert.throws(() => resolveGlenHome({ GLEN_HOME: "a" }, "", "/h")); assert.equal(sunPathMax("darwin"), 104); assert.ok(isPlainToken("abc-_1")); assert.ok(!isPlainToken("a/b"));
 });
 test("AC307 protocol table and idle bound", async () => {
@@ -78,7 +78,7 @@ test("AC321 multibyte home at each platform byte limit is rejected before mkdir"
             assert.ok((home + tail).length < limit);
             f.deps.env.GLEN_HOME = home;
             await f.start(); await f.start();
-            assert.equal(f.handle.endpoint(), null); assert.equal(f.notes.length, 1);
+            assert.equal(f.handle.endpoint(), null); assert.equal(f.notes.length, 2);
             assert.match(f.notes[0], /GLEN_HOME is too long/); assert.ok(!fs.existsSync(home));
         } finally { await f.close(); }
     }
@@ -92,5 +92,23 @@ test("AC307 exact line limit is accepted and bytes after the first newline are i
         assert.equal(response.ok, true); assert.deepEqual(extra, []);
         const frames = await request(e.socket, line + "\n" + "x".repeat(LIMITS.maxLine + 1));
         assert.equal(frames.length, 1); assert.equal(frames[0].ok, true);
+    } finally { await f.close(); }
+});
+test("omitted final is persisted as an explicit false", async () => {
+    const f = await fixture({ mode: "print" });
+    try {
+        assert.equal((await f.tools[0].execute("default-final", { text: "progress" }, null, null, f.ctx)).isError, undefined);
+        const record = JSON.parse(fs.readFileSync(path.join(f.home, "inbox", `${f.fields.sessionId}.ndjson`), "utf8"));
+        assert.ok(Object.hasOwn(record, "final"));
+        assert.equal(record.final, false);
+    } finally { await f.close(); }
+});
+test("AC321 warns once on every failing session_start", async () => {
+    const f = await fixture({}, { GLEN_HOME: "relative" });
+    try {
+        for (let i = 1; i <= 3; i++) {
+            await f.emit("session_start"); assert.equal(f.notes.length, i);
+            await f.emit("agent_start"); assert.equal(f.notes.length, i);
+        }
     } finally { await f.close(); }
 });

@@ -1,4 +1,4 @@
-use super::{ls::session_json, open};
+use super::open;
 use crate::{
     cli::{Cli, TailArgs, Tools},
     env::Env,
@@ -26,7 +26,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
 const POLL: Duration = Duration::from_millis(250);
 pub fn run(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
@@ -42,7 +42,7 @@ pub fn run(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     items.drain(..start);
     let mut outcome = if ctx.mode == Mode::Json {
         Outcome::new(
-            json!({"session":session_json(&o.summary,&o.handle,&o.lease,o.state,SystemTime::now()),"continued_from":o.continued_from,"leaf_id":o.session.leaf_id(),"skipped_lines":o.session.skipped_lines,"items":items}),
+            json!({"session":open::session_json(&o),"continued_from":o.continued_from,"leaf_id":o.session.leaf_id(),"skipped_lines":o.session.skipped_lines,"items":items}),
             "",
         )
     } else {
@@ -262,7 +262,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         };
     }
     let init = (|| -> std::io::Result<()> {
-        stream.event("session",fields(json!({"session":session_json(&o.summary,&o.handle,&o.lease,o.state,SystemTime::now()),"continued_from":o.continued_from,"skipped_lines":o.session.skipped_lines})))?;
+        stream.event("session",fields(json!({"session":open::session_json(&o),"continued_from":o.continued_from,"skipped_lines":o.session.skipped_lines})))?;
         stream.warnings(&ctx.warnings)?;
         if o.not_yet_persisted {
             stream.warnings(&[crate::error::Warning {
@@ -287,6 +287,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     if init.is_err() {
         return ExitCode::from(1);
     }
+    let mut endpoint_missing: Option<Instant> = None;
     while o.not_yet_persisted {
         if stop.load(Ordering::Relaxed) {
             return stream.end(130);
@@ -294,8 +295,20 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         thread::sleep(POLL);
         match open::open_for_send(cli, env, &o.session.header.id) {
             Ok(next) if !next.not_yet_persisted => o = next,
-            Ok(_) => (),
-            Err(e) if e.code == ErrorCode::NotFound => (),
+            Ok(_) => endpoint_missing = None,
+            Err(e) if e.code == ErrorCode::NotFound => {
+                if endpoint_missing.get_or_insert_with(Instant::now).elapsed()
+                    >= Duration::from_secs(5)
+                {
+                    return stream.fail(GlenError::new(
+                        ErrorCode::NotFound,
+                        format!(
+                            "live session {} disappeared before writing a transcript",
+                            o.session.header.id
+                        ),
+                    ));
+                }
+            }
             Err(e) => return stream.fail(e),
         }
     }

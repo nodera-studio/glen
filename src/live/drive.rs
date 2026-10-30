@@ -122,6 +122,19 @@ fn on_frame(
                     if !["completed", "aborted", "error"].contains(&status) {
                         return Ok(Some(Err(protocol("invalid settled status"))));
                     }
+                    if let Some(warnings) =
+                        body.get("warnings").and_then(serde_json::Value::as_array)
+                    {
+                        for warning in warnings {
+                            match serde_json::from_value::<Warning>(warning.clone()) {
+                                Ok(warning) => w.status.warnings.push(warning),
+                                Err(e) => w.log(
+                                    "warning",
+                                    &format!("skipping malformed settled warning: {e}"),
+                                ),
+                            }
+                        }
+                    }
                     let assistant = optional_text(&body, "assistant_text")?;
                     let stop = optional_text(&body, "stop_reason")?;
                     let error_message = optional_text(&body, "error_message")?;
@@ -153,6 +166,10 @@ fn on_frame(
                             f.state = State::Aborted;
                             f
                         }
+                        "not_delivered" => Failure::new(
+                            "not_delivered",
+                            "omp did not append the live request's user message; delivery failed or the queued message was removed",
+                        ),
                         "shutdown" => Failure::new(
                             "omp_exited",
                             "the live omp session closed before the request settled",
@@ -372,6 +389,20 @@ mod tests {
         frame(json!({"v":1,"id":"r","ok":true,"data":{"delivered_as":"prompt"}}))
     }
     #[test]
+    fn settled_batch_warning_survives_to_job_status() {
+        let (_t, mut w) = worker();
+        let mut s = Observation::default();
+        on_frame(&mut w, &mut s, ack()).unwrap();
+        let done = on_frame(&mut w, &mut s, frame(json!({"v":1,"id":"r","event":"settled","status":"completed","assistant_text":"shared answer","warnings":[{"code":"batched","message":"shared with j7654321"},{"future":"unknown"}]}))).unwrap().unwrap();
+        done.unwrap();
+        w.save().unwrap();
+        let saved = w.store.read_status(&w.id).unwrap();
+        assert_eq!(saved.warnings.len(), 1);
+        assert_eq!(saved.warnings[0].code, "batched");
+        assert!(saved.warnings[0].message.contains("j7654321"));
+        assert_eq!(s.assistant.as_deref(), Some("shared answer"));
+    }
+    #[test]
     fn frame_outcome_table() {
         for (status, code, state) in [
             ("completed", None, State::Completed),
@@ -397,6 +428,7 @@ mod tests {
         for (wire, code, state) in [
             ("session_switched", "session_switched", State::Aborted),
             ("shutdown", "omp_exited", State::Failed),
+            ("not_delivered", "not_delivered", State::Failed),
             ("internal", "protocol", State::Failed),
         ] {
             let (_t, mut w) = worker();

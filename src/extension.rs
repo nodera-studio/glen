@@ -1,3 +1,4 @@
+pub(crate) mod write;
 use crate::{error::Warning, live};
 use std::{cmp::Ordering, fs, io, path::Path};
 use xxhash_rust::xxh64::xxh64;

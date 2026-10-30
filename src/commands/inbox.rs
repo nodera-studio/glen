@@ -10,7 +10,7 @@ use crate::{
 };
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeSet, HashMap, HashSet},
     process::ExitCode,
     time::Duration,
 };
@@ -54,12 +54,25 @@ struct Read {
     ends: Vec<(String, Cursor)>,
     skipped: usize,
 }
+fn validate_filter(filter: Option<&str>) -> Result<(), GlenError> {
+    if let Some(filter) = filter
+        && filter.len() < 4
+        && filter.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err(GlenError::new(
+            ErrorCode::Usage,
+            "inbox --session requires a full session id or at least 4 hex digits",
+        ));
+    }
+    Ok(())
+}
 fn collect(
     home: &GlenHome,
     filter: Option<&str>,
     all: bool,
     cursors: Option<&HashMap<String, Cursor>>,
 ) -> Result<Read, GlenError> {
+    validate_filter(filter)?;
     let mut read = Read {
         records: vec![],
         ends: vec![],
@@ -108,18 +121,26 @@ pub fn run(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
     let home = glen_home::resolve(env)?;
     let read = collect(&home, a.session.as_deref(), a.all, None)?;
     let total = read.records.len();
+    let sessions = read
+        .records
+        .iter()
+        .map(|(stem, _, _, _)| stem)
+        .collect::<HashSet<_>>()
+        .len();
     let human = if total == 0 {
         ctx.painter.paint(Token::Muted, "no messages from omp yet")
     } else {
         format!(
-            "{}\n\n{} messages · {} sessions · {}",
+            "{}\n\n{} {} · {} {} · {}",
             read.records
                 .iter()
                 .map(|(_, r, _, _)| human(r, ctx))
                 .collect::<Vec<_>>()
                 .join("\n\n"),
             total,
-            read.ends.len(),
+            if total == 1 { "message" } else { "messages" },
+            sessions,
+            if sessions == 1 { "session" } else { "sessions" },
             if a.peek { "peek" } else { "marked read" }
         )
     };
