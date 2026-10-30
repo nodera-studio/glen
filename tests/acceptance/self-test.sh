@@ -44,6 +44,19 @@ jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1
 printf '%s\n' '{"type":"api-request","betas":["oauth-2025-04-20","claude-code-20250219"],"message":{"content":[{"type":"tool_use","name":"Telemetry"}]}}' >> "$S/transcript.jsonl"
 "$A/acc.sh" check b "$S"
 cp "$S/calls.ndjson" "$S/good.ndjson"
+cp "$S/transcript.jsonl" "$S/good-transcript.jsonl"
+jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls; echo \"exit=$?\"")}}]}}' > "$S/transcript.jsonl"
+"$A/acc.sh" check b "$S"
+jq -e '.pass and (.checks|any(.id=="AC-415-isolation" and .pass))' "$S/verdict.json" >/dev/null
+cp "$S/good-transcript.jsonl" "$S/transcript.jsonl"
+jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls; cat /etc/passwd")}}]}}' > "$S/transcript.jsonl"
+if "$A/acc.sh" check b "$S"; then echo 'compound b recording passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-415-isolation" and (.pass|not)) and all(.[];.pass or .id=="AC-415-isolation")' "$S/verdict.json" >/dev/null
+cp "$S/good-transcript.jsonl" "$S/transcript.jsonl"
+jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls | jq .")}}]}}' > "$S/transcript.jsonl"
+if "$A/acc.sh" check b "$S"; then echo 'piped b recording passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-415-isolation" and (.pass|not)) and all(.[];.pass or .id=="AC-415-isolation")' "$S/verdict.json" >/dev/null
+cp "$S/good-transcript.jsonl" "$S/transcript.jsonl"
 jq -c 'if .t=="end" and .stdout.data.assistant_text? then .stdout.data.assistant_text="missing" else . end' "$S/good.ndjson" > "$S/calls.ndjson"
 printf '{"t":"start","id":"killed","argv":["ls"],"ts":100}\n{"t":"guard_refused","argv":["send","foreign"]}\n' >> "$S/calls.ndjson"
 if "$A/acc.sh" check b "$S"; then echo 'bad recording passed' >&2; exit 1; fi

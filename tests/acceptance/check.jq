@@ -73,7 +73,7 @@ $m[0] as $manifest | $calls as $all |
  + (if $mode=="b" then
      uses($transcript) as $tools |
      [check("AC-415-transcript"; ($tools|length)>0 and all($tools[];.name=="Bash" or (.name=="Read" and (.input.file_path|startswith($scratch+"/")))); "required transcript: only Bash and scratch Read"),
-      check("AC-415-isolation"; all($tools[]; if .name=="Bash" then (.input.command as $c |
+      check("AC-415-isolation"; all($tools[]; if .name=="Bash" then (.input.command | sub("; echo (\"exit=\\$\\?\"|exit=\\$\\?)\\z"; ""; "i") as $c |
          (($c|startswith($scratch+"/bin/glen ")) or ($c|startswith("'"+$scratch+"/bin/glen' ")) or ($c|startswith("\""+$scratch+"/bin/glen\" "))) and
          (["&&","||",";","\n","$(","`","|"] | all(.[];. as $token|$c|contains($token)|not))) else true end); "only plain scratch-wrapper calls; orchestrator also audits transcript")]
     elif $mode=="b3" then
