@@ -90,19 +90,13 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
         for name in ["send", "wait", "jobs"] {
             assert!(out.out().contains(name), "{shell} script lacks {name}");
         }
+        let data = sb.glen(["completions", shell, "--json"]).run().ok_data();
+        assert!(!data["script"].as_str().unwrap().contains("__worker"));
     }
     assert!(
         !sb.glen_home.exists(),
-        "help and raw completions create nothing"
+        "help and completions create nothing"
     );
-    // JSON completions may legitimately create a spill as the command tree grows.
-    for shell in ["bash", "zsh", "fish", "elvish", "powershell"] {
-        let data = sb
-            .glen(["completions", shell, "--json"])
-            .run()
-            .ok_data_or_spilled(&sb.glen_home);
-        assert!(!data["script"].as_str().unwrap().contains("__worker"));
-    }
 }
 
 // ---------------------------------------------------------------------------------------------

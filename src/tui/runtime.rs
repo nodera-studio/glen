@@ -829,7 +829,7 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),Msg::ControlDone {local:3,op:ControlOp::Abort,result:Err(e)} if e.code == "not_implemented")
+            matches!(rx.recv_timeout(Duration::from_secs(2)).unwrap(),Msg::ControlDone {local:3,op:ControlOp::Abort,result:Err(e)} if e.code == "not_found")
         );
         effects
             .execute(Cmd::Submit {

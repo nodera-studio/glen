@@ -48,6 +48,9 @@ pub enum SceneKind {
     JobForked,
     InboxOverlay,
     HelpControlsOff,
+    HelpControlsOn,
+    ConfirmAbort,
+    ModelPicker,
     ScrolledWithNew,
     NarrowTranscript,
     TooSmall,
@@ -55,7 +58,7 @@ pub enum SceneKind {
     MultilinePrompt,
 }
 impl SceneKind {
-    pub const STATES: [Self; 19] = [
+    pub const STATES: [Self; 22] = [
         Self::EmptyScope,
         Self::SessionsDirMissing,
         Self::ListLoading,
@@ -70,6 +73,9 @@ impl SceneKind {
         Self::JobForked,
         Self::InboxOverlay,
         Self::HelpControlsOff,
+        Self::HelpControlsOn,
+        Self::ConfirmAbort,
+        Self::ModelPicker,
         Self::ScrolledWithNew,
         Self::NarrowTranscript,
         Self::TooSmall,
@@ -93,6 +99,9 @@ impl SceneKind {
             Self::JobForked => "job_forked",
             Self::InboxOverlay => "inbox_overlay",
             Self::HelpControlsOff => "help_controls_off",
+            Self::HelpControlsOn => "help_controls_on",
+            Self::ConfirmAbort => "confirm_abort",
+            Self::ModelPicker => "model_picker",
             Self::ScrolledWithNew => "scrolled_with_new",
             Self::NarrowTranscript => "narrow_60x20_transcript_tab",
             Self::TooSmall => "too_small_39x9",
@@ -443,7 +452,63 @@ pub fn scene(kind: SceneKind, size: (u16, u16), theme: TuiTheme) -> App {
             update::update(&mut app, Msg::Paste("x".repeat(524_289)));
             assert!(key(&mut app, KeyCode::Enter).is_empty());
         }
+        SceneKind::HelpControlsOn => {
+            key(&mut app, KeyCode::Esc);
+            key(&mut app, KeyCode::Char('?'));
+        }
+        SceneKind::ConfirmAbort => {
+            update::update(
+                &mut app,
+                Msg::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL)),
+            );
+        }
+        SceneKind::ModelPicker => {
+            let mut models: Vec<omp_rpc::ModelInfo> =
+                serde_json::from_str(include_str!("../../tests/support/fake_models.json")).unwrap();
+            models.sort_by(|a, b| (&a.provider, &a.id).cmp(&(&b.provider, &b.id)));
+            key(&mut app, KeyCode::Esc);
+            let commands = key(&mut app, KeyCode::Char('m'));
+            let [Cmd::Control { local, op, .. }] = commands.as_slice() else {
+                panic!("model picker requests models")
+            };
+            update::update(
+                &mut app,
+                Msg::ControlDone {
+                    local: *local,
+                    op: op.clone(),
+                    result: Ok(ControlData::Models {
+                        models: models
+                            .into_iter()
+                            .map(|m| ModelChoice {
+                                label: format!(
+                                    "{}/{} — {}{}",
+                                    m.provider,
+                                    m.id,
+                                    m.name,
+                                    if m.provider == "fake" && m.id == "fake-1" {
+                                        " (current)"
+                                    } else {
+                                        ""
+                                    }
+                                ),
+                                provider: m.provider,
+                                id: m.id,
+                            })
+                            .collect(),
+                        thinking_levels: vec![
+                            "off".into(),
+                            "low".into(),
+                            "medium".into(),
+                            "high".into(),
+                        ],
+                    }),
+                },
+            );
+        }
         SceneKind::InboxOverlay | SceneKind::HelpControlsOff => {
+            if kind == SceneKind::HelpControlsOff {
+                app.caps.controls = false;
+            }
             key(&mut app, KeyCode::Esc);
             key(
                 &mut app,

@@ -20,14 +20,14 @@ use std::{
     time::{Duration, Instant},
 };
 #[derive(Clone)]
-enum Control {
+pub(crate) enum Control {
     Abort,
     Model(String),
     Thinking(String),
     Compact(Option<String>),
 }
 impl Control {
-    fn name(&self) -> &'static str {
+    pub(crate) fn name(&self) -> &'static str {
         match self {
             Self::Abort => "abort",
             Self::Model(_) => "set_model",
@@ -60,7 +60,7 @@ fn open(cli: &Cli, env: &Env, target: &str) -> Result<super::open::Opened, GlenE
 fn session(opened: &super::open::Opened) -> Value {
     json!({"id":opened.session.header.id,"handle":opened.handle,"path":if opened.not_yet_persisted {None}else{Some(&opened.session.path)}})
 }
-fn op_error(error: OpError, ctx: &ctl::ErrCtx<'_>) -> GlenError {
+pub(crate) fn op_error(error: OpError, ctx: &ctl::ErrCtx<'_>) -> GlenError {
     if error.code == "interrupted" {
         return GlenError::new(ErrorCode::ControlFailed, error.message)
             .with_details(json!({"reason":"interrupted","route":ctx.route}));
@@ -89,7 +89,11 @@ fn normalize<T: serde::de::DeserializeOwned + serde::Serialize>(
 ) -> Result<Value, serde_json::Error> {
     serde_json::from_value::<T>(data).and_then(serde_json::to_value)
 }
-fn call(target: &mut Target, op: &Op, ctx: &ctl::ErrCtx<'_>) -> Result<Value, GlenError> {
+pub(crate) fn call(
+    target: &mut Target,
+    op: &Op,
+    ctx: &ctl::ErrCtx<'_>,
+) -> Result<Value, GlenError> {
     let mut data = target.call(op).map_err(|e| op_error(e, ctx))?;
     if matches!(op, Op::Abort) {
         if ctx.route == "none" {
@@ -147,7 +151,7 @@ fn call(target: &mut Target, op: &Op, ctx: &ctl::ErrCtx<'_>) -> Result<Value, Gl
     }
     Ok(result)
 }
-fn execute(
+pub(crate) fn execute(
     target: &mut Target,
     control: &Control,
     ctx: &ctl::ErrCtx<'_>,

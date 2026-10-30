@@ -1590,6 +1590,7 @@ pub(crate) mod tests {
             now,
             wall,
         );
+        app.caps.controls = false;
         let mut rows = vec![];
         for n in 0..8 {
             rows.push(SessionRow {
@@ -2915,6 +2916,15 @@ mod snapshots {
         TrueColor,
         Dark
     );
+    snapshot!(
+        state_help_controls_on,
+        HelpControlsOn,
+        (80, 24),
+        TrueColor,
+        Dark
+    );
+    snapshot!(state_confirm_abort, ConfirmAbort, (80, 24), TrueColor, Dark);
+    snapshot!(state_model_picker, ModelPicker, (80, 24), TrueColor, Dark);
     snapshot!(
         state_scrolled_with_new,
         ScrolledWithNew,

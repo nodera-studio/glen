@@ -1848,6 +1848,7 @@ mod tests {
     fn disabled_controls_toast_without_commands_from_panes_or_prompt() {
         for focus in [Focus::Sessions, Focus::Transcript, Focus::Prompt] {
             let mut a = app();
+            a.caps.controls = false;
             a.focus = focus;
             assert!(key(&mut a, KeyCode::Char('x'), KeyModifiers::CONTROL).is_empty());
             assert_eq!(
@@ -1858,6 +1859,7 @@ mod tests {
         }
         for code in ['m', 'T', 'C'] {
             let mut a = app();
+            a.caps.controls = false;
             assert!(plain(&mut a, KeyCode::Char(code)).is_empty());
             assert_eq!(
                 a.toast.as_ref().unwrap().text,

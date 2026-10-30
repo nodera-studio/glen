@@ -1181,10 +1181,7 @@ fn ac401_worker_appears_in_no_help_page_and_no_completion_script() {
             raw.out().contains("install-skill"),
             "{shell} script lacks install-skill"
         );
-        let data = sb
-            .glen(["completions", shell, "--json"])
-            .run()
-            .ok_data_or_spilled(&sb.glen_home);
+        let data = sb.glen(["completions", shell, "--json"]).run().ok_data();
         assert!(!data["script"].as_str().unwrap().contains("__worker"));
     }
 }

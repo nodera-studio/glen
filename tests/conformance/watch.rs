@@ -3645,46 +3645,72 @@ fn ac515_the_overlay_lists_every_session_chronologically() {
 // AC-516: session controls are not in this build.
 // =============================================================================================
 
+// W3b merged (44c9d5b): controls available; migrated at the W3b→W5 merge per W5 decision 4
 #[test]
-fn ac516_control_keys_start_nothing_and_say_so() {
+fn ac516_control_keys_dispatch_the_matching_control() {
     let lb = LiveBox::new();
     let ext = lb.start_ext(A.id, "ok", &[], &[]);
     let mut t = start(&lb.rb, &["watch", A.handle], 120, 40);
-    for (f, key) in [
-        (Focus::Sessions, b"m".as_slice()),
-        (Focus::Sessions, b"T"),
-        (Focus::Sessions, b"C"),
-        (Focus::Sessions, CTRL_X),
-        (Focus::Transcript, b"m"),
-        (Focus::Transcript, CTRL_X),
-        (Focus::Prompt, CTRL_X),
-    ] {
-        t.wait_for(
-            "the previous toast expired",
-            Duration::from_secs(3) + SLACK,
-            |v| !status_bar(v).contains(NOT_IN_BUILD),
-        );
-        t.focus_to(f);
-        t.key(key);
-        t.wait_for(&format!("the toast for {key:?} in {f:?}"), UI, |v| {
-            status_bar(v).contains(NOT_IN_BUILD)
-        });
-        let v = t.screen().clone();
-        assert!(
-            !v.contains("y stop") && !v.contains("n cancel"),
-            "a confirm opened\n{}",
-            t.ctx()
-        );
-    }
+    t.key(CTRL_X);
+    t.wait_for("the abort confirmation", UI, |v| {
+        status_bar(v).contains("y stop  n cancel")
+    });
+    t.key(b"y");
+    t.wait_for("abort reached the endpoint", UI, |_| {
+        ext.frames("in").iter().any(|f| f["op"] == "abort")
+    });
+    t.wait_for("abort completed", UI, |v| !v.contains("y stop"));
+
+    t.key(b"m");
+    t.wait_for("the model picker", UI, |v| v.contains("model · filter:"));
+    t.typ("fake/fake-1");
+    t.key(ENTER);
+    t.wait_for("the chosen model reached the endpoint", UI, |_| {
+        ext.frames("in").iter().any(|f| {
+            f["op"] == "set_model"
+                && f["args"]["provider"] == "fake"
+                && f["args"]["model_id"] == "fake-1"
+        })
+    });
+    t.wait_for("model change completed", UI, |v| {
+        status_bar(v).contains("thinking")
+    });
+
+    t.key(b"T");
+    t.wait_for("the thinking picker", UI, |v| {
+        v.contains("thinking level · filter:")
+    });
+    t.typ("high");
+    t.key(ENTER);
+    t.wait_for("the chosen thinking level reached the endpoint", UI, |_| {
+        ext.frames("in")
+            .iter()
+            .any(|f| f["op"] == "set_thinking_level" && f["args"]["level"] == "high")
+    });
+    t.wait_for("thinking change completed", UI, |v| {
+        status_bar(v).contains("thinking high")
+    });
+
+    t.key(b"C");
+    t.wait_for("the compact confirmation", UI, |v| {
+        status_bar(v).contains("y compact  n cancel")
+    });
+    t.key(b"y");
+    t.wait_for("compact reached the endpoint", UI, |_| {
+        ext.frames("in").iter().any(|f| f["op"] == "compact")
+    });
+    t.wait_for("compact completed", UI, |v| {
+        status_bar(v).contains("compacted")
+    });
+    assert!(!status_bar(t.screen()).contains(NOT_IN_BUILD));
     t.focus_to(Focus::Prompt);
+    t.key(CTRL_X);
+    t.wait_for("abort is available from the prompt", UI, |v| {
+        status_bar(v).contains("y stop  n cancel")
+    });
+    t.key(b"n");
     t.typ("mTC");
     t.wait_for("m T C type in the prompt", UI, |v| input_text(v) == "mTC");
-    std::thread::sleep(Duration::from_millis(500));
-    let ops: BTreeSet<String> = ext.ops_in().into_iter().collect();
-    assert!(
-        ops.iter().all(|o| o == "hello" || o == "state"),
-        "a control reached the endpoint: {ops:?}"
-    );
     assert!(lb.job_ids().is_empty());
     lb.assert_no_omp();
     t.quit();
@@ -3810,8 +3836,9 @@ fn open_help(t: &mut Tui, f: Focus) {
     t.settle(Duration::from_millis(100));
 }
 
+// W3b merged (44c9d5b): controls available; migrated at the W3b→W5 merge per W5 decision 4
 #[test]
-fn ac516_the_help_overlay_marks_controls_not_in_this_build() {
+fn ac516_the_help_overlay_lists_the_control_bindings_as_available() {
     let rb = RpcBox::new();
     let mut t = start(&rb, &["watch", A.handle], 140, 70);
     open_help(&mut t, Focus::Sessions);
@@ -3820,14 +3847,22 @@ fn ac516_the_help_overlay_marks_controls_not_in_this_build() {
         .into_iter()
         .filter(|(n, _)| ["Ctrl-X", "m", "T", "C"].contains(n))
     {
+        let label = match name {
+            "Ctrl-X" => "stop running turn",
+            "m" => "choose model",
+            "T" => "choose thinking level",
+            "C" => "compact session",
+            _ => unreachable!(),
+        };
         assert!(
-            rows.iter()
-                .any(|(k, row)| has_binding(std::slice::from_ref(k), &sp)
-                    && row.contains("(not in this build)")),
-            "{name} is not marked (not in this build)\n{}",
+            rows.iter().any(|(k, row)| {
+                has_binding(std::slice::from_ref(k), &sp) && row.contains(label)
+            }),
+            "{name} is not listed as available\n{}",
             t.ctx()
         );
     }
+    assert!(!t.screen().contains("(not in this build)"), "{}", t.ctx());
     t.key(ESC);
     t.quit();
 }
