@@ -9,7 +9,7 @@ workflow below) once to adapt the templated files to that project's actual stack
 **Engine strategy:**
 
 - **Claude + Codex (+ omp as the third reviewer and optional third investigator)** for review comprehensive passes and debug agents — cross-model consensus catches issues a single model misses
-- **Claude only** for planning, orchestrators, testing, error handling, docs, and all implementation stages EXCEPT the lean code-review gate inside `/implement` (1 Claude + 1 Codex pass, 2-vote)
+- **Claude only** for planning, orchestrators, testing, error handling and docs. The `/implement` review uses Claude ‖ Codex ‖ omp + synthesizer when omp is ready or risk is high; the lean Claude ‖ Codex gate applies only to low-risk diffs with a skipped omp probe.
 - Codebase audits use dual-engine (Claude + Codex) per group. Security audit additionally uses checklist perturbation.
 - **Model rides the session, not a hardcoded tier.** Every frontier role — orchestrators, planner/architect, the Implementer, reviewers, security/error finders, the debug investigator + adversary, and research — is `model: inherit`, so it runs on whatever the session runs. Never pin a frontier agent to a model that won't follow the session. Mechanical / summarization roles (test-runner, verifier, docs-updater, light audits, plan explorer/researcher) stay pinned `sonnet` — they don't need frontier compute. Effort: `high` is the default; `xhigh` is reserved for the Implementer, planner, and orchestrators on hard waves.
 
@@ -149,8 +149,10 @@ approve it. See `agents/plan/README.md` for the full 8-step diagram.
 ## Implementation workflow (`/implement`)
 
 Builds the approved plan. The Implementer (run in Codex) writes the code, wires it in,
-and writes its own tests; a lean internal review gate (1 Claude pass ‖ 1 Codex pass, 2-vote
-consensus) catches must-fix issues before the tail — an author-blind conformance-test
+and writes its own tests; the review gate catches must-fix issues before the tail.
+When omp is ready or risk is high, it uses Claude ‖ Codex ‖ omp + synthesizer (recording
+omp's reason if skipped); otherwise it uses the lean Claude ‖ Codex gate with 2-vote
+consensus. The tail is an author-blind conformance-test
 writer (who only ever saw the plan, never the diff or the Implementer's own tests) and a
 docs updater. `/implement-quick` is the same pipeline with fewer gates for small, low-risk
 changes, behind a fail-safe classifier that falls back to the full path on anything
@@ -218,10 +220,10 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 | `/research`              | Standalone research                                                               | `research/agent.md` — Context7 + web search + Playwright, saves report to `.claude/research/` |
 | `/brainstorm`            | Creative exploration                                                              | `brainstorm.md`                                                                               |
 | `/plan-implementation`   | Plan before coding                                                                | `plan/orchestrator.md`                                                                        |
-| `/implement`             | Build features/fixes                                                              | `implementation/orchestrator.md` (includes a lean internal Claude‖Codex code-review gate)     |
+| `/implement`             | Build features/fixes                                                              | `implementation/orchestrator.md` (Claude‖Codex‖omp + synthesizer when omp is ready or risk is high; lean gate otherwise) |
 | `/implement-quick`       | Fast path for small, low-risk changes                                            | `implementation/orchestrator-quick.md`                                                         |
 | `/review-implementation` | Self-review (heavy, standalone)                                                   | `review-implementation/orchestrator.md`                                                       |
-| `/code-review`           | Lean dual-engine review on current diff (standalone form of `/implement` Step 13) | `implementation/code-review.md` (Claude) ‖ `codex:codex-rescue`                               |
+| `/code-review`           | Lean dual-engine review on current diff (also the low-risk `/implement` fallback when omp is skipped) | `implementation/code-review.md` (Claude) ‖ `codex:codex-rescue` |
 | `/codex`                 | Dispatch a task to OpenAI Codex                                                   | `.claude/skills/codex/SKILL.md` → `codex:codex-rescue` agent                                  |
 | `/deep-debug`            | Heavy investigation                                                               | `debug/investigator.md` + `debug/adversary.md` (+ `debug/queue.md` for async-pipeline bugs)   |
 | `/run-ci`                | CI verification                                                                   | `local-ci.md`                                                                                 |
@@ -255,7 +257,7 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 - Analysis paralysis guard on writing agents (7-read threshold)
 - Deviation rules for coder (auto-fix trivial, STOP on architectural surprises)
 - Self-check step verifies every plan step was actually implemented
-- Lean dual-engine code-review gate (Step 13): 1 Claude + 1 Codex pass in parallel, 2-vote consensus + ≤2 rework cycles — separate from and much leaner than the standalone `/review-implementation`
+- Review gate (Step 13): Claude ‖ Codex ‖ omp + synthesizer when omp is ready or risk is high; low-risk diffs with a skipped omp probe use the lean Claude ‖ Codex gate and 2-vote consensus. Both paths allow ≤2 rework cycles and record unavailable engines.
 - Plan splitting into waves for 12+ step plans (fresh context per wave)
 - Fast path (`/implement-quick`) for small, low-risk changes — a fail-safe classifier gate, same quality bar, fewer gates
 - Optional project-specific domain-rubric gate slot (Role 3, conditional) — wire up your own isolated-context grader for any non-numeric, structural/textual artifact class this project cares about (see `implementation/orchestrator.md`'s Role 3 note)

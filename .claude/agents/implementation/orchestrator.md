@@ -372,10 +372,12 @@ the remainder (a fresh context is the entire point of splitting). For wave plans
 dispatch one Implementer per wave. Between slices, the handoff is `progress.md` +
 the plan's `<task>` XML — never the previous Implementer's transcript.
 
-### Role 2 — Review (fresh context, dual-engine by default)
+### Role 2 — Review (fresh context, engine readiness and risk select the gate)
 
 A fresh, independent review of the diff + spec — **never** the Implementer's
-transcript. By default run the lean **`/code-review` dual-engine gate** (see
+transcript. Probe omp before dispatch: when it is ready or the diff is high-risk,
+use the review block described below. Only low-risk diffs with a skipped probe
+run the lean **`/code-review` dual-engine gate** (see
 `.claude/commands/code-review.md`): the Claude pass (`implementation/code-review.md`)
 ‖ a Codex pass (`codex:codex-rescue`) in ONE message, merged by 2-vote consensus into
 one must-fix / recommended / notes report. No lint/type/style re-check — the

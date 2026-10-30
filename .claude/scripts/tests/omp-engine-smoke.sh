@@ -383,6 +383,65 @@ omp login && omp --profile glen-harness usage
 OMP_PROFILE=glen-harness omp usage; omp logout
 echo --dry-run; glen install-extension
 omp --profile glen-harness --profile default update
+"omp" "login"
+o"m"p l'og'in
+OMP LoGiN
+/usr/local/bin/omp config set a b
+env omp logout
+command omp login
+sudo -u root omp config set a b
+nice -n 5 omp update
+VAR=value omp config reset a
+env VAR=value command nice -n 5 omp login
+echo safe || omp login
+printf safe | omp logout
+(omp login)
+OMP_PROFILE=default omp login
+OMP_PROFILE='' omp update
+PI_PROFILE=default omp logout
+PI_PROFILE="" omp config set a b
+OMP_PROFILE='' PI_PROFILE=glen-harness omp login
+OMP_PROFILE=default PI_PROFILE=glen-harness omp login
+OMP_PROFILE=glen-harness env -u OMP_PROFILE omp login
+OMP_PROFILE=glen-harness env --unset=OMP_PROFILE omp login
+OMP_PROFILE=glen-harness omp --profile default update
+PI_PROFILE=glen-harness omp --profile=default config set a b
+PI_CODING_AGENT_DIR=/tmp/x omp --profile default login
+OMP_PROFILE=glen-harness omp --profile='' login
+OMP_PROFILE=glen-harness omp --profile "$GUARD_UNSET_PROFILE" login
+PI_CODING_AGENT_DIR=~/.omp/agent glen install-extension
+PI_CODING_AGENT_DIR="$HOME/.omp/agent" omp login
+PI_CODING_AGENT_DIR=${HOME}/.omp/agent omp config reset a
+PI_CODING_AGENT_DIR="$HOME/.omp/other/../agent" glen install-extension
+env PI_CODING_AGENT_DIR="~/.omp/agent" omp update
+PI_CODING_AGENT_DIR="$GUARD_UNSET_DIR" glen install-extension
+omp login --dry-run
+omp --dry-run config set a b
+omp settings --dry-run
+omp gc --apply
+omp gc --dry-run --apply
+omp auth import fixture.json
+omp agents --force
+omp settings
+omp session unpack fixture.tar
+omp gc --apply # --profile glen-harness
+omp login # --dry-run --profile glen-harness
+echo "$(omp login)"
+echo `omp logout`
+printf '%s' "$(echo "$(omp login)")"
+echo safe > /tmp/fixture; omp 2>/tmp/fixture config set a b
+OMP_PROFILE=glen-harness env -i PATH="$PATH" omp login
+OMP_PROFILE=glen-harness env --ignore-environment PATH="$PATH" omp login
+OMP_PROFILE=glen-harness env -uOMP_PROFILE omp login
+PI_CODING_AGENT_DIR=/tmp/x env -u PI_CODING_AGENT_DIR glen install-extension
+env OMP_PROFILE=$GUARD_UNSET_PROFILE omp login
+env OMP_PROFILE="$GUARD_UNSET_PROFILE" omp login
+OMP_PROFILE=glen-harness sudo omp login
+OMP_PROFILE=glen-harness omp --profile="$GUARD_UNSET_PROFILE" login
+OMP_PROFILE=glen-harness omp --profile="$(printf default)" login
+omp "$GUARD_UNSET_VERB" a b
+omp config "$GUARD_UNSET_VERB" a b
+echo > "$(omp login)"
 EOF
 while IFS= read -r command; do
   run_hook "$command"
@@ -405,7 +464,72 @@ cd x && glen --profile glen-harness install-extension
 omp --profile "glen-harness" skills install x
 not-omp login
 glen install-extension-extra
+rg -n "omp config set"
+git commit -m "omp login"
+gh pr create --body "...omp config set..."
+echo omp login
+printf '%s' 'omp login; glen install-extension'
+echo ';' 'omp' 'login'
+echo '$(omp login)'
+echo '#'; rg -n "omp config set # still an argument"
+# omp config set a b
+OMP_PROFILE=glen-harness omp update # omp login
+env -- OMP_PROFILE=glen-harness omp update
+PI_PROFILE=glen-harness omp login
+OMP_PROFILE=glen-harness PI_PROFILE=default omp login
+OMP_PROFILE=default omp --profile glen-harness login
+PI_PROFILE='' omp --profile=glen-harness config set a b
+PI_CODING_AGENT_DIR=~/.omp/agent glen --profile glen-harness install-extension
+PI_CODING_AGENT_DIR=/tmp/x omp config set a b
+PI_CODING_AGENT_DIR="$TMPDIR/omp-fixture" omp update
+env 'PI_CODING_AGENT_DIR=/tmp/x' glen install-extension
+env -u OMP_PROFILE OMP_PROFILE=glen-harness omp login
+command -v omp
+command -V omp
+command -- omp --profile glen-harness login
+sudo -u root nice -n 5 omp --profile glen-harness config set a b
+glen install-extension --dry-run --uninstall
+glen --profile default install-extension --dry-run
+omp gc
+omp gc --dry-run
+omp auth status
+omp agents
+omp session pack fixture
+omp --profile glen-harness gc --apply
+omp --profile glen-harness auth import fixture.json
+omp --profile glen-harness agents --force
+omp --profile glen-harness settings
+omp --profile glen-harness session unpack fixture.tar
+OMP_PROFILE=glen-harness sudo -E omp login
+OMP_PROFILE=glen-harness env -i PATH="$PATH" PI_PROFILE=glen-harness omp login
+omp config
+omp --profile glen-harness "$GUARD_UNSET_VERB" a b
 EOF
+
+# Multiline boundaries must be checked after joining continuations and removing
+# comments; a quoted separator or comment cannot grant a profile exemption.
+run_hook $'omp \\\nconfig \\\nset a b'
+assert_exit 'guard joins backslash-newline before matching' 2
+run_hook $'echo safe # omp --profile glen-harness\nomp login'
+assert_exit 'guard ignores comment profile and checks next line' 2
+run_hook $'omp login # --profile \\\nglen-harness'
+assert_exit 'guard joins continuation before stripping comments' 2
+run_hook $'rg -n "omp \\\nconfig set"'
+assert_exit 'guard preserves quoted argument across continuation' 0
+run_hook $'omp --profile \\\nglen-harness update'
+assert_exit 'guard recognizes continued explicit profile' 0
+
+mkdir "$WORK/parser-failure"
+printf '#!/bin/sh\nexit 127\n' > "$WORK/parser-failure/python3"
+chmod +x "$WORK/parser-failure/python3"
+(
+  export PATH="$WORK/parser-failure:$PATH"
+  run_hook 'omp login'
+  printf '%s\n' "$CODE" > "$WORK/parser-code"
+)
+CODE="$(cat "$WORK/parser-code")"
+assert_exit 'guard parser startup failure blocks command' 2
+assert_contains 'guard parser startup failure names problem' 'Cannot run the omp profile guard parser' "$STDERR"
 
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]

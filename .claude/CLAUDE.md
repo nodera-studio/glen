@@ -58,7 +58,6 @@ Several agent prompts were written for a TypeScript web monorepo. Apply them to 
   is `cargo run -- <args>`.
 - Review engines are Claude, Codex and omp (third engine: a Cursor model, read-only, via glen and
   `.claude/scripts/omp-engine.sh`; skipped with a note when `omp-engine.sh probe` fails).
-  CodeRabbit is not installed and is not used.
 - The `/implement` re-index step (Role 4) applies only if `code_index_status` with project `glen`
   shows an index; otherwise skip it and say so.
 - The Implementer's deterministic gate is `.claude/scripts/quality-gate.sh` (rustfmt check +

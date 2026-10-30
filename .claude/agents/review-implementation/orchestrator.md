@@ -61,14 +61,22 @@ Any engine that's unavailable is simply skipped — the synthesizer notes which 
 ran and adjusts confidence (cross-engine agreement needs ≥2 engines). Never silently
 claim three engines ran when one was down.
 
-## Step 4 — Run the three engines in parallel
+Inside `/implement`, select this block when omp is ready or the diff is high-risk.
+A low-risk diff with a skipped omp probe uses the lean Claude ‖ Codex `/code-review`
+gate instead. Standalone `/review-implementation` always uses this block, with
+unavailable engines and their reasons recorded as above.
+
+## Step 4 — Run the available engines in parallel
 
 Launch all three in ONE message: the Claude reviewer as an Agent call, and Codex +
 omp (when the probe is ready) as **background** Bash (they're slow LLM reviews — don't serialize them).
 **Match the diff scope across all three engines** so they review the same code:
-committed branch work → `--base "$BASE"`; uncommitted in-pipeline changes (Role 2,
-before the slice is committed) → `--uncommitted` for Codex and the omp engine (use
-`git diff HEAD` plus untracked files for the Claude reviewer in that scope).
+the whole branch and `/implement` Role 2 use `--base "$BASE"`, covering committed
+step groups plus working-tree and untracked changes against the merge-base.
+Use `--uncommitted` for Codex and omp only when the requested scope is explicitly
+limited to changes since HEAD; use `git diff HEAD` plus untracked files for the
+Claude reviewer in that scope. A slice having uncommitted work does not by itself
+exclude its already-committed changes from review.
 
 **Claude engine** (Agent tool):
 ```
@@ -87,7 +95,7 @@ mkdir -p target/reports && codex review --base "$BASE" > target/reports/codex-re
 ```bash
 mkdir -p target/reports && bash .claude/scripts/omp-engine.sh review --repo "$PWD" --base "$BASE" --out target/reports/omp-review.txt > target/reports/omp-engine.log 2>&1
 ```
-Use `--uncommitted` in place of `--base "$BASE"` for the uncommitted-scope role.
+Use `--uncommitted` in place of `--base "$BASE"` only for an explicitly uncommitted scope.
 Exit codes: 0 ok, 3 skipped, 4 failed, 5 timeout, 2 usage error. Read the answer in
 `target/reports/omp-review.txt` and the result in `target/reports/omp-review.txt.json`.
 Do NOT re-run omp manually: the engine already retries capacity issues once internally.
