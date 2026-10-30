@@ -1,0 +1,5 @@
+{"type":"title","v":1,"title":"Add fixtures","source":"auto","updatedAt":"2026-10-29T10:00:00.000Z","pad":"                                                                                                                                                  "}
+{"type":"session","version":3,"id":"01a10cdd-6b80-7a29-9c5e-6d1f3b8e4a07","timestamp":"2026-10-29T10:00:00.000Z","cwd":"/home/fixture/work/alpha"}
+{"type":"model_change","id":"00000002","parentId":null,"timestamp":"2026-10-29T10:00:00.000Z","runtime":{"version":"18.14.0"},"model":"anthropic/claude-sonnet-4-5","role":"default"}
+{"type":"message","id":"00000003","parentId":"00000002","timestamp":"2026-10-29T10:00:00.000Z","runtime":{"version":"18.14.0"},"message":{"role":"user","content":[{"type":"text","text":"Add synthetic migration fixtures."}]}}
+{"type":"message","id":"00000004","parentId":"00000003","timestamp":"2026-10-29T10:00:00.000Z","runtime":{"version":"18.14.0"},"message":{"role":"assistant","content":[{"type":"text","text":"Added the synthetic fixtures."}],"stopReason":"stop","api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5"}}

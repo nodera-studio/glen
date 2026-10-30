@@ -60,3 +60,18 @@ signals, then wait for worker and omp teardown before releasing their temporary 
 `FAKE_EXT_SCENARIO`: ok, busy, progress, slow, never_settles, aborted, error, moved, switched, shutdown, crash, mismatch, rekey, hang, no_send, v2, malformed, no_ack, queued. `FAKE_EXT_DELAY_MS` controls slow; `FAKE_EXT_VERSION` changes hello; `FAKE_EXT_KEEP_FILES=1` retains crash files; `FAKE_EXT_CWD` gives endpoint-only scope. `FAKE_EXT_LOG` logs `{t,dir,frame}` NDJSON. Like the extension, the fake writes inbox replies itself; glen must not duplicate them.
 
 The separate fake omp host in `extension/glen/test/fake-pi.ts` drives event sequences and real sockets through Node. `tests/extension_ts.rs` runs those tests from cargo; CI installs Node 26. No npm installation is needed.
+
+## Demo tree (`tests/fixtures/demo/`)
+
+A separate synthetic catalog for the site demo golden. `tests/site_demo.rs` copies this tree
+and replaces `/home/fixture` with the sandbox HOME in the copy, never in the checked-in files.
+Each title slot is exactly 256 bytes including its newline, as in the reader fixtures.
+
+| Key | File under `agent/sessions/-work-alpha/` | Handle | Purpose |
+|---|---|---|---|
+| A | `2026-10-29T12-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl` | `e27c0de` | live migration fix, thinking, edit/test tools and final reply |
+| C | `2026-10-29T11-30-00-000Z_01a0fd2a-4140-7e05-a3f4-0c9a4b7e2d81.jsonl` | `b7e2d81` | idle route review |
+| G | `2026-10-29T10-00-00-000Z_01a10cdd-6b80-7a29-9c5e-6d1f3b8e4a07.jsonl` | `b8e4a07` | idle fixture work |
+
+To change the demo story, edit it, then run `npm --prefix site run demo:refresh`.
+The migration prompt is W2's unmodified job text (`src/rpc/worker.rs` sends `self.job.text`).

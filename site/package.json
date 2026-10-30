@@ -10,11 +10,16 @@
     "build": "astro build",
     "preview": "astro preview --host 127.0.0.1 --port 4321",
     "check": "astro check",
-    "test:unit": "node --test src/components/terminal/terminal-player.test.mjs scripts/check-budgets.test.mjs",
+    "test:unit": "node --test src/components/terminal/terminal-player.test.mjs scripts/check-budgets.test.mjs src/data/ansi.test.mjs src/data/install.test.mjs scripts/check-links.test.mjs",
     "budgets": "node scripts/check-budgets.mjs",
     "test:e2e": "playwright test",
     "lhci": "lhci autorun",
-    "verify": "npm run check && npm run build && npm run test:unit && npm run budgets"
+    "verify": "npm run check && npm run build && npm run test:unit && npm run budgets && npm run links",
+    "links": "node scripts/check-links.mjs",
+    "deploy": "npm run verify && node scripts/check-links.mjs --online && npx --yes wrangler@4.124.0 deploy",
+    "deploy:dry": "npm run build && npx --yes wrangler@4.124.0 deploy --dry-run",
+    "demo:refresh": "cd .. && GLEN_UPDATE_DEMO=1 cargo test --locked --test site_demo",
+    "readme:shot": "node scripts/readme-shot.mjs"
   },
   "dependencies": {
     "@astrojs/react": "7.1.2",
