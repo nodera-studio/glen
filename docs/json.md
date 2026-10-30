@@ -216,6 +216,8 @@ Read the active branch. `--tools` and `--thinking` control detail; `--raw` retur
 ## `glen tail`
 
 Read latest items (default 10). `-n 0 -f` streams only new events.
+The tail item example is a shape catalogue: one example per item kind (and per assistant
+`tool_calls` variant), rather than a literal single transcript.
 
 | Field | Meaning |
 |---|---|
@@ -239,6 +241,127 @@ Read latest items (default 10). `-n 0 -f` streams only new events.
         "text": "The test depends on map order. Fixed.",
         "thinking_words": 0,
         "timestamp": "2026-10-01T09:00:07Z"
+      },
+      {
+        "error": null,
+        "has_thinking": true,
+        "id": "10000005",
+        "kind": "assistant",
+        "model": "anthropic/claude-sonnet-4-5",
+        "stop_reason": "toolUse",
+        "text": "Let me read the test.",
+        "thinking_words": 5,
+        "timestamp": "2026-10-01T09:00:05Z",
+        "tool_calls": [
+          {
+            "id": "toolu_01",
+            "name": "read",
+            "summary": "tests/parser_test.rs",
+            "result": {
+              "is_error": false,
+              "text": "fn parser_test() { … }",
+              "chars": 22,
+              "truncated": false,
+              "images": 0
+            }
+          }
+        ]
+      },
+      {
+        "id": "10000002",
+        "kind": "model_change",
+        "model": "anthropic/claude-sonnet-4-5",
+        "timestamp": "2026-10-01T09:00:02Z"
+      },
+      {
+        "id": "10000001",
+        "kind": "thinking_level",
+        "level": "high",
+        "timestamp": "2026-10-01T09:00:01Z"
+      },
+      {
+        "id": "10000003",
+        "images": 0,
+        "kind": "user",
+        "text": "Why does parser_test flake?",
+        "timestamp": "2026-10-01T09:00:03Z"
+      },
+      {
+        "id": "40000005",
+        "kind": "branch_summary",
+        "summary": "Abandoned the regex approach.",
+        "timestamp": "2026-10-03T08:00:05Z"
+      },
+      {
+        "id": "50000005",
+        "kind": "compaction",
+        "summary": "Placeholder.",
+        "timestamp": "2026-10-04T11:45:05Z",
+        "tokens_after": 9000,
+        "tokens_before": 42000
+      },
+      {
+        "cancelled": false,
+        "chars": 2,
+        "command": "cargo test",
+        "exit_code": 0,
+        "id": "5000000a",
+        "kind": "bash",
+        "output": "ok",
+        "timestamp": "2026-10-04T11:45:10Z",
+        "truncated": false
+      },
+      {
+        "id": "10000006",
+        "kind": "tool_result",
+        "timestamp": "2026-10-01T09:00:06Z",
+        "tool_call_id": "toolu_01",
+        "tool_name": "read",
+        "is_error": false,
+        "text": "fn parser_test() { … }",
+        "chars": 22,
+        "truncated": false,
+        "images": 0
+      },
+      {
+        "id": "1000000b",
+        "kind": "developer",
+        "timestamp": "2026-10-01T09:00:11Z",
+        "text": "Keep the parser test deterministic."
+      },
+      {
+        "id": "1000000c",
+        "kind": "python",
+        "timestamp": "2026-10-01T09:00:12Z",
+        "code": "print(sorted({\"b\": 2, \"a\": 1}))",
+        "exit_code": 0,
+        "cancelled": false,
+        "output": "['a', 'b']\n",
+        "chars": 11,
+        "truncated": false
+      },
+      {
+        "id": "1000000d",
+        "kind": "custom",
+        "timestamp": "2026-10-01T09:00:13Z",
+        "custom_type": "test-status",
+        "text": "parser_test passes with sorted keys."
+      },
+      {
+        "id": "1000000e",
+        "kind": "file_mention",
+        "timestamp": "2026-10-01T09:00:14Z",
+        "files": [
+          {
+            "path": "tests/parser_test.rs",
+            "line_count": 42
+          }
+        ]
+      },
+      {
+        "id": "1000000f",
+        "kind": "reset",
+        "timestamp": "2026-10-01T09:00:15Z"
       }
     ],
     "leaf_id": "10000009",
