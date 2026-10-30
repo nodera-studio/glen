@@ -6,7 +6,7 @@ pub struct ItemOpts {
     pub thinking: bool,
     pub tools: Tools,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -17,7 +17,7 @@ pub struct ToolCall {
     pub arguments: Option<Value>,
     pub result: Option<ToolResultView>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct ToolResultView {
     pub is_error: bool,
     pub text: String,
@@ -25,12 +25,12 @@ pub struct ToolResultView {
     pub truncated: bool,
     pub images: usize,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Mention {
     pub path: String,
     pub line_count: Option<u64>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Item {
     User {

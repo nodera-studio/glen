@@ -10,6 +10,7 @@ pub mod render;
 pub mod rpc;
 pub mod sandbox;
 pub mod skill;
+pub mod tui;
 use clap::Parser;
 use std::{ffi::OsString, process::ExitCode};
 pub fn run() -> ExitCode {

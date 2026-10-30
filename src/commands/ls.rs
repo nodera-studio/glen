@@ -50,13 +50,42 @@ fn read_endpoint_row(
     owners: &Path,
     endpoints: &HashMap<String, crate::live::client::Hello>,
 ) -> Option<Row> {
-    if let Some(h) = endpoints.get(&summary.id) {
+    let endpoint = endpoints.get(&summary.id);
+    if endpoint.is_some() {
         if summary.file.path.exists() {
             let _ = scan_tail(&mut summary);
         }
-        return Some(Row {
-            summary,
-            handle: String::new(),
+    } else {
+        scan_tail(&mut summary).ok()?;
+    }
+    let RowState {
+        lease,
+        state,
+        source,
+        detail,
+    } = infer_row(&mut summary, endpoint, |s| lease::probe(owners, &s.id));
+    Some(Row {
+        summary,
+        handle: String::new(),
+        lease,
+        state,
+        source,
+        detail,
+    })
+}
+pub(crate) struct RowState {
+    pub lease: Lease,
+    pub state: State,
+    pub source: &'static str,
+    pub detail: Option<String>,
+}
+pub(crate) fn infer_row(
+    summary: &mut Summary,
+    endpoint: Option<&crate::live::client::Hello>,
+    probe: impl FnOnce(&Summary) -> Lease,
+) -> RowState {
+    if let Some(h) = endpoint {
+        return RowState {
             lease: Lease::Unknown {
                 reason: "extension".into(),
                 errno: None,
@@ -64,21 +93,19 @@ fn read_endpoint_row(
             state: if h.busy { State::Busy } else { State::Live },
             source: "extension",
             detail: h.mode.clone(),
-        });
+        };
     }
-    scan_tail(&mut summary).ok()?;
-    let lease = lease::probe(owners, &summary.id);
-    refine_held(&mut summary, &lease);
+    let lease = probe(summary);
+    refine_held(summary, &lease);
     let state = lease::infer_state(&lease, summary.in_flight);
-    Some(Row {
-        summary,
-        handle: String::new(),
+    RowState {
         lease,
         state,
         source: "disk",
         detail: None,
-    })
+    }
 }
+
 #[cfg(test)]
 fn read_rows(
     catalog: &Catalog,
@@ -531,5 +558,58 @@ mod branch_parent_tests {
         refine_held(&mut summary, &Lease::Held);
         assert_eq!(summary.last_turn, TurnStatus::Complete);
         assert!(!summary.in_flight);
+    }
+}
+
+#[cfg(test)]
+mod inference_tests {
+    use super::*;
+    use crate::{
+        live::client::Hello,
+        omp::{
+            fixtures,
+            listing::{SessionFile, scan_head},
+        },
+    };
+    #[test]
+    fn endpoint_state_does_not_probe_and_disk_state_probes_once() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let mut summary = scan_head(SessionFile::at(&path).unwrap()).unwrap();
+        let mut endpoint = Hello {
+            protocol: 1,
+            ops: vec!["send".into()],
+            ext_version: None,
+            omp_version: None,
+            pid: 0,
+            session_id: summary.id.clone(),
+            session_file: Some(path),
+            mode: Some("tui".into()),
+            state: "live".into(),
+            busy: false,
+            queued: false,
+            active_requests: 0,
+        };
+        for busy in [false, true] {
+            endpoint.busy = busy;
+            let row = infer_row(&mut summary, Some(&endpoint), |_| {
+                panic!("endpoint must not probe")
+            });
+            assert_eq!(row.state, if busy { State::Busy } else { State::Live });
+            assert_eq!(row.source, "extension");
+            assert_eq!(row.detail.as_deref(), Some("tui"));
+            assert!(
+                matches!(row.lease, Lease::Unknown { reason, errno: None } if reason == "extension")
+            );
+        }
+        let mut probes = 0;
+        let row = infer_row(&mut summary, None, |_| {
+            probes += 1;
+            Lease::Free
+        });
+        assert_eq!(probes, 1);
+        assert_eq!(row.state, State::Idle);
+        assert_eq!(row.source, "disk");
+        assert!(row.detail.is_none());
     }
 }

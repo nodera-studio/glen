@@ -38,7 +38,7 @@ pub(crate) fn job_progress(job: &Job, s: &Status) -> String {
         _ => s.status.as_str().into(),
     }
 }
-fn duration(ms: i64) -> String {
+pub(crate) fn duration(ms: i64) -> String {
     let seconds = ms.max(0) / 1000;
     if seconds < 60 {
         format!("{seconds}s")
@@ -77,40 +77,30 @@ fn painted_lines(ctx: &OutputCtx, token: Token, value: &str) -> Vec<String> {
         .map(|line| ctx.painter.paint(token, &line))
         .collect()
 }
-pub(crate) fn outcome(
-    store: &JobStore,
-    job: &Job,
-    waited: Waited,
-    ctx: &OutputCtx,
-) -> Result<Outcome, GlenError> {
-    let interrupted = matches!(&waited, Waited::Interrupted(_));
-    let terminal = matches!(&waited, Waited::Terminal(_));
-    let s = match waited {
-        Waited::Terminal(s) | Waited::Running(s) | Waited::Interrupted(s) => s,
-    };
-    let view = job_view(job, &s, jiff::Timestamp::now());
+pub(crate) fn job_error(store: &JobStore, job: &Job, s: &Status) -> Result<GlenError, GlenError> {
+    let view = job_view(job, s, jiff::Timestamp::now());
     let forked = s
         .forked
         .as_ref()
         .map(|f| json!({"from":f.from,"to":f.to,"to_handle":session_handle(&f.to)}));
-    if terminal && s.status != State::Completed {
-        let error = s.error.as_ref();
-        let code = if error.is_some_and(|e| e.code == "no_route") {
-            ErrorCode::NoRoute
-        } else {
-            ErrorCode::JobFailed
-        };
-        let mut e = GlenError::new(
-            code,
-            format!(
-                "job {} {}: {}",
-                job.handle,
-                s.status.as_str(),
-                error.map(|e| e.message.as_str()).unwrap_or("no result")
-            ),
-        )
-        .with_details(json!({"status":s.status,"job":view,"error":s.error,"forked":forked}));
-        e.hint = if error.and_then(|e| e.hint.as_ref()).is_some() {
+    let error = s.error.as_ref();
+    let code = if error.is_some_and(|e| e.code == "no_route") {
+        ErrorCode::NoRoute
+    } else {
+        ErrorCode::JobFailed
+    };
+    let mut e = GlenError::new(
+        code,
+        format!(
+            "job {} {}: {}",
+            job.handle,
+            s.status.as_str(),
+            error.map(|e| e.message.as_str()).unwrap_or("no result")
+        ),
+    )
+    .with_details(json!({"status":s.status,"job":view,"error":s.error,"forked":forked}));
+    e.hint =
+        if error.and_then(|e| e.hint.as_ref()).is_some() {
             error.and_then(|e| e.hint.clone())
         } else {
             Some(format!(
@@ -123,8 +113,34 @@ pub(crate) fn outcome(
                     .display()
             ))
         };
-        e.warnings = s.warnings.clone();
-        return Err(e);
+    e.warnings = s.warnings.clone();
+    Ok(e)
+}
+pub(crate) fn completed_summary(job: &Job, s: &Status, now: jiff::Timestamp) -> String {
+    let session = session(job, s);
+    let label = session["handle"].as_str().unwrap_or("@new");
+    let elapsed = duration(job_view(job, s, now)["elapsed_ms"].as_i64().unwrap_or(0));
+    format!("✓ completed · {} · {label} · {elapsed}", job.handle)
+}
+pub(crate) fn outcome(
+    store: &JobStore,
+    job: &Job,
+    waited: Waited,
+    ctx: &OutputCtx,
+) -> Result<Outcome, GlenError> {
+    let interrupted = matches!(&waited, Waited::Interrupted(_));
+    let terminal = matches!(&waited, Waited::Terminal(_));
+    let s = match waited {
+        Waited::Terminal(s) | Waited::Running(s) | Waited::Interrupted(s) => s,
+    };
+    let now = jiff::Timestamp::now();
+    let view = job_view(job, &s, now);
+    let forked = s
+        .forked
+        .as_ref()
+        .map(|f| json!({"from":f.from,"to":f.to,"to_handle":session_handle(&f.to)}));
+    if terminal && s.status != State::Completed {
+        return Err(job_error(store, job, &s)?);
     }
     let session = session(job, &s);
     let session_label = session["handle"].as_str().unwrap_or("@new");
@@ -135,7 +151,7 @@ pub(crate) fn outcome(
         let r = store.read_result(&id)?;
         let heading = format!("✓ completed · {} · {}", job.handle, session_label);
         let elapsed = duration(view["elapsed_ms"].as_i64().unwrap_or(0));
-        let summary = format!("{heading} · {elapsed}");
+        let summary = completed_summary(job, &s, now);
         let summary = if ctx
             .width
             .is_some_and(|w| text::width(&summary) > usize::from(w))
@@ -449,6 +465,46 @@ mod live_progress_tests {
         assert_eq!(
             job_progress(&job, &status),
             "delivered as follow_up; omp is working"
+        );
+    }
+}
+
+#[cfg(test)]
+mod shared_tests {
+    use super::*;
+    #[test]
+    fn summaries_and_errors_keep_session_elapsed_and_diagnostics() {
+        let tree = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(tree.path());
+        let mut job = crate::jobs::tests::job();
+        job.created_at = "2026-10-30T00:00:00Z".into();
+        let mut s = Status {
+            status: State::Completed,
+            updated_at: "2026-10-30T00:01:05Z".into(),
+            ..Status::default()
+        };
+        let now = "2026-10-30T01:00:00Z".parse().unwrap();
+        assert_eq!(
+            completed_summary(&job, &s, now),
+            format!("✓ completed · {} · e27c0de · 1m 05s", job.handle)
+        );
+        job.route = Route::New;
+        s.actual_session_id = Some("01a00000-0000-7000-8000-000001234567".into());
+        assert!(completed_summary(&job, &s, now).contains(" · 1234567 · "));
+        s.status = State::Lost;
+        s.warnings.push(crate::error::Warning {
+            code: "test".into(),
+            message: "warning".into(),
+        });
+        let e = job_error(&store, &job, &s).unwrap();
+        assert_eq!(e.code, ErrorCode::JobFailed);
+        assert_eq!(e.message, format!("job {} lost: no result", job.handle));
+        assert!(e.hint.unwrap().ends_with("/worker.log"));
+        assert_eq!(e.warnings.len(), 1);
+        job.id = "broken".into();
+        assert_eq!(
+            job_error(&store, &job, &s).unwrap_err().code,
+            ErrorCode::Internal
         );
     }
 }

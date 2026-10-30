@@ -1,11 +1,12 @@
 pub mod completions;
 pub mod doctor;
+pub(crate) mod follow;
 pub mod inbox;
 pub mod install_extension;
 pub mod install_skill;
 pub mod jobs;
 pub mod ls;
-mod open;
+pub(crate) mod open;
 pub mod send;
 pub mod show;
 pub mod tail;
