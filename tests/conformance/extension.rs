@@ -170,8 +170,8 @@ fn ac302_install_writes_one_private_rendered_file_and_nothing_else() {
     assert_eq!(d["path"], s(&ix.file()), "{d}");
     assert_eq!(d["agent_dir"], s(&ix.agent), "{d}");
     assert_eq!(d["agent_dir_source"], "env", "{d}");
-    // The value for the default profile is not specified (doctor's `paths.profile` uses null).
-    assert!(d["profile"].is_null() || d["profile"] == "default", "{d}");
+    // §A10 W3 clarifications: null for the default profile, like doctor's `paths.profile`.
+    assert!(d["profile"].is_null(), "{d}");
     assert_eq!(d["glen_home"], s(&ix.sb.glen_home), "{d}");
 
     let f = ix.file();
@@ -216,6 +216,7 @@ fn ac302_the_target_follows_the_effective_profile() {
     let want = sb.home.join(".omp/agent/extensions/glen/index.ts");
     assert_eq!(d["path"], s(&want), "{d}");
     assert_eq!(d["agent_dir_source"], "default", "{d}");
+    assert!(d["profile"].is_null(), "the default profile is null: {d}");
     assert!(want.is_file());
 
     // A named profile ignores PI_CODING_AGENT_DIR, whichever way it is selected.
@@ -290,12 +291,17 @@ fn ac303_an_identical_rendering_is_unchanged_and_untouched() {
     ix.env(&[]);
     age(&ix.file());
     let before = stamp(&ix.file());
-    for args in [&[][..], &["--dry-run"][..]] {
+    for args in [
+        &[][..],
+        &["--dry-run"][..],
+        &["--force"][..],
+        &["--force", "--dry-run"][..],
+    ] {
         let env = ix.env(args);
         let d = &env["data"];
         assert_install_data(d);
         assert_eq!(d["action"], "unchanged", "{args:?}: {d}");
-        assert_eq!(d["dry_run"], !args.is_empty(), "{d}");
+        assert_eq!(d["dry_run"], args.contains(&"--dry-run"), "{d}");
         assert_eq!(
             stamp(&ix.file()),
             before,
@@ -392,6 +398,7 @@ fn ac303_newer_modified_and_foreign_files_are_skipped_unless_forced() {
         }
         let env = ix.env(&["--force", "--dry-run"]);
         assert_eq!(env["data"]["dry_run"], true, "{env}");
+        assert_eq!(env["data"]["action"], "replaced", "{name}: {env}");
         assert_eq!(
             stamp(&ix.file()),
             before,
@@ -399,10 +406,9 @@ fn ac303_newer_modified_and_foreign_files_are_skipped_unless_forced() {
         );
 
         let env = ix.env(&["--force"]);
-        let action = env["data"]["action"].as_str().unwrap_or("");
-        assert!(
-            !["skipped", "unchanged"].contains(&action),
-            "{name}: --force overwrites: {env}"
+        assert_eq!(
+            env["data"]["action"], "replaced",
+            "§A10 W3 clarifications: --force overwrite reports replaced ({name}): {env}"
         );
         assert_eq!(env["data"]["restart_required"], true, "{name}: {env}");
         assert_eq!(
@@ -560,6 +566,10 @@ fn ac304_doctor_reports_each_extension_state() {
     }
     assert_eq!(e["path"], s(&ix.file()), "{e}");
     assert_eq!(e["state"], "not_installed", "{e}");
+    assert_eq!(
+        e["current"], false,
+        "§A10 W3 clarifications: a boolean: {e}"
+    );
     assert!(
         !ix.agent.join("extensions").exists(),
         "doctor creates no extensions dir"
@@ -570,6 +580,7 @@ fn ac304_doctor_reports_each_extension_state() {
     let d = ix.doctor();
     assert_eq!(check(&d, "extension")["status"], "ok", "{d}");
     assert_eq!(d["extension"]["state"], "current", "{d}");
+    assert_eq!(d["extension"]["current"], true, "{d}");
     assert_eq!(d["extension"]["version"], PKG_VERSION, "{d}");
     let current = fs::read(ix.file()).unwrap();
 
@@ -577,6 +588,7 @@ fn ac304_doctor_reports_each_extension_state() {
     let d = ix.doctor();
     assert_eq!(check(&d, "extension")["status"], "warn", "{d}");
     assert_eq!(d["extension"]["state"], "outdated", "{d}");
+    assert_eq!(d["extension"]["current"], false, "{d}");
     assert_eq!(d["extension"]["version"], "0.0.1", "{d}");
 
     for (name, _, make) in protected_cases() {
@@ -584,6 +596,7 @@ fn ac304_doctor_reports_each_extension_state() {
         let d = ix.doctor();
         assert_eq!(check(&d, "extension")["status"], "warn", "{name}: {d}");
         assert_eq!(d["extension"]["state"], name, "{d}");
+        assert_eq!(d["extension"]["current"], false, "{name}: {d}");
     }
 
     fs::write(ix.file(), &current).unwrap();
@@ -598,6 +611,7 @@ fn ac304_doctor_reports_each_extension_state() {
     );
     assert_eq!(check(&d, "extension")["status"], "warn", "{d}");
     assert_eq!(d["extension"]["state"], "different_home", "{d}");
+    assert_eq!(d["extension"]["current"], false, "{d}");
 }
 
 #[test]
@@ -726,22 +740,23 @@ fn tree_bytes(root: &Path) -> Vec<(String, u64, SystemTime, Vec<u8>)> {
 
 #[test]
 fn ac303_every_flag_combination_on_each_state() {
-    // (state, uninstall, force) → expected action; `None` = any writing action (the --force
-    // overwrite of a protected file, whose action name AC-303 leaves open).
-    let expect = |state: &str, uninstall: bool, force: bool| -> Option<&'static str> {
+    // (state, uninstall, force) → expected action (AC-303 and the §A10 W3 clarifications).
+    let expect = |state: &str, uninstall: bool, force: bool| -> &'static str {
         match (state, uninstall, force) {
-            ("absent", false, _) => Some("installed"),
-            ("absent", true, _) => Some("not_installed"),
-            ("outdated", false, _) => Some("upgraded"),
-            ("outdated", true, _) => Some("removed"),
-            ("modified", false, false) => Some("skipped"),
-            ("modified", false, true) => None,
-            ("modified", true, false) => Some("skipped"),
-            ("modified", true, true) => Some("removed"),
+            ("absent", false, _) => "installed",
+            ("absent", true, _) => "not_installed",
+            ("current", false, _) => "unchanged",
+            ("current", true, _) => "removed",
+            ("outdated", false, _) => "upgraded",
+            ("outdated", true, _) => "removed",
+            ("modified", false, false) => "skipped",
+            ("modified", false, true) => "replaced",
+            ("modified", true, false) => "skipped",
+            ("modified", true, true) => "removed",
             _ => unreachable!(),
         }
     };
-    for state in ["absent", "outdated", "modified"] {
+    for state in ["absent", "current", "outdated", "modified"] {
         for bits in 0..8u8 {
             let (dry, force, uninstall) = (bits & 1 != 0, bits & 2 != 0, bits & 4 != 0);
             let ix = Ix::new();
@@ -750,7 +765,7 @@ fn ac303_every_flag_combination_on_each_state() {
                 let cur = fs::read(ix.file()).unwrap();
                 if state == "outdated" {
                     craft(&ix.file(), "0.0.1", body(&cur));
-                } else {
+                } else if state == "modified" {
                     let mut b = cur.clone();
                     b.extend_from_slice(b"// edit\n");
                     fs::write(ix.file(), b).unwrap();
@@ -772,13 +787,11 @@ fn ac303_every_flag_combination_on_each_state() {
             assert_install_data(d);
             assert_eq!(d["dry_run"], dry, "{state} {args:?}: {d}");
             let action = d["action"].as_str().unwrap_or("");
-            match expect(state, uninstall, force) {
-                Some(want) => assert_eq!(action, want, "{state} {args:?}: {env}"),
-                None => assert!(
-                    !["skipped", "unchanged", "removed", "not_installed"].contains(&action),
-                    "{state} {args:?}: {env}"
-                ),
-            }
+            assert_eq!(
+                action,
+                expect(state, uninstall, force),
+                "{state} {args:?}: {env}"
+            );
             if dry {
                 assert_eq!(
                     tree_bytes(&ix.agent),

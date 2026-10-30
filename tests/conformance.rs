@@ -6,7 +6,8 @@
 //!   lease, with the shared `reader` harness.
 //! - W2 (`.claude/plans/v010-wave-2-rpc.md`, AC-201…AC-227; §A3–§A11, §A15): rpc, rpc_jobs, with
 //!   the `rpc_support` harness driving the `fake_omp` example peer through `GLEN_OMP_BIN`.
-//! - W3 (`.claude/plans/v010-wave-3-live.md`, AC-301…AC-327 incl. O1–O8; §A3–§A11, §A15): live,
+//! - W3 (`.claude/plans/v010-wave-3-live.md`, AC-301…AC-327 incl. O1–O8, the O6 settlement
+//!   amendment and the conformance clarifications; §A3–§A11, §A15): live,
 //!   extension, inbox, w3_surface, with the `live_support` harness driving the `fake_ext` example
 //!   peer and in-test unix-socket endpoints.
 //!

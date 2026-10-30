@@ -1038,20 +1038,21 @@ fn endpoint_only(lb: &LiveBox, cwd: Option<&Path>) -> Ext {
     lb.start_ext(X_ID, "ok", &env, &[])
 }
 
-/// The ls row of the endpoint-only session (O3 says `state_source:"endpoint"`, design §A3 says
-/// `"extension"`; both are accepted here and the conflict is reported).
-fn assert_endpoint_only_row(d: &Value) {
-    let x = row(d, X_ID);
+/// The session object of the endpoint-only session (§A10 W3 clarifications: `state_source` is
+/// `"extension"` everywhere, superseding O3's `"endpoint"`; an unwritten session has `path:null`).
+fn assert_endpoint_only_session(x: &Value) {
+    assert_eq!(x["id"], X_ID, "{x}");
     assert_eq!(x["handle"], tail7(X_ID), "{x}");
     assert_eq!(x["state"], "live", "{x}");
-    assert!(
-        ["extension", "endpoint"].contains(&x["state_source"].as_str().unwrap_or("")),
-        "{x}"
-    );
+    assert_eq!(x["state_source"], "extension", "{x}");
     assert!(
         x["path"].is_null(),
-        "§A10: endpoint-only ls paths are null: {x}"
+        "an unwritten session has path:null: {x}"
     );
+}
+
+fn assert_endpoint_only_row(d: &Value) {
+    assert_endpoint_only_session(row(d, X_ID));
 }
 
 #[test]
@@ -1089,7 +1090,7 @@ fn ac326_show_and_tail_of_an_endpoint_only_session_are_empty_with_a_warning() {
         let out = lb.glen([args[0], args[1], "--json"]).run();
         let env = ok_doc(&out, 0);
         assert_eq!(env["data"]["items"], json!([]), "{args:?}: {env}");
-        assert_eq!(env["data"]["session"]["id"], X_ID, "{args:?}: {env}");
+        assert_endpoint_only_session(&env["data"]["session"]);
         assert!(
             warning_codes(&env).contains(&"not_yet_persisted".to_owned()),
             "{args:?}: O3 warning: {env}"
@@ -1152,4 +1153,88 @@ fn ac324_live_send_human_mode_reports_the_reply() {
     assert!(!out.is_json(), "human mode: {}", out.ctx());
     assert!(out.out().contains("pong: hi"), "{}", out.ctx());
     lb.assert_quiet();
+}
+
+/// The registry's `session_file`, set the way the extension republishes it after omp's first
+/// write (atomic: dotfile, then rename).
+fn publish_session_file(lb: &LiveBox, id: &str, file: &Path) {
+    let p = lb.registry_path(id);
+    let mut reg = read_json(&p).expect("a registry to update");
+    reg["session_file"] = json!(file);
+    let tmp = lb.run_live().join(".republish.tmp");
+    write_private(&tmp, &serde_json::to_vec(&reg).unwrap());
+    fs::rename(&tmp, &p).unwrap();
+}
+
+#[test]
+fn ac326_tail_follow_on_an_endpoint_only_session_waits_for_the_transcript_then_streams_it() {
+    let lb = LiveBox::new();
+    let _ext = endpoint_only(&lb, Some(&lb.bx.alpha));
+    let mut st = lb.bx.follow(&["tail", &tail7(X_ID), "-f", "--json"]);
+    // Nothing to stream yet, and the stream keeps waiting.
+    let quiet = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < quiet
+        && let Some(l) = st.next_line(Duration::from_millis(800))
+    {
+        let ev = parse_stream_line(&l, &st.ctx());
+        assert_ne!(
+            ev["event"],
+            "item",
+            "no transcript exists yet\n{}",
+            st.ctx()
+        );
+        assert_ne!(ev["ok"], false, "waiting is not an error\n{}", st.ctx());
+    }
+    let ts = "2026-10-30T12:00:00.000Z";
+    let file = lb.bx.add(
+        ALPHA,
+        ts,
+        X_ID,
+        Some(&s(&lb.bx.alpha)),
+        &[
+            user("x0000001", None, ts, "First words."),
+            reply("x0000002", Some("x0000001"), ts, "First answer."),
+        ],
+    );
+    publish_session_file(&lb, X_ID, &file);
+    let mut seen = Vec::new();
+    let deadline = Instant::now() + T;
+    while seen.len() < 2 {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let ev = st.next_json(left);
+        assert_ne!(ev["ok"], false, "{}", st.ctx());
+        if ev["event"] == "item" {
+            seen.push(ev["item"]["id"].as_str().unwrap().to_owned());
+        }
+    }
+    assert_eq!(seen, ["x0000001", "x0000002"], "{}", st.ctx());
+    st.interrupt();
+    assert_eq!(st.wait(T).code(), Some(130), "{}", st.ctx());
+    assert_eq!(st.last_line(), json!({"v": 1, "event": "end", "ok": true}));
+}
+
+#[test]
+fn ac326_tail_follow_ends_not_found_when_the_tui_quits_without_writing() {
+    let lb = LiveBox::new();
+    let mut ext = endpoint_only(&lb, Some(&lb.bx.alpha));
+    let mut st = lb.bx.follow(&["tail", &tail7(X_ID), "-f", "--json"]);
+    assert!(
+        st.next_line(Duration::from_millis(800))
+            .is_none_or(|l| parse_stream_line(&l, "")["ok"] != false),
+        "{}",
+        st.ctx()
+    );
+    ext.stop();
+    assert!(!ext.registry.exists(), "the endpoint is gone");
+    let t = Instant::now();
+    let status = st.wait(Duration::from_secs(20));
+    let took = t.elapsed();
+    assert_eq!(status.code(), Some(3), "not_found exits 3\n{}", st.ctx());
+    let last = st.last_line();
+    assert_eq!(last["ok"], false, "{last}");
+    assert_eq!(last["error"]["code"], "not_found", "{last}");
+    assert!(
+        took >= Duration::from_secs(4) && took < Duration::from_secs(12),
+        "after the five-second disappearance grace: {took:?}"
+    );
 }

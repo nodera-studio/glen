@@ -538,3 +538,31 @@ fn ac325_records_missing_the_optional_ids_are_read_as_nulls() {
     }
     assert_eq!(m["text"], "lean", "{m}");
 }
+
+#[test]
+fn ac319_a_session_tail_shorter_than_four_hex_digits_is_usage() {
+    let sb = Sandbox::new();
+    two_sessions(&sb.glen_home);
+    for follow in [false, true] {
+        let mut args = vec!["inbox", "--session", "9a7"];
+        if follow {
+            args.push("-f");
+        }
+        args.push("--json");
+        let out = sb.glen(&args).run();
+        failed(&out, "usage");
+        assert!(
+            !sb.glen_home.join("inbox/.read").exists(),
+            "follow={follow}: nothing was read or marked"
+        );
+    }
+    // Four digits and full ids stay accepted.
+    assert_eq!(
+        texts(&inbox(&sb, &["--session", "9a72", "--peek"])),
+        ["second", "fourth"]
+    );
+    assert_eq!(
+        texts(&inbox(&sb, &["--session", D.id, "--peek"])),
+        ["second", "fourth"]
+    );
+}

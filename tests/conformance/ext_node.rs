@@ -3,7 +3,8 @@
 //! written here from omp's documented API (`pi.on`, `pi.registerTool`, `pi.sendUserMessage`,
 //! `pi.zod`, `ctx.mode/agent/sessionManager/isIdle/hasPendingMessages/setTimeout/clearTimer/ui`),
 //! and the real `glen` binary talks to it (AC-305…AC-313, AC-316, AC-321, AC-322 as observable
-//! from outside the extension). `fake_ext` shares glen's Rust registry types; this group is the
+//! from outside the extension; the O6 per-request reply spans, batching and `not_delivered`).
+//! The host emits omp's start/end message pairs; `HOST_SCRIPT=1` lets a test drive each event. `fake_ext` shares glen's Rust registry types; this group is the
 //! only check that the TypeScript side and the Rust side agree on the files and the wire.
 //!
 //! Needs Node ≥ 22.6 on PATH. Without it the tests print a note and pass locally; with `CI` set
@@ -65,6 +66,11 @@ const pi = fallback("pi_unknown", {
     log({ k: "sendUserMessage", text, opts: opts ?? null, idle: st.idle });
     if (E.HOST_THROW === "1") throw new Error("host refused the message");
     if (E.HOST_HOLD === "1") return;
+    if (E.HOST_SCRIPT === "1") {
+      // Scripted: a prompt starts streaming, a busy delivery queues; the test drives every event.
+      if (st.idle) st.idle = false; else st.queue.push(text);
+      return;
+    }
     if (st.idle) {
       st.idle = false;
       setImmediate(() => run([text]).catch((e) => log({ k: "run_error", e: String(e) })));
@@ -102,14 +108,26 @@ async function reply(params) {
   log({ k: "tool_result", id, r });
 }
 const OLD = { role: "assistant", content: [{ type: "text", text: "OLD CONTEXT" }], stopReason: "stop" };
+// omp emits input and output messages as start/end pairs.
+async function message(m) {
+  await emit("message_start", { message: m });
+  await emit("message_end", { message: m });
+}
+const userMsg = (t) => ({ role: "user", content: [{ type: "text", text: t }] });
+const assistantMsg = (t) => ({ role: "assistant", content: [{ type: "text", text: t }], stopReason: "stop" });
+async function assistant(t) {
+  const a = assistantMsg(t);
+  await message(a);
+  await emit("turn_end", { message: a, toolResults: [] });
+}
 async function run(texts) {
   st.idle = false;
   await emit("before_agent_start", { reason: "prompt", prompt: texts.join("\n\n") });
   await emit("agent_start", {});
-  for (const t of texts) await emit("message_end", { message: { role: "user", content: [{ type: "text", text: t }] } });
+  for (const t of texts) await message(userMsg(t));
   for (const t of texts) await reply({ text: "reply: " + t, final: true });
-  const a = { role: "assistant", content: [{ type: "text", text: "pong: " + texts.join(" + ") }], stopReason: "stop" };
-  await emit("message_end", { message: a });
+  const a = assistantMsg("pong: " + texts.join(" + "));
+  await message(a);
   await emit("turn_end", { message: a, toolResults: [] });
   await emit("agent_end", { messages: [OLD, a], willContinue: false });
   await sleep(Number(E.HOST_IDLE_DELAY_MS ?? "200"));
@@ -118,10 +136,8 @@ async function run(texts) {
 }
 async function drain() {
   await reply({ text: "own run reply" });
-  const own = { role: "assistant", content: [{ type: "text", text: "own run" }], stopReason: "stop" };
-  await emit("message_end", { message: own });
-  await emit("turn_end", { message: own, toolResults: [] });
-  await emit("agent_end", { messages: [own], willContinue: false });
+  await assistant("own run");
+  await emit("agent_end", { messages: [OLD], willContinue: false });
   await sleep(300);
   const batch = st.queue.splice(0);
   if (batch.length) await run(batch); else st.idle = true;
@@ -136,6 +152,21 @@ rl.on("line", async (line) => {
     else if (cmd === "shutdown") await emit("session_shutdown", {});
     else if (cmd === "switch") { st.id = rest[0]; await emit("session_switch", { reason: rest[1], previousSessionFile: st.file }); }
     else if (cmd === "exit") { console.log("ok exit"); process.exit(0); }
+    // Scripted events (HOST_SCRIPT=1): one omp event or state change per command.
+    else if (cmd === "start") await emit("session_start", {});
+    else if (cmd === "start_run") { st.idle = false; await emit("before_agent_start", { reason: "prompt", prompt: rest.join(" ") }); await emit("agent_start", {}); }
+    else if (cmd === "user") {
+      const t = rest.join(" ");
+      const i = st.queue.indexOf(t);
+      if (i >= 0) st.queue.splice(i, 1);
+      await message(userMsg(t));
+    }
+    else if (cmd === "assistant") await assistant(rest.join(" "));
+    else if (cmd === "custom") await message({ role: "custom", customType: "async-result", content: [{ type: "text", text: rest.join(" ") }], display: true });
+    else if (cmd === "reply") await reply({ text: rest.join(" ") });
+    else if (cmd === "end") await emit("agent_end", { messages: [OLD], willContinue: false });
+    else if (cmd === "idle") st.idle = true;
+    else if (cmd === "drop") st.queue = [];
   } catch (e) { log({ k: "cmd_error", cmd, e: String(e) }); }
   console.log("ok " + cmd);
 });
@@ -648,6 +679,20 @@ fn node_ac321_a_glen_home_at_the_socket_limit_binds_nothing_and_notifies_once() 
         .collect();
     assert!(socks.is_empty(), "AC-321: nothing bound: {socks:?}");
     assert_eq!(h.of("notify").len(), 1, "AC-321: one notice\n{}", h.diag());
+    // §A10 W3 clarifications: once per failing session_start, so a later start notifies again.
+    let mut h = h;
+    h.cmd("start");
+    assert_eq!(
+        h.of("notify").len(),
+        2,
+        "one notice per session_start\n{}",
+        h.diag()
+    );
+    let socks: Vec<String> = list_tree(Path::new(&home))
+        .into_iter()
+        .filter(|p| p.ends_with(".sock") || p.ends_with(".json"))
+        .collect();
+    assert!(socks.is_empty(), "still nothing bound: {socks:?}");
     h.assert_clean();
 }
 
@@ -738,8 +783,40 @@ fn node_ac309_ac310_ac316_an_idle_session_gets_a_prompt_and_settles_only_once_id
     h.assert_clean();
 }
 
+/// `glen wait <job> --json` until terminal; returns the envelope (exit 0) or the error (exit 7).
+fn wait_env(lb: &LiveBox, job: &str, exit: i32) -> Value {
+    let out = lb
+        .glen(["wait", &job_handle(job), "--timeout", "60s", "--json"])
+        .run();
+    if exit == 0 {
+        ok_doc(&out, 0)
+    } else {
+        failed(&out, "job_failed")
+    }
+}
+
+/// `send <text> --no-wait` plus `flags`, then wait until the job is accepted; returns its id.
+fn accepted(lb: &LiveBox, text: &str, flags: &[&str], env: &[(&str, &str)]) -> String {
+    let mut args = vec!["--no-wait"];
+    args.extend_from_slice(flags);
+    let mut run = lb.send(A.handle, text, &args);
+    for (k, v) in env {
+        run = run.env(k, v);
+    }
+    let j = job_id(&data_of(&run.run(), 10));
+    lb.wait_status(&j, "accepted", LONG, |s| s["status"] == "accepted");
+    j
+}
+
+fn reply_texts(v: &Value) -> Vec<String> {
+    arr(v)
+        .iter()
+        .map(|r| r["text"].as_str().unwrap().to_owned())
+        .collect()
+}
+
 #[test]
-fn node_ac309_ac311_busy_sends_queue_and_replies_follow_consumption() {
+fn node_ac309_o6_batched_queued_requests_share_one_span_with_a_batched_warning() {
     let Some(nd) = node_env() else { return };
     let lb = LiveBox::new();
     let dir = install(&lb);
@@ -751,16 +828,8 @@ fn node_ac309_ac311_busy_sends_queue_and_replies_follow_consumption() {
         "AC-318 from the real extension"
     );
 
-    let j1 = job_id(&data_of(
-        &lb.send(A.handle, "one", &["--no-wait"]).run(),
-        10,
-    ));
-    lb.wait_status(&j1, "accepted", LONG, |s| s["status"] == "accepted");
-    let j2 = job_id(&data_of(
-        &lb.send(A.handle, "two", &["--steer", "--no-wait"]).run(),
-        10,
-    ));
-    lb.wait_status(&j2, "accepted", LONG, |s| s["status"] == "accepted");
+    let j1 = accepted(&lb, "one", &[], &[]);
+    let j2 = accepted(&lb, "two", &["--steer"], &[]);
     assert_eq!(lb.status(&j1)["delivered_as"], "follow_up");
     assert_eq!(lb.status(&j2)["delivered_as"], "steer");
     let sends = h.of("sendUserMessage");
@@ -777,36 +846,238 @@ fn node_ac309_ac311_busy_sends_queue_and_replies_follow_consumption() {
         h.diag()
     );
 
-    // The TUI user's own run ends (with its own glen_reply), then the queued batch runs.
+    // The TUI user's own run ends (with its own glen_reply); then omp delivers both queued
+    // messages adjacently in one run, with no assistant output between them.
     h.cmd("drain");
-    for (j, text) in [(&j1, "one"), (&j2, "two")] {
-        let w = data_of(
-            &lb.glen(["wait", &job_handle(j), "--timeout", "20s", "--json"])
-                .run(),
-            0,
+    let w1 = wait_env(&lb, &j1, 0);
+    let w2 = wait_env(&lb, &j2, 0);
+    for (w, other) in [(&w1, &j2), (&w2, &j1)] {
+        let d = &w["data"];
+        assert_eq!(
+            d["assistant_text"], "pong: one + two",
+            "the shared span: {w}"
         );
-        assert_eq!(w["assistant_text"], "pong: one + two", "{text}: {w}");
+        assert_eq!(
+            reply_texts(&d["replies"]),
+            ["reply: one", "reply: two"],
+            "{w}"
+        );
+        let st = lb.status(job_id(d).as_str());
+        for warnings in [&w["warnings"], &st["warnings"]] {
+            let batched: Vec<&Value> = warnings
+                .as_array()
+                .map(|a| a.iter().filter(|x| x["code"] == "batched").collect())
+                .unwrap_or_default();
+            assert_eq!(batched.len(), 1, "a `batched` warning: {warnings}");
+            assert!(
+                batched[0]["message"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains(&job_handle(other)),
+                "it names the other job handle {}: {warnings}",
+                job_handle(other)
+            );
+        }
+    }
+    assert_eq!(
+        w1["data"]["replies"], w2["data"]["replies"],
+        "identical records streamed to every batch member"
+    );
+
+    let inbox = ndjson(&lb.inbox_file(A.id));
+    assert_eq!(
+        inbox.len(),
+        3,
+        "one durable record per tool call: {inbox:?}"
+    );
+    for r in &inbox {
+        assert!(
+            r["job_id"].is_null() && r["request_id"].is_null(),
+            "own-run and shared batch records have no single owner: {r}"
+        );
+    }
+    lb.assert_quiet();
+    h.assert_clean();
+}
+
+#[test]
+fn node_o6_interleaved_prompt_follow_up_prompt_steer_each_answer_from_its_own_span() {
+    let Some(nd) = node_env() else { return };
+    let lb = LiveBox::new();
+    let dir = install(&lb);
+    let mut h = Host::start(&lb, nd, &dir, A.id, None, &[("HOST_SCRIPT", "1")]);
+
+    // Prompt A, answered in its run; follow-up B queued while A runs.
+    let ja = accepted(&lb, "alpha", &[], &[]);
+    for c in [
+        "start_run alpha",
+        "user alpha",
+        "reply alpha progress",
+        "assistant done",
+    ] {
+        h.cmd(c);
+    }
+    let jb = accepted(&lb, "bravo", &["--follow-up"], &[]);
+    h.cmd("end");
+    // B's user message is the next boundary: A settles no later than this, B is still open.
+    h.cmd("user bravo");
+    lb.wait_status(&ja, "A terminal", Duration::from_secs(5), is_terminal);
+    assert!(!is_terminal(&lb.status(&jb)), "B's span is still open");
+    for c in ["assistant second", "end", "idle"] {
+        h.cmd(c);
+    }
+
+    // Prompt C starts a run; steer D arrives mid-run; an async-result wake-up follows D.
+    lb.wait_terminal(&jb);
+    let jc = accepted(&lb, "charlie", &[], &[]);
+    for c in [
+        "start_run charlie",
+        "user charlie",
+        "assistant charlie started a background job",
+    ] {
+        h.cmd(c);
+    }
+    let jd = accepted(&lb, "delta", &["--steer"], &[]);
+    for c in [
+        "user delta",
+        "assistant steered",
+        "custom background job finished",
+        "assistant late async text",
+        "reply late reply",
+        "end",
+        "idle",
+    ] {
+        h.cmd(c);
+    }
+
+    let want = [
+        (&ja, "prompt", "done", vec!["alpha progress"]),
+        (&jb, "follow_up", "second", vec![]),
+        (&jc, "prompt", "charlie started a background job", vec![]),
+        (&jd, "steer", "steered", vec![]),
+    ];
+    for (j, delivered, text, replies) in want {
+        let w = wait_env(&lb, j, 0);
+        let d = &w["data"];
+        assert_eq!(d["delivered_as"], delivered, "{w}");
+        assert_eq!(
+            d["assistant_text"], text,
+            "O6: the answer from its own span: {w}"
+        );
+        assert_eq!(reply_texts(&d["replies"]), replies, "{w}");
+        assert!(
+            !warning_codes(&w).iter().any(|c| c == "batched"),
+            "separated by assistant output, never batched: {w}"
+        );
     }
     let inbox = ndjson(&lb.inbox_file(A.id));
-    let by_text = |t: &str| {
-        inbox
-            .iter()
-            .find(|r| r["text"] == t)
-            .unwrap_or_else(|| panic!("no inbox record {t:?}: {inbox:?}"))
-            .clone()
-    };
-    let own = by_text("own run reply");
+    let late = inbox.iter().find(|r| r["text"] == "late reply").unwrap();
     assert!(
-        own["job_id"].is_null() && own["request_id"].is_null(),
-        "AC-311: a queued (unconsumed) request never borrows the user's reply: {own}"
+        late["job_id"].is_null() && late["request_id"].is_null(),
+        "content after an unowned boundary belongs to no glen job: {late}"
     );
-    for t in ["reply: one", "reply: two"] {
-        assert_eq!(
-            by_text(t)["job_id"],
-            j2.as_str(),
-            "AC-311: the newest consumed unsettled request"
-        );
+    let progress = inbox
+        .iter()
+        .find(|r| r["text"] == "alpha progress")
+        .unwrap();
+    assert_eq!(progress["job_id"], ja.as_str(), "{progress}");
+    lb.assert_quiet();
+    h.assert_clean();
+}
+
+fn assert_not_delivered(lb: &LiveBox, j: &str) -> Value {
+    let err = wait_env(lb, j, 7);
+    assert_job_failed(&err, "failed", "not_delivered");
+    let st = lb.status(j);
+    assert_eq!(st["error"]["code"], "not_delivered", "{st}");
+    err
+}
+
+#[test]
+fn node_o6_a_queued_message_removed_before_delivery_fails_not_delivered_at_quiescence() {
+    let Some(nd) = node_env() else { return };
+    let lb = LiveBox::new();
+    let dir = install(&lb);
+    let mut h = Host::start(
+        &lb,
+        nd,
+        &dir,
+        A.id,
+        None,
+        &[("HOST_SCRIPT", "1"), ("HOST_BUSY", "1")],
+    );
+    let j = accepted(&lb, "never sent", &[], &[("GLEN_JOB_TIMEOUT", "90s")]);
+    assert_eq!(lb.status(&j)["delivered_as"], "follow_up");
+    // The TUI user removes the queued message; their own run ends and the session goes idle.
+    for c in ["drop", "assistant own run", "end", "idle"] {
+        h.cmd(c);
     }
+    let t = Instant::now();
+    let st = lb.wait_status(&j, "terminal", Duration::from_secs(10), is_terminal);
+    assert!(
+        t.elapsed() < Duration::from_secs(10),
+        "at quiescence, not at a 30 s deadline: {st}"
+    );
+    let err = assert_not_delivered(&lb, &j);
+    assert!(err["details"]["job"].is_object(), "{err}");
+    let res = read_json(&lb.job_dir(&j).join("result.json"));
+    assert!(
+        res.as_ref().is_none_or(|r| r["assistant_text"].is_null()),
+        "never the user's run: {res:?}"
+    );
+    lb.assert_quiet();
+    h.assert_clean();
+}
+
+#[test]
+fn node_o6_an_undelivered_submission_never_takes_over_an_unrelated_run() {
+    let Some(nd) = node_env() else { return };
+    let lb = LiveBox::new();
+    let dir = install(&lb);
+    let mut h = Host::start(&lb, nd, &dir, A.id, None, &[("HOST_SCRIPT", "1")]);
+    // The submission is accepted but never reaches omp; the TUI user then runs their own turn.
+    let j = accepted(&lb, "lost prompt", &[], &[("GLEN_JOB_TIMEOUT", "90s")]);
+    for c in [
+        "start_run typed by the user",
+        "user typed by the user",
+        "reply typed reply",
+        "assistant answer to the user",
+        "end",
+        "idle",
+    ] {
+        h.cmd(c);
+    }
+    let err = assert_not_delivered(&lb, &j);
+    assert!(!err.to_string().contains("answer to the user"), "{err}");
+    let res = read_json(&lb.job_dir(&j).join("result.json"));
+    if let Some(r) = res {
+        assert!(r["assistant_text"].is_null(), "{r}");
+        assert_eq!(r["replies"], json!([]), "{r}");
+    }
+    let typed = ndjson(&lb.inbox_file(A.id));
+    assert!(
+        typed[0]["job_id"].is_null(),
+        "the user's reply has no glen owner: {typed:?}"
+    );
+    lb.assert_quiet();
+    h.assert_clean();
+}
+
+#[test]
+fn node_o6_an_undelivered_prompt_fails_not_delivered_after_the_delivery_deadline() {
+    let Some(nd) = node_env() else { return };
+    let lb = LiveBox::new();
+    let dir = install(&lb);
+    let h = Host::start(&lb, nd, &dir, A.id, None, &[("HOST_SCRIPT", "1")]);
+    let t = Instant::now();
+    let j = accepted(&lb, "into the void", &[], &[("GLEN_JOB_TIMEOUT", "90s")]);
+    let st = lb.wait_status(&j, "terminal", Duration::from_secs(45), is_terminal);
+    let took = t.elapsed();
+    assert!(
+        took >= Duration::from_secs(28) && took < Duration::from_secs(40),
+        "the 30 s delivery deadline: {took:?} {st}"
+    );
+    assert_not_delivered(&lb, &j);
     lb.assert_quiet();
     h.assert_clean();
 }
@@ -830,6 +1101,11 @@ fn node_ac311_talk_back_from_the_tui_reaches_glen_inbox_with_null_ids() {
     );
     let lines = ndjson(&lb.inbox_file(A.id));
     assert_eq!(lines.len(), 1, "invalid calls record nothing: {lines:?}");
+    assert_eq!(
+        lines[0]["final"], false,
+        "§A10 W3 clarifications: an omitted final is stored as false: {}",
+        lines[0]
+    );
     assert_eq!(mode(&lb.glen_home().join("inbox")), 0o700);
     let d = data_of(&lb.glen(["inbox", "--json"]).run(), 0);
     let m = &arr(&d["messages"])[0];
