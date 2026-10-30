@@ -8,12 +8,13 @@ import * as crypto from "node:crypto";
 const GLEN_VERSION = "__GLEN_VERSION__";
 const BAKED_GLEN_HOME = "__GLEN_HOME__";
 export const PROTOCOL = 1;
-export const OPS = ["hello", "state", "send"];
-export const RESERVED_OPS = ["abort", "list_models", "set_model", "set_thinking_level", "compact"];
-export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
-type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number };
+export const OPS = ["hello", "state", "send", "abort", "list_models", "set_model", "set_thinking_level", "compact"];
+export const RESERVED_OPS: string[] = [];
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxInstructions: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
+type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number; abortWaitMs?: number };
 type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; lastTextAssistant: any; settled: boolean };
-type Endpoint = { server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
+type Endpoint = { compacting: boolean; server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
 const ENDPOINTS = new Map<number, Endpoint>();
 export function isPlainToken(id: unknown): id is string { return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id); }
 export function sunPathMax(platform: string) { return platform === "darwin" ? 104 : 108; }
@@ -144,6 +145,57 @@ function state(e: Endpoint, hello: boolean) {
     const busy = !e.ctx.isIdle();
     return { ...(hello ? { protocol: PROTOCOL, protocols: [PROTOCOL], ops: OPS } : {}), ext_version: version(), omp_version: e.ompVersion, pid: e.deps.pid, session_id: e.sessionId, session_file: e.sessionFile, mode: e.mode, state: busy ? "busy" : "idle", busy, queued: e.ctx.hasPendingMessages(), active_requests: e.requests.length };
 }
+export function thinkingLevelsOf(model: any): string[] { return ["off", ...(model?.reasoning ? model.thinking?.efforts ?? [] : [])]; }
+export function modelRef(model: any) { return model ? { provider: model.provider, id: model.id } : null; }
+export function modelRow(model: any) { return { provider: model.provider, id: model.id, name: model.name, reasoning: !!model.reasoning, thinking_levels: thinkingLevelsOf(model), context_window: model.contextWindow ?? null, max_tokens: model.maxTokens ?? null }; }
+async function control(e: Endpoint, conn: net.Socket, frame: any) {
+    const { id, op } = frame, a = frame.args === undefined ? {} : frame.args;
+    const error = (code: string, message: string, details?: object) => { if (!conn.destroyed) conn.end(JSON.stringify({ v: PROTOCOL, id, ok: false, error: { code, message, ...(details ? { details } : {}) } }) + "\n"); };
+    const success = (data: object) => { identity(e); if (!conn.destroyed) conn.end(JSON.stringify({ v: PROTOCOL, id, ok: true, data: { ...data, session_id: e.sessionId } }) + "\n"); };
+    try {
+        // A socket belongs only to the cached main-agent context.
+        if ((e.ctx.agent?.kind ?? "main") !== "main") { conn.destroy(); return; }
+        identity(e);
+        if (typeof a !== "object" || a === null || Array.isArray(a) || (a.expect_session_id != null && typeof a.expect_session_id !== "string")) { error("bad_request", `invalid ${op} arguments`); return; }
+        if (op === "set_model" && (typeof a.provider !== "string" || !a.provider.trim() || typeof a.model_id !== "string" || !a.model_id.trim())) { error("bad_request", "invalid set_model arguments"); return; }
+        if (op === "set_thinking_level" && !THINKING_LEVELS.includes(a.level)) { error("bad_request", "invalid set_thinking_level arguments"); return; }
+        if (op === "compact" && a.instructions != null && (typeof a.instructions !== "string" || Buffer.byteLength(a.instructions) > LIMITS.maxInstructions)) { error("bad_request", "invalid compact arguments"); return; }
+        if (a.expect_session_id != null && a.expect_session_id !== e.sessionId) { error("session_mismatch", "session identity changed", { session_id: e.sessionId }); return; }
+        if (op === "abort") {
+            if (e.ctx.isIdle() && !e.compacting) { success({ was: "idle", aborted: false, idle_after: true, queued: e.ctx.hasPendingMessages() }); return; }
+            e.ctx.abort(); notify(e.ctx, "glen: stopping the running turn (requested by a glen client)");
+            const end = Date.now() + (e.deps.abortWaitMs ?? 3000);
+            while ((!e.ctx.isIdle() || e.compacting) && Date.now() < end) { await new Promise<void>(resolve => e.ctx.setTimeout(resolve, 50)); identity(e); }
+            success({ was: "busy", aborted: true, idle_after: e.ctx.isIdle() && !e.compacting, queued: e.ctx.hasPendingMessages() });
+        } else if (op === "list_models") {
+            success({ current: modelRef(e.ctx.model), thinking_level: e.pi.getThinkingLevel() ?? null, models: e.ctx.models.list().map(modelRow) });
+        } else if (op === "set_model") {
+            const model = e.ctx.models.list().find((m: any) => m.provider === a.provider && m.id === a.model_id);
+            if (!model) { error("model_not_found", `Model not found: ${a.provider}/${a.model_id}`); return; }
+            const previous = modelRef(e.ctx.model), busy = !e.ctx.isIdle() || e.ctx.hasPendingMessages();
+            const applied = await e.pi.setModel(model); identity(e);
+            if (!applied) { error("no_auth", `No API key for ${model.provider}/${model.id}`); return; }
+            notify(e.ctx, `glen: model set to ${model.provider}/${model.id}`);
+            success({ model: { ...modelRef(model), name: model.name }, previous, thinking_level: e.pi.getThinkingLevel() ?? "off", thinking_levels: thinkingLevelsOf(model), busy });
+        } else if (op === "set_thinking_level") {
+            const available = thinkingLevelsOf(e.ctx.model);
+            if (!available.includes(a.level)) { error("invalid_level", `thinking level ${a.level} is unavailable for the current model`, { available, model: modelRef(e.ctx.model) }); return; }
+            const previous = e.pi.getThinkingLevel() ?? null, busy = !e.ctx.isIdle() || e.ctx.hasPendingMessages();
+            e.pi.setThinkingLevel(a.level); identity(e);
+            notify(e.ctx, `glen: thinking set to ${a.level}`);
+            success({ thinking_level: e.pi.getThinkingLevel() ?? null, previous, model: modelRef(e.ctx.model), available, busy });
+        } else if (op === "compact") {
+            if (!e.ctx.isIdle() || e.ctx.hasPendingMessages() || e.compacting) { error("busy", "abort the run first (`glen abort <s>`), or wait for it to finish"); return; }
+            e.compacting = true;
+            try {
+                const tokens_before = e.ctx.getContextUsage()?.tokens ?? null;
+                notify(e.ctx, "glen: compacting the session");
+                await e.ctx.compact(a.instructions ?? undefined); identity(e);
+                success({ tokens_before, tokens_after: e.ctx.getContextUsage()?.tokens ?? null });
+            } finally { e.compacting = false; }
+        }
+    } catch (err) { quietly(() => identity(e)); error("omp_error", err instanceof Error ? err.message : String(err)); }
+}
 function connection(e: Endpoint, conn: net.Socket) {
     e.connections.add(conn);
     const chunks: Buffer[] = [];
@@ -178,6 +230,7 @@ function connection(e: Endpoint, conn: net.Socket) {
             if (frame.v !== PROTOCOL) { error(id, "unsupported_version", "unsupported protocol version", { supported: [PROTOCOL] }); return; }
             identity(e);
             if (frame.op === "hello" || frame.op === "state") { conn.end(JSON.stringify({ v: PROTOCOL, id, ok: true, data: state(e, frame.op === "hello") }) + "\n"); return; }
+            if (OPS.includes(frame.op) && frame.op !== "send") { void control(e, conn, frame); return; }
             if (frame.op !== "send") { error(id, "unsupported_op", "unsupported operation", { op: frame.op ?? null, ops: OPS, reserved: RESERVED_OPS.includes(frame.op) }); return; }
             if (e.requests.some(r => r.id === id) || e.settledIds.has(id)) { error(id, "bad_request", "duplicate request id"); return; }
             const a = frame.args;
@@ -270,7 +323,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
         fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 }); sweep(home, deps); unlink(socket);
         const server = net.createServer(conn => { try { connection(e, conn); } catch { conn.destroy(); } });
         server.on("error", err => trace(e, "server_error", { reason: String(err) }));
-        const e: Endpoint = { server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanHasActivity: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
+        const e: Endpoint = { compacting: false, server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanHasActivity: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
         try {
             await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, () => { server.removeListener("error", reject); resolve(); }); });
             fs.chmodSync(socket, 0o600);

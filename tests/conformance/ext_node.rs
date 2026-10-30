@@ -444,7 +444,7 @@ fn node_ac305_ac308_a_tui_session_start_publishes_a_private_endpoint() {
     assert_eq!(f["id"], "h1", "{f}");
     assert_eq!(f["ok"], true, "{f}");
     let mut want = json!({
-        "protocol": 1, "protocols": [1], "ops": ["hello", "state", "send"],
+        "protocol": 1, "protocols": [1], "ops": OPS,
         "ext_version": PKG_VERSION, "pid": h.pid, "session_id": A.id,
         "mode": "tui", "state": "idle", "busy": false, "queued": false, "active_requests": 0,
     });
@@ -491,7 +491,7 @@ fn node_ac307_protocol_errors_and_reserved_ops() {
     assert_error(&f, json!("x"), "unsupported_version");
     assert_eq!(f["error"]["details"]["supported"], json!([1]), "{f}");
 
-    for op in RESERVED_OPS {
+    for op in ["future_op", "steer"] {
         let f = one(exchange(
             &sock,
             format!("{{\"v\":1,\"id\":\"r\",\"op\":\"{op}\",\"args\":{{}}}}\n").as_bytes(),
@@ -499,7 +499,7 @@ fn node_ac307_protocol_errors_and_reserved_ops() {
         assert_error(&f, json!("r"), "unsupported_op");
         assert_eq!(
             f["error"]["details"],
-            json!({"op": op, "ops": OPS, "reserved": true}),
+            json!({"op": op, "ops": OPS, "reserved": false}),
             "{f}"
         );
     }

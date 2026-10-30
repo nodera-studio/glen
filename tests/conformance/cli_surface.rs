@@ -49,20 +49,11 @@ fn ac001_help_lists_exactly_the_visible_commands() {
         out.assert_exit(0);
         assert_eq!(
             listed_commands(&out.out()),
-            [
-                "completions",
-                "doctor",
-                "help",
-                "inbox",
-                "install-extension",
-                "install-skill",
-                "jobs",
-                "ls",
-                "send",
-                "show",
-                "tail",
-                "wait"
-            ],
+            {
+                let mut names = VISIBLE;
+                names.sort();
+                names
+            },
             "{}",
             out.ctx()
         );
@@ -107,6 +98,11 @@ fn a9_every_command_accepts_help_and_version() {
         "send",
         "wait",
         "jobs",
+        "abort",
+        "models",
+        "model",
+        "thinking",
+        "compact",
         "inbox",
         "install-extension",
         "install-skill",
@@ -194,6 +190,12 @@ fn a9_rpc_arguments_parse() {
         &["wait", "j1234567", "--timeout", "30s"],
         &["jobs", "--session", "abc1234", "--active", "-n", "3"],
         &["jobs", "--limit", "3"],
+        &["abort", "abc1234", "--timeout", "1s"],
+        &["stop", "abc1234"],
+        &["models", "abc1234", "--provider", "fake"],
+        &["model", "abc1234", "fake/fake-1"],
+        &["thinking", "abc1234", "xhigh"],
+        &["compact", "abc1234", "--instructions", "keep facts"],
     ];
     for args in valid {
         let out = sb.glen(*args).run();
@@ -235,6 +237,9 @@ fn a9_invalid_arguments_are_usage_errors() {
         &["--json", "completions"],
         &["--json", "completions", "notashell"],
         &["doctor", "unexpected-positional"],
+        &["thinking", "abc1234", "banana"],
+        &["models", "--timeout", "0"],
+        &["abort", "abc1234", "--timeout", "0"],
     ];
     for args in invalid {
         sb.glen(*args).run().error_envelope("usage");
@@ -279,11 +284,20 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "send",
             "wait",
             "jobs",
+            "abort",
+            "models",
+            "model",
+            "thinking",
+            "compact",
             "inbox",
             "install-extension",
             "install-skill",
         ] {
             assert!(contains_command_word(&script, name), "{shell} lacks {name}");
+        }
+        assert!(contains_command_word(&script, "stop"), "{shell} lacks stop");
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert!(script.contains(level), "{shell} lacks {level}");
         }
         assert_no_hidden_commands(&script, shell);
     }
@@ -324,15 +338,20 @@ fn a10_explicit_json_completions_carry_shell_and_script() {
         (vec!["--json", "completions", "bash"], "bash"),
     ] {
         let out = sb.glen(&args).run();
-        let data = out.ok_data();
         out.assert_stderr_empty();
-        assert_eq!(data["shell"], Value::from(shell), "{}", out.ctx());
+        let context = out.ctx();
+        let data = completion_data(out);
+        assert_eq!(data["shell"], Value::from(shell), "{}", context.clone());
         let script = data["script"].as_str().expect("data.script is a string");
-        assert!(!script.trim().is_empty(), "{}", out.ctx());
-        assert!(contains_command_word(script, "doctor"), "{}", out.ctx());
+        assert!(!script.trim().is_empty(), "{}", context.clone());
+        assert!(
+            contains_command_word(script, "doctor"),
+            "{}",
+            context.clone()
+        );
         assert_no_hidden_commands(script, shell);
         if shell == "zsh" {
-            assert!(script.starts_with("#compdef glen"), "{}", out.ctx());
+            assert!(script.starts_with("#compdef glen"), "{}", context.clone());
         }
     }
 }

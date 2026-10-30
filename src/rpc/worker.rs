@@ -75,6 +75,8 @@ pub(crate) struct Worker {
     pub(crate) status: Status,
     pub(crate) cancel: Arc<AtomicBool>,
     pub(crate) deadline: Instant,
+    pub(crate) control_in_flight: Option<std::path::PathBuf>,
+    pub(crate) omp_queued: bool,
 }
 pub fn main(arg: &str) -> ExitCode {
     let loaded = (|| -> Result<Worker, GlenError> {
@@ -99,6 +101,8 @@ pub fn main(arg: &str) -> ExitCode {
             id,
             job,
             status,
+            control_in_flight: None,
+            omp_queued: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + Duration::from_millis(left),
         })
@@ -152,25 +156,53 @@ impl Worker {
         self.store.write_status(&self.id, &self.status)?;
         Ok(())
     }
-    fn controls(&self) -> bool {
+    fn controls(&self) -> (bool, Vec<control::Request>) {
         let mut abort = false;
+        let mut pending = Vec::new();
         for req in control::poll(&self.store.dir(&self.id)) {
+            if self.control_in_flight.as_ref() == Some(&req.path) {
+                continue;
+            }
+            if control::expired(&req) {
+                self.answer_control(&req, Err(control::expired_error()));
+                continue;
+            }
             match &req.op {
-                Ok(control::ControlOp::Abort) => abort = true,
-                Err(op) => {
-                    if let Err(e) = control::respond(
-                        &req,
-                        Err(("unsupported_op", format!("unsupported control op: {op}"))),
-                    ) {
+                Ok(control::ControlOp::Abort) => {
+                    let actual = self
+                        .status
+                        .actual_session_id
+                        .as_deref()
+                        .or(self.job.session_id.as_deref());
+                    if req
+                        .expect_session_id
+                        .as_deref()
+                        .is_some_and(|expected| actual != Some(expected))
+                    {
+                        self.answer_control(
+                            &req,
+                            Err(crate::ops::OpError::new(
+                                crate::ops::SESSION_MISMATCH,
+                                "the job is driving another session",
+                            )
+                            .with_details(json!({"session_id":actual}))),
+                        );
+                    } else {
+                        abort = true;
+                    }
+                }
+                Ok(control::ControlOp::Ctl(_)) => pending.push(req.clone()),
+                Err(error) => {
+                    if let Err(e) = control::respond(&req, Err(error.clone())) {
                         self.log("control", &e.to_string());
                     }
                 }
             }
         }
-        abort
+        (abort, pending)
     }
     fn stop_requested(&self) -> bool {
-        self.cancel.load(Ordering::SeqCst) || self.controls()
+        self.cancel.load(Ordering::SeqCst) || self.controls().0
     }
     pub(crate) fn check_stop(&self) -> Result<(), Failure> {
         if self.stop_requested() {
@@ -181,11 +213,45 @@ impl Worker {
             Ok(())
         }
     }
+    fn mark_holder(&self, lock: &lock::SessionLock) {
+        let holder = lock::Holder {
+            v: 1,
+            kind: lock::HolderKind::Job,
+            job_id: Some(self.id.as_str().into()),
+            pid: std::process::id(),
+            start: liveness::current().map(|i| i.start),
+        };
+        if let Err(e) = lock::mark(lock, &holder) {
+            self.log("holder", &e.to_string());
+        }
+    }
+    fn answer_control(
+        &self,
+        req: &control::Request,
+        result: Result<Option<Value>, crate::ops::OpError>,
+    ) {
+        if let Err(e) = control::respond(req, result) {
+            self.log("control", &e.to_string());
+        }
+    }
     fn respond_pending(&self) {
         for req in control::poll(&self.store.dir(&self.id)) {
-            let result = match &req.op {
-                Ok(_) => Ok(()),
-                Err(op) => Err(("unsupported_op", format!("unsupported control op: {op}"))),
+            if self.control_in_flight.as_ref() == Some(&req.path) {
+                continue;
+            }
+            let result = if control::expired(&req) {
+                Err(control::expired_error())
+            } else {
+                match &req.op {
+                    Ok(control::ControlOp::Abort) => Ok(Some(
+                        json!({"job_status": self.status.status,"session_id":self.status.actual_session_id.as_ref().or(self.job.session_id.as_ref()),"queued":self.omp_queued}),
+                    )),
+                    Ok(control::ControlOp::Ctl(_)) => Err(crate::ops::OpError::new(
+                        crate::ops::JOB_ENDED,
+                        "the glen job ended before the control ran; glen retries on the session",
+                    )),
+                    Err(error) => Err(error.clone()),
+                }
             };
             if let Err(e) = control::respond(&req, result) {
                 self.log("control", &e.to_string());
@@ -300,6 +366,7 @@ impl Worker {
                 })?;
             match acquired {
                 lock::Acquired::Locked { lock, waited } => {
+                    self.mark_holder(&lock);
                     session_lock = Some(lock);
                     self.status.waited_ms = Some(waited.as_millis().min(u64::MAX as u128) as u64);
                     self.status.waiting_for_lock = false;
@@ -348,6 +415,7 @@ impl Worker {
             warnings,
             replies,
         } = started;
+        self.omp_queued = baseline.queued_message_count > 0;
         self.status.omp_pid = client.pid();
         self.status.warnings.extend(warnings);
         self.save()?;
@@ -364,6 +432,11 @@ impl Worker {
                     lock::try_acquire(&self.store.home, &baseline.session_id)?
                         .ok_or_else(|| Failure::new("internal", "cannot lock the new session"))?,
                 );
+            }
+            if self.job.route == Route::New
+                && let Some(lock) = &session_lock
+            {
+                self.mark_holder(lock);
             }
             self.status.actual_session_id = Some(baseline.session_id.clone());
             self.status.actual_session_file =
@@ -470,6 +543,7 @@ impl Worker {
         }
     }
     fn apply_state(&mut self, s: omp_rpc::SessionState, baseline: &str, sink: &ReplySink) {
+        self.omp_queued = s.queued_message_count > 0;
         if s.session_id != baseline {
             self.status.forked = Some(Forked {
                 from: baseline.into(),
@@ -563,7 +637,9 @@ impl Worker {
         let live_handle = self.job.session_handle.clone();
         let mut run = Run::default();
         let mut ack_pending = true;
-        std::thread::scope(|scope| -> Result<(), Failure> {
+        let (control_tx, control_rx) =
+            mpsc::channel::<(control::Request, Result<Value, crate::ops::OpError>)>();
+        let result = std::thread::scope(|scope| -> Result<(), Failure> {
             let (tx, rx) = mpsc::channel();
             let phase = &phase;
             scope.spawn(move || {
@@ -707,11 +783,43 @@ impl Worker {
                         }
                     });
                 }
-                if self.stop_requested() {
+                while let Ok((req, result)) = control_rx.try_recv() {
+                    self.answer_control(&req, result.map(Some));
+                    self.control_in_flight = None;
+                }
+                let (abort, pending) = self.controls();
+                if self.cancel.load(Ordering::SeqCst) || abort {
                     run.stop = Some(StopReason::Cancelled);
                 }
                 if Instant::now() >= self.deadline && run.prompt.is_none() && run.stop.is_none() {
                     run.stop = Some(StopReason::Timeout);
+                }
+                if run.stop.is_none()
+                    && self.control_in_flight.is_none()
+                    && let Some(req) = pending.into_iter().next()
+                    && let Ok(control::ControlOp::Ctl(op)) = &req.op
+                {
+                    if matches!(op, crate::ops::Op::Compact(_)) {
+                        self.answer_control(&req, Err(crate::ops::OpError::new(crate::ops::BUSY, "a glen job is running on this session; wait for it (`glen wait <j>`) or `glen abort <session>` first")));
+                    } else if control::expired(&req) {
+                        self.answer_control(&req, Err(control::expired_error()));
+                    } else {
+                        self.control_in_flight = Some(req.path.clone());
+                        let op = op.clone();
+                        let tx = control_tx.clone();
+                        let deadline = self.deadline;
+                        scope.spawn(move || {
+                            let result = crate::ctl::exec::exec_until(
+                                client,
+                                &op,
+                                req.expect_session_id.as_deref(),
+                                Some(deadline),
+                            );
+                            if tx.send((req, result)).is_err() {
+                                eprintln!("worker control receiver closed");
+                            }
+                        });
+                    }
                 }
                 if run.stop.is_some() {
                     let mut guard = phase
@@ -733,13 +841,26 @@ impl Worker {
                     }
                     Next::HardKill => {
                         if let Some(pid) = client.pid() {
-                            kill_group(pid, rustix::process::Signal::TERM);
+                            if let Err(e) = rpc::kill_group(pid, rustix::process::Signal::TERM) {
+                                self.log("kill", &e.to_string());
+                            }
                             std::thread::sleep(rpc::KILL_GRACE);
-                            kill_group(pid, rustix::process::Signal::KILL);
+                            if let Err(e) = rpc::kill_group(pid, rustix::process::Signal::KILL) {
+                                self.log("kill", &e.to_string());
+                            }
                         }
                         run.killed = true;
                     }
                     Next::Finish(t) => {
+                        if t.state == State::Aborted
+                            && run.stop == Some(StopReason::Cancelled)
+                            && self.controls().0
+                        {
+                            match client.call(&PollState(GetStateCommand {})) {
+                                Ok(state) => self.apply_state(state, baseline, sink),
+                                Err(error) => self.log("abort state", &error.to_string()),
+                            }
+                        }
                         // Source drain is the completion barrier, including command_output
                         // emitted immediately before a local ack.
                         for ev in events.try_iter() {
@@ -770,7 +891,17 @@ impl Worker {
                     }
                 }
             }
-        })
+        });
+        // The terminal publication above skips the in-flight request. Only its
+        // actual result may acknowledge it after the scoped thread has joined.
+        while let Ok((req, answer)) = control_rx.try_recv() {
+            self.answer_control(&req, answer.map(Some));
+            self.control_in_flight = None;
+        }
+        if self.control_in_flight.take().is_some() {
+            self.respond_pending();
+        }
+        result
     }
     fn finish_run(
         &mut self,
@@ -896,14 +1027,6 @@ fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
     f.hint=Some("close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)".into());
     Err(f)
 }
-fn kill_group(pid: u32, signal: rustix::process::Signal) {
-    if let Some(pid) = rustix::process::Pid::from_raw(pid as i32)
-        && let Err(e) = rustix::process::kill_process_group(pid, signal)
-        && e != rustix::io::Errno::SRCH
-    {
-        eprintln!("cannot signal omp group: {e}");
-    }
-}
 struct Started {
     client: Client,
     events: Receiver<Event>,
@@ -1012,22 +1135,7 @@ fn test_delay(key: &str) -> Duration {
         Duration::ZERO
     }
 }
-// These calls must not hold the polling thread (or submission gate) for CALL_TIMEOUT.
-macro_rules! polling_command {
-    ($name:ident, $inner:ty, $timeout:expr) => {
-        #[derive(serde::Serialize)]
-        #[serde(transparent)]
-        struct $name($inner);
-        impl Command for $name {
-            const NAME: &'static str = <$inner as Command>::NAME;
-            const TIMEOUT_MS: Option<u64> = Some($timeout);
-            type Output = <$inner as Command>::Output;
-            fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-                <$inner as Command>::decode(data)
-            }
-        }
-    };
-}
+use super::polling_command;
 polling_command!(SubmitPrompt, PromptCommand, 100);
 polling_command!(PollState, GetStateCommand, 100);
 polling_command!(StateSecond, GetStateCommand, 1000);
@@ -1358,6 +1466,8 @@ mod tests {
             store,
             id,
             job,
+            control_in_flight: None,
+            omp_queued: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + Duration::from_secs(10),
         };
@@ -1396,6 +1506,8 @@ mod tests {
             store,
             id,
             job,
+            control_in_flight: None,
+            omp_queued: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: now - Duration::from_secs(1),
         };
@@ -1708,5 +1820,109 @@ mod tests {
             panic!("not terminal")
         };
         assert_eq!(t.error.unwrap().code, "timeout");
+    }
+}
+
+#[cfg(test)]
+mod control_tests {
+    use super::*;
+    fn worker(root: &std::path::Path) -> Worker {
+        let store = crate::jobs::tests::store(root);
+        let job = crate::jobs::tests::job();
+        let id = JobId::parse(&job.id).unwrap();
+        store.create(&job).unwrap();
+        Worker {
+            status: store.read_status(&id).unwrap(),
+            store,
+            id,
+            job,
+            cancel: Arc::new(AtomicBool::new(false)),
+            deadline: Instant::now() + Duration::from_secs(10),
+            control_in_flight: None,
+            omp_queued: false,
+        }
+    }
+    fn write(w: &Worker, name: &str, op: Value) -> std::path::PathBuf {
+        let dir = w
+            .store
+            .home
+            .ensure_dir(&format!("jobs/{}/control", w.id.as_str()))
+            .unwrap();
+        let path = dir.join(format!("{name}.json"));
+        crate::jobs::write_json(&path, &op).unwrap();
+        path
+    }
+    fn done(path: &std::path::Path) -> Value {
+        serde_json::from_slice(&std::fs::read(path.with_extension("done.json")).unwrap()).unwrap()
+    }
+    #[test]
+    fn controls_classify_without_dispatching_before_ready_and_expire_abort() {
+        let temp = tempfile::tempdir().unwrap();
+        let w = worker(temp.path());
+        let first = write(&w, "1", json!({"v":1,"op":"list_models"}));
+        write(
+            &w,
+            "2",
+            json!({"v":1,"op":"set_thinking_level","args":{"level":"high"}}),
+        );
+        let expired = write(&w, "3", json!({"v":1,"op":"abort","deadline_ms":1}));
+        let malformed = write(&w, "4", json!({"v":1,"op":"set_model"}));
+        let mismatch = write(
+            &w,
+            "5",
+            json!({"v":1,"op":"abort","args":{"expect_session_id":"other"}}),
+        );
+        let (abort, pending) = w.controls();
+        assert!(!abort);
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[0].path, first);
+        assert!(first.exists());
+        assert_eq!(done(&expired)["error"]["code"], crate::ops::TIMEOUT);
+        assert_eq!(done(&malformed)["error"]["code"], crate::ops::BAD_REQUEST);
+        assert_eq!(
+            done(&mismatch)["error"]["code"],
+            crate::ops::SESSION_MISMATCH
+        );
+        write(&w, "6", json!({"v":1,"op":"abort"}));
+        assert!(w.controls().0);
+    }
+    #[test]
+    fn terminal_acknowledgements_skip_inflight_and_keep_typed_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        w.status.status = State::Aborted;
+        w.omp_queued = true;
+        let abort = write(&w, "1", json!({"v":1,"op":"abort"}));
+        let deferred = write(&w, "2", json!({"v":1,"op":"list_models"}));
+        let inflight = write(
+            &w,
+            "3",
+            json!({"v":1,"op":"set_thinking_level","args":{"level":"high"}}),
+        );
+        w.control_in_flight = Some(inflight.clone());
+        w.respond_pending();
+        assert_eq!(
+            done(&abort)["data"],
+            json!({"job_status":"aborted","session_id":w.job.session_id,"queued":true})
+        );
+        assert_eq!(done(&deferred)["error"]["code"], crate::ops::JOB_ENDED);
+        assert!(inflight.exists());
+        assert!(!inflight.with_extension("done.json").exists());
+        w.control_in_flight = None;
+        w.respond_pending();
+        assert_eq!(done(&inflight)["error"]["code"], crate::ops::JOB_ENDED);
+    }
+    #[test]
+    fn holder_is_published_on_the_held_inode() {
+        let temp = tempfile::tempdir().unwrap();
+        let w = worker(temp.path());
+        let id = w.job.session_id.as_deref().unwrap();
+        let lock = lock::try_acquire(&w.store.home, id).unwrap().unwrap();
+        w.mark_holder(&lock);
+        let holder = lock::holder(&w.store.home, id).unwrap();
+        assert_eq!(holder.kind, lock::HolderKind::Job);
+        assert_eq!(holder.job_id.as_deref(), Some(w.id.as_str()));
+        assert_eq!(holder.pid, std::process::id());
+        assert!(lock::is_held(&w.store.home, id));
     }
 }

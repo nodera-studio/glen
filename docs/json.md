@@ -34,7 +34,7 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 | 4 | false | `ambiguous` | use a candidate handle |
 | 5 | false | `omp_unavailable` | omp missing, broken or timed out |
 | 6 | false | `no_route` | refusal: live owner, unknown lease, or sandbox |
-| 7 | false | `job_failed` | failed, aborted or lost job |
+| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job |
 | 8 | false | `not_implemented` | hidden unfinished command |
 | 10 | true | running | job continues; use wait |
 | 11 | true | forked | use forked.to_handle |
@@ -975,3 +975,34 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `changed_during_install` | install-extension | extension file or directory changed during install; skipped |
 
 New visible commands and visible aliases must add a section and contract runner in their own wave.
+
+
+## `glen abort`
+
+`glen abort <session> [--timeout DUR]` stops the active run. Data fields are `session:{id,handle,path}`, `route:live|job|none`, `was:busy|idle`, `aborted`, `idle_after`, `queued`, `queued_jobs` (job handles). The job route adds `job` and `job_status`; `aborted` means that job ended aborted. An idle abort starts nothing. `abort_pending` means omp has not become idle; `jobs_queued` means waiting glen jobs start next. Queued omp messages remain queued.
+
+## `glen stop`
+
+Visible alias of `glen abort`, with exactly the same arguments and envelope.
+
+## `glen models`
+
+`glen models [session] [--provider P] [--timeout DUR]` returns `session` (null without a target), `route`, `current:{provider,id}|null`, `current_source:session|disk|null`, `thinking_level`, `thinking_configured`, `default_model:{provider,id}|null`, `total`, and `models`. Rows are `{provider,id,name,reasoning,thinking_levels,context_window,max_tokens,current}` sorted by provider then id. Provider filtering is case-insensitive and happens before `total`.
+
+Without a target omp starts with `--no-session`; `default_model` is that in-memory selection and current is null. Disk fallback never resumes the target. No thinking entry means null; configured thinking (including auto) is retained when recorded. Endpoint-only fallback has null selection and `not_yet_persisted`. Other fallbacks can warn `session_unreachable` or `extension_outdated`. No GLEN_HOME is created except for oversized output spill.
+
+## `glen model`
+
+`glen model <session> <spec> [--timeout DUR]` returns `{session,route,model:{provider,id,name},previous:{provider,id}|null,changed,thinking_level,thinking_levels,busy,scope:"session",forked}`. Exact provider/id wins; otherwise a case-insensitive full pair or bare id must be unique. Ambiguity exits 4 with `details.candidates:[{provider,id,name}]`; not found exits 3. omp records even an unchanged model selection. `thinking_changed` reports a changed effective level. Busy changes apply to the next model request.
+
+## `glen thinking`
+
+`glen thinking <session> <level> [--timeout DUR]` returns `{session,route,thinking_level,requested,previous,changed,model:{provider,id}|null,available,busy,scope:"session",forked}`. Levels are off|minimal|low|medium|high|xhigh|max, validated against the current model before a set call. Invalid model levels exit 2 usage with `details.reason:"invalid_level"`, available and model. `thinking_clamped` reports an effective level differing from requested. auto/inherit are not offered.
+
+## `glen compact`
+
+`glen compact <session> [--instructions TEXT] [--timeout DUR]` returns `{session,route,compacted:true,tokens_before,tokens_after,forked}`. Instructions are at most 524288 bytes. Streaming, compacting, queued messages or an active job refuse with control_failed/busy. Token fields are null when not reported.
+
+All controls use one 90s default command deadline, accept a positive `--timeout DUR`, and route live → owning job → unowned RPC. JSON emits one envelope and empty stderr. Mutations never persist global settings. A changed post-op session id exits 11 with `forked:{from,to,to_handle}`; otherwise forked is null. Model/thinking changes on endpoint-only sessions warn `not_yet_persisted` until omp's first answer writes the file.
+
+`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol. Missing credentials include an omp-login hint. RPC deadlines and SIGINT stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT exits 130 with `{status:"interrupted",session,route,interrupted:true,hint}`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.

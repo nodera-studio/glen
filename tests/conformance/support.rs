@@ -21,6 +21,25 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
 /// The one command still hidden after W3 and W4 (AC-301, AC-401).
+pub const VISIBLE: [&str; 17] = [
+    "ls",
+    "show",
+    "tail",
+    "send",
+    "wait",
+    "jobs",
+    "abort",
+    "models",
+    "model",
+    "thinking",
+    "compact",
+    "inbox",
+    "install-extension",
+    "install-skill",
+    "doctor",
+    "completions",
+    "help",
+];
 pub const HIDDEN: [&str; 1] = ["watch"];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
@@ -531,4 +550,19 @@ pub fn lexical(p: &Path) -> PathBuf {
         }
     }
     out
+}
+
+/// More visible commands make some completion envelopes exceed the default
+/// output budget. Inspect the complete document without disabling spill checks.
+pub fn completion_data(mut out: Out) -> Value {
+    let envelope = out.ok_envelope();
+    if let Some(spilled) = envelope.get("spilled") {
+        assert_eq!(spilled["format"], "json");
+        let path = PathBuf::from(spilled["path"].as_str().unwrap());
+        assert!(path.is_absolute());
+        let bytes = fs::read(path).unwrap();
+        assert_eq!(bytes.len() as u64, spilled["bytes"].as_u64().unwrap());
+        out.stdout = bytes;
+    }
+    out.ok_data()
 }

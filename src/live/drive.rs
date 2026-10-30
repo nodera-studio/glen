@@ -189,8 +189,18 @@ fn on_frame(
 }
 fn controls(w: &Worker) {
     for req in control::poll(&w.store.dir(&w.id)) {
-        let message=match &req.op {Ok(_)=>"abort of a live session needs session controls (a later glen version); the turn keeps running".into(),Err(op)=>format!("unsupported control op: {op}")};
-        if let Err(e) = control::respond(&req, Err(("unsupported_op", message))) {
+        let result = match &req.op {
+            Ok(control::ControlOp::Abort) => Err(crate::ops::OpError::new(
+                crate::ops::UNSUPPORTED_OP,
+                "stop the run with `glen abort <session>`",
+            )),
+            Ok(control::ControlOp::Ctl(_)) => Err(crate::ops::OpError::new(
+                crate::ops::UNSUPPORTED_OP,
+                "live sessions take controls on their socket; run `glen <command> <session>`",
+            )),
+            Err(error) => Err(error.clone()),
+        };
+        if let Err(e) = control::respond(&req, result) {
             w.log("control", &e.to_string());
         }
     }
@@ -377,6 +387,8 @@ mod tests {
                 id,
                 job,
                 status,
+                control_in_flight: None,
+                omp_queued: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 deadline: Instant::now() + std::time::Duration::from_secs(20),
             },

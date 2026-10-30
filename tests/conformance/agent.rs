@@ -1118,20 +1118,11 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
         out.assert_exit(0);
         assert_eq!(
             command_names(&out.out()),
-            [
-                "completions",
-                "doctor",
-                "help",
-                "inbox",
-                "install-extension",
-                "install-skill",
-                "jobs",
-                "ls",
-                "send",
-                "show",
-                "tail",
-                "wait"
-            ],
+            {
+                let mut names = VISIBLE;
+                names.sort();
+                names
+            },
             "{}",
             out.ctx()
         );
@@ -1191,7 +1182,7 @@ fn ac401_worker_appears_in_no_help_page_and_no_completion_script() {
             raw.out().contains("install-skill"),
             "{shell} script lacks install-skill"
         );
-        let data = sb.glen(["completions", shell, "--json"]).run().ok_data();
+        let data = completion_data(sb.glen(["completions", shell, "--json"]).run());
         assert!(!data["script"].as_str().unwrap().contains("__worker"));
     }
 }

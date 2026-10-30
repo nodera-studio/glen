@@ -1,0 +1,352 @@
+//! Foreground, lock-owning RPC clients. Only omp writes the resumed transcript.
+use crate::{
+    error::{ErrorCode, GlenError, Warning},
+    glen_home::GlenHome,
+    jobs::{
+        Forked,
+        lock::{self, SessionLock},
+    },
+    omp::{
+        continuation,
+        lease::{self, Lease},
+        paths::OmpPaths,
+        session::Session,
+    },
+    ops::{self, Op, OpError},
+    rpc,
+};
+use omp_rpc::{Client, ClientOptions, Event, SessionState};
+use serde_json::Value;
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, RecvTimeoutError},
+    },
+    time::{Duration, Instant},
+};
+pub(crate) enum OpenError {
+    Busy,
+    Reroute,
+    Failed(GlenError),
+    Stopped(OpError),
+}
+impl From<GlenError> for OpenError {
+    fn from(e: GlenError) -> Self {
+        Self::Failed(e)
+    }
+}
+pub struct Ephemeral {
+    client: Option<Arc<Client>>,
+    events: Receiver<Event>,
+    lock: Option<SessionLock>,
+    baseline: Box<SessionState>,
+    deadline: Instant,
+    stop: Arc<AtomicBool>,
+    warnings: Vec<Warning>,
+}
+pub(crate) fn stopped(deadline: Instant, stop: &AtomicBool) -> Result<(), OpError> {
+    if stop.load(Ordering::SeqCst) {
+        Err(OpError::new(
+            "interrupted",
+            "the glen command was interrupted",
+        ))
+    } else if Instant::now() >= deadline {
+        Err(OpError::new(
+            ops::TIMEOUT,
+            "the glen command deadline passed",
+        ))
+    } else {
+        Ok(())
+    }
+}
+impl Ephemeral {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn open_session(
+        home: &GlenHome,
+        paths: &OmpPaths,
+        session: &Session,
+        profile: Option<&str>,
+        bin: &Path,
+        cwd: &Path,
+        deadline: Instant,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self, OpenError> {
+        stopped(deadline, &stop).map_err(OpenError::Stopped)?;
+        let id = &session.header.id;
+        let Some(lock) = lock::try_acquire(home, id)
+            .map_err(|e| GlenError::new(ErrorCode::Io, format!("cannot lock session {id}: {e}")))?
+        else {
+            return Err(OpenError::Busy);
+        };
+        let mut warnings = vec![];
+        let holder = lock::Holder {
+            v: 1,
+            kind: lock::HolderKind::Control,
+            job_id: None,
+            pid: std::process::id(),
+            start: crate::jobs::liveness::current().map(|i| i.start),
+        };
+        if let Err(e) = lock::mark(&lock, &holder) {
+            warnings.push(Warning {
+                code: "holder_unavailable".into(),
+                message: format!("cannot mark control holder for session {id}: {e}"),
+            });
+        }
+        let followed = continuation::follow(&session.path)?;
+        let current = Session::load(&followed.path).map_err(|e| {
+            GlenError::new(
+                ErrorCode::Io,
+                format!("cannot re-read session {}: {e}", followed.path.display()),
+            )
+        })?;
+        if current.header.id != *id {
+            return Err(OpenError::Failed(moved(id, &current.header.id)));
+        }
+        match crate::live::route::find(
+            home,
+            id,
+            crate::live::HELLO_PROBE.min(deadline.saturating_duration_since(Instant::now())),
+        ) {
+            crate::live::route::Endpoint::Live { .. }
+            | crate::live::route::Endpoint::Unhealthy { .. } => return Err(OpenError::Reroute),
+            _ => (),
+        }
+        let probe = lease::probe(&paths.session_owners_dir, id);
+        if !matches!(probe, Lease::Free) {
+            return Err(OpenError::Failed(
+                GlenError::new(
+                    ErrorCode::NoRoute,
+                    format!(
+                        "session {id} has an omp owner or its lease is unknown ({})",
+                        lease::state_detail(&probe).unwrap_or_default()
+                    ),
+                )
+                .with_hint(crate::live::route::lease_held_hint(paths)),
+            ));
+        }
+        let mut command = rpc::base_command(bin, profile, cwd);
+        command.arg("--resume").arg(&followed.path);
+        let mut opened = Self::spawn(command, Some(lock), deadline, stop)?;
+        opened.warnings.extend(warnings);
+        if opened.baseline.session_id != *id {
+            return Err(OpenError::Failed(moved(id, &opened.baseline.session_id)));
+        }
+        Ok(opened)
+    }
+    pub(crate) fn open_listing(
+        profile: Option<&str>,
+        bin: &Path,
+        cwd: &Path,
+        deadline: Instant,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self, OpenError> {
+        let mut command = rpc::base_command(bin, profile, cwd);
+        command.arg("--no-session");
+        Self::spawn(command, None, deadline, stop)
+    }
+    fn spawn(
+        command: std::process::Command,
+        lock: Option<SessionLock>,
+        deadline: Instant,
+        stop: Arc<AtomicBool>,
+    ) -> Result<Self, OpenError> {
+        stopped(deadline, &stop).map_err(OpenError::Stopped)?;
+        let ready_deadline = (Instant::now() + rpc::READY_TIMEOUT).min(deadline);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let result = Client::spawn(
+                command,
+                ClientOptions {
+                    tools: vec![],
+                    uris: vec![],
+                    ready_timeout: ready_deadline.saturating_duration_since(Instant::now()),
+                    default_timeout: rpc::CALL_TIMEOUT,
+                },
+            )
+            .and_then(|(client, events)| {
+                let baseline = client.call(&omp_rpc::GetStateCommand {})?;
+                Ok((Arc::new(client), events, baseline))
+            });
+            if let Err(late) = tx.send(result) {
+                drop(late);
+            }
+        });
+        loop {
+            stopped(deadline, &stop).map_err(OpenError::Stopped)?;
+            match rx.recv_timeout(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(Ok((client, events, baseline))) => {
+                    return Ok(Self {
+                        client: Some(client),
+                        events,
+                        lock,
+                        baseline: Box::new(baseline),
+                        deadline,
+                        stop,
+                        warnings: vec![],
+                    });
+                }
+                Ok(Err(error)) => {
+                    if Instant::now() >= deadline {
+                        return Err(OpenError::Stopped(OpError::new(
+                            ops::TIMEOUT,
+                            "omp startup exceeded the command deadline",
+                        )));
+                    }
+                    return Err(OpenError::Failed(
+                        GlenError::new(
+                            ErrorCode::OmpUnavailable,
+                            format!("cannot start omp for session control: {error}"),
+                        )
+                        .with_hint("check omp or set GLEN_OMP_BIN"),
+                    ));
+                }
+                Err(RecvTimeoutError::Timeout) => (),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(OpenError::Stopped(OpError::new(
+                        ops::INTERNAL,
+                        "omp startup thread ended",
+                    )));
+                }
+            }
+        }
+    }
+    fn terminate(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if Arc::strong_count(&client) > 1
+            && let Some(pid) = client.pid()
+        {
+            if let Err(e) = rpc::kill_group(pid, rustix::process::Signal::TERM) {
+                self.warnings.push(Warning {
+                    code: "teardown_error".into(),
+                    message: e.to_string(),
+                });
+            }
+            let end = Instant::now() + Duration::from_secs(1);
+            while Arc::strong_count(&client) > 1 && Instant::now() < end {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            if Arc::strong_count(&client) > 1 {
+                if let Err(e) = rpc::kill_group(pid, rustix::process::Signal::KILL) {
+                    self.warnings.push(Warning {
+                        code: "teardown_error".into(),
+                        message: e.to_string(),
+                    });
+                }
+                let end = Instant::now() + Duration::from_secs(1);
+                while Arc::strong_count(&client) > 1 && Instant::now() < end {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+        match Arc::try_unwrap(client) {
+            Ok(client) => {
+                if let Err(e) = client.close() {
+                    self.warnings.push(Warning {
+                        code: "teardown_error".into(),
+                        message: e.to_string(),
+                    });
+                }
+            }
+            Err(client) => {
+                self.warnings.push(Warning {
+                    code: "teardown_error".into(),
+                    message: "omp was stopped but its control thread has not returned".into(),
+                });
+                drop(client);
+            }
+        }
+    }
+    fn run(&mut self, op: Option<Op>, expect: Option<String>) -> Result<Value, OpError> {
+        stopped(self.deadline, &self.stop)?;
+        let (tx, rx) = mpsc::channel();
+        let client = self
+            .client
+            .as_ref()
+            .ok_or_else(|| OpError::new(ops::OMP_ERROR, "omp client is closed"))?
+            .clone();
+        let deadline = self.deadline;
+        std::thread::spawn(move || {
+            let result = match op {
+                Some(op) => {
+                    super::exec::exec_until(&client, &op, expect.as_deref(), Some(deadline))
+                }
+                None => super::exec::state(&client).and_then(|s| {
+                    serde_json::to_value(s).map_err(|e| OpError::new(ops::INTERNAL, e.to_string()))
+                }),
+            };
+            if tx.send(result).is_err() {
+                drop(client);
+            }
+        });
+        let result = loop {
+            if let Err(error) = stopped(self.deadline, &self.stop) {
+                self.terminate();
+                break Err(error);
+            }
+            match rx.recv_timeout(
+                Duration::from_millis(100)
+                    .min(self.deadline.saturating_duration_since(Instant::now())),
+            ) {
+                Ok(result) => break result,
+                Err(RecvTimeoutError::Timeout) => (),
+                Err(_) => break Err(OpError::new(ops::INTERNAL, "omp control thread ended")),
+            }
+        };
+        for event in self.events.try_iter() {
+            if let Event::Notification(omp_rpc::RpcNotification::RpcAgentEvent(
+                omp_rpc::RpcAgentEvent::Notice(notice),
+            )) = event
+                && notice.source.as_deref() == Some("session-persistence")
+                && notice.level.as_str() == "error"
+            {
+                self.warnings.push(Warning {
+                    code: "persistence_error".into(),
+                    message: notice.message,
+                });
+            }
+        }
+        if result.as_ref().is_err_and(|e| e.code == ops::TIMEOUT) {
+            self.terminate();
+        }
+        result
+    }
+    pub fn session_id(&self) -> &str {
+        &self.baseline.session_id
+    }
+    pub fn call(&mut self, op: &Op, expect: Option<&str>) -> Result<Value, OpError> {
+        self.run(Some(op.clone()), expect.map(str::to_owned))
+    }
+    pub fn finish(mut self) -> Result<(Option<Forked>, Vec<Warning>), OpError> {
+        let final_state = self.run(None, None)?;
+        let to = final_state["sessionId"]
+            .as_str()
+            .ok_or_else(|| OpError::new(ops::INTERNAL, "final omp state has no session id"))?;
+        let forked = (to != self.baseline.session_id).then(|| Forked {
+            from: self.baseline.session_id.clone(),
+            to: to.into(),
+        });
+        self.terminate();
+        self.lock.take();
+        Ok((forked, std::mem::take(&mut self.warnings)))
+    }
+}
+impl Drop for Ephemeral {
+    fn drop(&mut self) {
+        self.terminate();
+        self.lock.take();
+    }
+}
+fn moved(from: &str, to: &str) -> GlenError {
+    GlenError::new(
+        ErrorCode::ControlFailed,
+        "the session moved before the control could run",
+    )
+    .with_details(serde_json::json!({"reason":"session_moved","from":from,"to":to}))
+    .with_hint("run `glen ls` and retry on the new handle")
+}

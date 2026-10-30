@@ -1,0 +1,157 @@
+[
+  {
+    "provider": "fake",
+    "id": "fake-1",
+    "name": "fake fake-1",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:1",
+    "reasoning": true,
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    },
+    "contextWindow": 200000,
+    "maxTokens": 8192,
+    "thinking": {
+      "mode": "effort",
+      "efforts": [
+        "low",
+        "medium",
+        "high"
+      ]
+    }
+  },
+  {
+    "provider": "fake",
+    "id": "fake-2",
+    "name": "fake fake-2",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:1",
+    "reasoning": false,
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    },
+    "contextWindow": 200000,
+    "maxTokens": 8192,
+    "thinking": {
+      "mode": "effort",
+      "efforts": []
+    }
+  },
+  {
+    "provider": "other",
+    "id": "fake-2",
+    "name": "other fake-2",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:1",
+    "reasoning": true,
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    },
+    "contextWindow": 200000,
+    "maxTokens": 8192,
+    "thinking": {
+      "mode": "effort",
+      "efforts": [
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    }
+  },
+  {
+    "provider": "router",
+    "id": "vendor/m-3",
+    "name": "router vendor/m-3",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:1",
+    "reasoning": true,
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    },
+    "contextWindow": 200000,
+    "maxTokens": 8192,
+    "thinking": {
+      "mode": "effort",
+      "efforts": [
+        "low",
+        "high"
+      ]
+    }
+  },
+  {
+    "provider": "vendor",
+    "id": "m-3",
+    "name": "vendor m-3",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:1",
+    "reasoning": true,
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    },
+    "contextWindow": 200000,
+    "maxTokens": 8192,
+    "thinking": {
+      "mode": "effort",
+      "efforts": [
+        "low",
+        "high"
+      ]
+    }
+  },
+  {
+    "provider": "nokey",
+    "id": "locked-1",
+    "name": "nokey locked-1",
+    "api": "openai-completions",
+    "baseUrl": "http://127.0.0.1:1",
+    "reasoning": false,
+    "input": [
+      "text"
+    ],
+    "cost": {
+      "input": 0,
+      "output": 0,
+      "cacheRead": 0,
+      "cacheWrite": 0
+    },
+    "contextWindow": 200000,
+    "maxTokens": 8192,
+    "thinking": {
+      "mode": "effort",
+      "efforts": []
+    }
+  }
+]

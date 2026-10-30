@@ -63,20 +63,8 @@ fn harness_process_probes_see_a_live_process_group() {
 #[test]
 fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
     let sb = Sandbox::new();
-    let want = [
-        "completions",
-        "doctor",
-        "help",
-        "inbox",
-        "install-extension",
-        "install-skill",
-        "jobs",
-        "ls",
-        "send",
-        "show",
-        "tail",
-        "wait",
-    ];
+    let mut want = VISIBLE;
+    want.sort();
     for args in [["--help"], ["-h"], ["help"]] {
         let out = sb.glen(args).run();
         out.assert_exit(0);
@@ -102,7 +90,10 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
         for name in ["send", "wait", "jobs"] {
             assert!(out.out().contains(name), "{shell} script lacks {name}");
         }
-        let data = sb.glen(["completions", shell, "--json"]).run().ok_data();
+        // JSON-wrapped scripts may spill now that controls enlarge them;
+        // keep that allowed output state separate from the raw/help lazy check.
+        let json_sb = Sandbox::new();
+        let data = completion_data(json_sb.glen(["completions", shell, "--json"]).run());
         assert!(!data["script"].as_str().unwrap().contains("__worker"));
     }
     assert!(
@@ -1471,7 +1462,11 @@ fn assert_cancelled_quickly(rb: &RpcBox, id: &str, since: Instant) {
     assert_eq!(st["error"]["code"], "cancelled", "{st}");
     assert!(took <= ABORT_BOUND, "abort took {took:?}");
     let done = rb.wait_file(&rb.job_dir(id).join("control/a.done.json"), LONG);
-    assert_eq!(done, json!({"v": 1, "ok": true}));
+    // W3b AC-356: the acknowledgement reports the terminal job status.
+    assert_eq!(
+        done,
+        json!({"v": 1, "ok": true, "data":{"job_status":"aborted","session_id":A.id,"queued":false}})
+    );
 }
 
 #[test]
@@ -1524,7 +1519,7 @@ fn ac218_unknown_malformed_and_ignored_control_files_leave_the_job_running() {
         let done = rb.wait_file(&control.join(format!("{name}.done.json")), LONG);
         assert_eq!(done["v"], 1, "{name}: {done}");
         assert_eq!(done["ok"], false, "{name}: {done}");
-        assert_eq!(done["error"]["code"], "unsupported_op", "{name}: {done}");
+        assert_eq!(done["error"]["code"], "bad_request", "{name}: {done}");
         assert!(done["error"]["message"].is_string(), "{name}: {done}");
     }
     std::thread::sleep(Duration::from_millis(600));
