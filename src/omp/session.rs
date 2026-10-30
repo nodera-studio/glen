@@ -210,6 +210,14 @@ pub fn text_of(content: &Value, sep: &str) -> String {
             .flatten()
             .filter_map(|v| match v["type"].as_str() {
                 Some("text") => v["text"].as_str().map(str::to_owned),
+                Some(
+                    "image"
+                    | "thinking"
+                    | "redactedThinking"
+                    | "toolCall"
+                    | "fallback"
+                    | "anthropicServerTool",
+                ) => None,
                 Some(t) => Some(format!("[{t}]")),
                 None => None,
             })
@@ -383,6 +391,31 @@ mod fixture_tests {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+    use serde_json::json;
+    #[test]
+    fn user_images_do_not_become_text_placeholders() {
+        let message = json!({"role":"user","content":[
+            {"type":"text","text":"look"},
+            {"type":"image","data":"opaque","mimeType":"image/png"}
+        ]});
+        assert_eq!(text_of(&message["content"], "\n"), "look");
+    }
+    #[test]
+    fn only_unknown_blocks_become_text_placeholders() {
+        let content = json!([
+            {"type":"text","text":"visible"},
+            {"type":"image"},
+            {"type":"thinking"},
+            {"type":"redactedThinking"},
+            {"type":"toolCall"},
+            {"type":"fallback"},
+            {"type":"anthropicServerTool"},
+            {"type":"future_block"},
+            {"type":"text"},
+            {}
+        ]);
+        assert_eq!(text_of(&content, "\n"), "visible\n[future_block]");
+    }
     #[test]
     fn v1_idless_entries_get_stable_linear_ids_in_memory() {
         let bytes = include_bytes!("../../tests/fixtures/v1-session.jsonl");

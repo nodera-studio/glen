@@ -262,6 +262,7 @@ pub fn build(entries: &[&Entry], opts: &ItemOpts) -> Vec<Item> {
                                     })
                                 }
                             }
+                            Some("image" | "fallback" | "anthropicServerTool") => {}
                             Some(t) => prose.push(format!("[{t}]")),
                             None => {}
                         }
@@ -445,17 +446,19 @@ mod regression_tests {
     fn unknown_blocks_survive_all_text_message_paths() {
         let mut bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n".to_vec();
         let mut previous = Value::Null;
-        for (i, role) in ["user", "developer", "custom", "toolResult"]
+        for (i, role) in ["user", "developer", "custom", "toolResult", "assistant"]
             .iter()
             .enumerate()
         {
             let id = i.to_string();
             let e = json!({"type":"message", "id":id,"parentId":previous,"message":{"role":role,"display":true,
-                "content":[{"type":"text","text":"visible"},{"type":"future_block"},{"type":"image"}]}});
+                "content":[{"type":"text","text":"visible"},{"type":"future_block"},{"type":"image"},
+                    {"type":"thinking"},{"type":"redactedThinking"},{"type":"toolCall"},
+                    {"type":"fallback"},{"type":"anthropicServerTool"}]}});
             bytes.extend(format!("{e}\n").bytes());
             previous = id.into();
         }
-        bytes.extend(format!("{}\n",json!({"type":"custom_message","id":"custom-entry","parentId":"3","display":true,"content":[{"type":"future_block"}]})).bytes());
+        bytes.extend(format!("{}\n",json!({"type":"custom_message","id":"custom-entry","parentId":"4","display":true,"content":[{"type":"future_block"}]})).bytes());
         let s = Session::parse(Path::new("blocks"), &bytes).unwrap();
         let items = serde_json::to_value(build(
             &s.active_branch(),
@@ -471,8 +474,13 @@ mod regression_tests {
                 "{item}"
             );
         }
-        for item in &items.as_array().unwrap()[..4] {
-            assert!(item["text"].as_str().unwrap().contains("[image]"));
+        for item in &items.as_array().unwrap()[..5] {
+            let sep = if item["kind"] == "assistant" {
+                "\n\n"
+            } else {
+                "\n"
+            };
+            assert_eq!(item["text"], format!("visible{sep}[future_block]"));
         }
     }
 }

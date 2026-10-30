@@ -198,7 +198,11 @@ pub fn render_item(item: &Item, prev_model: &mut Option<String>, st: &Style<'_>)
                 "◆ assistant",
                 Token::Accent2,
                 timestamp,
-                model.as_deref(),
+                if model != prev_model {
+                    model.as_deref()
+                } else {
+                    None
+                },
                 st,
             );
             *prev_model = model.clone();
@@ -458,7 +462,7 @@ mod tests {
         assert_eq!(
             render('A', ColorDepth::None, Some(80)),
             format!(
-                "· thinking level high\n\n· model anthropic/claude-sonnet-4-5\n\n❯ user · {hm}\n  Why does parser_test flake?\n\n◆ assistant · claude-sonnet-4-5 · {hm}\n  ∴ thinking · 4 words\n  Let me read the test.\n  ↳ read tests/parser_test.rs · ✓ fn parser_test() {{ … }}\n\n◆ assistant · claude-sonnet-4-5 · {hm}\n  The test depends on map order. Fixed."
+                "· thinking level high\n\n· model anthropic/claude-sonnet-4-5\n\n❯ user · {hm}\n  Why does parser_test flake?\n\n◆ assistant · claude-sonnet-4-5 · {hm}\n  ∴ thinking · 4 words\n  Let me read the test.\n  ↳ read tests/parser_test.rs · ✓ fn parser_test() {{ … }}\n\n◆ assistant · {hm}\n  The test depends on map order. Fixed."
             )
         );
     }
