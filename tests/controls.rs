@@ -1021,3 +1021,186 @@ fn ac352_unresponsive_live_endpoint_and_ac363_whole_hello_deadline() {
             .all(|r| r["frame"]["op"] == "hello")
     );
 }
+
+#[test]
+fn fix1_terminal_job_waits_for_in_flight_ack_without_duplicate_model_change() {
+    let b = RpcBox::new();
+    let before = session_lines(&b.omp.session('A')).len();
+    let release = b.omp.tmp.path().join("release");
+    let launched = checked(
+        command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
+            .env("FAKE_OMP_RUN_RELEASE", &release)
+            .env("FAKE_OMP_STATE_DELAY_MS", "950")
+            .output()
+            .unwrap(),
+        10,
+    );
+    let id = job_id(&launched);
+    accepted(&b, id);
+    let child = command(&b, &["model", "e27c0de", "fake/fake-2", "--json"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    fs::write(release, "go").unwrap();
+    let changed = checked(child.wait_with_output().unwrap(), 0);
+    assert_eq!(changed["data"]["route"], "job");
+    b.wait_worker_gone(id);
+    assert_eq!(b.frames_in("set_model").len(), 1);
+    assert_eq!(
+        session_lines(&b.omp.session('A'))
+            .iter()
+            .skip(before)
+            .filter(|line| line["type"] == "model_change")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn fix2_inbox_preflight_past_request_deadline_never_sets_model() {
+    let b = RpcBox::new();
+    let launched = checked(
+        command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
+            .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
+            .env("FAKE_OMP_STATE_DELAY_MS", "1500")
+            .output()
+            .unwrap(),
+        10,
+    );
+    let id = job_id(&launched);
+    accepted(&b, id);
+    let before = b.frames_in("get_state").len();
+    let error = run(
+        &b,
+        &[
+            "model",
+            "e27c0de",
+            "fake/fake-2",
+            "--timeout",
+            "500ms",
+            "--json",
+        ],
+        7,
+    );
+    assert_eq!(error["error"]["details"]["reason"], "timeout");
+    assert!(b.frames_in("get_state").len() > before);
+    let dir = b.job_dir(id).join("control");
+    let ack = poll(Duration::from_secs(5), || {
+        fs::read_dir(&dir).ok()?.flatten().find_map(|entry| {
+            let path = entry.path();
+            path.to_string_lossy()
+                .ends_with(".done.json")
+                .then(|| serde_json::from_slice::<Value>(&fs::read(path).unwrap()).unwrap())
+        })
+    });
+    assert_eq!(ack["error"]["code"], "timeout");
+    assert!(b.frames_in("set_model").is_empty());
+    terminate_job(&b, id);
+}
+
+#[test]
+fn fix7_closed_in_flight_control_after_terminal_retries_once() {
+    let b = RpcBox::new();
+    let launched = checked(
+        command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
+            .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
+            .env("FAKE_OMP_STATE_DELAY_MS", "8000")
+            .output()
+            .unwrap(),
+        10,
+    );
+    let id = job_id(&launched);
+    accepted(&b, id);
+    let before = b.frames_in("get_state").len();
+    let child = command(
+        &b,
+        &[
+            "model",
+            "e27c0de",
+            "fake/fake-2",
+            "--timeout",
+            "25s",
+            "--json",
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    poll(Duration::from_secs(3), || {
+        (b.frames_in("get_state").len() > before).then_some(())
+    });
+    fs::write(
+        b.job_dir(id).join("control/stop.json"),
+        r#"{"v":1,"op":"abort"}"#,
+    )
+    .unwrap();
+    b.wait_terminal(id, Duration::from_secs(13));
+    let fake_pid = b.fake_log().iter().find(|r| r["event"] == "start").unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    // Closing the RPC peer unblocks the control while the worker joins it.
+    let pid = rustix::process::Pid::from_raw(fake_pid as i32).unwrap();
+    rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
+    let changed = checked(child.wait_with_output().unwrap(), 0);
+    assert_eq!(changed["data"]["route"], "rpc");
+    assert_eq!(b.frames_in("set_model").len(), 1);
+    assert_eq!(
+        b.fake_log()
+            .iter()
+            .filter(|r| r["event"] == "start")
+            .count(),
+        2
+    );
+    b.wait_worker_gone(id);
+}
+
+#[test]
+fn fix8_terminal_lock_holder_waits_or_reports_finishing() {
+    for release in [true, false] {
+        let b = RpcBox::new();
+        let launched = launch(&b);
+        let id = job_id(&launched);
+        accepted(&b, id);
+        terminate_job(&b, id);
+        let identity = glen::jobs::liveness::current().unwrap();
+        let lock = hold_glen_lock_as(
+            &home(&b),
+            A_ID,
+            Some(Holder {
+                v: 1,
+                kind: HolderKind::Job,
+                job_id: Some(id.into()),
+                pid: identity.pid,
+                start: Some(identity.start),
+            }),
+        );
+        let mut child = command(&b, &["abort", "e27c0de", "--timeout", "5s", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let start = Instant::now();
+        if release {
+            std::thread::sleep(Duration::from_millis(400));
+            assert!(child.try_wait().unwrap().is_none());
+            drop(lock);
+            let result = checked(child.wait_with_output().unwrap(), 0);
+            assert_eq!(result["data"]["was"], "idle");
+        } else {
+            let error = checked(child.wait_with_output().unwrap(), 7);
+            assert_eq!(error["error"]["details"]["reason"], "busy");
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("a glen job is finishing; retry")
+            );
+            assert!(start.elapsed() >= Duration::from_millis(1900));
+            assert!(start.elapsed() < Duration::from_secs(4));
+            drop(lock);
+        }
+    }
+}

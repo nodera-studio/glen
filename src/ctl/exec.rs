@@ -36,8 +36,22 @@ pub(crate) fn rpc_error(error: omp_rpc::Error) -> OpError {
         }
         omp_rpc::Error::Closed | omp_rpc::Error::Io(_) => {
             OpError::new(ops::OMP_ERROR, "omp exited")
+                .with_details(json!({"transport_closed":true}))
         }
         error => OpError::new(ops::INTERNAL, error.to_string()),
+    }
+}
+pub(crate) fn job_error(error: OpError, terminal: bool) -> OpError {
+    if terminal
+        && error.code == ops::OMP_ERROR
+        && error
+            .details
+            .as_ref()
+            .is_some_and(|d| d["transport_closed"] == true)
+    {
+        OpError::new(ops::JOB_ENDED, "the job ended before answering the control")
+    } else {
+        error
     }
 }
 fn value(data: impl Serialize) -> Result<Value, OpError> {
@@ -430,5 +444,135 @@ mod tests {
         );
         assert_eq!(data["thinking_levels"], json!(["off"]));
         assert_eq!(data["busy"], true);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod fix_cycle_tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixStream,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn closed_and_io_only_retry_after_job_is_terminal() {
+        for terminal in [false, true] {
+            for error in [
+                omp_rpc::Error::Closed,
+                omp_rpc::Error::Io(std::io::Error::other("closed peer")),
+            ] {
+                assert_eq!(
+                    job_error(rpc_error(error), terminal).code,
+                    if terminal {
+                        ops::JOB_ENDED
+                    } else {
+                        ops::OMP_ERROR
+                    }
+                );
+            }
+            let command = rpc_error(omp_rpc::Error::Command {
+                command: "set_model".into(),
+                error: "omp exited".into(),
+                code: None,
+            });
+            assert_eq!(job_error(command, terminal).code, ops::OMP_ERROR);
+            assert_eq!(
+                job_error(OpError::new(ops::TIMEOUT, "timeout"), terminal).code,
+                ops::TIMEOUT
+            );
+        }
+    }
+
+    #[test]
+    fn every_mutation_rechecks_deadline_after_preflight() {
+        for (op, block_levels) in [
+            (
+                Op::SetModel(ops::SetModelArgs {
+                    provider: "fake".into(),
+                    model_id: "fake-2".into(),
+                }),
+                false,
+            ),
+            (
+                Op::SetThinkingLevel(ops::ThinkingArgs {
+                    level: "high".into(),
+                }),
+                false,
+            ),
+            (
+                Op::SetThinkingLevel(ops::ThinkingArgs {
+                    level: "high".into(),
+                }),
+                true,
+            ),
+            (Op::Compact(ops::CompactArgs::default()), false),
+        ] {
+            let (client_io, mut server) = UnixStream::pair().unwrap();
+            let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+            server
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let thread = std::thread::spawn(move || {
+                writeln!(server, "{}", json!({"type":"ready","protocolVersion":1})).unwrap();
+                let mut reader = BufReader::new(server.try_clone().unwrap());
+                for command in if block_levels {
+                    vec!["get_state", "get_available_thinking_levels"]
+                } else {
+                    vec!["get_state"]
+                } {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let req: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(req["type"], command);
+                    if command != "get_state" || !block_levels {
+                        std::thread::sleep(Duration::from_millis(200));
+                    }
+                    let data = if command == "get_state" {
+                        json!({"sessionId":"s","thinkingLevel":"medium"})
+                    } else {
+                        json!({"levels":["off","high"]})
+                    };
+                    writeln!(server, "{}", json!({"type":"response","id":req["id"],"command":command,"success":true,"data":data})).unwrap();
+                }
+                finished_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                server
+                    .set_read_timeout(Some(Duration::from_millis(50)))
+                    .unwrap();
+                let mut line = String::new();
+                match reader.read_line(&mut line) {
+                    Ok(0) => (),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                        ) => {}
+                    result => panic!("unexpected RPC: {line} ({result:?})"),
+                }
+            });
+            let (client, _events) = Client::from_io(
+                client_io.try_clone().unwrap(),
+                client_io,
+                omp_rpc::ClientOptions {
+                    tools: vec![],
+                    uris: vec![],
+                    ready_timeout: Duration::from_secs(2),
+                    default_timeout: Duration::from_secs(1),
+                },
+            )
+            .unwrap();
+            let error = exec_until(
+                &client,
+                &op,
+                Some("s"),
+                Some(Instant::now() + Duration::from_millis(100)),
+            )
+            .unwrap_err();
+            assert_eq!(error.code, ops::TIMEOUT);
+            finished_tx.send(()).unwrap();
+            client.close().unwrap();
+            thread.join().unwrap();
+        }
     }
 }

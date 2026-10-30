@@ -1,7 +1,7 @@
 //! Deadline-bearing requests to a job's held RPC client.
 use crate::{
     glen_home::write_private_atomic,
-    jobs::{JobId, JobStore},
+    jobs::{JobId, JobStore, liveness, lock},
     ops::{self, Op, OpError},
 };
 use serde_json::{Value, json};
@@ -47,7 +47,7 @@ pub fn request(
             format!("cannot write control {}: {e}", path.display()),
         )
     })?;
-    let mut ended = None;
+    let mut ended = false;
     loop {
         super::ephemeral::stopped(deadline, stop)?;
         match std::fs::read(&done) {
@@ -97,13 +97,24 @@ pub fn request(
                 ));
             }
         }
-        if store.read_status(job).is_ok_and(|s| s.status.is_terminal())
-            && ended.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(1)
-        {
+        // Once the worker can no longer execute this request, read the answer
+        // once more before allowing the caller's single retry.
+        if ended {
             return Err(OpError::new(
                 ops::JOB_ENDED,
                 format!("job {} ended before answering the control", job.handle()),
             ));
+        }
+        ended =
+            store.read_status(job).is_ok_and(|s| {
+                s.status.is_terminal()
+                    && (!lock::is_held(&store.home, expect)
+                        || s.worker_pid.zip(s.worker_start.as_deref()).is_some_and(
+                            |(pid, start)| liveness::check(pid, start) != liveness::Liveness::Alive,
+                        ))
+            });
+        if ended {
+            continue;
         }
         std::thread::sleep(
             Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),

@@ -215,11 +215,14 @@ fn open_error(error: OpenError, opened: Option<&Opened>) -> GlenError {
 enum Owner {
     Job(JobId),
     Control,
+    Finishing,
     Unknown,
     Free,
 }
 fn owner(store: &JobStore, session_id: &str, deadline: Instant, stop: &AtomicBool) -> Owner {
-    let end = (Instant::now() + Duration::from_secs(1)).min(deadline);
+    let started = Instant::now();
+    let mut end = (started + Duration::from_secs(1)).min(deadline);
+    let mut finishing = false;
     loop {
         if !lock::is_held(&store.home, session_id) {
             return Owner::Free;
@@ -232,6 +235,16 @@ fn owner(store: &JobStore, session_id: &str, deadline: Instant, stop: &AtomicBoo
             match holder.kind {
                 lock::HolderKind::Control => return Owner::Control,
                 lock::HolderKind::Job => {
+                    finishing = holder
+                        .job_id
+                        .as_deref()
+                        .and_then(JobId::parse)
+                        .is_some_and(|id| {
+                            store.read_status(&id).is_ok_and(|s| s.status.is_terminal())
+                        });
+                    if finishing {
+                        end = (started + Duration::from_secs(2)).min(deadline);
+                    }
                     if let Some(id) = holder.job_id.as_deref().and_then(JobId::parse)
                         && store.active_for_session(session_id).iter().any(
                             |(active, job, status)| {
@@ -254,6 +267,9 @@ fn owner(store: &JobStore, session_id: &str, deadline: Instant, stop: &AtomicBoo
     }
     if !lock::is_held(&store.home, session_id) {
         return Owner::Free;
+    }
+    if finishing {
+        return Owner::Finishing;
     }
     let mut active = store
         .active_for_session(session_id)
@@ -381,6 +397,12 @@ pub(crate) fn route(
             match holder {
                 Owner::Job(job) => return Ok((job_target(store, job, id, deadline, stop), vec![])),
                 Owner::Free => continue,
+                Owner::Finishing if op_name == "abort" => {
+                    return Err(super::to_glen_error(
+                        OpError::new(ops::BUSY, "a glen job is finishing; retry"),
+                        &context(opened),
+                    ));
+                }
                 _ => {
                     if op_name == "abort" {
                         return Err(super::to_glen_error(
@@ -598,9 +620,24 @@ mod tests {
             owner(&store, session_id, Instant::now(), &stop),
             Owner::Unknown
         ));
-        drop(lock);
+        // A terminal job with a matching live holder is still finishing until
+        // its worker releases the lock.
+        holder.start = status.worker_start.clone();
+        lock::mark(&lock, &holder).unwrap();
         assert!(matches!(
             owner(&store, session_id, Instant::now(), &stop),
+            Owner::Finishing
+        ));
+        drop(lock);
+        // Parallel tests may fork while the lock is held; allow their inherited
+        // descriptors to close at exec before requiring the lock to be free.
+        assert!(matches!(
+            owner(
+                &store,
+                session_id,
+                Instant::now() + Duration::from_secs(2),
+                &stop
+            ),
             Owner::Free
         ));
     }

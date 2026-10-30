@@ -784,7 +784,12 @@ impl Worker {
                     });
                 }
                 while let Ok((req, result)) = control_rx.try_recv() {
-                    self.answer_control(&req, result.map(Some));
+                    self.answer_control(
+                        &req,
+                        result.map(Some).map_err(|e| {
+                            crate::ctl::exec::job_error(e, self.status.status.is_terminal())
+                        }),
+                    );
                     self.control_in_flight = None;
                 }
                 let (abort, pending) = self.controls();
@@ -807,13 +812,17 @@ impl Worker {
                         self.control_in_flight = Some(req.path.clone());
                         let op = op.clone();
                         let tx = control_tx.clone();
-                        let deadline = self.deadline;
+                        let deadline = req.deadline_ms.and_then(|end| {
+                            Instant::now().checked_add(Duration::from_millis(end.saturating_sub(
+                                jiff::Timestamp::now().as_millisecond().max(0) as u64,
+                            )))
+                        });
                         scope.spawn(move || {
                             let result = crate::ctl::exec::exec_until(
                                 client,
                                 &op,
                                 req.expect_session_id.as_deref(),
-                                Some(deadline),
+                                deadline,
                             );
                             if tx.send((req, result)).is_err() {
                                 eprintln!("worker control receiver closed");
@@ -895,7 +904,12 @@ impl Worker {
         // The terminal publication above skips the in-flight request. Only its
         // actual result may acknowledge it after the scoped thread has joined.
         while let Ok((req, answer)) = control_rx.try_recv() {
-            self.answer_control(&req, answer.map(Some));
+            self.answer_control(
+                &req,
+                answer
+                    .map(Some)
+                    .map_err(|e| crate::ctl::exec::job_error(e, self.status.status.is_terminal())),
+            );
             self.control_in_flight = None;
         }
         if self.control_in_flight.take().is_some() {
