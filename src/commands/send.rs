@@ -47,6 +47,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             .as_deref()
             .map(Path::new)
             .filter(|p| p.is_dir())
+            .or(scope.as_deref())
             .unwrap_or(env.cwd())
             .to_path_buf()
     } else {

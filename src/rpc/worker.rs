@@ -369,20 +369,30 @@ impl Worker {
     }
     fn start(&mut self, sink: Arc<ReplySink>) -> Result<Option<Started>, Failure> {
         let abandon = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let job = self.job.clone();
         let deadline = self.deadline;
+        let ready_deadline = Instant::now() + rpc::READY_TIMEOUT;
         std::thread::scope(|scope| {
             let (tx, rx) = mpsc::channel();
             let startup_abandon = abandon.clone();
+            let startup_ready = ready.clone();
             let startup = scope.spawn(move || {
-                let result = Started::spawn(&job, deadline, sink, &startup_abandon);
+                let result = Started::spawn(
+                    &job,
+                    deadline,
+                    ready_deadline,
+                    &startup_ready,
+                    sink,
+                    &startup_abandon,
+                );
                 if let Err(undelivered) = tx.send(result) {
                     // A late Started owns its Client; dropping it tears omp down.
                     drop(undelivered);
                 }
             });
             let result = loop {
-                if let Err(failure) = self.check_stop() {
+                if let Err(failure) = self.check_start_stop(ready_deadline, &ready) {
                     abandon.store(true, Ordering::SeqCst);
                     // Persist and acknowledge before joining the bounded blocking call.
                     let finished = self.finish_failure(failure);
@@ -390,7 +400,7 @@ impl Worker {
                 }
                 match rx.recv_timeout(rpc::TICK) {
                     Ok(result) => {
-                        if let Err(failure) = self.check_stop() {
+                        if let Err(failure) = self.check_start_stop(ready_deadline, &ready) {
                             abandon.store(true, Ordering::SeqCst);
                             let finished = self.finish_failure(failure);
                             drop(result);
@@ -414,6 +424,22 @@ impl Worker {
             drop(rx);
             result
         })
+    }
+    fn check_start_stop(&self, ready_deadline: Instant, ready: &AtomicBool) -> Result<(), Failure> {
+        let stop = self.check_stop();
+        // Preserve the first bound even while Client::spawn is tearing down a never-ready peer.
+        if !stop.as_ref().is_err_and(|f| f.code == "cancelled")
+            && !ready.load(Ordering::SeqCst)
+            && ready_deadline < self.deadline
+            && Instant::now() >= ready_deadline
+        {
+            Err(Failure::new(
+                "omp_unavailable",
+                "omp did not become ready within 60s (see worker.log)",
+            ))
+        } else {
+            stop
+        }
     }
     fn apply_state(&mut self, s: omp_rpc::SessionState, baseline: &str, sink: &ReplySink) {
         if s.session_id != baseline {
@@ -737,6 +763,8 @@ impl Started {
     fn spawn(
         job: &Job,
         deadline: Instant,
+        ready_deadline: Instant,
+        ready: &AtomicBool,
         sink: Arc<ReplySink>,
         abandon: &AtomicBool,
     ) -> Result<Self, Failure> {
@@ -753,14 +781,18 @@ impl Started {
             ClientOptions {
                 tools: vec![],
                 uris: vec![],
-                ready_timeout: rpc::READY_TIMEOUT
-                    .min(deadline.saturating_duration_since(Instant::now())),
+                ready_timeout: deadline
+                    .min(ready_deadline)
+                    .saturating_duration_since(Instant::now()),
                 default_timeout: rpc::CALL_TIMEOUT,
             },
         );
         check()?;
         let (client, events) = spawned.map_err(|e| {
-            let code = if matches!(
+            let code = if matches!(e, omp_rpc::Error::Timeout { .. }) && deadline <= ready_deadline
+            {
+                "timeout"
+            } else if matches!(
                 e,
                 omp_rpc::Error::Io(_) | omp_rpc::Error::Timeout { .. } | omp_rpc::Error::Closed
             ) {
@@ -770,6 +802,7 @@ impl Started {
             };
             Failure::new(code, format!("cannot start omp: {e} (see worker.log)"))
         })?;
+        ready.store(true, Ordering::SeqCst);
         let tools = client.set_custom_tools(vec![reply::glen_reply_tool(sink)]);
         check()?;
         let tools = tools.map_err(|e| {
@@ -1090,6 +1123,68 @@ fn next(run: &Run, now: Instant, deadline: Instant) -> Next {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn startup_bounds_preserve_first_timeout_during_teardown() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let job = crate::jobs::tests::job();
+        let id = JobId::parse(&job.id).unwrap();
+        store.create(&job).unwrap();
+        let now = Instant::now();
+        let mut worker = Worker {
+            status: store.read_status(&id).unwrap(),
+            store,
+            id,
+            job,
+            cancel: Arc::new(AtomicBool::new(false)),
+            deadline: now - Duration::from_secs(1),
+        };
+        let ready_deadline = now - Duration::from_secs(2);
+        assert_eq!(
+            worker
+                .check_start_stop(ready_deadline, &AtomicBool::new(false))
+                .unwrap_err()
+                .code,
+            "omp_unavailable"
+        );
+        // A peer that already became ready remains subject to the job deadline.
+        assert_eq!(
+            worker
+                .check_start_stop(ready_deadline, &AtomicBool::new(true))
+                .unwrap_err()
+                .code,
+            "timeout"
+        );
+        worker.deadline = now - Duration::from_secs(3);
+        assert_eq!(
+            worker
+                .check_start_stop(ready_deadline, &AtomicBool::new(false))
+                .unwrap_err()
+                .code,
+            "timeout"
+        );
+        worker.deadline = now + Duration::from_secs(10);
+        assert_eq!(
+            worker
+                .check_start_stop(ready_deadline, &AtomicBool::new(false))
+                .unwrap_err()
+                .code,
+            "omp_unavailable"
+        );
+        assert!(
+            worker
+                .check_start_stop(ready_deadline, &AtomicBool::new(true))
+                .is_ok()
+        );
+        worker.cancel.store(true, Ordering::SeqCst);
+        assert_eq!(
+            worker
+                .check_start_stop(ready_deadline, &AtomicBool::new(false))
+                .unwrap_err()
+                .code,
+            "cancelled"
+        );
+    }
     fn turn(status: Option<PromptStatus>, settled: bool) -> PromptTurn {
         PromptTurn {
             events: vec![],

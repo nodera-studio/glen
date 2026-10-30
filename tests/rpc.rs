@@ -118,6 +118,65 @@ fn ac202_spawns_omp_with_resume_no_ui_and_managed_env() {
     );
 }
 #[test]
+fn w2_latest_cwd_falls_back_and_is_recorded() {
+    for header_cwd in [None, Some("missing"), Some("file"), Some("valid")] {
+        let b = RpcBox::new();
+        let path = b.omp.session('A');
+        let text = fs::read_to_string(&path).unwrap();
+        let text = text
+            .lines()
+            .map(|line| {
+                let Ok(mut value) = serde_json::from_str::<Value>(line) else {
+                    return line.to_owned();
+                };
+                if value["type"] == "session" {
+                    value.as_object_mut().unwrap().remove("cwd");
+                    if let Some(kind) = header_cwd {
+                        value["cwd"] = json!(match kind {
+                            "missing" => b.omp.home.join("missing"),
+                            "file" => path.clone(),
+                            _ => b.omp.beta(),
+                        });
+                    }
+                }
+                serde_json::to_string(&value).unwrap()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&path, &text).unwrap();
+        let out = b
+            .glen(&[
+                "send",
+                "@latest",
+                "hello",
+                "--cwd",
+                b.omp.alpha().to_str().unwrap(),
+                "--json",
+            ])
+            .current_dir(&b.omp.home)
+            .output()
+            .unwrap();
+        let value = envelope(&out, 0);
+        let id = job_id(&value);
+        b.wait_worker_gone(&id);
+        let expected = if header_cwd == Some("valid") {
+            b.omp.beta()
+        } else {
+            b.omp.alpha()
+        };
+        assert_eq!(b.job(&id).0["session_id"], A_ID);
+        assert_eq!(b.job(&id).0["cwd"], json!(expected));
+        let start = b
+            .fake_log()
+            .into_iter()
+            .find(|v| v["event"] == "start")
+            .unwrap();
+        assert_eq!(start["cwd"], json!(expected));
+        assert_eq!(fs::read_to_string(&path).unwrap(), text);
+    }
+}
+#[test]
 fn ac203_send_completes_with_reply() {
     let b = RpcBox::new();
     let before = fs::read(b.omp.session('A')).unwrap();
@@ -127,6 +186,7 @@ fn ac203_send_completes_with_reply() {
     assert_eq!(d["assistant_text"], "pong: hello");
     assert_eq!(d["replies"][0]["text"], "reply: hello");
     assert_eq!(d["replies"][0]["final"], true);
+    assert_eq!(d["replies"][0].get("request_id"), Some(&Value::Null));
     assert_eq!(d["session_settled"], true);
     assert_eq!(d["delivered_as"], "prompt");
     assert!(d["forked"].is_null());
@@ -140,6 +200,9 @@ fn ac203_send_completes_with_reply() {
         serde_json::from_str::<Value>(replies.trim()).unwrap(),
         d["replies"][0]
     );
+    let result: Value =
+        serde_json::from_slice(&fs::read(b.job_dir(&id).join("result.json")).unwrap()).unwrap();
+    assert_eq!(result["replies"], d["replies"]);
     let tools = &b.frames_in("set_host_tools")[0]["tools"];
     assert_eq!(tools.as_array().unwrap().len(), 1);
     assert_eq!(tools[0]["name"], "glen_reply");
@@ -779,6 +842,24 @@ fn ac218_abort_while_starting() {
     );
 }
 
+#[test]
+fn w2_ready_bound_before_deadline_is_omp_unavailable() {
+    let b = RpcBox::new();
+    let out = b
+        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        .env("GLEN_JOB_TIMEOUT", "61s")
+        .env("FAKE_OMP_READY_DELAY_MS", "120000")
+        .output()
+        .unwrap();
+    let value = envelope(&out, 10);
+    let id = job_id(&value);
+    let status = b.wait_terminal(&id, Duration::from_secs(75));
+    assert_eq!(status["status"], "failed");
+    assert_eq!(status["error"]["code"], "omp_unavailable");
+    b.wait_worker_gone(&id);
+    assert!(b.frames_in("prompt").is_empty());
+    assert!(b.frames_in("set_host_tools").is_empty());
+}
 #[test]
 fn ac215_deadline_while_starting() {
     for scenario in ["ok", "no_ready"] {

@@ -159,11 +159,11 @@ pub struct Reply {
     pub v: u32,
     pub id: String,
     pub session_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub job_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub request_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<String>,
     pub text: String,
     #[serde(rename = "final")]
@@ -305,14 +305,14 @@ impl JobStore {
     }
     pub fn resolve(&self, arg: &str) -> Result<JobId, GlenError> {
         let arg = arg.to_ascii_lowercase();
-        let ids = self.list();
         let matches: Vec<_> = if let Some(id) = JobId::parse(&arg) {
-            ids.into_iter().filter(|i| *i == id).collect()
+            self.list().into_iter().filter(|i| *i == id).collect()
         } else if let Some(tail) = arg
             .strip_prefix('j')
             .filter(|s| s.len() >= 7 && s.bytes().all(|b| b.is_ascii_hexdigit()))
         {
-            ids.into_iter()
+            self.list()
+                .into_iter()
                 .filter(|i| i.simple().ends_with(tail))
                 .collect()
         } else {
@@ -446,6 +446,37 @@ pub(crate) mod tests {
                 .get_version_num(),
             7
         );
+    }
+    #[test]
+    fn reply_serialization_keeps_absent_fields_as_null() {
+        let reply = Reply {
+            v: 1,
+            id: "reply".into(),
+            session_id: "session".into(),
+            job_id: None,
+            request_id: None,
+            tool_call_id: None,
+            text: "hello".into(),
+            is_final: false,
+            at: "2026-10-30T00:00:00Z".into(),
+        };
+        let encoded = serde_json::to_value(&reply).unwrap();
+        assert_eq!(
+            encoded,
+            json!({
+                "v":1,"id":"reply","session_id":"session","job_id":null,
+                "request_id":null,"tool_call_id":null,"text":"hello","final":false,
+                "at":"2026-10-30T00:00:00Z"
+            })
+        );
+        let mut legacy = encoded;
+        for key in ["job_id", "request_id", "tool_call_id"] {
+            legacy.as_object_mut().unwrap().remove(key);
+        }
+        let decoded: Reply = serde_json::from_value(legacy).unwrap();
+        assert!(decoded.job_id.is_none());
+        assert!(decoded.request_id.is_none());
+        assert!(decoded.tool_call_id.is_none());
     }
     #[test]
     fn schemas_roundtrip_and_lenient_status() {
