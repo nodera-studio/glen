@@ -53,6 +53,9 @@ Modes: `--version`, `--mode rpc [--no-ui] [--profile NAME] [--resume FILE]`, and
 `in` / `out` carry a frame; `exit` carries the reason. Tests poll these records and status files as readiness
 signals, then wait for worker and omp teardown before releasing their temporary directories.
 
+W4 JSON contract runners reuse these reader fixtures and the `fake_omp` scenarios
+(ok, delayed, fork, error and hold-lease); no contract test reads a live omp home.
+
 ## Demo tree (`tests/fixtures/demo/`)
 
 A separate synthetic catalog for the site demo golden. `tests/site_demo.rs` copies this tree

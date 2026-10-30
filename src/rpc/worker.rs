@@ -201,9 +201,21 @@ impl Worker {
             hint: f.hint,
             details: f.details,
         });
+        self.map_sandbox_error();
         self.save()?;
         self.respond_pending();
         Ok(())
+    }
+    fn map_sandbox_error(&mut self) {
+        if let Some(error) = self.status.error.as_mut()
+            && let Some(mapped) =
+                crate::sandbox::map_worker_failure(&Env::from_process(), &error.message)
+        {
+            error.code = "no_route".into();
+            error.message = mapped.message;
+            error.hint = mapped.hint;
+            error.details = mapped.details;
+        }
     }
     fn probe(&self) -> Result<(), Failure> {
         let Some(id) = self.job.session_id.as_deref() else {
@@ -212,6 +224,7 @@ impl Worker {
         route_probe(
             lease::probe(&self.job.owners_dir, id),
             self.job.session_handle.as_deref().unwrap_or(id),
+            &Env::from_process(),
         )
     }
     fn moved(&self, to: &str) -> Failure {
@@ -771,19 +784,30 @@ impl Worker {
         self.store.write_result(&self.id, &result)?;
         self.status.status = terminal.state;
         self.status.error = terminal.error;
+        self.map_sandbox_error();
         self.save()?;
         self.respond_pending();
         self.log("finish", self.status.status.as_str());
         Ok(())
     }
 }
-fn route_probe(lease: Lease, handle: &str) -> Result<(), Failure> {
+fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
     let message = match lease {
         Lease::Free => return Ok(()),
         Lease::Held => {
             format!("before spawning omp: session {handle} is open in another omp process")
         }
-        Lease::Unknown(r) => {
+        unknown @ Lease::Unknown { .. } => {
+            if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &unknown) {
+                return Err(Failure {
+                    state: State::Failed,
+                    code: "no_route",
+                    error_message: e.message,
+                    hint: e.hint,
+                    details: e.details,
+                });
+            }
+            let r = lease::state_detail(&unknown).unwrap_or_default();
             format!(
                 "before spawning omp: cannot tell whether another omp process owns session {handle} ({r})"
             )
@@ -1365,14 +1389,54 @@ mod tests {
         }
     }
     #[test]
+    fn cycle2_worker_probe_uses_raw_permission_errno() {
+        let env = Env::for_test(
+            None,
+            std::path::Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        for errno in [libc::EPERM, libc::EACCES, libc::EROFS] {
+            let error = route_probe(
+                Lease::Unknown {
+                    reason: "backend diagnostic".into(),
+                    errno: Some(errno),
+                },
+                "e27c0de",
+                &env,
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "no_route");
+            assert_eq!(error.details.unwrap()["reason"], "sandboxed");
+            assert!(error.hint.unwrap().contains("outside the sandbox"));
+        }
+    }
+    #[test]
     fn review11_refusal_identifies_pre_spawn_phase() {
-        for lease in [Lease::Held, Lease::Unknown("denied".into())] {
-            let e = route_probe(lease, "e27c0de").unwrap_err();
+        for lease in [
+            Lease::Held,
+            Lease::Unknown {
+                reason: "denied".into(),
+                errno: None,
+            },
+        ] {
+            let e = route_probe(
+                lease,
+                "e27c0de",
+                &Env::for_test(None, std::path::Path::new("/"), &[]),
+            )
+            .unwrap_err();
             assert_eq!(e.code, "no_route");
             assert!(e.error_message.starts_with("before spawning omp:"));
             assert!(e.error_message.contains("e27c0de"));
         }
-        assert!(route_probe(Lease::Free, "e27c0de").is_ok());
+        assert!(
+            route_probe(
+                Lease::Free,
+                "e27c0de",
+                &Env::for_test(None, std::path::Path::new("/"), &[])
+            )
+            .is_ok()
+        );
     }
     #[test]
     fn review9_completed_result_cancellation_table() {

@@ -67,6 +67,7 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
         "completions",
         "doctor",
         "help",
+        "install-skill",
         "jobs",
         "ls",
         "send",

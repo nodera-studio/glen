@@ -412,13 +412,19 @@ fn run() -> io::Result<u8> {
                         "unsettled" | "never_settles" | "unsettled_exit"
                     );
                 let status = match scenario.as_str() {
-                    "error" => "error",
+                    "error" | "network_refused" | "network_dns" | "network_denied" => "error",
                     "aborted" => "aborted",
                     _ => "completed",
                 };
                 let mut frame = json!({"type":"prompt_result","id":p["id"],"agentInvoked":true,"status":status,"sessionSettled":settled});
-                if scenario == "error" {
-                    frame["error"] = json!({"message":"fake provider error","retryable":true});
+                if status == "error" {
+                    let message = match scenario.as_str() {
+                        "network_refused" => "connect: Connection refused",
+                        "network_dns" => "DNS resolution failed",
+                        "network_denied" => "connect: Operation not permitted",
+                        _ => "fake provider error",
+                    };
+                    frame["error"] = json!({"message":message,"retryable":true});
                 }
                 out(frame)?;
                 if scenario == "unsettled_exit" {

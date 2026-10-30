@@ -40,6 +40,7 @@ fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
             "completions",
             "doctor",
             "help",
+            "install-skill",
             "jobs",
             "ls",
             "send",

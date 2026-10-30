@@ -106,6 +106,7 @@ pub fn resolve(env: &Env, profile_flag: Option<&str>) -> Result<OmpPaths, GlenEr
         .map(|p| base_config_root.join("profiles").join(p).join("agent"));
     let agent_override = env
         .non_empty("PI_CODING_AGENT_DIR")
+        .or_else(|| env.non_empty("OMP_CODING_AGENT_DIR"))
         .filter(|raw| derived.as_deref().and_then(Path::to_str) != Some(*raw));
     let (agent_dir, agent_dir_source) = if profile.is_some() {
         (default_agent.clone(), AgentDirSource::Profile)
@@ -385,6 +386,35 @@ mod tests {
                 t.path().join("omp/run/session-owners")
             );
         }
+    }
+    #[test]
+    fn whitespace_path_variables_are_unset() {
+        let expected = resolve_vars(&[]);
+        for key in [
+            "PI_CONFIG_DIR",
+            "PI_CODING_AGENT_DIR",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+        ] {
+            let actual = resolve_vars(&[(key, " \t ")]);
+            assert_eq!(
+                serde_json::to_value(actual).unwrap(),
+                serde_json::to_value(&expected).unwrap(),
+                "{key}"
+            );
+        }
+        let env = Env::for_test(
+            Some(Path::new("/h")),
+            Path::new("/w"),
+            &[("CLAUDE_CONFIG_DIR", " \t ")],
+        );
+        assert_eq!(
+            crate::skill::user_target(&env, crate::skill::Agent::Claude).unwrap(),
+            Path::new("/h/.claude/skills/glen/SKILL.md")
+        );
+        let env = Env::for_test(Some(Path::new(" \t ")), Path::new("/w"), &[]);
+        assert!(!env.home_is_explicit());
+        assert_eq!(resolve(&env, None).unwrap_err().code, ErrorCode::InvalidEnv);
     }
     #[test]
     fn no_home() {
