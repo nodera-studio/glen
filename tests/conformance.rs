@@ -6,6 +6,8 @@
 //!   lease, with the shared `reader` harness.
 //! - W2 (`.claude/plans/v010-wave-2-rpc.md`, AC-201…AC-227; §A3–§A11, §A15): rpc, rpc_jobs, with
 //!   the `rpc_support` harness driving the `fake_omp` example peer through `GLEN_OMP_BIN`.
+//! - W4 (`.claude/plans/v010-wave-4-agent.md`, AC-401…AC-413 and AC-419; O3, O5–O7; §A9–§A13 and
+//!   `docs/json.md`): agent. The acceptance modes (AC-414…AC-418, AC-420, AC-421) need real omp.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!
@@ -21,6 +23,8 @@ mod rpc_support;
 #[path = "conformance/support.rs"]
 mod support;
 
+#[path = "conformance/agent.rs"]
+mod agent;
 #[path = "conformance/cli_surface.rs"]
 mod cli_surface;
 #[path = "conformance/color.rs"]
