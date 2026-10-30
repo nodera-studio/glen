@@ -648,8 +648,8 @@ The `omp_env_files` check value is an array of absolute paths (empty when none n
 ## `glen completions`
 
 Raw script by default; JSON only when explicitly requested.
-`completions --json` may spill under the same `GLEN_MAX_OUTPUT` rule as other document output.
-This is an accepted consequence of W0's spill design, not a defect.
+`completions --json` always returns inline regardless of size and never creates `GLEN_HOME`.
+This is a deliberate exemption from the general `GLEN_MAX_OUTPUT` spill rule.
 
 | Field | Meaning |
 |---|---|

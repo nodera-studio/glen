@@ -404,6 +404,16 @@ fn human_control(
     };
     let level = render::sanitize(data["thinking_level"].as_str().unwrap_or("unknown"));
     let text = match control {
+        Control::Abort
+            if data["aborted"] == false
+                && job.is_some()
+                && matches!(
+                    data["job_status"].as_str(),
+                    Some("completed" | "failed" | "lost")
+                ) =>
+        {
+            format!("· job {} had already finished", job.unwrap_or("unknown"))
+        }
         Control::Abort if data["aborted"] == false => {
             format!("· {handle} is idle; nothing to abort")
         }
@@ -704,10 +714,19 @@ fn models_table(data: &Value, ctx: &OutputCtx) -> String {
         .filter_map(|m| m["provider"].as_str())
         .collect::<std::collections::BTreeSet<_>>()
         .len();
+    let selection = if data["current"].is_null() && data["default_model"].is_object() {
+        format!("default {}", pair(&data["default_model"]))
+    } else {
+        format!("current {}", pair(&data["current"]))
+    };
     let footer = format!(
-        "{} models · {providers} providers · current {} · thinking {} ({})",
+        "{} models · {providers} {} · {selection} · thinking {} ({})",
         data["total"].as_u64().unwrap_or(0),
-        pair(&data["current"]),
+        if providers == 1 {
+            "provider"
+        } else {
+            "providers"
+        },
         render::sanitize(data["thinking_level"].as_str().unwrap_or("unknown")),
         data["current_source"].as_str().unwrap_or("profile")
     );
@@ -722,6 +741,92 @@ fn models_table(data: &Value, ctx: &OutputCtx) -> String {
 mod tests {
     use super::*;
     use clap::Parser;
+
+    fn human_output() -> OutputCtx {
+        let cli = Cli::try_parse_from(["glen", "--human", "models"]).unwrap();
+        let env = Env::for_test(None, std::path::Path::new("."), &[]);
+        OutputCtx::new(
+            &cli.global,
+            crate::output::OutputKind::Document,
+            &env,
+            &crate::output::Terminal {
+                stdout_tty: false,
+                stderr_tty: false,
+                stdout_cols: None,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn models_footer_shows_profile_default_and_pluralizes_providers() {
+        let output = human_output();
+        let mut data = json!({
+            "models": [{"provider":"fake","id":"fake-1"}],
+            "total": 1,
+            "current": null,
+            "default_model": {"provider":"fake","id":"fake-1"},
+            "thinking_level": null,
+            "current_source": null
+        });
+        let human = models_table(&data, &output);
+        assert!(
+            human.contains("1 provider · default fake/fake-1"),
+            "{human}"
+        );
+        data["models"] = json!([]);
+        data["total"] = json!(0);
+        data["default_model"] = Value::Null;
+        assert!(models_table(&data, &output).contains("0 providers · current unknown"));
+        data["models"] = json!([
+            {"provider":"fake","id":"fake-1"},
+            {"provider":"other","id":"other-1"}
+        ]);
+        data["total"] = json!(2);
+        data["current"] = json!({"provider":"other","id":"other-1"});
+        data["default_model"] = json!({"provider":"fake","id":"fake-1"});
+        assert!(models_table(&data, &output).contains("2 providers · current other/other-1"));
+    }
+
+    #[test]
+    fn abort_finished_jobs_reports_job_handle_and_keeps_idle_wording() {
+        let output = human_output();
+        for status in ["completed", "failed", "lost"] {
+            let data = json!({
+                "route":"job", "job_status":status,
+                "was":"busy", "aborted":false, "idle_after":true
+            });
+            assert_eq!(
+                human_control(
+                    "s1234567",
+                    &Control::Abort,
+                    &data,
+                    Some("j1234567"),
+                    &output
+                ),
+                "· job j1234567 had already finished · glen job j1234567"
+            );
+        }
+        for route in ["rpc", "live", "none"] {
+            let data = json!({"route":route,"was":"idle","aborted":false});
+            assert!(
+                human_control("s1234567", &Control::Abort, &data, None, &output)
+                    .starts_with("· s1234567 is idle; nothing to abort")
+            );
+        }
+        let data = json!({"route":"job","job_status":"aborted","aborted":true});
+        assert!(
+            human_control(
+                "s1234567",
+                &Control::Abort,
+                &data,
+                Some("j1234567"),
+                &output
+            )
+            .starts_with("✓ cancelled glen job j1234567 on s1234567")
+        );
+    }
+
     #[test]
     fn control_sandbox_refusals_follow_target_validation_and_precede_lease_probes() {
         let tree = crate::omp::fixtures::tree();

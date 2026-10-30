@@ -551,18 +551,3 @@ pub fn lexical(p: &Path) -> PathBuf {
     }
     out
 }
-
-/// More visible commands make some completion envelopes exceed the default
-/// output budget. Inspect the complete document without disabling spill checks.
-pub fn completion_data(mut out: Out) -> Value {
-    let envelope = out.ok_envelope();
-    if let Some(spilled) = envelope.get("spilled") {
-        assert_eq!(spilled["format"], "json");
-        let path = PathBuf::from(spilled["path"].as_str().unwrap());
-        assert!(path.is_absolute());
-        let bytes = fs::read(path).unwrap();
-        assert_eq!(bytes.len() as u64, spilled["bytes"].as_u64().unwrap());
-        out.stdout = bytes;
-    }
-    out.ok_data()
-}

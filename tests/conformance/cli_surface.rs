@@ -340,7 +340,7 @@ fn a10_explicit_json_completions_carry_shell_and_script() {
         let out = sb.glen(&args).run();
         out.assert_stderr_empty();
         let context = out.ctx();
-        let data = completion_data(out);
+        let data = out.ok_data();
         assert_eq!(data["shell"], Value::from(shell), "{}", context.clone());
         let script = data["script"].as_str().expect("data.script is a string");
         assert!(!script.trim().is_empty(), "{}", context.clone());
@@ -353,6 +353,24 @@ fn a10_explicit_json_completions_carry_shell_and_script() {
         if shell == "zsh" {
             assert!(script.starts_with("#compdef glen"), "{}", context.clone());
         }
+    }
+}
+
+#[test]
+fn json_bash_completions_exceed_budget_inline_without_creating_home() {
+    let sb = Sandbox::new();
+    for budget in ["24000", "1"] {
+        let out = sb
+            .glen(["completions", "bash", "--json"])
+            .env("GLEN_MAX_OUTPUT", budget)
+            .run();
+        out.assert_stderr_empty();
+        assert!(out.stdout.len() > budget.parse::<usize>().unwrap());
+        assert!(out.ok_envelope().get("spilled").is_none());
+        let data = out.ok_data();
+        assert_eq!(data["shell"], "bash");
+        assert!(!data["script"].as_str().unwrap().trim().is_empty());
+        assert!(!sb.glen_home.exists(), "completions create nothing");
     }
 }
 
