@@ -1,0 +1,39 @@
+---
+import palette from '../../../../src/render/palette.json';
+import { scenes, cwd } from '../../data/demo.mjs';
+import { compileTimeline, WINDOW_ROWS, SPINNER_FRAMES, SPINNER_FRAME_MS, SEND_WAIT_MS, commandParts } from './terminal-timeline.mjs';
+import './terminal.css';
+const timeline = compileTimeline(scenes);
+const vars = [...palette.tokens.map(t => `--glen-${t.name}:${t.dark.hex}`), `--beam-start:${timeline.beam.startMs}ms`, `--beam-dur:${timeline.beam.durationMs}ms`, `--beam-laps:${timeline.beam.laps}`, `--settle:${timeline.settleMs}ms`, `--total:${timeline.totalMs}ms`, `--spinner-dur:${SPINNER_FRAME_MS * [...SPINNER_FRAMES].length}ms`, `--spinner-runs:${Math.ceil(SEND_WAIT_MS / (SPINNER_FRAME_MS * [...SPINNER_FRAMES].length))}`, `--offset:${timeline.finalOffset}`, `--window-rows:${WINDOW_ROWS}`].join(';');
+---
+<figure class="terminal" aria-labelledby="t-caption" style={vars}>
+ <div class="t-art">
+ <div class="t-title"><span>{cwd}</span><div class="t-controls"><input type="checkbox" class="t-pause focus-ring" id="t-pause" /><label for="t-pause">Pause</label><button class="t-replay focus-ring" type="button" hidden>Replay</button></div></div>
+ <div class="t-window"><div class="t-scroll">
+ {(['wide','narrow'] as const).map(variant => <div class={`t-${variant}`} aria-hidden="true">
+  {timeline.rows.filter(r => r.units !== 0).map(row => {
+   const data = scenes[row.scene];
+   const replacement = data?.transient && row.index === data.transient.replacesRow - 1 ? timeline.rows.find(r=>r.scene===row.scene && r.index===row.index+1) : undefined;
+   const style = `--t:${row.startMs}ms;--units:${row.units};${row.endMs ? `--t-out:${row.endMs}ms;` : ''}`;
+   return replacement ? <div class="t-swap" style={style}>
+    <div class="t-row t-transient"><span class="t-spinner"><span>{[...SPINNER_FRAMES].map(frame=><span>{frame}</span>)}</span></span> {data.transient?.label}</div>
+    <div class="t-row" style={`--t:${replacement.startMs}ms`}>{data[variant][replacement.index]?.map(span=><span class:list={[span.tone && `t-${span.tone}`,span.glyph && 't-glyph']}>{span.text}</span>)}</div>
+   </div> : row.index < 0 ? <div class="t-row t-command" style={style}><span class="t-ps">$ </span>{commandParts(data?.cmd ?? '').map((part,i)=><>{i>0 && <br class="t-break" />}<span class="t-piece" style={`--n:${part.text.length};--td:${(row.type?.durationMs ?? 0)*part.text.length/(data?.cmd.length || 1)}ms;--t:${row.startMs+(row.type?.durationMs ?? 0)*part.offset/(data?.cmd.length || 1)}ms`}><span class="t-cmd">{part.text}</span><span class="t-caret t-active"></span></span></>)}{row.index===-2 && <span class="t-caret t-rest"></span>}</div>
+   : <div class="t-row" style={style} data-last-line={row.scene===scenes.length-1 && row.index===data.wide.length-1 ? '' : undefined}>{data[variant][row.index]?.map(span=><span class:list={[span.tone && `t-${span.tone}`,span.glyph && 't-glyph']}>{span.text}</span>)}</div>;
+  })}
+ </div>)}
+ </div></div></div>
+ <div class="sr-only t-transcript">{scenes.map(scene=><><p>Command: {scene.cmd}</p><pre>{scene.wide.filter((_,i)=>!scene.transient || i!==scene.transient.replacesRow-1).map(row=>row.map(span=>span.text).join('')).join('\n')}</pre></>)}</div>
+ <figcaption id="t-caption">A recorded-style demo with synthetic sessions. Replies come from the omp model's <code>glen_reply</code> tool, and any that arrive after glen stops waiting land in <code>glen inbox</code>. Sessions already open in omp need <code>glen install-extension</code> first.</figcaption>
+ <Fragment set:html={`<style>${timeline.css}</style>`} />
+ <script is:inline>
+ (() => {
+  const el = document.querySelector('.terminal');
+  const replay = el.querySelector('.t-replay'); replay.hidden = false;
+  replay.addEventListener('click', () => {
+   el.querySelector('.t-pause').checked = false;
+   el.classList.add('t-reset'); void el.offsetWidth; el.classList.remove('t-reset');
+  });
+ })();
+ </script>
+</figure>

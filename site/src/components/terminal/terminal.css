@@ -1,0 +1,43 @@
+.terminal { min-width: 0; --t-row: 22px; margin: 0 }
+.t-art { background: var(--term-bg); color: var(--term-fg); border-radius: 12px; box-shadow: var(--card-shadow); padding: 0 12px 12px; font: 13px/var(--t-row) var(--font-mono) }
+.t-title { min-height: 44px; display:flex; align-items:center; justify-content:space-between; gap:8px; border-bottom:1px solid var(--term-line); color:var(--glen-muted); font-size:12px }
+.t-controls { display:flex; align-items:center; gap:6px; font-family:var(--font-sans); font-size:12px }
+.t-pause { accent-color:var(--glen-focus); width:13px; height:13px }
+.t-replay { margin-left:6px; text-decoration:underline; color:var(--glen-muted) }
+.t-window { position:relative; height:calc(var(--window-rows) * var(--t-row)); overflow:hidden; container-type:inline-size; margin-top:12px }
+.t-scroll { transform:translateY(calc(-1 * var(--offset) * var(--t-row))); animation:t-scroll var(--total) linear both }
+.t-row { height:var(--t-row); white-space:pre; visibility:visible; animation:t-in 1ms steps(1) var(--t) both }
+.t-command { height:calc(var(--units) * var(--t-row)); position:relative; white-space:normal }
+.t-piece { display:inline-block; position:relative }.t-break { display:none }
+.t-cmd { white-space:pre; display:inline-block; animation:t-type var(--td) steps(var(--n),end) var(--t) backwards }
+.t-ps { color:var(--glen-muted) }
+.t-caret { display:inline-block; background:var(--glen-accent); width:1ch; height:1em; vertical-align:-.1em; visibility:hidden }
+.t-active { position:absolute; left:100%; top:.3em; animation:t-caret var(--td) steps(var(--n),end) var(--t) backwards,t-blink 1060ms steps(1) var(--t) 6 }
+.t-rest { visibility:inherit; animation:t-blink 1060ms steps(1) var(--t) 6 }
+.t-glyph { display:inline-block; width:1ch; text-align:center }
+.t-muted { color:var(--glen-muted) }.t-accent { color:var(--glen-accent) }.t-accent_2 { color:var(--glen-accent_2) }.t-success { color:var(--glen-success) }.t-warning { color:var(--glen-warning) }.t-danger { color:var(--glen-danger) }.t-focus { color:var(--glen-focus) }
+.t-swap { display:grid; height:var(--t-row) }.t-swap > * { grid-area:1/1 }
+.t-transient { visibility:hidden; color:var(--glen-muted) }
+.t-spinner { display:inline-block; height:var(--t-row); width:1ch; overflow:hidden; vertical-align:bottom }
+.t-spinner > span { display:block; animation:t-spin var(--spinner-dur) steps(10) var(--t) var(--spinner-runs) backwards }.t-spinner > span > span { display:block; height:var(--t-row) }
+.t-narrow { display:none; font-size:12px }
+@container (max-width: 38rem) { .t-wide { display:none }.t-narrow { display:block }.t-break { display:block } }
+
+.terminal figcaption { margin-top:16px; font:13px/1.6 var(--font-sans); color:var(--ink-subdued); max-width:64ch }
+@keyframes t-in { from { visibility:hidden } to { visibility:visible } }
+@keyframes t-type { from { clip-path:inset(0 100% 0 0) } to { clip-path:inset(0) } }
+@keyframes t-caret { from { transform:translateX(calc(var(--n) * -1ch)); visibility:hidden } 0.01% { visibility:visible } to { transform:translateX(0); visibility:visible } }
+@keyframes t-blink { 0%,49% { opacity:1 } 50%,100% { opacity:0 } }
+/* Delayed reveal and end share a grid cell with the completion line. */
+.t-transient { animation:t-in 1ms steps(1) var(--t) both,t-out 1ms steps(1) var(--t-out) forwards }
+@keyframes t-out { to { visibility:hidden } }
+@keyframes t-spin { to { transform:translateY(calc(-10 * var(--t-row))) } }
+@property --t-beam-angle { syntax:'<angle>'; initial-value:0deg; inherits:false }
+.t-window::before, .t-window::after { content:''; position:absolute; z-index:2; inset:0; border-radius:6px; padding:1px; pointer-events:none; opacity:0; mask:linear-gradient(white 0 0) content-box,linear-gradient(white 0 0); mask-composite:exclude }
+.t-window::before { background:conic-gradient(from var(--t-beam-angle),transparent 65%,var(--glen-focus),var(--glen-accent),transparent); animation:t-beam var(--beam-dur) linear var(--beam-start) backwards }
+@keyframes t-beam { 0% { opacity:0; --t-beam-angle:0deg } .001% { opacity:1 } 100% { opacity:1; --t-beam-angle:720deg } }
+.t-window::after { background:var(--glen-success); animation:t-settle 1300ms linear var(--settle) backwards }
+@keyframes t-settle { 0% { opacity:0 } 15.38%,61.54% { opacity:1 } 100% { opacity:0 } }
+.terminal:has(.t-pause:checked) *, .terminal:has(.t-pause:checked) .t-window::before, .terminal:has(.t-pause:checked) .t-window::after { animation-play-state:paused !important }
+.t-reset *, .t-reset .t-window::before, .t-reset .t-window::after { animation:none !important }
+@media (prefers-reduced-motion: reduce) { .terminal *, .t-window::before, .t-window::after { animation:none !important }.terminal .t-window { height:auto }.terminal .t-scroll { transform:none }.t-controls { display:none } }

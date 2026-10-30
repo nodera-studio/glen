@@ -1,0 +1,135 @@
+{
+  "cli": {
+    "package": "@morphin/cli",
+    "version": "1.0.6"
+  },
+  "registry": "https://registry.morphin.dev/registry.json",
+  "fetchedAt": "2026-10-30",
+  "license": {
+    "spdx": "MIT",
+    "holder": "Morphin",
+    "year": 2026,
+    "source": "https://github.com/sikkeep/morphin-registry/blob/main/LICENSE",
+    "notice": "src/components/morphin/LICENSE"
+  },
+  "refresh": "re-run add with --overwrite into vendor/morphin/<slug>, review git diff, port changes by hand into src/components/morphin/<dir>; never add into src/",
+  "preflightProvenance": {
+    "fallback_commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+    "fallback_repo": "sikkeep/morphin-registry",
+    "reason": "@morphin/cli@1.0.6 add --registry https://registry.morphin.dev/registry.json failed: 404 on files/components/lib/utils.ts",
+    "cli_added": [
+      "animated-svg-branch-connector (full)",
+      "animated-border-button (components/demo.tsx only, before the 404)"
+    ],
+    "fetched": "2026-10-30"
+  },
+  "items": [
+    {
+      "slug": "morphing-navigation-tabs-compact-expanded",
+      "method": "github-fallback",
+      "vendor": "vendor/morphin/morphing-navigation-tabs-compact-expanded",
+      "files": [
+        "demo.tsx",
+        "expandable-tabs.tsx",
+        "lib/utils.ts"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "usehooks-ts",
+        "lucide-react",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/morphin/navigation-tabs/ExpandableTabs.tsx"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "usehooks-ts",
+        "lucide-react"
+      ],
+      "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+      "notes": [
+        "Fallback lib/utils.ts also returned 404 on GitHub; copied verbatim from vendor/morphin/animated-svg-branch-connector/lib/utils.ts (CLI-written).",
+        "Preflight fallback paths are retained exactly as supplied; files lists the actual snapshot paths."
+      ],
+      "changes": [
+        "motion/react with LazyMotion strict; redesign tokens; reduced motion",
+        "Accessible controlled tabs"
+      ]
+    },
+    {
+      "slug": "animated-border-button",
+      "method": "github-fallback",
+      "vendor": "vendor/morphin/animated-border-button",
+      "files": [
+        "components/demo.tsx",
+        "demo.tsx",
+        "lib/utils.ts",
+        "ui/button.tsx",
+        "ui/icons/success.tsx",
+        "ui/icons/trash.tsx"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "torph",
+        "@radix-ui/react-slot",
+        "class-variance-authority",
+        "clsx",
+        "tailwind-merge"
+      ],
+      "adaptedTo": [
+        "src/components/morphin/border-button/CopyButton.tsx"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "torph",
+        "@radix-ui/react-slot",
+        "class-variance-authority"
+      ],
+      "commit": "bb022929fab786debee9b9efe107eddf7097afd8",
+      "notes": [
+        "Fallback lib/utils.ts also returned 404 on GitHub; copied verbatim from vendor/morphin/animated-svg-branch-connector/lib/utils.ts (CLI-written).",
+        "Preflight fallback paths are retained exactly as supplied; files lists the actual snapshot paths.",
+        "components/demo.tsx was CLI-written before the registry 404; remaining files were supplied by the GitHub fallback."
+      ],
+      "changes": [
+        "motion/react with LazyMotion strict; redesign tokens; reduced motion",
+        "Mount-only clipboard button with success and error states"
+      ]
+    },
+    {
+      "slug": "animated-svg-branch-connector",
+      "method": "cli",
+      "vendor": "vendor/morphin/animated-svg-branch-connector",
+      "files": [
+        "components/card.tsx",
+        "components/svg-branches.tsx",
+        "index-demo.tsx",
+        "lib/utils.ts",
+        "providers/resize.tsx",
+        "ui/cross.tsx",
+        "ui/lines.tsx"
+      ],
+      "upstreamDependencies": [
+        "framer-motion",
+        "next-useragent",
+        "usehooks-ts",
+        "tailwind-merge",
+        "clsx"
+      ],
+      "adaptedTo": [
+        "src/components/morphin/branch-connector/RouteDiagram.tsx"
+      ],
+      "droppedDependencies": [
+        "framer-motion",
+        "next-useragent",
+        "usehooks-ts"
+      ],
+      "changes": [
+        "motion/react with LazyMotion strict; redesign tokens; reduced motion",
+        "Static routes and one in-view trace; removed interval and resize provider"
+      ]
+    }
+  ]
+}

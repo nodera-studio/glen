@@ -1,0 +1,10 @@
+---
+import InstallTabs from './islands/InstallTabs';
+import { site } from '../data/site';
+---
+<section id="install" aria-labelledby="install-h" class="section">
+ <h2 id="install-h">Install</h2>
+ <InstallTabs client:visible commands={site.commands} releasesUrl={site.releasesUrl} releaseAvailable={site.releaseAvailable} />
+ <p class="mt-6 max-w-[64ch] text-body-sm text-ink-subdued"><strong class="font-medium text-ink">Check your setup.</strong> <code>{site.commands.doctor}</code> shows the omp it found, its version and the paths glen will use.</p>
+ <p class="mt-3 max-w-[64ch] text-body-sm text-ink-subdued">To reach sessions that are already open in omp: <code>{site.commands.extension}</code>, then restart that omp session.</p>
+</section>

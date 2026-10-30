@@ -1,0 +1,13 @@
+---
+import Terminal from './terminal/Terminal.astro';
+import { site } from '../data/site';
+---
+<section aria-labelledby="hero-h" class="hero grid min-w-0 gap-10 pb-16 pt-12 sm:pt-16 lg:grid-cols-[5fr_7fr] lg:gap-8 lg:pb-20 lg:pt-20">
+ <div class="min-w-0">
+  <h1 id="hero-h" class="max-w-[15ch] text-display tracking-[-0.035em] text-ink-heading">Let Claude Code and Codex talk to your omp sessions.</h1>
+  <p class="mt-6 max-w-[64ch] text-body text-ink-subdued">glen is a small CLI. It finds omp sessions, reads their transcripts, sends a message into one, and brings the reply back to the agent that asked.</p>
+  <div class="mt-7 flex flex-wrap items-center gap-x-6 gap-y-4"><a href="#install" class="focus-ring inline-flex h-10 items-center rounded-md bg-brand px-4 text-ui font-medium text-brand-fg hover:bg-brand-hover">Install glen</a><a href={site.repoUrl} class="focus-ring text-ui text-ink underline underline-offset-4">View on GitHub</a></div>
+  <p class="mt-5 text-ui leading-6 text-ink-subdued">macOS and Linux. Tested with omp {site.testedOmp}.</p>
+ </div>
+ <Terminal />
+</section>

@@ -1,0 +1,15 @@
+---
+import AgentTabs from './islands/AgentTabs';
+const codes = [
+ ['0','the reply is in the output'],
+ ['10','still running, so run glen wait <job>'],
+ ['6','the session is open in omp without the extension, so install it and restart omp'],
+ ['7','the job failed (details.status says why)'],
+ ['11','omp moved the session, so use the new handle'],
+];
+---
+<section id="agents" aria-labelledby="agents-h" class="section">
+ <h2 id="agents-h">Use it from your agent</h2>
+ <AgentTabs client:visible />
+ <div class="mt-8 overflow-x-auto"><table class="w-full text-left text-body-sm"><caption class="mb-3 text-left font-medium text-ink-heading">What the exit code tells your agent</caption><thead><tr class="border-b border-line"><th scope="col" class="w-16 py-3 pr-5 font-medium">Exit</th><th scope="col" class="py-3 font-medium">Meaning</th></tr></thead><tbody>{codes.map(([code,meaning])=><tr class="border-b border-line"><th scope="row" class="py-3 pr-5 align-top font-normal"><code>{code}</code></th><td class="py-3 text-ink-subdued">{meaning}</td></tr>)}</tbody></table></div>
+</section>

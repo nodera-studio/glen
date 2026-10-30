@@ -4,6 +4,8 @@
 # Runs the static half of .github/workflows/ci.yml from the repo root:
 #   1. cargo fmt --all -- --check                          (blocking)
 #   2. cargo clippy --all-targets --locked -- -D warnings   (blocking)
+#   3. site check, build, timeline tests, budgets when site/palette changed
+#      (Playwright and LHCI remain CI-only.)
 # Tests are run separately by the Implementer (`cargo test --locked`), so a slice can
 # report "tests red" and "gate red" as distinct states.
 #
@@ -30,6 +32,20 @@ run_step() {
 
 run_step fmt cargo fmt --all -- --check
 run_step clippy cargo clippy --all-targets --locked -- -D warnings
+
+base=$(git merge-base HEAD origin/main 2>/dev/null || git merge-base HEAD main 2>/dev/null || echo HEAD)
+site_changed=$(git diff --name-only "$base" -- site src/render/palette.json; git ls-files --others --exclude-standard -- site)
+if [ -n "$site_changed" ]; then
+  if [ ! -d site/node_modules ]; then
+    echo "quality-gate: site changed but site/node_modules is missing; run 'npm ci' in site/" >&2
+    status=1
+  else
+    run_step site-check npm --prefix site run check
+    run_step site-build npm --prefix site run build
+    run_step site-unit npm --prefix site run test:unit
+    run_step site-budgets npm --prefix site run budgets
+  fi
+fi
 
 if [ "$status" -eq 0 ]; then
   echo "quality-gate: clean" >&2
