@@ -69,6 +69,116 @@ test("O6 replays all 42 events of 05-trace in exact order with transcript messag
         assert.equal(inbox.at(-1).request_id, null);
     } finally { await f.close(); }
 });
+test("O6 replays all 37 events of 05b-trace in exact order with transcript message bodies", async () => {
+    // 05b-transcript.txt supplies the user/assistant text and async-result body.
+    // It renders tool calls as summaries, so their assistant text is empty and
+    // the omitted tool-result bodies are empty placeholders.
+    const trace = fs.readFileSync(new URL("./fixtures/05b-trace.ndjson", import.meta.url), "utf8").trim().split("\n").map(line => JSON.parse(line));
+    assert.equal(trace.length, 37);
+    const texts = ["Use the bash tool to run: for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1; done; then answer done.", "Then answer with the word second.", "Use the bash tool to run: sleep 20; then answer slow.", "Stop waiting and answer with the word steered."];
+    const a = user(texts[0]), b = user(texts[1]), c = user(texts[2]), d = user(texts[3]);
+    const tool = assistant(""), result = { role: "toolResult", content: "" };
+    const notice = { role: "custom", customType: "async-result", content: "<system-notice>\nBackground job bg_1 has completed. Resume your work using the result below.\n(no output)\n\nWall time: 10.05 seconds\n</system-notice>" };
+    const bodies = new Map([
+        [3, a], [4, a], [5, tool], [6, tool], [7, result], [8, result],
+        [11, d], [12, d], [13, assistant("")], [14, assistant("steered")],
+        [17, b], [18, b], [19, assistant("")], [20, assistant("second")],
+        [23, c], [24, c], [25, tool], [26, tool], [27, result], [28, result],
+        [30, notice], [31, notice], [32, assistant("")], [33, assistant("slow")],
+    ]);
+    const f = await fixture();
+    const clients = new Map<string, Awaited<ReturnType<typeof client>>>();
+    const ids: string[] = [];
+    const seen: string[] = [];
+    try {
+        for (const [i, row] of trace.entries()) {
+            for (const r of row.requests) if (!clients.has(r.id)) {
+                const n = ids.length;
+                ids.push(r.id);
+                f.fields.idle = r.deliveredAs === "prompt";
+                clients.set(r.id, await send(f, r.id, texts[n], r.deliveredAs === "steer" ? "steer" : "auto"));
+            }
+            f.fields.idle = row.idle; f.fields.pending = row.queued;
+            seen.push(row.event);
+            if (row.event === "quiescent") {
+                for (const c of clients.values()) await c.until(() => c.ended);
+            } else {
+                if (row.event === "message_start" || row.event === "message_end") assert.ok(bodies.has(i), `missing body for event ${i}`);
+                await f.emit(row.event, { reason: row.reason, willContinue: row.willContinue, awaitingAsyncWork: row.awaitingAsyncWork, message: bodies.get(i) });
+            }
+            if (i === 11) {
+                const a = clients.get(ids[0])!;
+                await a.until(() => a.ended);
+                assert.equal(a.frames.at(-1).assistant_text, null); // closed by the steer, never answered
+            }
+            if (i === 30 || i === 31) {
+                assert.equal(f.handle.requests().some(r => r.id === ids[2] && r.consumed), true);
+                assert.equal(clients.get(ids[2])!.frames.some(r => r.event === "settled"), false);
+            }
+        }
+        assert.deepEqual(seen, trace.map(row => row.event));
+        assert.deepEqual(ids.map(id => clients.get(id)!.frames.at(-1).assistant_text), [null, "second", "slow", "steered"]);
+        for (const c of clients.values()) {
+            assert.equal(c.frames.filter(r => r.event === "consumed").length, 1);
+            assert.equal(c.frames.filter(r => r.event === "settled").length, 1);
+            assert.deepEqual(c.frames.at(-1).warnings, []);
+        }
+    } finally { await f.close(); }
+});
+const notices = [
+    { role: "custom", content: "custom notice" },
+    { role: "custom", customType: "async-result", content: "<system-notice>background result</system-notice>" },
+    { role: "async-result", content: "background result" },
+    { role: "system", content: "system notice" },
+    { role: "system-notice", content: "system notice" },
+    { role: "developer", content: "developer notice" },
+];
+test("notices before assistant text retain the span through tool turns and glen_reply", async () => {
+    for (const notice of notices) for (const starts of [true, false]) {
+        const f = await fixture();
+        try {
+            await f.start(); const c = await send(f, "waiting", "waiting for an answer");
+            await f.emit("message_end", { message: user("waiting for an answer") });
+            await f.emit("message_start", { message: assistant("") });
+            await f.emit("message_end", { message: assistant("") });
+            await f.emit("message_end", { message: { role: "toolResult", content: "backgrounded" } });
+            await f.tools[0].execute("progress", { text: "still working" }, null, null, f.ctx);
+            if (starts) await f.emit("message_start", { message: notice });
+            await f.emit("message_end", { message: notice });
+            assert.equal(f.handle.requests().length, 1);
+            await f.tools[0].execute("owned", { text: "still owned" }, null, null, f.ctx);
+            await c.until(() => c.frames.filter(r => r.event === "reply").length === 2);
+            assert.equal(c.frames.findLast(r => r.event === "reply").reply.request_id, "waiting");
+            assert.equal(c.frames.some(r => r.event === "settled"), false);
+            await f.emit("message_end", { message: assistant("draft") });
+            await f.emit("message_end", { message: assistant("real answer") });
+            f.fields.idle = true; await f.emit("agent_end"); await c.until(() => c.ended);
+            assert.equal(c.frames.at(-1).assistant_text, "real answer");
+            assert.equal(c.frames.filter(r => r.event === "settled").length, 1);
+        } finally { await f.close(); }
+    }
+});
+test("notices after assistant text close the span at start or the end-only fallback", async () => {
+    for (const notice of notices) for (const starts of [true, false]) {
+        const f = await fixture();
+        try {
+            await f.start(); const c = await send(f, "answered", "answer me");
+            await f.emit("message_end", { message: user("answer me") });
+            await f.emit("message_end", { message: assistant("last answer") });
+            if (starts) await f.emit("message_start", { message: notice });
+            else await f.emit("message_end", { message: notice });
+            await c.until(() => c.ended);
+            assert.equal(c.frames.at(-1).assistant_text, "last answer");
+            await f.tools[0].execute("unowned", { text: "wake-up reply" }, null, null, f.ctx);
+            if (starts) await f.emit("message_end", { message: notice });
+            await f.emit("message_end", { message: assistant("later unowned answer") });
+            assert.equal(c.frames.filter(r => r.event === "settled").length, 1);
+            assert.equal(c.frames.some(r => r.event === "reply"), false);
+            const inbox = fs.readFileSync(`${f.home}/inbox/${f.fields.sessionId}.ndjson`, "utf8").trim().split("\n").map(line => JSON.parse(line));
+            assert.equal(inbox.at(-1).request_id, null);
+        } finally { await f.close(); }
+    }
+});
 test("failed asynchronous submission times out not_delivered and never adopts an unrelated run", async () => {
     const f = await fixture(); f.deps.deliveryMs = 150;
     try {
@@ -191,6 +301,26 @@ test("an unrelated user or a new run separates empty queued spans instead of bat
             await f.emit("message_end", { message: user("first") });
             if (separation === "user") await f.emit("message_end", { message: user("unrelated") });
             else await f.emit("agent_start");
+            await f.emit("message_end", { message: user("second") });
+            await a.until(() => a.ended);
+            await f.emit("message_end", { message: assistant("second only") });
+            f.fields.idle = true; await f.emit("agent_end"); await b.until(() => b.ended);
+            assert.equal(a.frames.at(-1).assistant_text, null);
+            assert.equal(b.frames.at(-1).assistant_text, "second only");
+            assert.deepEqual(a.frames.at(-1).warnings, []);
+            assert.deepEqual(b.frames.at(-1).warnings, []);
+        } finally { await f.close(); }
+    }
+});
+test("notices, tool-only turns and glen_reply keep queued requests from batching across them", async () => {
+    for (const activity of ["message_start", "message_end", "reply", "notice"]) {
+        const f = await fixture({ idle: false });
+        try {
+            await f.start(); const a = await send(f, "a", "first"); const b = await send(f, "b", "second");
+            await f.emit("message_end", { message: user("first") });
+            if (activity === "reply") await f.tools[0].execute("progress", { text: "working" }, null, null, f.ctx);
+            else if (activity === "notice") await f.emit("message_end", { message: { role: "custom", content: "notice before an answer" } });
+            else await f.emit(activity, { message: assistant("") });
             await f.emit("message_end", { message: user("second") });
             await a.until(() => a.ended);
             await f.emit("message_end", { message: assistant("second only") });
