@@ -62,7 +62,19 @@ fn shape_eq(doc: &Value, real: &Value, path: &str) -> Result<(), String> {
             Ok(())
         }
         (Value::Array(a), Value::Array(b)) => {
-            if let (Some(a), Some(b)) = (a.first(), b.first()) {
+            // Tail documents one shape per item kind; other arrays keep their existing checks.
+            if path == "tail.data.items" && a.iter().chain(b).all(|item| item.get("kind").is_some())
+            {
+                for (index, item) in b.iter().enumerate() {
+                    let example = a
+                        .iter()
+                        .find(|example| example["kind"] == item["kind"])
+                        .ok_or_else(|| {
+                            format!("{path}[{index}]: undocumented kind {}", item["kind"])
+                        })?;
+                    shape_eq(example, item, &format!("{path}[{index}]"))?;
+                }
+            } else if let (Some(a), Some(b)) = (a.first(), b.first()) {
                 shape_eq(a, b, &format!("{path}[0]"))?;
             }
             Ok(())
@@ -344,6 +356,82 @@ fn shape_checker_reports_path() {
     assert!(err.contains("root.data") && err.contains("field") && err.contains("renamed"));
 }
 #[test]
+fn tail_shape_checker_matches_every_item_by_kind() {
+    let docs = examples();
+    let items = &docs["tail"].values[0]["data"]["items"];
+    let mut reordered = items.as_array().unwrap().clone();
+    reordered.reverse();
+    reordered.push(reordered[0].clone());
+    assert!(shape_eq(items, &serde_json::json!(reordered), "tail.data.items").is_ok());
+    assert!(shape_eq(items, &serde_json::json!([]), "tail.data.items").is_ok());
+
+    // A later malformed item must fail even when the first item matches.
+    let mut malformed = items.clone();
+    malformed[1].as_object_mut().unwrap().remove("id");
+    let err = shape_eq(items, &malformed, "tail.data.items").unwrap_err();
+    assert!(err.contains("tail.data.items[1]") && err.contains("id"));
+    let mut malformed = items.clone();
+    malformed[1]["extra"] = serde_json::json!(true);
+    assert!(shape_eq(items, &malformed, "tail.data.items").is_err());
+    let mut malformed = items.clone();
+    malformed[1]["id"] = serde_json::json!(42);
+    assert!(shape_eq(items, &malformed, "tail.data.items").is_err());
+
+    let mut unknown = items.clone();
+    unknown[1]["kind"] = serde_json::json!("undocumented_item");
+    let err = shape_eq(items, &unknown, "tail.data.items").unwrap_err();
+    assert!(err.contains("tail.data.items[1]") && err.contains("undocumented_item"));
+    assert!(shape_eq(&serde_json::json!([]), &unknown, "tail.data.items").is_err());
+}
+#[test]
+fn shape_checker_untagged_arrays_keep_first_item_behavior() {
+    for (doc, real) in [
+        (serde_json::json!([1]), serde_json::json!([2, "ignored"])),
+        (
+            serde_json::json!([{"id": "example"}]),
+            serde_json::json!([{"id": "real"}, {"different": true}]),
+        ),
+    ] {
+        assert!(shape_eq(&doc, &real, "tail.data.items").is_ok());
+    }
+    assert!(
+        shape_eq(
+            &serde_json::json!([1]),
+            &serde_json::json!(["wrong"]),
+            "tail.data.items"
+        )
+        .is_err()
+    );
+}
+#[test]
+fn evidence_error_shapes() {
+    let docs = examples();
+    let example = &docs["error.usage"].values[0];
+    let call = serde_json::json!({
+        "ok": false,
+        "exit": 2,
+        "stdout": {
+            "v": 1,
+            "ok": false,
+            "error": {
+                "code": "usage",
+                "message": "unexpected argument '--cwd' found",
+                "details": {"text": "Usage: glen tail [OPTIONS] <SESSION>"}
+            }
+        }
+    });
+    assert!(shape_eq(example, &call["stdout"], "error.usage").is_ok());
+    let mut missing_code = call["stdout"].clone();
+    missing_code["error"]
+        .as_object_mut()
+        .unwrap()
+        .remove("code");
+    assert!(shape_eq(example, &missing_code, "error.usage").is_err());
+    let mut extra_field = call["stdout"].clone();
+    extra_field["error"]["extra"] = serde_json::json!(true);
+    assert!(shape_eq(example, &extra_field, "error.usage").is_err());
+}
+#[test]
 #[ignore]
 fn evidence_shapes() {
     let Ok(path) = std::env::var("GLEN_CONTRACT_EVIDENCE") else {
@@ -371,16 +459,27 @@ fn evidence_shapes() {
         else {
             continue;
         };
-        let id = if command == "send" {
+        let error_id = format!(
+            "error.{}{}",
+            call["stdout"]["error"]["code"].as_str().unwrap_or_default(),
+            if call["stdout"]["error"]["code"] == "no_route"
+                && call["stdout"]["error"]["details"]["reason"] == "sandboxed"
+            {
+                ".sandboxed"
+            } else {
+                ""
+            }
+        );
+        let id = if call["ok"] == false
+            || call["stdout"]["ok"] == false
+            || !matches!(call["exit"].as_i64(), Some(0 | 10 | 11 | 130))
+        {
+            error_id.as_str()
+        } else if command == "send" {
             match call["exit"].as_i64() {
                 Some(0) => "send.completed",
                 Some(10 | 130) => "send.running",
                 Some(11) => "send.forked",
-                Some(6) if call["stdout"]["error"]["details"]["reason"] == "sandboxed" => {
-                    "error.no_route.sandboxed"
-                }
-                Some(6) => "error.no_route",
-                Some(7) => "error.job_failed",
                 _ => continue,
             }
         } else {

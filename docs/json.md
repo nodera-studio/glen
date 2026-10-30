@@ -216,6 +216,7 @@ Read the active branch. `--tools` and `--thinking` control detail; `--raw` retur
 ## `glen tail`
 
 Read latest items (default 10). `-n 0 -f` streams only new events.
+The document example includes one item per kind exercised by the transcript fixtures.
 
 | Field | Meaning |
 |---|---|
@@ -239,6 +240,50 @@ Read latest items (default 10). `-n 0 -f` streams only new events.
         "text": "The test depends on map order. Fixed.",
         "thinking_words": 0,
         "timestamp": "2026-10-01T09:00:07Z"
+      },
+      {
+        "id": "10000002",
+        "kind": "model_change",
+        "model": "anthropic/claude-sonnet-4-5",
+        "timestamp": "2026-10-01T09:00:02Z"
+      },
+      {
+        "id": "10000001",
+        "kind": "thinking_level",
+        "level": "high",
+        "timestamp": "2026-10-01T09:00:01Z"
+      },
+      {
+        "id": "10000003",
+        "images": 0,
+        "kind": "user",
+        "text": "Why does parser_test flake?",
+        "timestamp": "2026-10-01T09:00:03Z"
+      },
+      {
+        "id": "40000005",
+        "kind": "branch_summary",
+        "summary": "Abandoned the regex approach.",
+        "timestamp": "2026-10-03T08:00:05Z"
+      },
+      {
+        "id": "50000005",
+        "kind": "compaction",
+        "summary": "Placeholder.",
+        "timestamp": "2026-10-04T11:45:05Z",
+        "tokens_after": 9000,
+        "tokens_before": 42000
+      },
+      {
+        "cancelled": false,
+        "chars": 2,
+        "command": "cargo test",
+        "exit_code": 0,
+        "id": "5000000a",
+        "kind": "bash",
+        "output": "ok",
+        "timestamp": "2026-10-04T11:45:10Z",
+        "truncated": false
       }
     ],
     "leaf_id": "10000009",

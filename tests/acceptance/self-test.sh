@@ -8,6 +8,12 @@ S=$(mktemp -d "${TMPDIR:-/tmp}/ga-fixture.XXXXXX")
 S=$(cd -- "$S" && pwd -P)
 trap 'rm -rf "$S"' EXIT # This script owns every file beneath its newly created directory.
 mkdir -p "$S/project" "$S/bin" "$S/glen-bin"
+# Evidence retains conversation lines and drops Claude's internal beta-header telemetry.
+printf '%s\n' '{"type":"api-request","betas":["oauth-2025-04-20","claude-code-20250219"]}' '{"type":"user","message":{"content":"hello"}}' > "$S/transcript.jsonl"
+copy_transcript "$S/transcript.jsonl" "$S/filtered-transcript.jsonl"
+jq -se 'length==1 and .[0].type=="user" and .[0].message.content=="hello"' "$S/filtered-transcript.jsonl" >/dev/null
+copy_transcript "$S/missing-transcript.jsonl" "$S/absent-transcript.jsonl"
+[[ ! -e $S/absent-transcript.jsonl ]] || die 'missing transcript produced evidence'
 # Large help output must finish writing before either required-command check exits early.
 cat > "$S/help-glen" <<'EOF'
 #!/usr/bin/env bash
@@ -33,7 +39,9 @@ jq -cn --slurpfile m "$S/manifest.json" '
   {t:"start",id:($i|tostring),argv:$v.a,ts:($i*10)},
   {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$S/calls.ndjson"
 printf 'R-nonce L-nonce T-nonce close that session\n' > "$S/report.md"
-jq -cn --arg s "$S" '{message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls")}}]}}' > "$S/transcript.jsonl"
+jq -cn --arg s "$S" '{type:"assistant",message:{content:[{type:"tool_use",id:"t1",name:"Bash",input:{command:($s+"/bin/glen ls")}}]}}' > "$S/transcript.jsonl"
+# Telemetry tool-shaped data must not affect the verdict or appear in copied evidence.
+printf '%s\n' '{"type":"api-request","betas":["oauth-2025-04-20","claude-code-20250219"],"message":{"content":[{"type":"tool_use","name":"Telemetry"}]}}' >> "$S/transcript.jsonl"
 "$A/acc.sh" check b "$S"
 cp "$S/calls.ndjson" "$S/good.ndjson"
 jq -c 'if .t=="end" and .stdout.data.assistant_text? then .stdout.data.assistant_text="missing" else . end' "$S/good.ndjson" > "$S/calls.ndjson"

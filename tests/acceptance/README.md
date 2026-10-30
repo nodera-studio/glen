@@ -170,6 +170,7 @@ screens, requires no live endpoint files, compares session and owner-skill snaps
 recordings/prompts/reports/provenance/verdict into evidence, and runs `gitleaks dir --no-banner
 --redact` (no git history). Any finding fails the mode. Provenance holds git SHA, binary SHA256,
 tool versions and env **names only**, never values. Never include credential stores in evidence.
+Evidence `transcript.jsonl` and verdict input retain only `user`, `assistant`, `system`, and `summary` lines, excluding `api-request` telemetry.
 Scratch extension/skills/home remain in TMPDIR for inspection; session files remain in the
 normal agent dir's scratch bucket(s). The harness never removes omp data or owner credentials.
 

@@ -5,6 +5,11 @@ A=$(cd -- "$(dirname -- "$0")" && pwd -P)
 ROOT=$(cd -- "$A/../.." && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 2; }
 need() { command -v "$1" >/dev/null || die "missing prerequisite: $1"; }
+copy_transcript() {
+    if [[ -f $1 ]]; then
+        jq -c 'select(.type == "user" or .type == "assistant" or .type == "system" or .type == "summary")' "$1" > "$2"
+    fi
+}
 nonce() { printf '%s-' "$1"; od -An -N4 -tx1 /dev/urandom | tr -d ' \n'; }
 # Portable names + mtimes + sizes, no contents. No credentials enter the evidence.
 snapshot() {
@@ -145,8 +150,12 @@ check_mode() {
         return
     fi
     # Empty optional inputs are arrays; required evidence is checked by its mode.
-    local empty
+    local empty transcript
     empty=$(mktemp "${TMPDIR:-/tmp}/ga-check.XXXXXX"); printf '' > "$empty"
+    transcript="$empty.transcript"
+    printf '' > "$transcript"
+    # Verdicts and copied evidence use the same conversation lines, excluding api-request telemetry.
+    copy_transcript "$S/transcript.jsonl" "$transcript"
     local report='' person='{}' jobs=true config=false
     [[ ! -f $S/report.md ]] || report=$(cat "$S/report.md")
     [[ ! -f $S/person-verdict.json ]] || person=$(cat "$S/person-verdict.json")
@@ -159,12 +168,12 @@ check_mode() {
     fi
     jq -n --arg mode "$mode" --arg scratch "$S" --arg report "$report" --argjson person "$person" --argjson jobs_unchanged "$jobs" --argjson config_restored "$config" \
       --slurpfile m "$S/manifest.json" --slurpfile calls "${S}/calls.ndjson" \
-      --slurpfile transcript "$([[ -f $S/transcript.jsonl ]] && printf '%s' "$S/transcript.jsonl" || printf '%s' "$empty")" \
+      --slurpfile transcript "$transcript" \
       --slurpfile discovered "$([[ -f $S/b3.jsonl ]] && printf '%s' "$S/b3.jsonl" || printf '%s' "$empty")" \
       --slurpfile probe "$([[ -f $S/b2-probe.jsonl ]] && printf '%s' "$S/b2-probe.jsonl" || printf '%s' "$empty")" \
       --slurpfile control "$([[ -f $S/b2-control.jsonl ]] && printf '%s' "$S/b2-control.jsonl" || printf '%s' "$empty")" \
       -f "$A/check.jq" > "$S/verdict.json"
-    rm -f "$empty"
+    rm -f "$empty" "$transcript"
     jq -r '.checks[]|"\(if .pass then "PASS" else "FAIL" end) \(.id): \(.evidence)"' "$S/verdict.json"
     jq -e '.pass' "$S/verdict.json" >/dev/null
 }
@@ -193,7 +202,8 @@ teardown() {
     cmp -s "$S/owner-skills.before.txt" "$S/owner-skills.after.txt" || { printf 'FAIL owner skills changed\n' >&2; status=1; }
     mkdir -p "$evidence"
     local file
-    for file in manifest.json calls.ndjson provenance.json verdict.json report.md transcript.jsonl b3.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
+    for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
+    copy_transcript "$S/transcript.jsonl" "$evidence/transcript.jsonl"
     for file in "$S"/prompt-*.md "$S"/*.typescript "$S"/*.screen.txt; do [[ ! -f $file ]] || cp "$file" "$evidence/"; done
     jq -r '.buckets[]' "$S/manifest.json" > "$evidence/scratch-buckets.txt"
     jq -r --slurpfile m "$S/manifest.json" '.[] | .path as $path | select(any($m[0].buckets[]; . as $b|$path|startswith($b+"/"))) | .path' "$S/owner-sessions.after.json" > "$evidence/sessions-left.txt"
