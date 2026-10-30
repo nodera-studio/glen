@@ -64,22 +64,49 @@ pub fn streaming_behavior(d: Deliver) -> omp_rpc::StreamingBehavior {
         _ => omp_rpc::StreamingBehavior::FollowUp,
     }
 }
-pub fn omp_command(job: &Job) -> Command {
-    // Worker validates the optional binary before entering the RPC path.
-    let mut c = Command::new(job.omp_bin.as_deref().unwrap_or(std::path::Path::new("")));
-    c.args(["--mode", "rpc", "--no-ui"]);
-    if let Some(p) = &job.profile_flag {
-        c.args(["--profile", p])
+pub(crate) fn base_command(
+    bin: &std::path::Path,
+    profile_flag: Option<&str>,
+    cwd: &std::path::Path,
+) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .args(["--mode", "rpc", "--no-ui"])
+        .env("GLEN_MANAGED", "1")
+        .current_dir(cwd);
+    if let Some(profile) = profile_flag {
+        let profile = profile.trim();
+        command
+            .args(["--profile", profile])
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE");
     }
+    command
+}
+pub fn omp_command(job: &Job) -> Command {
+    let mut command = base_command(
+        job.omp_bin.as_deref().unwrap_or(std::path::Path::new("")),
+        job.profile_flag.as_deref(),
+        &job.cwd,
+    );
     if job.route == Route::Rpc
         && let Some(file) = &job.session_file
     {
-        c.arg("--resume").arg(file);
+        command.arg("--resume").arg(file);
     }
-    c.env("GLEN_MANAGED", "1").current_dir(&job.cwd);
-    c
+    command
+}
+pub(crate) fn kill_group(pid: u32, signal: rustix::process::Signal) -> io::Result<()> {
+    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
+        return Err(io::Error::other("invalid omp pid"));
+    };
+    match rustix::process::kill_process_group(pid, signal) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+        Err(e) => Err(io::Error::new(
+            io::Error::from(e).kind(),
+            format!("cannot signal omp process group {pid}: {e}"),
+        )),
+    }
 }
 pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
     let mut opts = OpenOptions::new();
@@ -126,6 +153,24 @@ pub fn session_handle(id: &str) -> String {
         .skip(simple.chars().count().saturating_sub(7))
         .collect()
 }
+
+// These calls must not hold the polling thread (or submission gate) for CALL_TIMEOUT.
+macro_rules! polling_command {
+    ($name:ident, $inner:ty, $timeout:expr) => {
+        #[derive(serde::Serialize)]
+        #[serde(transparent)]
+        struct $name($inner);
+        impl omp_rpc::Command for $name {
+            const NAME: &'static str = <$inner as omp_rpc::Command>::NAME;
+            const TIMEOUT_MS: Option<u64> = Some($timeout);
+            type Output = <$inner as omp_rpc::Command>::Output;
+            fn decode(data: Option<serde_json::Value>) -> Result<Self::Output, serde_json::Error> {
+                <$inner as omp_rpc::Command>::decode(data)
+            }
+        }
+    };
+}
+pub(crate) use polling_command;
 
 #[cfg(test)]
 mod tests {

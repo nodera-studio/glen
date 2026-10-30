@@ -36,21 +36,11 @@ fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
     names.sort_unstable();
     assert_eq!(
         names,
-        [
-            "completions",
-            "doctor",
-            "help",
-            "inbox",
-            "install-extension",
-            "install-skill",
-            "jobs",
-            "ls",
-            "send",
-            "show",
-            "tail",
-            "wait",
-            "watch"
-        ],
+        {
+            let mut names = VISIBLE;
+            names.sort();
+            names
+        },
         "{}",
         out.ctx()
     );

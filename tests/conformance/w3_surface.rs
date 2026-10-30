@@ -29,21 +29,7 @@ fn listed_commands(help: &str) -> Vec<String> {
 #[test]
 fn ac301_help_lists_exactly_the_w3_commands() {
     let sb = Sandbox::new();
-    let mut want = vec![
-        "ls",
-        "show",
-        "tail",
-        "send",
-        "wait",
-        "jobs",
-        "inbox",
-        "watch",
-        "install-extension",
-        "install-skill",
-        "doctor",
-        "completions",
-        "help",
-    ];
+    let mut want = VISIBLE;
     want.sort();
     for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
         let out = sb.glen(args).run();

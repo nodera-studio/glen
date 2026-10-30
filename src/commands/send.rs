@@ -241,11 +241,7 @@ pub(crate) fn submit(
                     ),
                     _ => format!("session {} is open in another omp process", o.handle),
                 };
-                let hint = if paths.extensions_dir.join("glen/index.ts").is_file() {
-                    "restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)"
-                } else {
-                    "run `glen install-extension`, then restart that omp session"
-                };
+                let hint = crate::live::route::lease_held_hint(&paths);
                 return Err(GlenError::new(ErrorCode::NoRoute, message).with_hint(hint));
             }
         }

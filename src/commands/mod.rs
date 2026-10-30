@@ -1,4 +1,5 @@
 pub mod completions;
+pub mod ctl;
 pub mod doctor;
 pub(crate) mod follow;
 pub mod inbox;
@@ -25,6 +26,11 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
         Command::Send(a) => send::run(cli, a, env, ctx),
         Command::Wait(a) => wait::run(cli, a, env, ctx),
         Command::Jobs(a) => jobs::run(cli, a, env, ctx),
+        Command::Abort(a) => ctl::run_abort(cli, a, env, ctx),
+        Command::Models(a) => ctl::run_models(cli, a, env, ctx),
+        Command::Model(a) => ctl::run_model(cli, a, env, ctx),
+        Command::Thinking(a) => ctl::run_thinking(cli, a, env, ctx),
+        Command::Compact(a) => ctl::run_compact(cli, a, env, ctx),
         Command::Worker(_) => Err(GlenError::new(
             ErrorCode::Internal,
             "__worker is dispatched before commands",
@@ -34,7 +40,12 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
         Command::Ls(a) => ls::run(cli, a, env, ctx),
         Command::InstallSkill(a) => install_skill::run(a, env, ctx),
         Command::Doctor(_) => doctor::run(cli, env, ctx),
-        Command::Completions(args) => completions::run(args),
+        Command::Completions(args) => {
+            let mut outcome = completions::run(args)?;
+            outcome.human = crate::cli::complete_controls(args.shell, outcome.human);
+            outcome.data["script"] = serde_json::json!(outcome.human);
+            Ok(outcome)
+        }
         Command::Watch(_) => Err(GlenError::new(
             ErrorCode::Internal,
             "watch is dispatched before commands",

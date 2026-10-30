@@ -5,6 +5,11 @@ A=$(cd -- "$(dirname -- "$0")" && pwd -P)
 ROOT=$(cd -- "$A/../.." && pwd -P)
 die() { printf '%s\n' "$*" >&2; exit 2; }
 need() { command -v "$1" >/dev/null || die "missing prerequisite: $1"; }
+copy_transcript() {
+    if [[ -f $1 ]]; then
+        jq -c 'select(.type == "user" or .type == "assistant" or .type == "system" or .type == "summary")' "$1" > "$2"
+    fi
+}
 nonce() { printf '%s-' "$1"; od -An -N4 -tx1 /dev/urandom | tr -d ' \n'; }
 # Portable names + mtimes + sizes, no contents. No credentials enter the evidence.
 snapshot() {
@@ -20,6 +25,24 @@ safe_scratch() {
     actual=$(cd -- "$1" && pwd -P)
     [[ $actual == "$(jq -r .scratch "$actual/manifest.json")" ]] || die 'scratch path differs from manifest'
 }
+# macOS /usr/bin/screen 4.00.03 runs -X stuff/hardcopy against no window in a never-attached
+# session (a silent no-op, an empty hardcopy), so every window command selects window 0.
+tui() { screen -S "$1" -p 0 -X "${@:2}"; }
+# omp's prepaint keeps the pty cooked until its settings load, so a CR typed then reaches the editor
+# as LF (insert newline) and nothing is sent. omp draws the resumed transcript only after it takes
+# raw input, so wait for the session's first prompt on screen before typing.
+tui_ready() {
+    local name=$1 first=$2 deadline=$((SECONDS+60))
+    until tui "$name" hardcopy -h "$S/$name.ready.txt" && sleep 0.3 && LC_ALL=C grep -aqF -- "$first" "$S/$name.ready.txt"; do
+        ((SECONDS<deadline)) || die "$name: omp TUI not ready"; sleep 0.2
+    done
+}
+require_w3_surface() {
+    local binary=$1 help
+    help=$("$binary" --help) || die 'acceptance needs W3'
+    grep -Eq '^  inbox[[:space:]]' <<< "$help" || die 'acceptance needs W3'
+    grep -Eq '^  install-extension[[:space:]]' <<< "$help" || die 'acceptance needs W3'
+}
 setup() {
     local mode=$1
     [[ $mode =~ ^(a|b|b2|b3|c1|c2)$ ]] || die 'mode must be a, b, b2, b3, c1 or c2'
@@ -28,8 +51,7 @@ setup() {
     if [[ $mode == c2 && ${ACC_C2_CONSENT-} != yes ]]; then die 'c2 owner-pending: explicit owner consent required (ACC_C2_CONSENT=yes)'; fi
     (cd "$ROOT" && cargo build --release --locked) >&2
     local binary="$ROOT/target/release/glen"
-    "$binary" --help | grep -Eq '^  inbox[[:space:]]' || die 'acceptance needs W3'
-    "$binary" --help | grep -Eq '^  install-extension[[:space:]]' || die 'acceptance needs W3'
+    require_w3_surface "$binary"
     need omp
     [[ $(omp --version) == 'omp/18.14.0' ]] || die 'acceptance needs omp/18.14.0'
     local S P G report sessions agent probe R L X ext suffix screen_l screen_x deadline out
@@ -77,8 +99,10 @@ setup() {
         screen -dmS "$screen_l" bash "$S/live.sh"
         deadline=$((SECONDS+30))
         while [[ ! -f $GLEN_HOME/run/live/$(jq -r .L.id "$S/manifest.json").json ]]; do ((SECONDS<deadline)) || die 'live endpoint timeout'; sleep 0.2; done
+        tui_ready "$screen_l" 'Acceptance L: reply with the single word ready.'
         screen -dmS "$screen_x" bash "$S/held.sh"
-        screen -S "$screen_x" -X stuff $'Acceptance X: answer with the word ok.\r'
+        tui_ready "$screen_x" 'Acceptance X: reply with the single word ready.'
+        tui "$screen_x" stuff $'Acceptance X: answer with the word ok.\r'
         deadline=$((SECONDS+120))
         while :; do
             out=$("$G" ls --cwd "$P" --json)
@@ -86,7 +110,7 @@ setup() {
             ((SECONDS<deadline)) || die 'X lease timeout'; sleep 0.5
         done
         if [[ $mode != a ]]; then
-            screen -S "$screen_l" -X stuff "Use glen_reply to tell the calling agent: $(jq -r .NONCE_T "$S/manifest.json")"$'\r'
+            tui "$screen_l" stuff "Use glen_reply to tell the calling agent: $(jq -r .NONCE_T "$S/manifest.json")"$'\r'
             deadline=$((SECONDS+120))
             while :; do
                 out=$("$G" inbox --peek --json)
@@ -114,6 +138,17 @@ check_mode() {
     local mode=$1 S=$2
     [[ $mode =~ ^(a|b|b2|b3|c1|c2)$ ]] || die 'unknown check mode'
     [[ -f $S/manifest.json ]] || die 'missing manifest'
+    if [[ ! -f $S/calls.ndjson ]]; then
+        # Reuse the mode's check IDs, but fail every check when setup left no recording.
+        jq -n --arg mode "$mode" --arg scratch "$S" --arg report '' --argjson person '{}' \
+          --argjson jobs_unchanged false --argjson config_restored false --slurpfile m "$S/manifest.json" \
+          --argjson calls '[]' --argjson transcript '[]' --argjson discovered '[]' --argjson probe '[]' --argjson control '[]' \
+          -f "$A/check.jq" | jq --arg path "$S/calls.ndjson" \
+          '.pass=false | .checks |= map(.pass=false | .evidence=("missing recording: "+$path))' > "$S/verdict.json"
+        jq -r '.checks[]|"FAIL \(.id): \(.evidence)"' "$S/verdict.json"
+        jq -e '.pass' "$S/verdict.json" >/dev/null
+        return
+    fi
     # Empty optional inputs are arrays; required evidence is checked by its mode.
     local empty
     empty=$(mktemp "${TMPDIR:-/tmp}/ga-check.XXXXXX"); printf '' > "$empty"
@@ -144,8 +179,8 @@ teardown() {
     local name
     for name in "$(jq -r '.screen_l // empty' "$S/manifest.json")" "$(jq -r '.screen_x // empty' "$S/manifest.json")"; do
         [[ -n $name && $name == ga-* ]] || continue
-        screen -S "$name" -X hardcopy "$S/$name.screen.txt" 2>/dev/null || true
-        screen -S "$name" -X stuff $'/exit\r' 2>/dev/null || true
+        tui "$name" hardcopy -h "$S/$name.screen.txt" 2>/dev/null || true
+        tui "$name" stuff $'/exit\r' 2>/dev/null || true
     done
     sleep 3
     for name in "$(jq -r '.screen_l // empty' "$S/manifest.json")" "$(jq -r '.screen_x // empty' "$S/manifest.json")"; do
@@ -154,7 +189,7 @@ teardown() {
     done
     local status=0 sessions
     sessions=$(jq -r .sessions_dir "$S/manifest.json")
-    if [[ -d $S/home/run/live ]] && find "$S/home/run/live" -type f -print -quit | grep -q .; then printf 'FAIL live endpoints remain\n' >&2; status=1; fi
+    if [[ -d $S/home/run/live ]] && [[ -n $(find "$S/home/run/live" -type f -print -quit) ]]; then printf 'FAIL live endpoints remain\n' >&2; status=1; fi
     snapshot "$sessions" > "$S/owner-sessions.after.json"
     if ! jq -en --slurpfile before "$S/owner-sessions.before.json" --slurpfile after "$S/owner-sessions.after.json" --slurpfile m "$S/manifest.json" '
       all($before[0][]; . as $old | any($after[0][]; .==$old)) and
@@ -163,7 +198,8 @@ teardown() {
     cmp -s "$S/owner-skills.before.txt" "$S/owner-skills.after.txt" || { printf 'FAIL owner skills changed\n' >&2; status=1; }
     mkdir -p "$evidence"
     local file
-    for file in manifest.json calls.ndjson provenance.json verdict.json report.md transcript.jsonl b3.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
+    for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
+    copy_transcript "$S/transcript.jsonl" "$evidence/transcript.jsonl" || { printf 'FAIL transcript copy\n' >&2; status=1; }
     for file in "$S"/prompt-*.md "$S"/*.typescript "$S"/*.screen.txt; do [[ ! -f $file ]] || cp "$file" "$evidence/"; done
     jq -r '.buckets[]' "$S/manifest.json" > "$evidence/scratch-buckets.txt"
     jq -r --slurpfile m "$S/manifest.json" '.[] | .path as $path | select(any($m[0].buckets[]; . as $b|$path|startswith($b+"/"))) | .path' "$S/owner-sessions.after.json" > "$evidence/sessions-left.txt"
@@ -176,6 +212,7 @@ teardown() {
     # O1: no credential store was copied; never delete agent.db or omp session files.
     return "$status"
 }
+[[ ${BASH_SOURCE[0]} == "$0" ]] || return 0
 case "${1-}" in
     setup) [[ $# == 2 ]] || die 'usage: acc.sh setup MODE'; setup "$2" ;;
     person) [[ $# == 2 ]] || die 'usage: acc.sh person S'; safe_scratch "$2"; expect "$A/person.exp" "$2" ;;

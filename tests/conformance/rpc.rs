@@ -63,21 +63,8 @@ fn harness_process_probes_see_a_live_process_group() {
 #[test]
 fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
     let sb = Sandbox::new();
-    let want = [
-        "completions",
-        "doctor",
-        "help",
-        "inbox",
-        "install-extension",
-        "install-skill",
-        "jobs",
-        "ls",
-        "send",
-        "show",
-        "tail",
-        "wait",
-        "watch",
-    ];
+    let mut want = VISIBLE;
+    want.sort();
     for args in [["--help"], ["-h"], ["help"]] {
         let out = sb.glen(args).run();
         out.assert_exit(0);
@@ -121,6 +108,107 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
 // ---------------------------------------------------------------------------------------------
 // AC-202 — job creation and the omp command line.
 // ---------------------------------------------------------------------------------------------
+
+#[test]
+fn models_without_session_shows_default_and_one_provider() {
+    let rb = RpcBox::new();
+    let data = rb.glen(["models", "--json"]).run().ok_data();
+    assert_eq!(
+        data["default_model"],
+        json!({"provider":"fake","id":"fake-1"})
+    );
+    assert!(data["current"].is_null());
+    let out = rb.glen(["models", "--provider", "fake", "--human"]).run();
+    out.assert_exit(0);
+    assert!(
+        out.out().contains("1 provider · default fake/fake-1"),
+        "{}",
+        out.ctx()
+    );
+}
+
+#[test]
+fn abort_job_finishing_before_control_arrives_preserves_json_and_reports_finished() {
+    struct StoppedWorker(i64);
+    impl Drop for StoppedWorker {
+        fn drop(&mut self) {
+            signal_group(self.0, Signal::KILL);
+        }
+    }
+
+    for status in ["completed", "failed", "lost"] {
+        for mode in ["--human", "--json"] {
+            let rb = RpcBox::new();
+            let sent = rb
+                .glen(["send", A.handle, "hello", "--no-wait", "--json"])
+                .env("FAKE_OMP_SCENARIO", "hang")
+                .run();
+            let id = job_id(&data_of(&sent, 10));
+            let dir = rb.job_dir(&id);
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let mut state = loop {
+                let state: Value =
+                    serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap())
+                        .unwrap();
+                if state["status"] == "accepted" {
+                    break state;
+                }
+                assert!(std::time::Instant::now() < deadline, "{state}");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let pid = state["worker_pid"].as_i64().unwrap();
+            signal_group(pid, Signal::STOP);
+            let _worker = StoppedWorker(pid);
+
+            // Freeze the fixture worker so the test can deliver a terminal job
+            // acknowledgement after the CLI has selected the active job route.
+            let out = std::thread::scope(|scope| {
+                let client =
+                    scope.spawn(|| rb.glen(["abort", A.handle, mode, "--timeout", "5s"]).run());
+                let request = loop {
+                    let request = std::fs::read_dir(dir.join("control"))
+                        .ok()
+                        .and_then(|entries| {
+                            entries
+                                .filter_map(Result::ok)
+                                .map(|e| e.path())
+                                .find(|p| p.extension().is_some_and(|ext| ext == "json"))
+                        });
+                    if let Some(request) = request {
+                        break request;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(Duration::from_millis(10));
+                };
+                state["status"] = json!(status);
+                std::fs::write(dir.join("status.json"), state.to_string()).unwrap();
+                let reply = json!({"v":1,"ok":true,"data":{
+                    "job_status":status,"session_id":A.id,"queued":false
+                }});
+                let temporary = request.with_extension("tmp");
+                std::fs::write(&temporary, reply.to_string()).unwrap();
+                std::fs::rename(temporary, request.with_extension("done.json")).unwrap();
+                client.join().unwrap()
+            });
+            out.assert_exit(0);
+            if mode == "--human" {
+                assert!(
+                    out.out()
+                        .starts_with(&format!("· job {} had already finished", job_handle(&id))),
+                    "{}",
+                    out.ctx()
+                );
+            } else {
+                let data = out.ok_data();
+                assert_eq!(data["route"], "job");
+                assert_eq!(data["job_status"], status);
+                assert_eq!(data["was"], "busy");
+                assert_eq!(data["aborted"], false);
+                assert_eq!(data["idle_after"], true);
+            }
+        }
+    }
+}
 
 #[test]
 fn ac202_send_creates_a_private_uuidv7_job_and_resumes_the_session_over_rpc() {
@@ -1478,7 +1566,11 @@ fn assert_cancelled_quickly(rb: &RpcBox, id: &str, since: Instant) {
     assert_eq!(st["error"]["code"], "cancelled", "{st}");
     assert!(took <= ABORT_BOUND, "abort took {took:?}");
     let done = rb.wait_file(&rb.job_dir(id).join("control/a.done.json"), LONG);
-    assert_eq!(done, json!({"v": 1, "ok": true}));
+    // W3b AC-356: the acknowledgement reports the terminal job status.
+    assert_eq!(
+        done,
+        json!({"v": 1, "ok": true, "data":{"job_status":"aborted","session_id":A.id,"queued":false}})
+    );
 }
 
 #[test]
@@ -1531,7 +1623,7 @@ fn ac218_unknown_malformed_and_ignored_control_files_leave_the_job_running() {
         let done = rb.wait_file(&control.join(format!("{name}.done.json")), LONG);
         assert_eq!(done["v"], 1, "{name}: {done}");
         assert_eq!(done["ok"], false, "{name}: {done}");
-        assert_eq!(done["error"]["code"], "unsupported_op", "{name}: {done}");
+        assert_eq!(done["error"]["code"], "bad_request", "{name}: {done}");
         assert!(done["error"]["message"].is_string(), "{name}: {done}");
     }
     std::thread::sleep(Duration::from_millis(600));

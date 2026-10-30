@@ -79,3 +79,16 @@ Each title slot is exactly 256 bytes including its newline, as in the reader fix
 
 To change the demo story, edit it, then run `npm --prefix site run demo:refresh`.
 The migration prompt is W2's unmodified job text (`src/rpc/worker.rs` sends `self.job.text`).
+
+
+## W3b control peers
+
+`tests/support/fake_models.json` contains six complete ModelInfo descriptors shared by both peers: fake/fake-1 (low, medium, high), fake/fake-2 (off only), other/fake-2 (all efforts), router/vendor/m-3, vendor/m-3, and nokey/locked-1 (no auth). Exact provider/id resolution beats an otherwise ambiguous bare id.
+
+fake_omp accepts `--no-session` without writing, restores model/thinking from resumed fixture copies, and appends model_change (even unchanged), changed thinking_level_change, and compaction entries itself. Every append is flushed with sync_all. `FAKE_OMP_SERIAL=1` serializes ordinary commands, including abort; the W2 concurrent delayed get_state default remains. `FAKE_OMP_COMPACT_DELAY_MS` delays compact, with no append after termination; `compact_error` returns Nothing to compact; `fork_control` changes the post-control id. `FAKE_OMP_READY_RELEASE` / `FAKE_OMP_RUN_RELEASE` gates exercise deferred and expired control requests.
+
+fake_ext now advertises all eight ops. `FAKE_EXT_OPS=w3` advertises hello/state/send and refuses former reserved controls. `FAKE_EXT_NO_AUTH=<provider>` refuses model selection; `FAKE_EXT_COMPACT_DELAY_MS` delays compaction, which abort cancels; `FAKE_EXT_ABORT_STUCK=1` waits 3s and reports idle_after false; `FAKE_EXT_POST_ID=1` returns a post-control id ending f0f0. Busy sessions refuse compact. Models/thinking are in memory only; the fake never opens the transcript.
+
+`tests/controls.rs` drives the binary over all routes; `extension/glen/test/controls.test.ts` drives the real extension with the fake host and real sockets. Neither uses an owner's omp data. The separate real-omp smoke is manual orchestrator evidence and is not run in this sandbox.
+
+Debug control builds also expose `FAKE_CTL_LOCK_WAIT_GATE=1` solely to publish a test synchronization marker under GLEN_HOME/run/locks after entering the lock-wait path. The endpoint-appearance race test waits for that marker before starting its peer; release builds never read it.

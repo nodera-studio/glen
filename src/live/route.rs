@@ -121,3 +121,11 @@ pub fn hint(kind: Unhealthy) -> String {
         "run `glen install-extension`, then restart that omp session (only TUI sessions accept glen messages)".into()
     }
 }
+
+pub fn lease_held_hint(paths: &crate::omp::paths::OmpPaths) -> String {
+    if paths.extensions_dir.join("glen/index.ts").is_file() {
+        "restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)".into()
+    } else {
+        "run `glen install-extension`, then restart that omp session".into()
+    }
+}
