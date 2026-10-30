@@ -18,8 +18,10 @@ fn human_lines(out: &Out) -> Vec<String> {
     out.out().lines().map(strip_ansi).collect()
 }
 
+/// AC-101 as superseded by W2 AC-201: the reader commands plus `send`, `wait` and `jobs` are
+/// listed; the remaining v0.1.0 commands stay hidden and exit 8.
 #[test]
-fn ac101_help_lists_the_reader_commands_and_the_rest_stay_hidden() {
+fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
     let bx = OmpBox::new();
     let out = bx.glen(["--help"]).run();
     out.assert_exit(0);
@@ -34,18 +36,24 @@ fn ac101_help_lists_the_reader_commands_and_the_rest_stay_hidden() {
     names.sort_unstable();
     assert_eq!(
         names,
-        ["completions", "doctor", "help", "ls", "show", "tail"],
+        [
+            "completions",
+            "doctor",
+            "help",
+            "jobs",
+            "ls",
+            "send",
+            "show",
+            "tail",
+            "wait"
+        ],
         "{}",
         out.ctx()
     );
     for name in HIDDEN {
-        let args: Vec<&str> = match name {
-            "send" => vec!["send", "e27c0de", "hi"],
-            "wait" => vec!["wait", "j1234567"],
-            other => vec![other],
-        };
-        bx.glen(&args).run().error_envelope("not_implemented");
+        bx.glen([name]).run().error_envelope("not_implemented");
     }
+    bx.assert_no_state();
 }
 
 #[test]
