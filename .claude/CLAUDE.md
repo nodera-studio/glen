@@ -60,7 +60,7 @@ Several agent prompts were written for a TypeScript web monorepo. Apply them to 
 - The `/implement` re-index step (Role 4) applies only if `code_index_status` with project `glen`
   shows an index; otherwise skip it and say so.
 - The Implementer's deterministic gate is `.claude/scripts/quality-gate.sh` (rustfmt check +
-  clippy `-D warnings`, plus the site checks when `site/` or `src/render/palette.json` changed); `/implement-quick`'s fail-safe classifier is
+  clippy `-D warnings`, also for the Linux target on macOS, plus the site checks when `site/` or `src/render/palette.json` changed); `/implement-quick`'s fail-safe classifier is
   `.claude/scripts/quick-classify.sh`. Where a prompt says `scripts/quality-gate.sh`, use these.
 - `/run-ci`, `/docs-audit`, `/tech-debt-audit`, `/error-audit` and the `/codebase-audit` scans
   (including the dependency audit) are ported to cargo and `rg`. `cargo-audit`, `cargo-outdated`,

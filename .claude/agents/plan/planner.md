@@ -70,6 +70,10 @@ parse status, track resume points, and extract metadata.
 ## Prerequisites
 - [ ] {Any setup needed before implementation — env vars, schema changes, etc.}
 
+### Network pre-flight
+- [ ] {Every new dependency or download, with the exact command and resolved version, e.g.
+      `cargo add foo@1.2.3`, `npm i -D bar@4.5.6` in `site/` — or "none"}
+
 ## Acceptance Criteria (EARS)
 <!-- The testable spec. Each is externally observable + verifiable and carries a STABLE ID (never
      renumbered) so a test/property can cite it and the spec-drift job can trace it. Rules: only
@@ -199,7 +203,22 @@ forward planning misses — especially wiring, error handling, and integration.
    W1 plan had Step 1 stripping control characters while a Step 13 test expected them
    escaped; only the Implementer caught it. Resolve each contradiction against the AC (the
    spec) and fix the wrong side, marked `[FIXED BY BACKWARD CHECK]`.
-5. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
+5. Check every timing AC (a deadline, timeout, "within N s", abort/cancel latency) against
+   the blocking calls the steps make on that path. Add up the worst-case waits a step can sit
+   in (startup readiness waits, per-call timeouts, retries, sleeps) and confirm the AC can
+   hold while each of them is in progress. The W2 plan's "abort within 1 s while starting"
+   contradicted its own 60 s ready wait and 10 s per-call timeouts; only the Implementer
+   found it. Fix the AC or make the waits interruptible, marked `[FIXED BY BACKWARD CHECK]`.
+6. Verify every tool and dependency the plan names. A step or spec that names a tool,
+   crate or package ("pin esbuild to the version Vite resolves", "use crate X's Y") must be
+   checked against the real tree: `cargo tree -i <crate>` / `cargo search`, `npm ls <pkg>`
+   (in `site/`), or the tool's `--version`. A spec once said to pin the esbuild that Vite
+   resolves, but Vite 8 bundles with Rolldown. Write the resolved version in the step; drop or rewrite
+   a step whose tool does not resolve. List every NEW dependency (crate, npm package,
+   CLI-added component, browser download) in a **Network pre-flight** block under
+   Prerequisites, with the exact command, since the Codex Implementer's sandbox may have no
+   network.
+7. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
    caught.
 </backward_check>
 
@@ -247,6 +266,13 @@ aligned.
 - Keep steps in dependency order — the implementation agent follows them sequentially.
 - Every plan includes a testing step with specific scenarios.
 - Every plan checks whether documentation needs updating.
+- **UI waves** (`site/`, landing pages, web (non-Rust) visual components): choose components only from the
+  catalogue survey the orchestrator supplies (every component of the named library rated);
+  cite the survey row for each pick. Name the design reference(s) and add a verification step
+  for the reference-fidelity check: side-by-side screenshots against each reference, plus a
+  token/pattern inventory citing reference and implementation at `path:line`. Mark the wave
+  for the Claude UI Implementer (see `implementation/orchestrator.md` → UI implementation
+  routing); Rust steps stay with Codex.
 - Don't write code. Describe what to do in enough detail to implement without ambiguity.
 
 </rules>

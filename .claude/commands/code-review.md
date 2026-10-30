@@ -41,7 +41,13 @@ Steps:
      PI_CODING_AGENT_DIR at tests/fixtures or a scratch dir under $TMPDIR, or use
      the fake omp via GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch
      the model of a live omp session. Report severity + category + file:line + issue + impact
-     - fix + confidence. Read-only — report only, do not fix. --effort high".
+     - fix + confidence. Read-only — report only, do not fix. Run in the foreground:
+     wait for the Codex task to finish and return the full review as your final
+     message, never only a background task id. --wait --effort high".
+   - The `--wait` is load-bearing: without it the forwarder may background a long
+     review and return at once with a task id. If a task id comes back anyway,
+     fetch the review (`codex-companion.mjs status <id> --wait`, then `result <id>`)
+     before merging; never merge a pass you have not read.
    - If `codex:codex-rescue` is unavailable, fall back per
      `.claude/skills/codex/SKILL.md`; if Codex is unreachable, run the Claude
      pass alone and note the degraded (single-engine) gate.
