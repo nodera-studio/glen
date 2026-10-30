@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "mnemosyne": {
+      "type": "http",
+      "url": "${MNEMOSYNE_MEMORY_URL:-http://localhost:8080/mcp}",
+      "headers": {
+        "Authorization": "Bearer ${MNEMOSYNE_TOKEN}"
+      }
+    }
+  }
+}
