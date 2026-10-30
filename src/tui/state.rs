@@ -85,11 +85,14 @@ impl App {
         }
     }
     pub fn narrow(&self) -> bool {
-        self.size.0 < 80
+        self.size.0 < 72
     }
     /// The view can supply its actual inner viewport via `update::set_viewport`.
     pub fn page(&self) -> usize {
         usize::from(self.transcript.height.max(1))
+    }
+    pub fn list_page(&self) -> usize {
+        self.list.page.unwrap_or_else(|| self.page()).max(1)
     }
     pub fn local(&mut self) -> u64 {
         let local = self.next_local;
@@ -119,6 +122,8 @@ pub enum Scope {
 }
 #[derive(Default)]
 pub struct ListState {
+    /// Visible rows supplied by layout; absent in reducer-only callers.
+    pub page: Option<usize>,
     pub loaded: bool,
     pub rows: Vec<SessionRow>,
     pub selected: Option<String>,
@@ -132,6 +137,7 @@ pub struct SessionRow {
     pub handle: String,
     pub path: Option<PathBuf>,
     pub title: String,
+    pub first_message: Option<String>,
     pub cwd: Option<String>,
     pub state: State,
     pub source: &'static str,
@@ -314,10 +320,20 @@ pub enum PickerKind {
 }
 #[derive(Clone, Debug)]
 pub struct Picker {
+    pub filter: String,
     pub kind: PickerKind,
     pub entries: Vec<PickerEntry>,
     pub selected: usize,
     pub target: Target,
+}
+impl Picker {
+    pub fn visible_entries(&self) -> Vec<&PickerEntry> {
+        let filter = self.filter.to_lowercase();
+        self.entries
+            .iter()
+            .filter(|entry| entry.label.to_lowercase().contains(&filter))
+            .collect()
+    }
 }
 #[derive(Clone, Debug)]
 pub struct PickerEntry {

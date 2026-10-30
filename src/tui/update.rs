@@ -24,7 +24,10 @@ pub fn update(app: &mut App, msg: Msg) -> Vec<Cmd> {
     let commands = match msg {
         Msg::Key(key) => key_update(app, key),
         Msg::Paste(s) => {
-            if app.overlay.is_none() && app.focus == Focus::Prompt {
+            if let Some(Overlay::Picker(p)) = &mut app.overlay {
+                p.filter.push_str(&text::single_line(&s));
+                p.selected = 0;
+            } else if app.overlay.is_none() && app.focus == Focus::Prompt {
                 app.prompt.insert_paste(&s);
             }
             vec![]
@@ -81,7 +84,7 @@ fn quit(app: &mut App, code: i32) -> Vec<Cmd> {
 fn toast(app: &mut App, s: impl Into<String>) {
     app.toast = Some(Toast {
         text: s.into(),
-        until: app.now + Duration::from_secs(5),
+        until: app.now + Duration::from_secs(3),
     });
 }
 fn save_draft(app: &mut App) {
@@ -157,7 +160,7 @@ fn select(app: &mut App, index: usize) -> Vec<Cmd> {
         return vec![];
     }
     switch_draft(app, row.id.clone());
-    let page = app.page();
+    let page = app.list_page();
     if index < app.list.offset {
         app.list.offset = index;
     } else if index >= app.list.offset.saturating_add(page) {
@@ -173,7 +176,7 @@ fn sessions(app: &mut App, snapshot: ListSnapshot) -> Vec<Cmd> {
     app.list.offset = app
         .list
         .offset
-        .min(app.list.rows.len().saturating_sub(app.page()));
+        .min(app.list.rows.len().saturating_sub(app.list_page()));
     if app.list.selected.is_none() && !app.list.rows.is_empty() {
         return select(app, 0);
     }
@@ -185,8 +188,8 @@ fn sessions(app: &mut App, snapshot: ListSnapshot) -> Vec<Cmd> {
     {
         if index < app.list.offset {
             app.list.offset = index;
-        } else if index >= app.list.offset + app.page() {
-            app.list.offset = index + 1 - app.page();
+        } else if index >= app.list.offset + app.list_page() {
+            app.list.offset = index + 1 - app.list_page();
         }
         if app.transcript.target.is_none() {
             return follow_command(app, true);
@@ -195,7 +198,11 @@ fn sessions(app: &mut App, snapshot: ListSnapshot) -> Vec<Cmd> {
     vec![]
 }
 fn movement(app: &mut App, action: Action) -> Vec<Cmd> {
-    let page = app.page();
+    let page = if app.focus == Focus::Sessions {
+        app.list_page()
+    } else {
+        app.page()
+    };
     if app.focus == Focus::Sessions {
         if app.list.rows.is_empty() {
             return vec![];
@@ -250,36 +257,51 @@ fn key_update(app: &mut App, key: KeyEvent) -> Vec<Cmd> {
         return vec![];
     }
     if let Some(overlay) = &mut app.overlay {
-        // Overlay-local movement is intentionally outside the documented action table.
-        if matches!(key.modifiers, KeyModifiers::NONE) {
-            let step = match key.code {
-                KeyCode::Up | KeyCode::Char('k') => Some(false),
-                KeyCode::Down | KeyCode::Char('j') => Some(true),
-                _ => None,
-            };
-            if let Some(down) = step {
-                match overlay {
-                    Overlay::Picker(p) => {
-                        p.selected = if down {
-                            p.selected
-                                .saturating_add(1)
-                                .min(p.entries.len().saturating_sub(1))
-                        } else {
-                            p.selected.saturating_sub(1)
-                        };
+        if let Overlay::Picker(p) = overlay {
+            if key.modifiers.is_empty() && matches!(key.code, KeyCode::Up | KeyCode::Down) {
+                p.selected = if key.code == KeyCode::Down {
+                    p.selected
+                        .saturating_add(1)
+                        .min(p.visible_entries().len().saturating_sub(1))
+                } else {
+                    p.selected.saturating_sub(1)
+                };
+            } else if key.kind == KeyEventKind::Press
+                && !key.modifiers.intersects(
+                    KeyModifiers::CONTROL
+                        | KeyModifiers::ALT
+                        | KeyModifiers::SUPER
+                        | KeyModifiers::HYPER
+                        | KeyModifiers::META,
+                )
+            {
+                match key.code {
+                    KeyCode::Char(c) if !c.is_control() => {
+                        p.filter.push(c);
+                        p.selected = 0;
                     }
-                    Overlay::Inbox => {
-                        app.inbox.scroll = if down {
-                            app.inbox
-                                .scroll
-                                .saturating_add(1)
-                                .min(app.inbox.records.len().saturating_sub(1))
-                        } else {
-                            app.inbox.scroll.saturating_sub(1)
-                        };
+                    KeyCode::Backspace => {
+                        p.filter.pop();
+                        p.selected = 0;
                     }
                     _ => (),
                 }
+            }
+        } else if let Overlay::Inbox = overlay
+            && key.modifiers.is_empty()
+        {
+            match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.inbox.scroll = app.inbox.scroll.saturating_sub(1)
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    app.inbox.scroll = app
+                        .inbox
+                        .scroll
+                        .saturating_add(1)
+                        .min(app.inbox.records.len().saturating_sub(1))
+                }
+                _ => (),
             }
         }
         return vec![];
@@ -381,11 +403,20 @@ fn dispatch(app: &mut App, action: Action) -> Vec<Cmd> {
             }
         }
         Pick => {
-            if let Some(Overlay::Picker(p)) = app.overlay.take()
-                && let Some(entry) = p.entries.get(p.selected)
-                && app.transcript.target.as_ref() == Some(&p.target)
-            {
-                return control(app, entry.op.clone(), None);
+            let op = if let Some(Overlay::Picker(p)) = &app.overlay {
+                (app.transcript.target.as_ref() == Some(&p.target))
+                    .then(|| {
+                        p.visible_entries()
+                            .get(p.selected)
+                            .map(|entry| entry.op.clone())
+                    })
+                    .flatten()
+            } else {
+                None
+            };
+            if let Some(op) = op {
+                app.overlay = None;
+                return control(app, op, None);
             }
         }
     }
@@ -569,6 +600,7 @@ fn control_done(app: &mut App, local: u64, op: ControlOp, result: Result<Control
                 toast(app, "no session control choices available");
             } else {
                 app.overlay = Some(Overlay::Picker(Picker {
+                    filter: String::new(),
                     kind,
                     entries,
                     selected: 0,
@@ -997,6 +1029,7 @@ mod tests {
             handle: format!("h{id}"),
             path: Some(PathBuf::from(format!("/fixture/{id}.jsonl"))),
             title: id.into(),
+            first_message: None,
             cwd: None,
             state: SessionState::Idle,
             source: "disk",
@@ -1946,6 +1979,7 @@ mod tests {
             OverlayCtx::Inbox => Some(Overlay::Inbox),
             OverlayCtx::Confirm => Some(Overlay::Confirm(ControlOp::Abort)),
             OverlayCtx::Picker => Some(Overlay::Picker(Picker {
+                filter: String::new(),
                 kind: PickerKind::Thinking,
                 entries: vec![PickerEntry {
                     label: "high".into(),
