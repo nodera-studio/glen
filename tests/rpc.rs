@@ -1151,3 +1151,261 @@ fn review5_delayed_final_state_still_detects_silent_fork() {
             .ends_with("f0f0")
     );
 }
+
+#[test]
+fn cycle3_eof_after_unsettled_completion_finishes_promptly() {
+    let b = RpcBox::new();
+    let start = Instant::now();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--json"])
+        .env("FAKE_OMP_SCENARIO", "unsettled_exit")
+        .env("GLEN_JOB_TIMEOUT", "60m")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 0);
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(v["data"]["session_settled"], false);
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|w| w["code"] == "settle_timeout")
+    );
+    b.wait_worker_gone(&job_id(&v));
+}
+
+#[test]
+fn cycle3_fresh_probe_queues_when_glen_claims_lock_and_lease() {
+    let b = RpcBox::new();
+    let gate = b.omp.home.join("probe-release");
+    let child = b
+        .glen(&["send", "e27c0de", "second", "--no-wait", "--json"])
+        .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    poll(Duration::from_secs(3), || {
+        gate.with_extension("ready").exists().then_some(())
+    });
+    // The first is_held has already returned false. A real glen worker now claims both locks.
+    let release = b.omp.home.join("first-release");
+    let first = b
+        .glen(&["send", "e27c0de", "first", "--no-wait", "--json"])
+        .env("FAKE_OMP_RUN_RELEASE", &release)
+        .env("FAKE_OMP_OWNERS_DIR", b.owners())
+        .output()
+        .unwrap();
+    let first = envelope(&first, 10);
+    accepted(&b, &job_id(&first));
+    assert!(matches!(
+        glen::omp::lease::probe(&b.owners(), A_ID),
+        glen::omp::lease::Lease::Held
+    ));
+    fs::write(&gate, "go").unwrap();
+    let second = envelope(&child.wait_with_output().unwrap(), 10);
+    let id = job_id(&second);
+    poll(Duration::from_secs(3), || {
+        (b.job(&id).1["waiting_for_lock"] == true).then_some(())
+    });
+    fs::write(release, "go").unwrap();
+    wait(&b, &first, 0);
+    assert_eq!(
+        wait(&b, &second, 0)["data"]["assistant_text"],
+        "pong: second"
+    );
+}
+
+#[test]
+fn cycle3_local_ack_survives_eof_before_forwarding() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--json"])
+        .env("FAKE_OMP_SCENARIO", "local_exit")
+        .env("FAKE_OMP_ACK_FORWARD_DELAY_MS", "400")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 0);
+    assert_eq!(v["data"]["command_output"], json!(["fake command output"]));
+    b.wait_worker_gone(&job_id(&v));
+    let r: Value =
+        serde_json::from_slice(&fs::read(b.job_dir(&job_id(&v)).join("result.json")).unwrap())
+            .unwrap();
+    assert_eq!(r["agent_invoked"], false);
+}
+
+#[test]
+fn cycle3_final_identity_check_after_deadline_or_cancel_detects_silent_fork() {
+    for cancel in [false, true] {
+        let b = RpcBox::new();
+        let o = b
+            .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+            .env("FAKE_OMP_SCENARIO", "fork_silent")
+            .env("FAKE_OMP_NEVER_SETTLE", "1")
+            .env("GLEN_JOB_TIMEOUT", if cancel { "30s" } else { "1500ms" })
+            .output()
+            .unwrap();
+        let v = envelope(&o, 10);
+        let id = job_id(&v);
+        poll(Duration::from_secs(3), || {
+            b.fake_log()
+                .iter()
+                .any(|v| v["event"] == "out" && v["frame"]["type"] == "prompt_result")
+                .then_some(())
+        });
+        if cancel {
+            control(&b, &id, "completed-cancel", json!({"v":1,"op":"abort"}));
+        }
+        let v = wait(&b, &v, 11);
+        assert_eq!(v["data"]["forked"]["from"], A_ID);
+        assert!(
+            v["data"]["forked"]["to"]
+                .as_str()
+                .unwrap()
+                .ends_with("f0f0")
+        );
+        assert_eq!(v["data"]["session_settled"], false);
+        assert_eq!(b.frames_in("get_state").len(), 3); // baseline, reply, final
+        assert!(b.frames_in("abort").is_empty());
+    }
+}
+
+#[test]
+fn cycle3_reply_during_delayed_fork_query_uses_new_identity() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hi", "--json"])
+        .env("FAKE_OMP_SCENARIO", "fork_reply")
+        .env("FAKE_OMP_DELAY_MS", "0")
+        .env("FAKE_OMP_STATE_DELAY_MS", "400")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 11);
+    b.wait_worker_gone(&job_id(&v));
+    let new = v["data"]["forked"]["to"].as_str().unwrap();
+    assert_eq!(v["data"]["replies"][0]["session_id"], new);
+    let records = fs::read_to_string(b.job_dir(&job_id(&v)).join("replies.ndjson")).unwrap();
+    let record: Value = serde_json::from_str(records.trim()).unwrap();
+    assert_eq!(record["session_id"], new);
+    assert!(
+        !b.omp
+            .glen_home
+            .join("inbox")
+            .join(format!("{A_ID}.ndjson"))
+            .exists()
+    );
+    let frames = b.fake_log();
+    let call = frames
+        .iter()
+        .position(|v| v["event"] == "out" && v["frame"]["type"] == "host_tool_call")
+        .unwrap();
+    let checked = frames
+        .iter()
+        .position(|v| {
+            v["event"] == "out"
+                && v["frame"]["command"] == "get_state"
+                && v["frame"]["data"]["sessionId"] == new
+        })
+        .unwrap();
+    assert!(
+        call < checked,
+        "reply must arrive before the fork query response"
+    );
+}
+
+#[test]
+fn cycle3_queue_marker_cleared_on_cancel_and_timeout() {
+    for cancel in [false, true] {
+        let b = RpcBox::new();
+        let lock = b.hold_glen_lock(A_ID);
+        let o = b
+            .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+            .env("GLEN_JOB_TIMEOUT", if cancel { "30s" } else { "1500ms" })
+            .output()
+            .unwrap();
+        let v = envelope(&o, 10);
+        let id = job_id(&v);
+        poll(Duration::from_secs(3), || {
+            (b.job(&id).1["waiting_for_lock"] == true).then_some(())
+        });
+        if cancel {
+            control(&b, &id, "queued-cancel", json!({"v":1,"op":"abort"}));
+        }
+        let s = b.wait_terminal(&id, Duration::from_secs(3));
+        assert_ne!(s["waiting_for_lock"], true);
+        assert_ne!(s["waited_ms"], 1);
+        assert_eq!(
+            s["error"]["code"],
+            if cancel { "cancelled" } else { "timeout" }
+        );
+        wait(&b, &v, 7);
+        assert!(b.fake_log().is_empty());
+        drop(lock);
+    }
+}
+
+#[test]
+fn cycle3_stale_state_responses_cannot_revert_reply_identity() {
+    // One returns through the call channel; the other times out and becomes unmatched.
+    for delay in ["600", "1500"] {
+        let b = RpcBox::new();
+        let run_release = b.omp.home.join("run-release");
+        let result_release = b.omp.home.join("result-release");
+        let o = b
+            .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+            .env("FAKE_OMP_SCENARIO", "stale_state")
+            .env("FAKE_OMP_OLD_STATE_DELAY_MS", delay)
+            .env("FAKE_OMP_RUN_RELEASE", &run_release)
+            .env("FAKE_OMP_RESULT_RELEASE", &result_release)
+            .env("GLEN_JOB_TIMEOUT", "8s")
+            .output()
+            .unwrap();
+        let v = envelope(&o, 10);
+        poll(Duration::from_secs(3), || {
+            (b.frames_in("get_state").len() >= 2).then_some(())
+        });
+        let old_request = b.frames_in("get_state")[1]["id"].clone();
+        fs::write(run_release, "go").unwrap();
+        poll(Duration::from_secs(4), || {
+            (b.frames_in("host_tool_result").len() == 2).then_some(())
+        });
+        let log = b.fake_log();
+        let late = log
+            .iter()
+            .position(|e| {
+                e["event"] == "out"
+                    && e["frame"]["command"] == "get_state"
+                    && e["frame"]["id"] == old_request
+            })
+            .unwrap();
+        let newer = log
+            .iter()
+            .position(|e| {
+                e["event"] == "out"
+                    && e["frame"]["command"] == "get_state"
+                    && e["frame"]["data"]["sessionId"]
+                        .as_str()
+                        .is_some_and(|s| s.ends_with("f0f0"))
+            })
+            .unwrap();
+        assert!(
+            newer < late,
+            "test must deliver the old state after the new state"
+        );
+        fs::write(result_release, "go").unwrap();
+        let done = wait(&b, &v, 11);
+        let new = done["data"]["forked"]["to"].as_str().unwrap();
+        let replies = done["data"]["replies"].as_array().unwrap();
+        assert_eq!(replies.len(), 2);
+        assert!(replies.iter().all(|r| r["session_id"] == new));
+        assert_eq!(b.job(&job_id(&v)).1["actual_session_id"], new);
+        assert!(
+            !b.omp
+                .glen_home
+                .join("inbox")
+                .join(format!("{A_ID}.ndjson"))
+                .exists()
+        );
+    }
+}

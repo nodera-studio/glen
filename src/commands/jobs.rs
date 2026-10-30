@@ -123,19 +123,17 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                 + 2 * columns.len().saturating_sub(1)
                 > usize::from(w)
             {
-                let Some(i) = columns
+                if let Some(pos) = [4, 3, 1]
                     .iter()
-                    .copied()
-                    .filter(|i| *i != 2 && budgets[*i] > 1)
-                    .max_by_key(|i| budgets[*i])
-                else {
-                    if let Some(pos) = columns.iter().rposition(|i| *i != 2) {
-                        columns.remove(pos);
-                        continue;
-                    }
+                    .find_map(|drop| columns.iter().position(|i| i == drop))
+                {
+                    columns.remove(pos);
+                } else {
+                    // Keep both handles intact; wrap session prose if even the two columns
+                    // cannot fit side by side at their natural widths.
+                    budgets[2] = usize::from(w).saturating_sub(budgets[0] + 2).max(1);
                     break;
-                };
-                budgets[i] -= 1;
+                }
             }
         }
         let mut table = Table::new(&ctx.painter, None);
@@ -165,7 +163,7 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                                 _ => Token::Muted,
                             },
                             &if i == 2 {
-                                text::wrap(v, ctx.width.map(usize::from)).join("\n")
+                                text::wrap(v, Some(budgets[2])).join("\n")
                             } else {
                                 text::truncate(v, budgets[i])
                             },

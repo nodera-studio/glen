@@ -100,6 +100,26 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     if let Some(o) = &opened
         && !lock::is_held(&home, &o.session.header.id)
     {
+        #[cfg(debug_assertions)]
+        if let Some(path) = env.get("FAKE_OMP_LEASE_PROBE_GATE") {
+            let ready = format!("{path}.ready");
+            std::fs::write(&ready, b"probing").map_err(|e| {
+                GlenError::new(
+                    ErrorCode::Io,
+                    format!("cannot write probe gate {ready}: {e}"),
+                )
+            })?;
+            let end = Instant::now() + Duration::from_secs(5);
+            while !Path::new(path).exists() {
+                if Instant::now() >= end {
+                    return Err(GlenError::new(
+                        ErrorCode::Io,
+                        format!("timed out waiting for probe gate {path}"),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
         let message = match lease::probe(&paths.session_owners_dir, &o.session.header.id) {
             Lease::Free => None,
             Lease::Held => Some(format!(
@@ -111,7 +131,9 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
                 o.handle
             )),
         };
-        if let Some(message) = message {
+        if let Some(message) = message
+            && !lock::is_held(&home, &o.session.header.id)
+        {
             return Err(GlenError::new(ErrorCode::NoRoute,message).with_hint("close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)"));
         }
     }

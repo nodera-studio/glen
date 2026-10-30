@@ -23,6 +23,7 @@ use omp_rpc::{
 };
 use serde_json::{Value, json};
 use std::{
+    collections::VecDeque,
     process::ExitCode,
     sync::{
         Arc, Mutex,
@@ -192,6 +193,7 @@ impl Worker {
         }
     }
     fn finish_failure(&mut self, f: Failure) -> Result<(), Failure> {
+        self.status.waiting_for_lock = false;
         self.status.status = f.state;
         self.status.error = Some(JobError {
             code: f.code.into(),
@@ -259,14 +261,17 @@ impl Worker {
                 .ok_or_else(|| Failure::new("internal", "resumed job has no session id"))?
                 .to_owned();
             self.log("lock", "waiting for glen session lock");
-            if lock::is_held(&self.store.home, &id) {
-                self.status.waited_ms = Some(1);
-                self.status.waiting_for_lock = true;
-                self.save()?;
-            }
-            match lock::acquire(&self.store.home, &id, self.deadline, &|| {
-                self.stop_requested()
-            })? {
+            let home = self.store.home.clone();
+            let acquired =
+                lock::acquire(&home, &id, self.deadline, &|| self.stop_requested(), || {
+                    let mut status = self.status.clone();
+                    status.waiting_for_lock = true;
+                    status.waited_ms = Some(1);
+                    self.store
+                        .write_status(&self.id, &status)
+                        .map_err(std::io::Error::other)
+                })?;
+            match acquired {
                 lock::Acquired::Locked { lock, waited } => {
                     session_lock = Some(lock);
                     self.status.waited_ms = Some(waited.as_millis().min(u64::MAX as u128) as u64);
@@ -304,12 +309,8 @@ impl Worker {
         }
         self.check_stop()?;
         self.log("spawn", "starting omp RPC");
-        let sink = Arc::new(ReplySink::new(
-            self.store.clone(),
-            self.store.home.clone(),
-            self.id.clone(),
-        ));
-        let Some(started) = self.start(sink.clone())? else {
+        let sink = ReplySink::new(self.store.clone(), self.store.home.clone(), self.id.clone());
+        let Some(started) = self.start()? else {
             // Cancellation is already durable. The startup thread has joined and dropped its client.
             return Ok(());
         };
@@ -318,6 +319,7 @@ impl Worker {
             events,
             baseline,
             warnings,
+            replies,
         } = started;
         self.status.omp_pid = client.pid();
         self.status.warnings.extend(warnings);
@@ -353,7 +355,7 @@ impl Worker {
                 .into(),
             );
             self.log("prompt", "sending message");
-            self.drive(&client, &events, &sink, &baseline.session_id)
+            self.drive(&client, &events, &replies, &sink, &baseline.session_id)
         })();
         // Terminal state must precede teardown, and the session lock stays held through close.
         let result = match result {
@@ -367,7 +369,7 @@ impl Worker {
         drop(session_lock);
         result
     }
-    fn start(&mut self, sink: Arc<ReplySink>) -> Result<Option<Started>, Failure> {
+    fn start(&mut self) -> Result<Option<Started>, Failure> {
         let abandon = Arc::new(AtomicBool::new(false));
         let ready = Arc::new(AtomicBool::new(false));
         let job = self.job.clone();
@@ -383,7 +385,6 @@ impl Worker {
                     deadline,
                     ready_deadline,
                     &startup_ready,
-                    sink,
                     &startup_abandon,
                 );
                 if let Err(undelivered) = tx.send(result) {
@@ -452,13 +453,7 @@ impl Worker {
         self.status.actual_session_id = Some(s.session_id);
         self.status.actual_session_file = s.session_file.map(std::path::PathBuf::from);
     }
-    fn event(
-        &mut self,
-        ev: Event,
-        run: &mut Run,
-        baseline: &str,
-        sink: &ReplySink,
-    ) -> Result<(), Failure> {
+    fn event(&mut self, ev: Event, run: &mut Run) -> Result<(), Failure> {
         match ev {
             Event::Notification(RpcNotification::RpcAgentEvent(ev)) => {
                 self.accept()?;
@@ -489,11 +484,9 @@ impl Worker {
             Event::Notification(RpcNotification::CommandOutput(c)) => {
                 run.command_output.push(c.text)
             }
-            Event::UnmatchedResponse(r) if r.command == "get_state" && r.success => {
-                if let Ok(s) = GetStateCommand::decode(r.data) {
-                    self.apply_state(s, baseline, sink);
-                }
-            }
+            // A timed-out SDK call has no worker sequence attached to its unmatched response.
+            // Only sequenced call results may publish identity; late frames are never authoritative.
+            Event::UnmatchedResponse(r) if r.command == "get_state" => (),
             Event::UnmatchedResponse(r) if r.command == "prompt" => {
                 if r.success {
                     run.ack(PromptCommand::decode(r.data).map_err(omp_rpc::Error::Json));
@@ -527,6 +520,7 @@ impl Worker {
         &mut self,
         client: &Client,
         events: &Receiver<Event>,
+        replies: &Receiver<reply::PendingReply>,
         sink: &ReplySink,
         baseline: &str,
     ) -> Result<(), Failure> {
@@ -536,13 +530,9 @@ impl Worker {
             streaming_behavior: Some(rpc::streaming_behavior(self.job.deliver_as)),
         };
         let phase = Mutex::new(Submission::Pending);
-        let delay = Env::from_process()
-            .get("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS")
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|n| *n <= 20_000)
-            .map(Duration::from_millis)
-            .unwrap_or_default();
+        let delay = test_delay("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS");
         let mut run = Run::default();
+        let mut ack_pending = true;
         std::thread::scope(|scope| -> Result<(), Failure> {
             let (tx, rx) = mpsc::channel();
             let phase = &phase;
@@ -569,15 +559,23 @@ impl Worker {
                 *guard = Submission::Submitted;
                 let ack = client.call(&SubmitPrompt(cmd));
                 drop(guard);
+                std::thread::sleep(test_delay("FAKE_OMP_ACK_FORWARD_DELAY_MS"));
                 if tx.send(ack).is_err() {
                     eprintln!("worker prompt ack receiver closed");
                 }
             });
-            let (state_tx, state_rx) =
-                mpsc::channel::<Result<omp_rpc::SessionState, omp_rpc::Error>>();
-            let mut state_pending = false;
-            let mut final_query = false;
+            let (state_tx, state_rx) = mpsc::channel::<(
+                u64,
+                bool,
+                Result<omp_rpc::SessionState, omp_rpc::Error>,
+                Option<reply::PendingReply>,
+            )>();
+            let mut states = StateSequence::default();
+            let mut reply_queue = VecDeque::new();
+            let mut reply_pending = false;
+            let mut state_pending = None;
             let mut final_checked = false;
+            let mut final_sequence = None;
             // Terminal status is published before joining any outstanding state call.
             let mut persistence_failure = None;
             loop {
@@ -585,36 +583,84 @@ impl Worker {
                 // here when the ack arrives; there is no asynchronous forwarder to overtake.
                 match events.recv_timeout(Duration::from_millis(50)) {
                     Ok(ev) => {
-                        if let Err(e) = self.event(ev, &mut run, baseline, sink) {
+                        if let Err(e) = self.event(ev, &mut run) {
                             persistence_failure = Some(e);
                             run.stop = Some(StopReason::Cancelled);
                         }
                     }
-                    Err(mpsc::RecvTimeoutError::Disconnected) if run.prompt.is_none() => {
-                        run.prompt = Some(Err(omp_rpc::Error::Closed))
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        run.closed = true;
+                        // EOF stays ready forever; other channels still need a bounded polling tick.
+                        std::thread::sleep(Duration::from_millis(50));
                     }
-                    Err(_) => (),
+                    Err(mpsc::RecvTimeoutError::Timeout) => (),
                 }
-                if let Ok(ack) = rx.try_recv() {
-                    run.ack(ack);
+                match rx.try_recv() {
+                    Ok(ack) => {
+                        ack_pending = false;
+                        run.ack(ack);
+                    }
+                    Err(mpsc::TryRecvError::Disconnected) => ack_pending = false,
+                    Err(mpsc::TryRecvError::Empty) => (),
                 }
-                if let Ok(state) = state_rx.try_recv() {
-                    state_pending = false;
-                    match state {
-                        Ok(s) => self.apply_state(s, baseline, sink),
-                        Err(e) => self.log("get_state", &e.to_string()),
+                // The submission thread may already own a successful local acknowledgement.
+                // Reconcile it before turning EOF into a transport failure.
+                if run.closed && !ack_pending && run.prompt.is_none() {
+                    run.prompt = Some(Err(omp_rpc::Error::Closed));
+                }
+                while let Ok((sequence, final_query, state, reply)) = state_rx.try_recv() {
+                    if state_pending == Some(sequence) {
+                        state_pending = None;
+                    }
+                    let checked = match state {
+                        Ok(s) => {
+                            if states.apply(sequence) {
+                                self.apply_state(s, baseline, sink);
+                            }
+                            Ok(())
+                        }
+                        Err(e) => {
+                            self.log("get_state", &e.to_string());
+                            Err(GlenError::new(
+                                ErrorCode::JobFailed,
+                                format!("cannot check session {baseline} for glen_reply: {e}"),
+                            ))
+                        }
+                    };
+                    if let Some(reply) = reply {
+                        reply_pending = false;
+                        reply::PendingReply::finish(reply, sink, checked);
                     }
                     if final_query {
                         final_checked = true;
                     }
                 }
-                if run.recheck_requested && !state_pending {
+                // Host tools run on SDK threads. Resolve identity after receiving each reply,
+                // before appending it, even if an earlier notice query is still in flight.
+                reply_queue.extend(replies.try_iter());
+                if !reply_pending && let Some(reply) = reply_queue.pop_front() {
+                    // Preserve host-call arrival order while notice queries can overlap.
+                    reply_pending = true;
+                    let sequence = states.issue();
+                    let tx = state_tx.clone();
+                    scope.spawn(move || {
+                        let state = client.call(&StateSecond(GetStateCommand {}));
+                        if tx.send((sequence, false, state, Some(reply))).is_err() {
+                            eprintln!("worker reply identity receiver closed");
+                        }
+                    });
+                }
+                if run.recheck_requested && state_pending.is_none() {
                     run.recheck_requested = false;
-                    state_pending = true;
+                    let sequence = states.issue();
+                    state_pending = Some(sequence);
                     let tx = state_tx.clone();
                     let left = self.deadline.saturating_duration_since(Instant::now());
                     scope.spawn(move || {
-                        if tx.send(query_state(client, left)).is_err() {
+                        if tx
+                            .send((sequence, false, query_state(client, left), None))
+                            .is_err()
+                        {
                             eprintln!("worker state receiver closed");
                         }
                     });
@@ -655,18 +701,20 @@ impl Worker {
                         // Source drain is the completion barrier, including command_output
                         // emitted immediately before a local ack.
                         for ev in events.try_iter() {
-                            if let Err(e) = self.event(ev, &mut run, baseline, sink) {
+                            if let Err(e) = self.event(ev, &mut run) {
                                 persistence_failure = Some(e);
                             }
                         }
-                        if !run.killed && run.stop.is_none() && !final_checked {
-                            if !state_pending {
-                                final_query = true;
-                                state_pending = true;
+                        if t.state == State::Completed && !final_checked {
+                            if final_sequence.is_none() {
+                                let sequence = states.issue();
+                                final_sequence = Some(sequence);
                                 let tx = state_tx.clone();
-                                let left = self.deadline.saturating_duration_since(Instant::now());
                                 scope.spawn(move || {
-                                    if tx.send(query_state(client, left)).is_err() {
+                                    // Completion always gets its own budget, including cancellation
+                                    // after a result and an exhausted absolute job deadline.
+                                    let state = client.call(&StateSecond(GetStateCommand {}));
+                                    if tx.send((sequence, true, state, None)).is_err() {
                                         eprintln!("worker final state receiver closed");
                                     }
                                 });
@@ -758,6 +806,7 @@ struct Started {
     events: Receiver<Event>,
     baseline: omp_rpc::SessionState,
     warnings: Vec<Warning>,
+    replies: Receiver<reply::PendingReply>,
 }
 impl Started {
     fn spawn(
@@ -765,7 +814,6 @@ impl Started {
         deadline: Instant,
         ready_deadline: Instant,
         ready: &AtomicBool,
-        sink: Arc<ReplySink>,
         abandon: &AtomicBool,
     ) -> Result<Self, Failure> {
         let check = || {
@@ -803,7 +851,8 @@ impl Started {
             Failure::new(code, format!("cannot start omp: {e} (see worker.log)"))
         })?;
         ready.store(true, Ordering::SeqCst);
-        let tools = client.set_custom_tools(vec![reply::glen_reply_tool(sink)]);
+        let (reply_tx, replies) = mpsc::channel();
+        let tools = client.set_custom_tools(vec![reply::glen_reply_tool(reply_tx)]);
         check()?;
         let tools = tools.map_err(|e| {
             let mut failure = Failure::new("reply_tool_rejected", e.to_string());
@@ -839,7 +888,25 @@ impl Started {
             events,
             baseline,
             warnings,
+            replies,
         })
+    }
+}
+// Integration tests execute the debug binary. Release workers never read fake-peer knobs.
+fn test_delay(key: &str) -> Duration {
+    #[cfg(debug_assertions)]
+    {
+        Env::from_process()
+            .get(key)
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|n| *n <= 20_000)
+            .map(Duration::from_millis)
+            .unwrap_or_default()
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = key;
+        Duration::ZERO
     }
 }
 // These calls must not hold the polling thread (or submission gate) for CALL_TIMEOUT.
@@ -977,6 +1044,25 @@ enum StopReason {
     Cancelled,
     Timeout,
 }
+// A later observation wins. Timed-out/unmatched SDK responses are deliberately ignored.
+#[derive(Default)]
+struct StateSequence {
+    issued: u64,
+    applied: u64,
+}
+impl StateSequence {
+    fn issue(&mut self) -> u64 {
+        self.issued += 1;
+        self.issued
+    }
+    fn apply(&mut self, sequence: u64) -> bool {
+        if sequence <= self.applied {
+            return false;
+        }
+        self.applied = sequence;
+        true
+    }
+}
 #[derive(Default)]
 struct Run {
     prompt: Option<Result<PromptTurn, omp_rpc::Error>>,
@@ -988,6 +1074,7 @@ struct Run {
     abort_sent_at: Option<Instant>,
     killed: bool,
     command_output: Vec<String>,
+    closed: bool,
 }
 impl Run {
     fn ack(&mut self, ack: Result<PromptAck, omp_rpc::Error>) {
@@ -1057,6 +1144,7 @@ fn next(run: &Run, now: Instant, deadline: Instant) -> Next {
                         if r.session_settled || run.settled_seen {
                             Terminal::completed(true)
                         } else if now >= deadline
+                            || run.closed
                             || run.stop.is_some()
                             || (!r.agent_invoked
                                 && run.completed_at.is_some_and(|t| {
@@ -1123,6 +1211,75 @@ fn next(run: &Run, now: Instant, deadline: Instant) -> Next {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cycle3_closed_completed_result_does_not_wait_for_deadline() {
+        let now = Instant::now();
+        let run = Run {
+            prompt: Some(Ok(turn(Some(PromptStatus::Completed), false))),
+            closed: true,
+            ..Run::default()
+        };
+        assert!(matches!(
+            next(&run, now, now + Duration::from_secs(3600)),
+            Next::Finish(Terminal {
+                state: State::Completed,
+                settled: false,
+                settle_timeout: true,
+                ..
+            })
+        ));
+    }
+    #[test]
+    fn cycle3_state_sequences_reject_older_results_and_unmatched_frames() {
+        let mut sequences = StateSequence::default();
+        let old = sequences.issue();
+        let new = sequences.issue();
+        assert!(sequences.apply(new));
+        assert!(!sequences.apply(old));
+        assert!(!sequences.apply(new));
+        let newest = sequences.issue();
+        assert!(sequences.apply(newest));
+
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let job = crate::jobs::tests::job();
+        let id = JobId::parse(&job.id).unwrap();
+        store.create(&job).unwrap();
+        let sink = ReplySink::new(store.clone(), store.home.clone(), id.clone());
+        sink.set_session("new".into());
+        let mut worker = Worker {
+            status: Status {
+                actual_session_id: Some("new".into()),
+                ..store.read_status(&id).unwrap()
+            },
+            store,
+            id,
+            job,
+            cancel: Arc::new(AtomicBool::new(false)),
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        let frame = serde_json::from_value(
+            json!({"id":"old-query", "command":"get_state", "success":true,
+            "data":{"sessionId":"old", "isStreaming":false,"isSettled":false,"messageCount":0}}),
+        )
+        .unwrap();
+        worker
+            .event(Event::UnmatchedResponse(frame), &mut Run::default())
+            .unwrap();
+        assert_eq!(worker.status.actual_session_id.as_deref(), Some("new"));
+        sink.record("late reply".into(), true, "call".into())
+            .unwrap();
+        assert_eq!(sink.replies()[0].session_id, "new");
+    }
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn cycle3_release_worker_has_no_fake_delay() {
+        assert_eq!(
+            test_delay("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS"),
+            Duration::ZERO
+        );
+        assert_eq!(test_delay("FAKE_OMP_ACK_FORWARD_DELAY_MS"), Duration::ZERO);
+    }
     #[test]
     fn startup_bounds_preserve_first_timeout_during_teardown() {
         let t = tempfile::tempdir().unwrap();

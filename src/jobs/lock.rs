@@ -64,8 +64,10 @@ pub fn acquire(
     id: &str,
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
+    mut on_blocked: impl FnMut() -> io::Result<()>,
 ) -> io::Result<Acquired> {
     let started = Instant::now();
+    let mut blocked = false;
     loop {
         if cancel() {
             return Ok(Acquired::Cancelled);
@@ -78,6 +80,10 @@ pub fn acquire(
                 lock,
                 waited: started.elapsed(),
             });
+        }
+        if !blocked {
+            on_blocked()?;
+            blocked = true;
         }
         std::thread::sleep(Duration::from_millis(200));
     }
@@ -132,24 +138,84 @@ mod tests {
                 &h,
                 "abc",
                 Instant::now() + Duration::from_millis(300),
-                &|| false
+                &|| false,
+                || Ok(())
             )
             .unwrap(),
             Acquired::TimedOut
         ));
         assert!(matches!(
-            acquire(&h, "abc", Instant::now() + Duration::from_secs(1), &|| true).unwrap(),
+            acquire(
+                &h,
+                "abc",
+                Instant::now() + Duration::from_secs(1),
+                &|| true,
+                || Ok(())
+            )
+            .unwrap(),
             Acquired::Cancelled
         ));
         drop(lock);
         assert!(!is_held(&h, "abc"));
         assert!(matches!(
-            acquire(&h, "abc", Instant::now() + Duration::from_secs(1), &|| {
-                false
-            })
+            acquire(
+                &h,
+                "abc",
+                Instant::now() + Duration::from_secs(1),
+                &|| { false },
+                || Ok(())
+            )
             .unwrap(),
             Acquired::Locked { .. }
         ));
+    }
+    #[test]
+    fn cycle3_blocked_callback_tracks_real_acquire_not_a_probe() {
+        use std::cell::{Cell, RefCell};
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        assert!(!is_held(&h, "race"));
+        let held = RefCell::new(None);
+        let blocked = Cell::new(0);
+        // Take the competing lock after any pre-check, just before the actual acquire.
+        let result = acquire(
+            &h,
+            "race",
+            Instant::now() + Duration::from_millis(450),
+            &|| {
+                if held.borrow().is_none() {
+                    *held.borrow_mut() = try_acquire(&h, "race").unwrap();
+                }
+                false
+            },
+            || {
+                blocked.set(blocked.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, Acquired::TimedOut));
+        assert_eq!(
+            blocked.get(),
+            1,
+            "publish only on the first actual contention"
+        );
+        assert!(is_held(&h, "race"));
+        drop(held);
+        // A pre-check could have seen held, but the real acquire is now uncontended.
+        let result = acquire(
+            &h,
+            "race",
+            Instant::now() + Duration::from_secs(1),
+            &|| false,
+            || {
+                blocked.set(blocked.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(matches!(result, Acquired::Locked { .. }));
+        assert_eq!(blocked.get(), 1, "no false queued marker after release");
     }
     #[test]
     fn lock_not_inherited_by_child() {

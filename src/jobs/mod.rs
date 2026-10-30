@@ -264,7 +264,12 @@ impl JobStore {
             use std::os::unix::fs::OpenOptionsExt;
             opts.mode(0o600);
         }
-        let file = opts.open(&path).map_err(|e| GlenError::read(&path, e))?;
+        let file = opts.open(&path).map_err(|e| {
+            GlenError::new(
+                ErrorCode::Io,
+                format!("cannot open {} for writing: {e}", path.display()),
+            )
+        })?;
         file.lock().map_err(|e| {
             GlenError::new(
                 ErrorCode::Io,
