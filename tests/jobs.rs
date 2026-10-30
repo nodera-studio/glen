@@ -146,6 +146,66 @@ fn ac220_order_limits_filters_and_lost_check() {
     );
 }
 #[test]
+fn w2_wait_shape_before_lookup_with_missing_home_or_no_match() {
+    let b = RpcBox::new();
+    for populated in [false, true] {
+        if populated {
+            make(&b, State::Completed, None);
+        }
+        for (arg, exit, code) in [
+            ("garbage", 2, "usage"),
+            ("j123", 2, "usage"),
+            ("j123456g", 2, "usage"),
+            ("J1234567", 3, "not_found"),
+            ("01a00000-0000-7000-8000-000001234567", 3, "not_found"),
+        ] {
+            let value = run(&b, &["wait", arg, "--json"], exit);
+            assert_eq!(value["error"]["code"], code);
+            if exit == 2 {
+                assert!(
+                    value["error"]["hint"]
+                        .as_str()
+                        .unwrap()
+                        .contains("glen jobs")
+                );
+            }
+            assert_eq!(b.omp.glen_home.exists(), populated);
+        }
+    }
+}
+#[test]
+fn w2_lost_age_uses_updated_at_instead_of_mtime() {
+    for (updated_at, old_mtime, expected) in [
+        ("2000-01-01T00:00:00Z", false, State::Lost),
+        ("2099-01-01T00:00:00Z", true, State::Queued),
+        ("invalid timestamp", true, State::Queued),
+    ] {
+        let b = RpcBox::new();
+        let id = make(&b, State::Queued, None);
+        let store = store(&b);
+        let mut status = store.read_status(&id).unwrap();
+        status.worker_pid = None;
+        status.worker_start = None;
+        status.updated_at = updated_at.into();
+        store.write_status(&id, &status).unwrap();
+        if old_mtime {
+            fs::File::open(store.dir(&id).join("status.json"))
+                .unwrap()
+                .set_modified(std::time::SystemTime::UNIX_EPOCH)
+                .unwrap();
+        }
+        let value = run(
+            &b,
+            &["wait", id.as_str(), "--timeout", "0", "--json"],
+            if expected == State::Lost { 7 } else { 10 },
+        );
+        assert_eq!(store.read_status(&id).unwrap().status, expected);
+        if expected == State::Lost {
+            assert_eq!(value["error"]["details"]["error"]["code"], "lost");
+        }
+    }
+}
+#[test]
 fn ac221_job_resolution() {
     let b = RpcBox::new();
     let id = make(&b, State::Completed, None);
