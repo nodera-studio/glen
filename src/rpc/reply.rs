@@ -4,7 +4,10 @@ use crate::{
     jobs::{JobId, JobStore, Reply, append_line},
 };
 use serde_json::{Map, Value, json};
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Mutex, mpsc},
+    time::Duration,
+};
 pub struct ReplySink {
     store: JobStore,
     home: GlenHome,
@@ -111,7 +114,21 @@ pub(crate) fn parse_reply_args(args: &Map<String, Value>) -> Result<(String, boo
     };
     Ok((text.into(), is_final))
 }
-pub fn glen_reply_tool(sink: Arc<ReplySink>) -> omp_rpc::HostTool {
+pub(crate) struct PendingReply {
+    text: String,
+    is_final: bool,
+    tool_call_id: String,
+    done: mpsc::SyncSender<Result<(), GlenError>>,
+}
+impl PendingReply {
+    pub fn finish(self, sink: &ReplySink, state: Result<(), GlenError>) {
+        let result = state.and_then(|()| sink.record(self.text, self.is_final, self.tool_call_id));
+        if self.done.send(result).is_err() {
+            eprintln!("glen_reply handler stopped waiting for identity check");
+        }
+    }
+}
+pub(crate) fn glen_reply_tool(replies: mpsc::Sender<PendingReply>) -> omp_rpc::HostTool {
     let schema = Map::from_iter([
         ("type".into(), json!("object")),
         (
@@ -130,7 +147,26 @@ pub fn glen_reply_tool(sink: Arc<ReplySink>) -> omp_rpc::HostTool {
                 return Err(GlenError::new(ErrorCode::JobFailed, "cancelled").into());
             }
             let (text, is_final) = parse_reply_args(&args)?;
-            sink.record(text, is_final, ctx.tool_call_id().into())?;
+            let (done, result) = mpsc::sync_channel(1);
+            replies
+                .send(PendingReply {
+                    text,
+                    is_final,
+                    tool_call_id: ctx.tool_call_id().into(),
+                    done,
+                })
+                .map_err(|_| {
+                    GlenError::new(
+                        ErrorCode::JobFailed,
+                        "glen_reply: worker stopped before identity check",
+                    )
+                })?;
+            result.recv_timeout(Duration::from_secs(10)).map_err(|e| {
+                GlenError::new(
+                    ErrorCode::JobFailed,
+                    format!("glen_reply: waiting for session identity: {e}"),
+                )
+            })??;
             Ok("delivered".into())
         },
     )
@@ -220,7 +256,8 @@ mod tests {
                 0o700
             );
         }
-        let tool = glen_reply_tool(Arc::new(sink));
+        let (tx, _rx) = mpsc::channel();
+        let tool = glen_reply_tool(tx);
         let d = tool.definition();
         assert_eq!(d.name, "glen_reply");
         assert_eq!(d.parameters["required"], json!(["text"]));

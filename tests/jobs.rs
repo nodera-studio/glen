@@ -352,3 +352,50 @@ fn review13_all_rpc_options_have_help() {
         }
     }
 }
+
+#[test]
+fn cycle3_narrow_jobs_preserve_full_job_handle() {
+    let b = RpcBox::new();
+    let id = make(&b, State::Completed, None);
+    for width in [30, 40] {
+        let o = b
+            .glen(&["jobs", "--human"])
+            .env("COLUMNS", width.to_string())
+            .output()
+            .unwrap();
+        assert!(o.status.success());
+        let text = String::from_utf8(o.stdout).unwrap();
+        assert!(text.contains(&id.handle()), "{width}: {text}");
+        assert!(text.contains("e27c0de"), "{width}: {text}");
+        assert!(text.lines().all(|s| glen::render::text::width(s) <= width));
+    }
+}
+
+#[test]
+fn cycle3_status_lock_open_failure_reports_writing_but_reads_still_report_reading() {
+    let b = RpcBox::new();
+    let id = make(&b, State::Queued, None);
+    let store = store(&b);
+    let status = store.read_status(&id).unwrap();
+    let path = store.dir(&id).join("status.lock");
+    // Replace only the test-created lock file to force an open error, even as root.
+    fs::remove_file(&path).unwrap();
+    fs::create_dir(&path).unwrap();
+    let err = store.write_status(&id, &status).unwrap_err();
+    assert_eq!(err.code, glen::error::ErrorCode::Io);
+    assert!(
+        err.message
+            .starts_with(&format!("cannot open {} for writing: ", path.display())),
+        "{err}"
+    );
+    let absent = JobId::new();
+    let err = store.read_status(&absent).unwrap_err();
+    assert_eq!(err.code, glen::error::ErrorCode::NotFound);
+    assert!(
+        err.message.starts_with(&format!(
+            "{}: ",
+            store.dir(&absent).join("status.json").display()
+        )),
+        "{err}"
+    );
+}

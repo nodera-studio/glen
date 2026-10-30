@@ -199,6 +199,7 @@ fn run() -> io::Result<u8> {
     let mut stage = 0;
     let mut replies: Vec<Value> = vec![];
     let mut reply_index = 0;
+    let mut running_queries = 0;
     loop {
         if scenario != "wedge" && terminated.load(Ordering::SeqCst) {
             break;
@@ -220,11 +221,18 @@ fn run() -> io::Result<u8> {
                     "set_event_filter" => response(&f, json!({"events":f["events"]}))?,
                     "get_state" => {
                         let data = json!({"sessionId":id,"sessionFile":session_file,"isStreaming":false,"isSettled":stage==0||stage==4,"messageCount":0});
-                        let delay = if stage != 0 {
+                        if stage != 0 {
+                            running_queries += 1;
+                        }
+                        let delay = if scenario == "stale_state" && running_queries == 1 {
+                            id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
+                            ms("FAKE_OMP_OLD_STATE_DELAY_MS", 1500)
+                        } else if stage != 0 {
                             ms("FAKE_OMP_STATE_DELAY_MS", 0)
                         } else {
                             Duration::ZERO
                         };
+                        let stale_reply = scenario == "stale_state" && running_queries == 1;
                         if delay.is_zero() {
                             response(&f, data)?;
                         } else {
@@ -232,6 +240,17 @@ fn run() -> io::Result<u8> {
                                 std::thread::sleep(delay);
                                 if let Err(e) = response(&f, data) {
                                     eprintln!("fake delayed state: {e}");
+                                    return;
+                                }
+                                if stale_reply {
+                                    // Let the polling loop consume the stale state before another reply.
+                                    std::thread::sleep(Duration::from_millis(150));
+                                    if let Err(e) = emit_call(
+                                        1,
+                                        &json!({"text":"reply after stale state","final":true}),
+                                    ) {
+                                        eprintln!("fake stale-state reply: {e}");
+                                    }
                                 }
                             });
                         }
@@ -262,9 +281,12 @@ fn run() -> io::Result<u8> {
                             prompt = Some(f);
                             continue;
                         }
-                        if scenario == "local" {
+                        if matches!(scenario.as_str(), "local" | "local_exit") {
                             out(json!({"type":"command_output","text":"fake command output"}))?;
                             response(&f, json!({"agentInvoked":false}))?;
+                            if scenario == "local_exit" {
+                                return Ok(0);
+                            }
                             prompt = Some(f);
                             continue;
                         }
@@ -294,7 +316,10 @@ fn run() -> io::Result<u8> {
                             log(json!({"event":"exit","reason":"crash"}))?;
                             return Ok(3);
                         }
-                        if scenario == "delayed_state" || scenario == "fork_reply" {
+                        if matches!(
+                            scenario.as_str(),
+                            "delayed_state" | "fork_reply" | "stale_state"
+                        ) {
                             if scenario == "fork_reply" {
                                 id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
                             }
@@ -360,6 +385,10 @@ fn run() -> io::Result<u8> {
                 stage = 5;
             }
             2 => {
+                if knob("FAKE_OMP_RESULT_RELEASE").is_some_and(|p| !Path::new(&p).exists()) {
+                    due = Some(Instant::now() + Duration::from_millis(10));
+                    continue;
+                }
                 if matches!(scenario.as_str(), "fork" | "fork_silent") {
                     id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
                     if scenario == "fork" {
@@ -377,7 +406,11 @@ fn run() -> io::Result<u8> {
                 out(
                     json!({"type":"agent_end","messages":[{"role":"user","content":p["message"],"timestamp":now()},assistant],"isTerminal":true,"yielded":true}),
                 )?;
-                let settled = !matches!(scenario.as_str(), "unsettled" | "never_settles");
+                let settled = knob("FAKE_OMP_NEVER_SETTLE").as_deref() != Some("1")
+                    && !matches!(
+                        scenario.as_str(),
+                        "unsettled" | "never_settles" | "unsettled_exit"
+                    );
                 let status = match scenario.as_str() {
                     "error" => "error",
                     "aborted" => "aborted",
@@ -388,6 +421,9 @@ fn run() -> io::Result<u8> {
                     frame["error"] = json!({"message":"fake provider error","retryable":true});
                 }
                 out(frame)?;
+                if scenario == "unsettled_exit" {
+                    return Ok(0);
+                }
                 if settled {
                     out(json!({"type":"session_settled"}))?;
                     stage = 4;

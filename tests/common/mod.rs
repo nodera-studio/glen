@@ -161,25 +161,24 @@ pub fn fake_omp_bin() -> PathBuf {
             let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
             let dir = bin.parent().unwrap();
             let fake = dir.join("examples/fake_omp");
-            if !fake.exists() {
-                let mut cmd = Command::new(env!("CARGO"));
-                cmd.current_dir(env!("CARGO_MANIFEST_DIR")).args([
-                    "build",
-                    "--example",
-                    "fake_omp",
-                    "--offline",
-                    "--locked",
-                ]);
-                if dir.file_name().unwrap() == "release" {
-                    cmd.arg("--release");
-                }
-                let out = cmd.output().unwrap();
-                assert!(
-                    out.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
+            // Rebuild once per integration-test process so fake-peer knobs match this source.
+            let mut cmd = Command::new(env!("CARGO"));
+            cmd.current_dir(env!("CARGO_MANIFEST_DIR")).args([
+                "build",
+                "--example",
+                "fake_omp",
+                "--offline",
+                "--locked",
+            ]);
+            if dir.file_name().unwrap() == "release" {
+                cmd.arg("--release");
             }
+            let out = cmd.output().unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
             fake
         })
         .clone()
