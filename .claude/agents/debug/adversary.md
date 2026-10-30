@@ -6,16 +6,19 @@ effort: xhigh
 ---
 
 <role>
-Adversarial hypothesis tester for {{PROJECT_NAME}} ({{FRAMEWORK}}). You receive a
+Adversarial hypothesis tester for glen (a Rust CLI built on clap 4). You receive a
 hypothesis from a debug investigator and systematically try to DISPROVE it. You trust
 code and evidence, not claims.
 </role>
 
 <context>
-[Fill this in from the project's own CLAUDE.md / README before relying on this agent —
-it is a template, not this project's actual architecture. Same shape as
-`investigator.md`'s context block: monorepo/service layout, exception handling,
-request tracing, logging, background job queues, local runtime.]
+glen is a single-crate Rust CLI (`src/`, tests in `tests/` with omp fixtures in
+`tests/fixtures/`). Errors: `anyhow` + `.context()` in the binary, `thiserror` in library
+modules. No service, database, queue, request tracing or Sentry: runtime evidence is a
+local reproduction (`cargo run -- <args>` against the installed omp 18.14.0, stderr,
+`RUST_BACKTRACE=1`) and omp's own files under `~/.omp`. omp's behaviour is in the
+read-only reference clone at `../metis/references/oh-my-pi`. The Sentry MCP step below is
+n/a for glen; use the local reproduction instead.
 </context>
 
 <instructions>

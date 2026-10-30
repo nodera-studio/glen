@@ -1,103 +1,108 @@
 ---
 name: local-ci
 description: >
-  Runs the full local CI verification pipeline — format, lint, typecheck,
-  production builds, unit tests, and E2E tests. Returns a structured
-  pass/fail report with actionable fix suggestions for any failures.
+  Runs glen's local CI verification pipeline, the same cargo checks as
+  .github/workflows/ci.yml (rustfmt, clippy -D warnings, tests) plus a typecheck
+  and a build. Returns a structured pass/fail report with actionable fix
+  suggestions for any failures.
 tools: Read, Bash, Grep, Glob
 model: claude-sonnet-5
 effort: low
 ---
 
 <role>
-CI pipeline runner and diagnostician for {{PROJECT_NAME}} ({{PRIMARY_LANGUAGE}} /
-{{FRAMEWORK}}). Execute the full verification suite [this project's actual runtime —
-Docker Compose, bare metal, a CI container], collect results, and produce a clear
-pass/fail report with actionable fix suggestions. Report only — never implement fixes.
+CI pipeline runner and diagnostician for glen (Rust, stable toolchain, edition 2024 /
+a clap 4 CLI). Execute the verification suite on the host with cargo (glen has no
+Docker, no dev stack and no services), collect results, and produce a clear pass/fail
+report with actionable fix suggestions. Report only: never implement fixes.
 </role>
 
 <context>
-Pipeline steps (sequential, stop on failure unless told otherwise) — resolve these
-against this project's actual scripts (`package.json`, `Makefile`, `pyproject.toml`,
-CI workflow config) rather than guessing:
+The source of truth is `.github/workflows/ci.yml`. It runs these three steps on
+`ubuntu-latest` and `macos-latest` with the stable toolchain, rustfmt and clippy:
 
-| Step                | Command               | What it checks                       |
-| ------------------- | ---------------------- | ------------------------------------- |
-| 1. Format           | `{{FORMAT_CMD}}`      | Code formatting consistency           |
-| 2. Lint             | `{{LINT_CMD}}`        | Lint rules                            |
-| 3. Typecheck        | `{{TYPECHECK_CMD}}`   | Type errors across all workspaces     |
-| 4. Build            | `{{BUILD_CMD}}`       | Production build(s)                   |
-| 5. Unit/integration | `{{TEST_CMD}}`        | Unit + integration test suite         |
-| 6. E2E (if present) | [project E2E command] | End-to-end suite (Playwright/Cypress) |
+```bash
+cargo fmt --all -- --check
+cargo clippy --all-targets --locked -- -D warnings
+cargo test --locked
+```
 
-If unit/integration and E2E don't share DB/service state, run them **in parallel**
-using two separate Bash tool calls in the same message; otherwise run sequentially.
-Use a generous timeout (600000ms) for builds and E2E — they're the slow steps.
+The local pipeline runs the same three, plus a typecheck and a build, in this order
+(sequential, stop on the first failure unless told to continue):
 
-Full pipeline shortcut: whatever single "run everything" command this project defines
-(e.g. `make ci`, `npm run ci`, `{{DEV_CMD}}` variant) — use it if present rather than
-chaining the steps manually.
+| Step         | Command                                              | What it checks                               |
+| ------------ | ---------------------------------------------------- | -------------------------------------------- |
+| 1. Format    | `cargo fmt --all -- --check`                         | rustfmt, report-only (never rewrites files)  |
+| 2. Lint      | `cargo clippy --all-targets --locked -- -D warnings` | clippy; any warning fails, as in CI          |
+| 3. Typecheck | `cargo check --all-targets --locked`                 | type errors in the crate, tests and examples |
+| 4. Build     | `cargo build --locked`                               | the debug binary links                       |
+| 5. Tests     | `cargo test --locked`                                | unit tests, `tests/` integration tests, doc tests |
 
-Quick modes — map to whatever subset commands this project exposes:
+Notes:
 
-- "static checks only" → format + lint + typecheck
-- "tests only" → unit/integration + E2E (parallel where independent)
-- "build only" → the build command
-- "format only" → the format command
+- `--locked` makes cargo fail instead of rewriting `Cargo.lock`. A lockfile error means
+  `Cargo.toml` changed without `cargo update`/`cargo build` being run and the new
+  `Cargo.lock` committed.
+- Clippy already typechecks, so step 3 rarely fails when step 2 passed; keep it for
+  the "static checks only" mode and for a clear error when clippy itself is missing.
+- There is no E2E suite. Tests read omp data only from `tests/fixtures/`, never a live
+  `~/.omp`, so they need no running omp.
+- CI also runs on Linux. This pipeline runs on the local host (macOS) only; a
+  platform-specific failure (paths, `dirs` locations, line endings) can still appear on
+  the Linux runner. Say so in the report when the change touches platform paths.
 
-Typical timeouts (adjust to what this project actually measures):
+Quick modes:
 
-- Format/lint/typecheck: ~30s each
-- Builds: ~2-5 min
-- Unit tests: ~1-2 min
-- E2E tests: ~3-10 min
+- `all` (default) → steps 1-5
+- `checks` → steps 1-3 (format, lint, typecheck)
+- `build` → step 4 (`cargo build --locked`; add `--release` only if asked)
+- `tests` → step 5
+
+Typical timeouts: format and typecheck under 30s; clippy, build and tests 1-3 min on a
+cold cache. Use a 600000ms Bash timeout for clippy, build and tests.
 </context>
 
 <instructions>
 
-## Step 1 — Verify the runtime is available
+## Step 1 — Verify the toolchain
 
-If this project is Docker-first and Docker is not running, report immediately — do
-not attempt to run checks outside the project's documented environment.
+Run `cargo --version && rustfmt --version && cargo clippy --version`. If any is
+missing, report it (fix: `rustup component add rustfmt clippy`) and stop.
 
-## Step 2 — Run pipeline from repo root
+## Step 2 — Run the pipeline from the repo root
 
-Run from the repo root. Run the static-check steps sequentially (format → lint →
-typecheck → build), then run the test steps **in parallel** if they're independent:
+Run the selected steps in order, each as its own Bash call so a failure is attributed
+to one step:
 
 ```bash
-# Sequential: format, lint, typecheck, build
-{{FORMAT_CMD}} 2>&1
-{{LINT_CMD}} 2>&1
-{{TYPECHECK_CMD}} 2>&1
-{{BUILD_CMD}} 2>&1
-
-# Parallel (two Bash tool calls in one message), if independent:
-{{TEST_CMD}} 2>&1          # unit/integration
-# [project's E2E command] 2>&1
+cargo fmt --all -- --check 2>&1
+cargo clippy --all-targets --locked -- -D warnings 2>&1
+cargo check --all-targets --locked 2>&1
+cargo build --locked 2>&1
+cargo test --locked 2>&1
 ```
 
 ## Step 3 — Diagnose failures
 
 When a step fails, identify specifics before reporting:
 
-- Format: list files that need formatting
-- Lint: list rules violated with file:line
-- Typecheck: list type errors with file:line and the error message
-- Builds: identify the compilation error
-- Tests: identify which test(s) failed and the assertion error
-- E2E: identify which spec/test failed and the assertion or timeout error
-- Suggest the fix (report only — do not implement)
+- Format: list the files rustfmt would change (fix: `cargo fmt --all`).
+- Lint: list each clippy lint name with file:line and the suggested change clippy
+  prints.
+- Typecheck/Build: the first compiler error with its code (`E0308` etc.), file:line
+  and message; later errors are often cascades.
+- Tests: the failing test names, the assertion or panic message, and file:line.
+- Lockfile: name the dependency that changed.
+- Suggest the fix (report only; do not implement).
 
 ## Step 4 — Cleanup
 
-After all steps complete (pass or fail), run this project's cleanup step if one
-exists (e.g. pruning dangling Docker images/build cache).
+None. `target/` is build cache; never delete it as part of a CI run.
 
 ## When called by other agents
 
-Run the full pipeline, including E2E. Report success concisely if everything passes.
-On failure, report with enough detail for the caller to fix or escalate.
+Run the full pipeline. Report success concisely if everything passes. On failure,
+report with enough detail for the caller to fix or escalate.
 
 </instructions>
 
@@ -106,26 +111,25 @@ On failure, report with enough detail for the caller to fix or escalate.
 ```markdown
 ## CI Results — {date}
 
-| Step               | Status    | Duration | Details                         |
-| ------------------ | --------- | -------- | -------------------------------- |
-| Format              | PASS/FAIL | Xs       | {summary}                       |
-| Lint                | PASS/FAIL | Xs       | {summary}                       |
-| Typecheck           | PASS/FAIL | Xs       | {N errors}                      |
-| Build               | PASS/FAIL | Xs       | {summary}                       |
-| Unit/integration    | PASS/FAIL | Xs       | {N passed, M failed}            |
-| E2E                 | PASS/FAIL | Xs       | {N passed, M failed, K skipped} |
+| Step      | Status    | Duration | Details              |
+| --------- | --------- | -------- | -------------------- |
+| Format    | PASS/FAIL | Xs       | {summary}            |
+| Lint      | PASS/FAIL | Xs       | {N warnings/errors}  |
+| Typecheck | PASS/FAIL | Xs       | {N errors}           |
+| Build     | PASS/FAIL | Xs       | {summary}            |
+| Tests     | PASS/FAIL | Xs       | {N passed, M failed} |
 
 ### Failures
 
 #### {Step Name}
 
-- **File:** `path/to/file.ts:42`
+- **File:** `src/path/to/file.rs:42`
 - **Error:** {error message}
 - **Fix:** {what to do}
 
 ### Gaps Detected
 
-- [ ] {any structural gaps found, e.g., missing lint config for a workspace}
+- [ ] {any structural gaps found, e.g. a CI step that has no local equivalent}
 ```
 
 </output_format>

@@ -13,7 +13,7 @@ but drop the planner, advisor, triple-engine review, and conformance gates that 
 `/implement` runs. Same doctrine, smaller blast radius.
 </role>
 
-**Done when:** the small change is implemented per the user's ask, tests + `scripts/quality-gate.sh`
+**Done when:** the small change is implemented per the user's ask, `cargo test --locked` + `.claude/scripts/quality-gate.sh`
 are green, one fresh review is clean, the codebase MCP is re-indexed, and the work is committed,
 pushed, and summarized.
 
@@ -25,15 +25,14 @@ Ground decisions in `.claude/CLAUDE.md` and the relevant area doc from its refer
 
 **Step 0 — run the classifier (mandatory, fail-safe).** Before touching anything:
 ```bash
-bash scripts/quick-classify.sh "{the user's task description}"
+bash .claude/scripts/quick-classify.sh "{the user's task description}"
 ```
-Exit 0 = quick path approved. **Any non-zero exit → STOP and route to `/implement`.** [This
-project must define its own `scripts/quick-classify.sh` — or an equivalent check — that
-escalates on a risk keyword (adapt to this project's domain, e.g.
-`auth/payment/money/migration/compliance/…`), a protected-path glob (this project's
-schema/migrations directory, auth/crypto code, any domain-critical package, `*.sql`), or
-an over-threshold diff — and **fails safe** (a missing task or a git error also
-escalates).] Echo the script's reason. Do NOT proceed past a non-zero exit; the
+Exit 0 = quick path approved. **Any non-zero exit → STOP and route to `/implement`.** The
+script escalates on a risk keyword (omp session writes, RPC/bridge/extension, secrets,
+releases, `--json` shape changes, dependency changes), a protected path in the diff
+(`Cargo.toml`, `Cargo.lock`, `.github/`, `lefthook.yml`, `AGENTS.md`, `CLAUDE.md`,
+`.claude/settings.json`, `.claude/hooks/`), or a diff over 6 files / 200 lines, and
+**fails safe** (a missing task or a git error also escalates). Echo the script's reason. Do NOT proceed past a non-zero exit; the
 classifier is a hard gate, not advice.
 
 Then apply judgment as a backstop — if ANY of these also fires, STOP and route to `/implement`:
@@ -61,9 +60,9 @@ Agent tool:
 ```
 
 Codex reads the affected area + the pattern file, makes the change, wires it, handles the error
-paths, writes/extends the unit test, runs the relevant tests (`make test-api` / `make test-web`) and
-`bash scripts/quality-gate.sh`, and fixes every failure and finding — looping in ITS context until
-tests AND the gate are green (rebuilding `packages/shared` if touched). The write→test→fix loop
+paths, writes/extends the unit test, runs `cargo test --locked` and
+`bash .claude/scripts/quality-gate.sh`, and fixes every failure and finding — looping in ITS context until
+tests AND the gate are green. The write→test→fix loop
 stays in one context — that context is Codex's. If Codex is unavailable, STOP and report
 "BLOCKER: Codex unavailable — pipeline blocked" to the user — do NOT hand-write the change and do
 NOT reroute to `/implement` (it depends on the same Codex implementer).
@@ -87,14 +86,14 @@ If the review reveals the change is bigger or riskier than it looked, stop and e
 ### 3 — Re-index + ship
 
 **Re-run the classifier before committing** (now the diff exists, so the protected-path + size legs
-fire): `bash scripts/quick-classify.sh "{task}"`. Non-zero → the change grew past the quick path; stop
+fire): `bash .claude/scripts/quick-classify.sh "{task}"`. Non-zero → the change grew past the quick path; stop
 and escalate to `/implement` rather than committing it on this track.
 
 Re-index the changed files into the **codebase MCP** so search reflects the merged code. Then
 commit (HEREDOC format, per this project's commit-trailer convention) and push by default:
-[this project's pre-push cleanup step, if any] → `git push` → open/update the PR → watch CI.
+`cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked` → `git push` → open/update the PR into `main` → watch CI (`gh pr checks <n> --watch`).
 Never `--no-verify`, never force-push a shared branch. Hand the user a one-paragraph summary +
-what to manually test in the running app.
+the `cargo run -- <args>` commands to try the change.
 
 <rules>
 

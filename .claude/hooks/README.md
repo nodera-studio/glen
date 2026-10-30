@@ -15,25 +15,25 @@ deliberately per hook:
 | Hook | Event | Posture | What it does |
 | --- | --- | --- | --- |
 | `session-start.sh` | `SessionStart` | info | Prints a "check available skills" reminder |
-| `reinject-invariants.sh` | `SessionStart`, `PreCompact` | info | Re-injects a short, project-defined invariants list so it survives context compaction — the payload is a placeholder in this template, see below |
+| `reinject-invariants.sh` | `SessionStart`, `PreCompact` | info | Re-injects glen's short invariants list (omp file ownership, lenient parsing, fixtures, trunk-only git, tool routing) so it survives context compaction |
 | `block-old-codex.sh` | `PreToolUse` (`Bash`, `Skill`) | hard block | Blocks legacy/duplicate Codex dispatch paths, redirects to the canonical one |
-| `steer-bash.sh` | `PreToolUse` (`Bash`) | warn (steers) | Redirects risky/inefficient bash patterns (`sed -i` → Edit tool, raw `cat`/`head` of code → Read tool, `.env` reads → secrets MCP, external `curl` → an allowlisted host check) toward better tools |
-| `capture-before-merge.sh` | `PreToolUse` (`Bash`, on `gh pr merge`) | hard block | Blocks a PR merge until a durable-memory entry referencing the PR/branch exists in-session (only meaningful if you run a memory MCP) |
-| `prettier-on-edit.sh` | `PostToolUse` (`Edit\|Write`) | warn-don't-block | Runs prettier on the edited file if the project has it configured |
+| `steer-bash.sh` | `PreToolUse` (`Bash`) | warn (steers) | Redirects risky/inefficient bash patterns (`sed -i` → Edit tool, raw `cat`/`head` of code including `.rs` → Read tool, `.env` reads → Mnemosyne secrets, external `curl` → an allowlisted host check) toward better tools |
+| `capture-before-merge.sh` | `PreToolUse` (`Bash`, on `gh pr merge`) | hard block | Blocks a PR merge until a Mnemosyne `memory_store` call referencing the PR/branch exists in-session |
 | `shellcheck-on-edit.sh` | `PostToolUse` (`Edit\|Write`) | warn-don't-block | Lints edited shell scripts if shellcheck is installed |
-| `mnemosyne-capture.sh` | `Stop` | opt-in (`MNEMOSYNE_CAPTURE=1`) | Captures an episodic fix summary into a memory MCP's findings table, if you run one |
 
-## Fill in before this does anything project-specific
+Not wired in glen:
 
-Two hooks ship as **mechanism-only placeholders** — they need your project's actual
-content before they're meaningful:
+- `mnemosyne-capture.sh` (`Stop`, opt-in `MNEMOSYNE_CAPTURE=1`) feeds the learned-rules loop,
+  which writes to a project-owned Postgres (`DATABASE_URL`). glen has no database, so the hook
+  stays unwired; the script is kept for reference.
+- The upstream `prettier-on-edit.sh` was removed: glen is Rust, formatted by `cargo fmt`
+  (lefthook pre-commit and CI check it).
 
-- **`reinject-invariants.sh`** — the re-injected payload is a bracketed placeholder list
-  ("[Add your project's non-negotiable invariants here]"). Replace it with the handful
-  of rules your project genuinely cannot afford an agent to forget after a compaction —
-  a data-access pattern that must never be bypassed, a testing policy, a git-hygiene
-  rule. Keep it short (a few hundred tokens); this re-injects on every compaction, so
-  bloat here is a recurring tax.
+## Project-specific content
+
+- **`reinject-invariants.sh`** carries glen's invariants. Keep it short (a few hundred
+  tokens); it re-injects on every compaction, so bloat here is a recurring tax. Change it
+  when `AGENTS.md`'s non-negotiables change.
 - **`steer-bash.sh`**'s `ALLOW_HOSTS` allowlist ships with just loopback addresses.
   Add your own trusted remote hosts (an internal API, a deploy target) if your project's
   agents legitimately need to `curl` them. This hook is the enforcement half of a

@@ -14,20 +14,18 @@ produce a unified synthesis the user can act on.
 Mode from `$ARGUMENTS`: none/`quick`/`light`/`check` → **quick**; `deep`/`full`/`all`
 → **deep**. Announce the mode before starting.
 
-Scan recipes and report templates live in `.claude/docs/CodebaseAuditScans.md` —
-read it when you start.
+Read `.claude/agents/codebase/orchestrator.md` and follow it: it holds the scope modes,
+the inline scan recipes (tech-debt-light, cli-surface-light, docs-light, all cargo/rg),
+and the synthesis steps.
 
-**Quick mode:** dispatch `codebase/dependency-audit.md` and `codebase/dead-code.md`
-via the Agent tool in parallel; run the three inline scans (tech-debt-light,
-api-surface-light, docs-light) yourself from the scans doc while they work; then
-synthesize with the quick-mode template.
+**Quick mode:** dispatch `.claude/agents/codebase/dependency-audit.md` via the Agent
+tool; run the three inline scans yourself while it works; then synthesize.
 
-**Deep mode:** dispatch the five tier-2 audits sequentially (each is heavy —
+**Deep mode:** dispatch the four tier-2 audits sequentially (each is heavy —
 sequential avoids context overload), each via the Agent tool reading its command
-file: `security-audit`, `error-audit`, `api-audit`, `docs-audit`,
-`tech-debt-audit` (`.claude/commands/{name}.md`). Then synthesize with the
-deep-mode template and update `.claude/tech-debt/` with new HIGH/CRITICAL
-findings.
+file: `security-audit`, `error-audit`, `docs-audit`, `tech-debt-audit`
+(`.claude/commands/{name}.md`). Then synthesize and update `.claude/tech-debt/` with
+new HIGH/CRITICAL findings.
 
 <rules>
 - Always produce the synthesis summary — raw agent outputs are too long for the

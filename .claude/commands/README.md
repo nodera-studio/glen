@@ -14,13 +14,13 @@ drives.
 | `/review-implementation` | `agents/review-implementation/orchestrator.md` | Standalone triple-engine review + synthesizer on the current branch |
 | `/code-review` | `agents/implementation/code-review.md` | Lean 2-engine version of the review gate, runnable standalone |
 | `/respond-to-review` | `agents/respond-to-review.md` | Classify PR review comments, verify claims, draft responses, apply fixes |
-| `/run-ci` | `agents/local-ci.md` | Full local CI pipeline in Docker (format, lint, typecheck, build, test) |
+| `/run-ci` | `agents/local-ci.md` | Local CI with cargo, mirroring `ci.yml` (fmt check, clippy `-D warnings`, check, build, test) |
 
 ## Autonomous / unattended
 
 | Command | Dispatches | What it does |
 | --- | --- | --- |
-| `/goal` | (writes `.claude/auto-mode/state.md`) | Declare or update the auto-mode objective + base branch — intent only, doesn't start the loop |
+| `/goal` | (writes `.claude/auto-mode/state.md`) | Declare or update the auto-mode objective (and whether it ends in a release tag) — intent only, doesn't start the loop |
 | `/auto-mode` | `skills/auto-mode/SKILL.md` | Drive a declared goal to merged completion, wave by wave, with no user gate in between — see the diagram below |
 
 ## Explore, research, brainstorm
@@ -44,17 +44,10 @@ drives.
 | --- | --- | --- |
 | `/codebase-audit` | `agents/codebase/orchestrator.md` | Tier 1 quick health check (default) or `deep` for all tier 2 audits |
 | `/security-audit` | `agents/codebase/security-audit/orchestrator.md` | Cartographer → deep agents → evidence-demanding synthesizer, ASVS 5.0 L2 |
-| `/error-audit` | `agents/codebase/error-audit/orchestrator.md` | 6 dual-engine agents (backend, frontend, queue) |
-| `/api-audit` | `agents/codebase/api-audit/orchestrator.md` | 4 dual-engine agents — endpoint inventory, auth, validation, docs sync |
+| `/error-audit` | `agents/codebase/error-audit/orchestrator.md` | 2 agents (Claude ‖ Codex) over the crate's error paths |
 | `/docs-audit` | `agents/codebase/docs-audit/orchestrator.md` | 3 agents (2 Claude + 1 Codex) — docs vs. actual code |
 | `/tech-debt-audit` | `agents/codebase/tech-debt-audit/orchestrator.md` | 4 agents (3 Claude + 1 Codex) — patterns, complexity, TODOs, library currency |
 | `/security-scan` | (inline — AgentShield + mcp-scan) | Scan `.claude/` config/hooks/MCP setup for security drift |
-
-## Copywrite
-
-| Command | Dispatches | What it does |
-| --- | --- | --- |
-| `/copywrite` | `agents/copywrite/orchestrator.md` | Polish user-facing copy to Apple voice — see `agents/copywrite/README.md` |
 
 ## Codex / cross-model
 
@@ -82,35 +75,35 @@ drives.
 
 The most complex command in the suite: it drives `/plan-implementation` and
 `/implement` in a loop against a declared goal, with **no user gate between waves**,
-until the whole goal is merged (and promoted to your release branch, if that's what the
-goal asked for).
+until the whole goal is merged on `main` (and tagged as a release, if that's what the goal
+asked for).
 
 ```mermaid
 flowchart TD
     G["/goal &lt;objective&gt;"] --> ST[".claude/auto-mode/state.md<br/>(shared state — survives compaction)"]
     ST --> AM["/auto-mode"]
 
-    AM --> RESOLVE{{"Resolve waves:<br/>tracker sub-issues first,<br/>plan-doc fallback,<br/>else run /plan-implementation"}}
+    AM --> RESOLVE{{"Resolve waves:<br/>Glen board child issues first,<br/>plan-doc fallback,<br/>else run /plan-implementation"}}
 
     RESOLVE --> WAVE
 
     subgraph WAVE["Per-wave pipeline — repeats with NO user gate between waves"]
         direction TB
-        W1["Bootstrap: branch off staging trunk,<br/>flip ticket → In Progress"]
+        W1["Bootstrap: branch off main,<br/>board issue → in_progress"]
         W2["/plan-implementation (skip if a plan exists)"]
-        W3["/implement"]
-        W4["Pre-push check → open PR into staging trunk"]
-        W5["Poll CI + review-bot comments (~270s cadence)<br/>triage + fix every finding"]
-        W6["All green + 1 clean cycle →<br/>capture durable decisions → merge (squash)"]
-        W7["Close wave: ticket → Done,<br/>shipped:staging label, delete branch"]
+        W3["/implement (includes the Claude ‖ Codex /code-review gate)"]
+        W4["Pre-push cargo checks → open PR into main,<br/>board issue → in_review"]
+        W5["Poll CI (fmt, clippy, test on Linux + macOS)<br/>+ PR comments; triage + fix every finding"]
+        W6["CI green + no unresolved comments →<br/>memory_store referencing the PR → squash-merge"]
+        W7["Close wave: issue → done + shipped:main,<br/>delete branch"]
         W1 --> W2 --> W3 --> W4 --> W5 --> W6 --> W7
     end
 
     WAVE -->|"more waves"| WAVE
-    WAVE -->|"all waves done"| DONE{{"Goal targets prod?"}}
-    DONE -->|no| FIN1["done — shipped to staging"]
-    DONE -->|yes| PROMO["ONE staging → release-branch PR,<br/>merge commit (never squash),<br/>flip tickets to shipped:prod"]
-    PROMO --> FIN2["done — shipped to prod"]
+    WAVE -->|"all waves done"| DONE{{"Goal asks for a release?"}}
+    DONE -->|no| FIN1["done — merged on main"]
+    DONE -->|yes| REL["release skill: version-bump PR,<br/>annotated v0.x.y tag on main,<br/>issues tagged released:v0.x.y"]
+    REL --> FIN2["done — released"]
 ```
 
 Escalates to the user only for genuine human-required blockers (credentials, material

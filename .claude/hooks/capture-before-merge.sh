@@ -5,7 +5,7 @@
 # this PR or branch IN THIS SESSION, so durable decisions/learnings are captured
 # BEFORE a green PR merges (and its branch is later deleted). The code itself is
 # never lost — it's in trunk history after the merge; this gate is about
-# KNOWLEDGE. See your project's branching-model doc + the auto-mode wave-close step.
+# KNOWLEDGE. See .claude/skills/branching-model/SKILL.md + the auto-mode wave-close step.
 #
 # Posture: FAIL OPEN. A capture gate must never wedge a legit merge:
 #   - no jq / no command / not `gh pr merge`            -> allow (exit 0)
@@ -60,11 +60,11 @@ n_parsed=$(printf '%s\n' "$parsed" | grep -c . 2>/dev/null || true)
 if [ "${n_parsed:-0}" -gt 0 ]; then
   # Parser works -> require a memory_store that references this PR/branch (literal match).
   printf '%s\n' "$parsed" | grep -qiF "${needles[@]}" && exit 0
-  deny "Capture-before-merge: store the durable decisions/learnings for PR #${PR:-<n>} (branch '${BRANCH:-?}') to the memory MCP BEFORE merging — call mcp__memory__memory_store and reference this PR: put 'PR #${PR:-<n>}' (or the branch '${BRANCH:-?}' if there is no PR number) in the title/content/tags (a one-line episodic note is fine if nothing major shipped). Then re-run the merge. See your project's branching-model doc."
+  deny "Capture-before-merge: store the durable decisions/learnings for PR #${PR:-<n>} (branch '${BRANCH:-?}') to Mnemosyne BEFORE merging — call mcp__plugin_mnemosyne_memory__memory_store with project \"glen\" and reference this PR: put 'PR #${PR:-<n>}' (or the branch '${BRANCH:-?}' if there is no PR number) in the title/content/tags (a one-line episodic note is fine if nothing major shipped). Then re-run the merge. See .claude/skills/branching-model/SKILL.md."
 fi
 
 # Parser found none -> disambiguate format drift (allow) from truly-no-capture (deny).
 if tail -c 500000 "$TRANSCRIPT" 2>/dev/null | grep -qa 'memory_store'; then
   exit 0   # a memory_store is present but unparsed (format drift) -> fail open
 fi
-deny "Capture-before-merge: no memory MCP entry was stored this session, so merging PR #${PR:-<n>} (branch '${BRANCH:-?}') would lose its knowledge. Call mcp__memory__memory_store with the durable decisions/learnings (reference 'PR #${PR:-<n>}' or the branch; a one-line episodic note suffices), then re-run the merge. See your project's branching-model doc."
+deny "Capture-before-merge: no memory MCP entry was stored this session, so merging PR #${PR:-<n>} (branch '${BRANCH:-?}') would lose its knowledge. Call mcp__plugin_mnemosyne_memory__memory_store (project \"glen\") with the durable decisions/learnings (reference 'PR #${PR:-<n>}' or the branch; a one-line episodic note suffices), then re-run the merge. See .claude/skills/branching-model/SKILL.md."

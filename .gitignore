@@ -13,6 +13,7 @@
 .claude/handoffs/
 .claude/tech-debt/
 .claude/testing/
+.claude/auto-mode/
 .claude/settings.local.json
 .claude/.orchestrator-mode
 .claude/*.local.*

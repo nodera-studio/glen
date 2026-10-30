@@ -1,89 +1,91 @@
 ---
 name: mnemosyne
 description: >-
-  Use your local "Mnemosyne" MCP stack — three private Postgres-backed servers with NO
-  public docs, invisible unless you know they exist: the memory MCP (mcp__memory__*) for durable
-  cross-session memory, the codebase MCP (mcp__codebase__*) for semantic code orientation, and
-  the secrets MCP (mcp__secrets__*) for the managed secret store. Reach for this whenever the
-  user wants to remember something for later or across sessions, recall "what did we decide about
-  X", store or look up a project decision, search past sessions, orient with "where does X live /
-  what handles Y" before diving into code, check whether the code index is fresh, or read a
-  managed secret. Trigger on indirect phrasing too — "make a note so we don't forget", "did we
-  already settle the approach for Y", "find where the invoice totals are computed", "this context
-  needs to survive compaction". It also routes AWAY from the wrong tool: literal in-loop string
-  matches are `rg`, not the codebase MCP; throwaway notes are not memory.
+  glen's guide to Mnemosyne, the owner's memory, code index, secrets store and project board,
+  reached through the `mnemosyne` plugin (tools `mcp__plugin_mnemosyne_<server>__<tool>`, servers
+  memory, codebase, secrets, workspace). Use it whenever work in glen needs to recall or record a
+  decision ("did we decide anything about X", "make a note so we don't forget", "store this before
+  merging"), read or update a board issue (create the wave issues, move an issue to in_progress /
+  in_review / done, tag it shipped:main, comment on it), look up prior omp research, check the code
+  index, or read a secret. Always project "glen" for memory/code/secrets and the Glen projectId for
+  workspace calls. Routes away from the wrong tool: literal matches in this repo are `rg`; issues
+  are never Linear or GitHub Issues; throwaway notes are not memories.
 ---
 
-# Mnemosyne — your local MCP stack (memory · codebase · secrets)
+# Mnemosyne in glen
 
-Three private servers on the dev box, all Postgres-backed, **no public docs**. They are easy to
-forget because nothing in a stock Claude Code session advertises them — this skill is their
-manual.
+The full manual is the plugin's own skills: `mnemosyne:mnemosyne` (memory, code, secrets, the
+board) and `mnemosyne:mnemosyne-workspace` (documents, comments, tags, revisions). This file
+holds the glen-specific values and the calls the harness relies on. Load tool schemas with
+ToolSearch before the first call (e.g. `+plugin_mnemosyne_workspace board document`).
 
-> The server code lives in a separate sibling repo (a Mnemosyne server project you run via
-> `docker compose` locally — see that repo's own README for setup). This skill only documents how
-> to USE the three MCP tools once they're running; it does not set them up.
+## glen's identifiers
 
-## The three servers, one stack
+| What | Value |
+| --- | --- |
+| Memory / code / secrets `project` | `glen` (case-insensitive; the workspace shows it as "Glen") |
+| Workspace `projectId` | `ff92abe1-da63-402d-a4f1-c8690e471be1` |
+| Related projects | omp-as-a-donor research → `metis`; harness questions → `agent-os`; machine and toolchain setup → `ops` |
 
-| Server       | Host             | Tools                                                                                                                                    | WHEN                                                  |
-| ------------ | ---------------- | ---------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
-| **memory**   | `localhost:8080` | `memory_search`, `memory_get`, `memory_get_recent`, `memory_get_entity`, `memory_list`, `memory_store`, `memory_update`, `memory_delete` | durable facts/decisions that must outlive the session |
-| **codebase** | `localhost:8081` | `code_search`, `code_get_file`, `code_index_status`, `code_reindex`                                                                      | semantic "where does X live" — orientation/planning   |
-| **secrets**  | `localhost:8082` | `secret_get`, `secret_list`, `secret_set`, `secret_delete`                                                                               | the managed secret store                              |
+Never write to the `default` project. A hook refuses memory, code and secrets calls without
+`project`; retry with the project it names.
 
-## memory — durable cross-session memory
+## Memory — recall before, record after
 
-**WHEN:** query at session start for prior decisions on the task; store a memory mid-session when
-a non-obvious decision is made or the user says "remember this"; **context that must survive
-compaction goes here, not ad-hoc notes** (`progress.md` complements for in-flight task state).
+- **Before substantial work:** `memory_search {project: "glen", query}` on the topic, and
+  `memory_list {project: "glen", sourceKind: "decision"}` (also `"tech-debt"` for the area).
+  Follow the decisions you find; if the work contradicts one, say so before proceeding.
+- **When done:** `memory_store {project: "glen", type, title, content, sourceKind?, tags?,
+  importance?, metadata?, decidedIn?, relatedIds?, supersedesId?}`. Search first and
+  `memory_update` an existing memory instead of duplicating.
+  - `type`: `semantic` (fact or decision), `procedural` (how-to), `episodic` (what happened),
+    `entity`.
+  - `sourceKind`: `decision`, `plan`, `implementation`, `tech-debt`, `research`, `audit`,
+    `requirements`.
+  - Tags lowercase kebab-case; reserved tags `architecture`, `security`, `performance`, `ops`,
+    `product` are spelled exactly. An architectural decision is `sourceKind: "decision"` and
+    `tags: ["architecture", ...]`.
+  - File paths go in `metadata.file`; tech debt uses `metadata: {debtId, severity, category, file}`.
+- **Before every `gh pr merge`:** store a memory referencing the PR (`PR #<n>` in the title,
+  content or tags). The `capture-before-merge` hook blocks the merge until one exists in the
+  session.
+- Never store transient state, transcripts or secret values.
 
-**The 4-type taxonomy** (the `type` enum on `memory_store` — write consistent types so search
-stays clean):
+## Code index
 
-- **episodic** — what happened (a fix that was applied, a turn outcome).
-- **semantic** — a durable fact or decision (the canonical type for "we decided X").
-- **procedural** — how-to (a repeatable runbook).
-- **entity** — a person / project / issue / artifact (e.g. a phase-tracking `tooling-artifact`
-  record).
+`code_search {project: "glen", query}` → `code_symbol_lookup` → `code_graph_expand` →
+`code_get_file`. The index is a snapshot (`code_index_status` shows when); inside this repo
+the working tree is the truth, and a known string is `rg`. `code_reindex` is a write: run it
+only when asked or when `/implement`'s re-index step applies (an index exists for `glen`).
 
-`memory_store` requires `{type, title, content}`; optional `importance` (0–1), `sourceKind`
-(tech-debt / research / plan / audit / decision / implementation / requirements / copywrite),
-`tags[]`, `metadata{}`. Read shapes:
+## Secrets
 
-- `memory_search` `{query, type?, limit?}` → top-k `{id, title, type, snippet}`.
-- `memory_get` `{id}` → full text for a search hit.
-- `memory_get_recent` → latest memories (session-start orientation).
+`secret_list {project: "glen"}` returns names only. `secret_get` only when a task needs the
+value; never echo it into chat, logs, commits, memories or documents. `secret_set` and
+`secret_delete` are denied in `settings.json`.
 
-**You rarely write by hand.** The Stop hook `.claude/hooks/mnemosyne-capture.sh` (opt-in
-`MNEMOSYNE_CAPTURE=1`) captures episodic fixes, and the nightly distiller
-(`.claude/scripts/mnemosyne/distill.sh`) promotes patterns — don't fight the auto-writer. Use
-`memory_store` for explicit, durable decisions worth recalling verbatim.
+## The board (glen's issue tracker)
 
-## codebase — semantic orientation
+Tools are `mcp__plugin_mnemosyne_workspace__*`; every call takes the Glen `projectId` above
+or a document id.
 
-**WHEN:** orientation and planning, **before** grep — `code_search` answers "where does the
-state machine for X live" better than a blind `rg`. It is **not** a replacement for literal
-matching: a known string or symbol → `rg`. The index **reflects the last sync** (re-indexed
-after merges); treat hits as orientation and re-grep if the area looks stale. `code_index_status`
-tells you how fresh it is; `code_reindex` is a mutator (prompt-gated — the pipeline re-indexes
-after merges already).
-
-## secrets — the managed secret store
-
-**WHEN:** reading a **managed** secret. Reconcile to the current posture: reading/editing `.env`
-via the Read/Edit tools is permitted under full-autonomy, and the secrets MCP is the managed
-store on top of that. `secret_get` / `secret_list` are the read path. **`secret_set` and
-`secret_delete` are mutators → denied** (see your permissions config's deny list). **Never echo a
-secret value** into logs, PRs, commits, or context.
-
-## Guardrails
-
-- Memory is **shared across sessions** — never store transient state or PII; one entity per
-  durable fact, not one per file touched, so the store stays legible.
-- The codebase index can be **stale** — orientation, not ground truth. Verify hot paths with the
-  Read tool / `rg` before acting.
-- **Never bundle these MCPs into a skill or plugin** — a plugin-bundled MCP that duplicates a
-  configured server is silently skipped (CC ≥ v2.1.71). They are configured at the box level;
-  this skill is guidance only.
-- Never `secret_set` a real value into a committed file.
+- **Shape:** modules hold issues; issues nest up to three levels; modules do not nest. Ideas
+  are not the backlog (`board_promote` graduates an idea into an issue or module and links it).
+- **Statuses:** `backlog` (default on create), `todo`, `in_progress`, `in_review`, `done`,
+  `cancelled`.
+- **Read:** `board_list {projectId, moduleId?, parentId?, kind?, statuses?, query?}` (board
+  order, with `blockedBy`); `document_get {id}` (one item with its `revision`, tags, comments).
+- **Create:** `document_create {projectId, kind: "modules" | "issues", title, markdown}`, then
+  nest with `board_place {id, parentId}`.
+- **Status change:** `document_update {id, expectedRevision, status, ...}`. Omitted fields take
+  schema defaults (`markdown: ""`, `tags: []`, ...), so send the item's current `title`,
+  `markdown`, `tags`, `priority`, `assigneeId` and `checklist` from `document_get` with the new
+  status, then re-read once to confirm nothing was blanked.
+- **Tags:** `document_tags_update {id, expectedRevision, mode: "add" | "remove", tags}` (atomic).
+  glen uses `shipped:main` (merged on `main`) and `released:v0.x.y` (in that tag).
+- **Comments:** `document_comment {id, expectedRevision, markdown}`.
+- **Revisions:** every write carries the latest `revision`; on `CONFLICT`, re-read and retry.
+- **Keys:** issues have keys `<PREFIX>-<n>`. Glen's prefix is unconfirmed until its first
+  issue exists (`.claude/CLAUDE.md` → Project profile); use the key the board returns.
+- **Errors:** `FORBIDDEN` / `NOT_FOUND` is the token's boundary — report it, don't work around
+  it. HTTP 401 means the token is missing or expired: tell the user.

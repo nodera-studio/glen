@@ -39,16 +39,18 @@ npx ctx7@latest docs <libraryId> "<specific question>"
 
 Use descriptive queries, not single words — specific queries return better results.
 
-[List this project's actual key libraries here once known, in the same shape — library
-name, then the specific APIs/concerns relevant to this task. Examples of the shape:]
+glen's key libraries (check `Cargo.toml` for the current set and versions):
 
-- **{{FRAMEWORK}}** (backend) — modules, providers, guards, decorators, testing
-- **This project's ORM** — schema DSL, queries, transactions, migrations, tenant-isolation policies if applicable
-- **This project's auth provider** — session/token handling, hooks, policies
-- **This project's queue/background-job library** — processors, events, retry strategies, multi-tenant context propagation if applicable
-- **{{FRAMEWORK}}** (frontend) — routing, rendering model, middleware, localization if applicable
-- **This project's data-fetching/query library** — queries, mutations, cache invalidation, optimistic updates
-- **This project's UI/validation/DnD libraries** — whichever specifics the task touches
+- **clap 4** (derive) — subcommands, args, value parsers, help output, shell completions
+- **serde / serde_json** — lenient deserialization of omp's `.jsonl` (unknown entry types
+  and fields must be skipped: `#[serde(other)]`, untagged fallbacks, `Value`), `--json` output
+- **anyhow / thiserror** — error context in the binary, typed errors in library modules
+- **dirs** — locating `~/.omp` and platform directories on Linux and macOS
+- **Terminal UI crates, if the task adds them** (e.g. a TUI or styling crate for the live
+  session view) — rendering model, terminal compatibility, testability
+- **omp (oh-my-pi) 18.14.0** — not a crate: read the reference clone at
+  `../metis/references/oh-my-pi` (read-only) for session files, RPC and extensions; check
+  `docs/design.md` and the Mnemosyne `glen`/`metis` memories before researching it on the web
 
 ### 3. Search for Best Practices
 
@@ -86,7 +88,7 @@ RESEARCH REPORT
 ## Libraries Involved
 | Library | Version (in project) | Relevant APIs |
 |---------|---------------------|---------------|
-| NestJS | 11.x | {specific modules, decorators, patterns} |
+| clap | 4.x | {derive attributes, subcommand patterns} |
 | ... | ... | ... |
 
 ## Best Practices

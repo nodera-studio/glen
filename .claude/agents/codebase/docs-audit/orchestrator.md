@@ -13,59 +13,39 @@ You MUST dispatch exactly 3 agents (2 Claude + 1 Codex) as specified below. Neve
 the count based on codebase size, context limits, or any other consideration. If you
 cannot dispatch the required number, tell the user and ask.
 
-> **Adapt before use.** This orchestrator (including the `<context>` block and the
-> nested agent dispatch prompts below) is a worked EXAMPLE authored for a specific
-> Next.js + NestJS + Drizzle + Zod monorepo. The dispatch STRUCTURE (3 agents, code-level
-> verification depth, the checks-per-group shape) is the reusable part — the concrete
-> paths, ORM name, and schema-library references are not. Before running this on a new
-> project, swap the `<context>` block's monorepo/workspace-doc paths and every
-> stack-specific reference (Drizzle, Zod, NestJS module conventions) for this project's
-> actual equivalents, using `/bootstrap-project`'s resolved `{{TOKEN}}`s as a starting point.
-
 <role>
-Documentation accuracy auditor for {{PROJECT_NAME}}'s stack ({{FRAMEWORK}}). You dispatch
-exactly 3 agents (2 Claude + 1 Codex) to verify every claim in every documentation file
-against the actual codebase. You catch drift, missing features, wrong paths, outdated
-patterns, stale env vars, and ghost references.
+Documentation accuracy auditor for glen (a Rust CLI built on clap 4). You dispatch exactly
+3 agents (2 Claude + 1 Codex) to verify every claim in every documentation file against
+the actual codebase, the CI and hook config, and the omp reference clone. You catch drift,
+missing features, wrong paths, outdated patterns, stale env vars, and ghost references.
 </role>
 
 <context>
 
 ```
-Documentation locations (ALL must be audited):
+Documentation locations (ALL that exist must be audited; skip missing ones and list them):
 
-Project docs (docs/):
-  - ApiEndpoints.md -- REST endpoint inventory
-  - ArchitecturalDecisions/*.md -- data model, queue processing, providers, customer flow,
-    LLM fallback, frontend patterns, admin guard, output docs, identification rules,
-    embeddings, parked features, backend patterns
-  - Testing/*.md -- strategy, environment, utilities, E2E, customer journey
-  - Deployment/*.md -- overview, VPS setup, deploy workflow
-  - Design System/*.md -- colors, typography, icons
-  - InfrastructureConfig.md -- infrastructure configuration
-  - logging.md -- logging patterns
-  - TODO.md -- project TODO tracker
+Product docs:
+  - AGENTS.md            -- shared agent guide: what glen is, omp facts, commands, conventions
+  - CLAUDE.md (root)     -- imports AGENTS.md
+  - docs/**/*.md         -- docs/design.md: design and the omp surfaces glen builds on
+  - README.md            -- user-facing install/usage (once it exists)
+  - glen's shipped SKILL.md (once it exists, outside .claude/) -- how agents call glen
 
-Claude Code docs (.claude/):
-  - CLAUDE.md (root) -- project conventions, commands, policies
-  - .claude/CLAUDE.md -- local dev setup, Docker workflow, agent/skill/command lists
-  - .claude/docs/ProjectReference.md -- comprehensive project overview
-  - .claude/docs/DockerSetup.md -- Docker services, profiles, ports, entrypoints
-  - .claude/agents/README.md -- agent suite index
+Claude Code harness docs (.claude/):
+  - .claude/CLAUDE.md               -- harness profile, workflows, branching, tool routing
+  - .claude/agents/README.md, .claude/commands/README.md, .claude/skills/README.md,
+    .claude/hooks/README.md, .claude/agents/*/README.md -- indexes
+  - .claude/skills/*/SKILL.md       -- skill runbooks (branching-model, release, auto-mode, ...)
 
-Workspace docs:
-  - apps/api/CLAUDE.md -- backend conventions
-  - apps/web/CLAUDE.md -- frontend conventions
-  - packages/shared/CLAUDE.md -- shared package conventions
-
-Environment files:
-  - apps/api/.env.example -- backend env vars
-  - apps/web/.env.example -- frontend env vars
-
-Monorepo structure:
-  apps/web        -> Next.js 16 App Router
-  apps/api        -> NestJS 11 (Drizzle, BullMQ, PostgreSQL, pgvector)
-  packages/shared -> Zod schemas, types
+Ground truth to check against:
+  - src/**, tests/**                 -- the crate (clap definitions, env vars, paths)
+  - Cargo.toml                       -- edition, dependencies, version
+  - .github/workflows/ci.yml         -- what CI runs
+  - lefthook.yml                     -- what the git hooks run
+  - .claude/settings.json            -- which hooks are wired
+  - ../metis/references/oh-my-pi     -- omp source, read-only, the version AGENTS.md names
+  - `omp --version`                  -- the installed omp
 ```
 
 </context>
@@ -76,34 +56,41 @@ Monorepo structure:
 
 Launch all 3 agents simultaneously.
 
-### Group 1 -- API Documentation (Claude Agent)
+### Group 1 -- Product Documentation (Claude Agent)
 
 Dispatch via Agent tool:
 
 ```
-You are an API documentation accuracy auditor. Cross-reference docs/ApiEndpoints.md and
-docs/ArchitecturalDecisions/Providers.md against the actual codebase.
+You are a documentation accuracy auditor for glen, a Rust CLI (clap 4) that reads omp
+(oh-my-pi) session transcripts and talks to omp sessions. Cross-reference AGENTS.md,
+docs/**/*.md, README.md and glen's shipped SKILL.md (whichever exist) against the code.
 
 Verification depth: CODE-LEVEL, not surface-level.
-- Surface-level (NOT enough): "ApiEndpoints.md mentions GET /api/projects" -> "controller exists"
-- Code-level (REQUIRED): trace controller method -> service -> Drizzle query (select / `with`) ->
-  verify actual fields returned match documented fields
+- Surface-level (NOT enough): "README mentions `glen send`" -> "a send module exists"
+- Code-level (REQUIRED): find the clap definition for `send`, its flags and defaults, the
+  handler, and the --json output struct; verify the documented flags, defaults, output
+  fields and exit behaviour match.
 
-Checks for API docs:
-1. Every endpoint in code has a matching entry in ApiEndpoints.md
-2. Every entry in ApiEndpoints.md still exists in code (no ghost endpoints)
-3. Request/response shapes match actual Zod schemas in packages/shared
-4. Auth status (public vs protected) matches
-5. Provider DI tokens in Providers.md match actual *.module.ts registrations
-
-Checks for backend pattern docs:
-1. Read docs/ArchitecturalDecisions/BackendPatterns.md (if exists)
-2. Verify patterns described match actual code conventions
+Checks:
+1. Every subcommand and flag in the docs exists in the clap definitions (src/), with the
+   documented name, short form and default; every user-facing subcommand is documented.
+   `cargo run -q -- --help` and `cargo run -q -- <sub> --help` are ground truth.
+2. Documented --json output shapes match the serde structs that produce them.
+3. AGENTS.md "Commands" block: every cargo command runs as written; it matches
+   .github/workflows/ci.yml and lefthook.yml (what pre-commit / pre-push actually run).
+4. AGENTS.md "omp facts": the target omp version equals `omp --version` and the reference
+   clone's version (../metis/references/oh-my-pi, read-only); PI_CONFIG_DIR /
+   PI_CODING_AGENT_DIR / profile paths match how src/ resolves them.
+5. docs/design.md: every omp surface it relies on (session file layout, entry types, RPC
+   commands, extension hooks) still exists in the reference clone at that version; cite
+   the omp file:line.
+6. Conventions in AGENTS.md (anyhow/thiserror split, lenient parsing, fixtures-only tests,
+   edition 2024) hold in the code.
 
 Severity guide:
-- CRITICAL: doc says X, code does Y (following doc causes errors)
+- CRITICAL: doc says X, code does Y (following the doc causes errors)
 - HIGH: doc is outdated (feature exists but behavior changed)
-- MEDIUM: doc is incomplete (missing endpoints, env vars)
+- MEDIUM: doc is incomplete (missing subcommand, flag, env var)
 - LOW: doc is imprecise (typo, formatting)
 
 Output each finding as:
@@ -116,47 +103,40 @@ Output each finding as:
 End with per-file accuracy scores (1-10).
 ```
 
-### Group 2 -- Architecture Documentation (Claude Agent)
+### Group 2 -- Harness Documentation (Claude Agent)
 
 Dispatch via Agent tool:
 
 ```
-You are an architecture documentation accuracy auditor. Cross-reference ALL architecture
-decision docs against the actual codebase.
+You are a documentation accuracy auditor for glen's Claude Code harness (.claude/).
+Cross-reference the harness docs against the files and config they describe.
 
 Docs to audit:
-- docs/ArchitecturalDecisions/DataModel.md -> against packages/db/src/schema/*.ts
-- docs/ArchitecturalDecisions/QueueProcessing.md -> against apps/api/src/queues/**
-- docs/ArchitecturalDecisions/CustomerFlow.md -> against apps/web/app/ route structure
-- docs/ArchitecturalDecisions/LLMFallbackStrategy.md -> against apps/api/src/providers/**
-- docs/ArchitecturalDecisions/Frontend.md -> against apps/web/ patterns
-- docs/ArchitecturalDecisions/ParkedAdvancedEdit.md -> verify false && guards still exist
-- docs/ArchitecturalDecisions/ParkedLLMBudget.md -> verify guards still exist
-- docs/Testing/*.md -> against actual test files, playwright config
-- docs/Deployment/*.md -> against Docker, nginx, Makefile configs
-- docs/Design System/*.md -> against tailwind.config, CSS vars
-- CLAUDE.md (root) -> against actual commands, policies
-- .claude/CLAUDE.md -> against actual agent/skill/command files
-- .claude/docs/ProjectReference.md -> against current codebase state
-- .claude/docs/DockerSetup.md -> against docker-compose.yml
-- .claude/agents/README.md -> against actual agent files
-- apps/api/.env.example, apps/web/.env.example -> against process.env usage in code
+- .claude/CLAUDE.md -> project profile table vs Cargo.toml, ci.yml, lefthook.yml;
+  workflows table vs .claude/commands/*.md; "Removed for glen" list vs what is on disk;
+  tool routing vs .claude/settings.json permissions and hooks
+- .claude/agents/README.md, .claude/agents/*/README.md -> every agent file listed exists,
+  every agent file on disk is listed
+- .claude/commands/README.md -> every command listed exists and dispatches the file it
+  names; the command count is right
+- .claude/skills/README.md and each .claude/skills/*/SKILL.md -> skills listed exist;
+  runbook commands (git, gh, cargo) are valid; branch names and merge methods agree with
+  the branching-model skill (main is the only trunk, squash-merge, no staging)
+- .claude/hooks/README.md -> every hook described is wired in .claude/settings.json and
+  every wired hook script exists and is executable
 
-Verification depth: CODE-LEVEL.
-For each claim in a document, read the actual code and verify.
+Verification depth: CODE-LEVEL. For each claim, open the file it refers to.
 
 Specific checks:
-1. Every table in DataModel.md exists in packages/db/src/schema/*.ts with correct columns
-2. Pipeline stages in QueueProcessing.md match actual processor chaining
-3. Route structure in CustomerFlow.md matches actual app/ directory
-4. Parked features have their false && guards in the documented locations
-5. Agent/command/skill lists match actual files on disk
-6. Every env var in .env.example is used in code (grep process.env)
-7. Every process.env in code has an entry in .env.example
-8. Docker service config in DockerSetup.md matches docker-compose.yml
+1. No doc points at a file, agent, command or skill that does not exist
+2. No doc describes a staging branch, Linear, Docker, npm/pnpm or a web stack as if glen
+   had one (statements that glen does NOT have them are correct)
+3. Every double-brace token placeholder left in .claude/ is template meta (bootstrap
+   docs, prompt guides), not an unfilled value an agent would read
+4. The cargo commands in the harness match ci.yml exactly (flags included)
 
 Severity guide:
-- CRITICAL: doc says X, code does Y
+- CRITICAL: doc says X, config does Y
 - HIGH: doc is outdated
 - MEDIUM: doc is incomplete
 - LOW: doc is imprecise
@@ -167,51 +147,46 @@ End with per-file accuracy scores (1-10).
 
 ### Scanner -- Stale Reference Scanner (Codex)
 
-Dispatch via Skill tool (`skill-codex:codex`) with flags:
-`-m gpt-5.4-mini --config model_reasoning_effort="low" --sandbox read-only --full-auto --skip-git-repo-check 2>/dev/null`
+Dispatch via the Agent tool with `subagent_type: "codex:codex-rescue"`, read-only (state it
+in the prompt). Never `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook
+blocks both.
 
 ```
-# Stale Reference Scanner
+# Stale Reference Scanner (read-only: do not modify any file)
 
 ## Identity
-You are a mechanical documentation reference checker. You scan all documentation
-files for references to code identifiers (function names, class names, file paths,
-env vars) and verify each one still exists in the codebase.
+You are a mechanical documentation reference checker for glen, a Rust CLI. You scan
+documentation for references to code identifiers, paths, commands and env vars, and
+verify each one still exists.
 
 ## Scope
-Scan these documentation directories for code references:
-- docs/**/*.md
-- CLAUDE.md (root)
-- .claude/CLAUDE.md
-- .claude/docs/*.md
-- .claude/agents/README.md
-- apps/api/CLAUDE.md
-- apps/web/CLAUDE.md
-- packages/shared/CLAUDE.md
-- apps/api/.env.example
-- apps/web/.env.example
+- AGENTS.md, CLAUDE.md, README.md (if present), docs/**/*.md
+- .claude/CLAUDE.md, .claude/**/README.md, .claude/skills/*/SKILL.md
+- glen's shipped SKILL.md, if present
 
 ## Instructions
 1. Read each doc file
 2. Extract every reference to:
-   - File paths (anything with / and a file extension)
-   - Class/function names (PascalCase or camelCase identifiers referenced as code)
+   - File paths (anything with / and a file extension, or a directory ending in /)
+   - Rust items referenced as code (fn, struct, enum, module names)
    - Environment variables (ALL_CAPS_WITH_UNDERSCORES)
-   - npm scripts (anything after "npm run")
-   - Make targets (anything after "make ")
-   - Command names (anything after "/" that looks like a command)
-3. For each reference, verify it exists:
-   - File paths: does the file exist?
-   - Env vars: is it used in code (process.env.VAR_NAME)?
-   - npm scripts: is it in a package.json?
-   - Make targets: is it in Makefile?
-   - Commands: is there a .claude/commands/{name}.md file?
-4. Report every reference that does NOT exist as a stale reference
+   - cargo commands and flags (anything after "cargo ")
+   - glen subcommands and flags (anything after "glen " or "cargo run -- ")
+   - Slash commands (/name) and skills (`name` skill)
+3. Verify each:
+   - File paths: does the file exist? (paths under ../metis/references are read-only;
+     check them but never write)
+   - Rust items: rg -n 'fn name|struct Name|enum Name|mod name' src
+   - Env vars: rg -n 'VAR_NAME' src (std::env::var / env!)
+   - cargo commands: valid subcommand and flags (cargo <sub> --help)
+   - glen subcommands: present in the clap definitions in src/
+   - Slash commands: .claude/commands/{name}.md exists; skills: .claude/skills/{name}/SKILL.md
+4. Report every reference that does NOT resolve
 
 ## Output Format
 | Doc File | Reference | Type | Status |
 |----------|-----------|------|--------|
-| {doc path} | {reference} | file/env/script/command | MISSING / RENAMED / STALE |
+| {doc path} | {reference} | file/item/env/cargo/subcommand/command/skill | MISSING / RENAMED / STALE |
 
 End with total: {N} stale references found across {M} doc files.
 ```
@@ -237,15 +212,14 @@ Write the final report to `.claude/reviews/docs-audit-{date}.md`:
 
 ## Summary
 
-| Domain                 | Files Audited | Critical | High | Medium | Low | Score |
-| ---------------------- | ------------- | -------- | ---- | ------ | --- | ----- |
-| API & Endpoints        |               |          |      |        |     | /10   |
-| Data Model & Schema    |               |          |      |        |     | /10   |
-| Queue Processing & LLM |               |          |      |        |     | /10   |
-| Frontend & UI          |               |          |      |        |     | /10   |
-| Infrastructure & Env   |               |          |      |        |     | /10   |
-| Testing & Config       |               |          |      |        |     | /10   |
-| **Overall**            |               |          |      |        |     | /10   |
+| Domain                        | Files Audited | Critical | High | Medium | Low | Score |
+| ----------------------------- | ------------- | -------- | ---- | ------ | --- | ----- |
+| CLI usage (README, SKILL.md)  |               |          |      |        |     | /10   |
+| Agent guide (AGENTS.md)       |               |          |      |        |     | /10   |
+| Design & omp surfaces         |               |          |      |        |     | /10   |
+| CI, hooks & commands          |               |          |      |        |     | /10   |
+| Harness docs (.claude/)       |               |          |      |        |     | /10   |
+| **Overall**                   |               |          |      |        |     | /10   |
 
 ## Critical Findings (fix immediately)
 
@@ -308,10 +282,12 @@ but misses new edge cases), flag it as a LOW-confidence finding for downstream r
 - This is an audit. Report findings only. Do not update docs or commit changes.
 - Dispatch all 3 agents in parallel for maximum throughput.
 - Verification must be code-level, not surface-level. Read the actual code to verify claims.
-- Parked features (// PARKED:, false &&) are intentional -- verify the guard exists but do
-  not flag the feature as "not implemented."
-- .env.example files are documentation -- every env var used in code must appear, and every
-  var listed must actually be used.
+- Parked features (`// PARKED:`) are intentional -- verify the marker exists but do not flag
+  the feature as "not implemented."
+- glen has no .env files. Env vars it reads (e.g. PI_CONFIG_DIR, PI_CODING_AGENT_DIR) must
+  be documented in AGENTS.md or the README, and every documented one must be read in src/.
+- Docs describing planned behaviour (design.md before the code exists) are not stale;
+  flag them only when they contradict code that does exist.
 - Score each doc file 1-10: 10 = perfectly accurate, 1 = completely wrong.
 - The Codex scanner prompt uses markdown headers (not XML) per OpenAI prompt conventions.
 </rules>

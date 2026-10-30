@@ -20,10 +20,12 @@ file path, processor/method name, severity, and a confidence tag.
 </role>
 
 <context>
-[Fill in this project's actual pipeline shape before running this audit. Example shape —
-replace with the real queues/stages and files:]
+**glen: not applicable today, and not dispatched by glen's error-audit orchestrator.**
+glen has no queue or background-job system (`.claude/CLAUDE.md` → Project profile). If it
+grows one, fill in the shape below with the real stages and files and add this arm back to
+`orchestrator.md`.
 
-{{BACKEND_DIR}}/queues/ (or equivalent) -> background job processors
+src/ (glen has no queue directory yet) -> background job processors
   N queues/topics: {list this project's actual stages}
   Pipeline: stage-1 -> stage-2 -> ... -> done
   Each stage can fail independently

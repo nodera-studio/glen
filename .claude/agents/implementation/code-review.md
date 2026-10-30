@@ -44,26 +44,30 @@ hide in utility functions, cleanup logic, and config. Do not skip files.
 ## Project Conventions (flagging convention-following code is a false positive)
 
 <conventions>
-[This block MUST be filled in with THIS project's actual conventions before the gate is
-useful — the items below are a placeholder shape, not real rules. Read the project's
-CLAUDE.md / AGENTS.md / rules files and replace each line with the real convention.]
+glen's conventions (from `AGENTS.md` and `.claude/CLAUDE.md`; re-read them if this block
+looks stale):
 
-- **Error chain**: how exceptions are wrapped into an error envelope, and how the
-  frontend consumes it.
-- **Auth**: the default auth posture (guarded-by-default vs. opt-in) and the
-  opt-out mechanism; how resource-by-id endpoints verify ownership.
-- **Data access / tenant isolation**: the helper or pattern tenant-scoped queries must go
-  through, if this project is multi-tenant; what a bypass looks like and whether any
-  carve-outs are documented.
-- **Background-job retry model**: application-level vs. broker-level retries — state
-  this project's actual convention so a correct pattern isn't flagged as a bug.
-- **Audit logging**: what a new auditable action requires (payload shape, i18n labels,
-  etc.), if this project has an audit log.
-- **Global mutation error fallback**: what the default UI error behavior is, so a
-  missing local handler isn't flagged when the global fallback already covers it.
-- **Language**: user-facing vs. developer-facing/log message language, if they differ.
-- **Parked code markers**: this project's convention for marking intentionally
-  incomplete code (e.g. `// PARKED:`) — do not flag these.
+- **Errors**: `anyhow` with `.context()` in the binary (`main.rs`, command handlers);
+  `thiserror` enums in library modules. A `?` without context on I/O or omp data is a
+  finding; `anyhow` in a library module is a finding.
+- **Lenient omp parsing**: unknown omp entry types and fields are skipped, not fatal
+  (omp adds entry types between releases). A truncated last `.jsonl` line (omp
+  mid-write) is skipped. `deny_unknown_fields` on omp data is a bug.
+- **omp ownership**: glen never writes to an omp session `.jsonl`; it sends through omp
+  (RPC or the glen bridge extension). Any write path to a session file is CRITICAL.
+- **No panics on external input**: no `unwrap()`/`expect()`/unchecked indexing on omp
+  files, RPC replies, argv or env. `expect("why")` on a true internal invariant is fine.
+- **Timeouts**: every wait on omp (process, socket, RPC/bridge reply) is bounded.
+- **Output contract**: human output on a TTY, `--json` for agents. In `--json` mode
+  stdout carries only valid JSON; diagnostics go to stderr; failure exits non-zero.
+- **Tests**: omp data comes from `tests/fixtures/`, never a live `~/.omp`. Conformance
+  tests live in `tests/conformance.rs`.
+- **Not applicable to glen** (do not flag their absence): auth, tenant isolation,
+  background-job retries, audit logging, UI error fallbacks, i18n. glen has no service,
+  database, queue or frontend.
+- **Language**: English for user-facing text, errors and logs.
+- **Parked code markers**: `// PARKED:` and `// FUTURE FEATURE:` mark intentionally
+  incomplete code — do not flag these.
 </conventions>
 
 ## Reasoning (apply to every candidate finding)

@@ -6,7 +6,7 @@ model: inherit
 # Security Audit Orchestrator (cartographer → focused deep agents → synthesizer)
 
 <role>
-You run a **periodic** deep security audit of {{PROJECT_NAME}} (per release / per
+You run a **periodic** deep security audit of glen (per release / per
 sprint / on an authz-or-schema change) — NOT a per-diff gate. The deterministic quality
 gate (SAST rulesets, linting) and the triple-engine diff review already give
 continuous SAST-level coverage on every change. So this audit covers ONLY what scanners

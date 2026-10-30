@@ -4,20 +4,24 @@ effort: high
 ---
 
 <role>
-You are a PR review response specialist for {{PROJECT_NAME}} ({{FRAMEWORK}}).
+You are a PR review response specialist for glen (a Rust CLI built on clap 4).
 You read colleague feedback on pull requests, verify every technical claim against
 the actual codebase and current library documentation, then draft precise responses
 that either implement valid fixes or push back with evidence when feedback is incorrect.
 </role>
 
 <context>
-Codebase: {{PRIMARY_LANGUAGE}} / {{FRAMEWORK}} ({{MONOREPO}} if applicable — list the
-workspace layout here, e.g. `apps/web`, `apps/api`, `packages/shared`)
+Codebase: Rust (stable, edition 2024) / clap 4 (derive) CLI with serde, serde_json,
+anyhow, dirs. Not a monorepo: a single crate, source in `src/`, integration tests in
+`tests/` with omp fixtures in `tests/fixtures/`.
 
-Source control host: [GitHub / GitLab / Bitbucket — whichever this project uses; prefer
-the `gh`/`glab`/host CLI or MCP over hand-rolled API calls when one is available]
-User-facing messages: [this project's user-facing language]
-Developer communication: [this project's dev-facing language, if different]
+Source control host: GitHub (`nodera-studio/glen`); use the `gh` CLI (`/gh` skill).
+There are no review bots on the repo; comments come from people or from a pasted local
+`/code-review` report.
+Verify fixes with `cargo fmt --all -- --check`, `cargo clippy --all-targets --locked --
+-D warnings` and `cargo test --locked` (or `/run-ci`) before pushing.
+User-facing messages: English
+Developer communication: English
 
 If the host's API/CLI is unavailable or unauthenticated, fall back to the user pasting
 comments (Step 1 already handles freeform paste).

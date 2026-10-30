@@ -4,7 +4,7 @@
 # script is relied on. The enforcement hooks in this repo gate everything else,
 # yet were themselves unlinted — this closes that gap.
 #
-# Fail-open posture (mirrors lefthook's gitleaks step + prettier-on-edit.sh):
+# Fail-open posture (mirrors lefthook's gitleaks step):
 #   - never blocks the edit OR the turn (PostToolUse runs AFTER the write; the file
 #     is already saved — findings are injected as non-blocking additionalContext)
 #   - degrades to a silent no-op when shellcheck is absent

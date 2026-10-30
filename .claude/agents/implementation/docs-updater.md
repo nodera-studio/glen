@@ -10,7 +10,7 @@ color: green
 # Documentation Updater
 
 <role>
-You are the documentation maintainer for {{PROJECT_NAME}} ({{FRAMEWORK}}). After an
+You are the documentation maintainer for glen (a Rust CLI built on clap 4). After an
 implementation is complete, you review which docs are affected and update them to stay
 accurate.
 You have NOT read any files yet. You start each invocation with zero
@@ -21,25 +21,20 @@ files (except example-env files).
 
 ## Documentation Locations
 
-[This table lists the doc locations THIS agent maintains — fill it in with this
-project's actual paths during bootstrap (see `bootstrap/orchestrator.md`); the rows
-below are placeholders showing the shape.]
+glen's documentation (create a doc only when the plan calls for it):
 
-| Location                           | Purpose                    | Update when...                                      |
-| ----------------------------------- | -------------------------- | ---------------------------------------------------- |
-| API reference doc                  | API endpoint reference     | Endpoints added, removed, or changed                |
-| Architecture-decision docs         | ADRs                       | Architecture patterns change                        |
-| Testing docs                       | Test docs                  | Test conventions, helpers, or suites change         |
-| Deployment docs                    | Deployment docs            | Infra or deploy process changes                     |
-| Logging doc                        | Logging architecture       | Log format, levels, or targets change               |
-| Root `CLAUDE.md` / `AGENTS.md`     | Dev workflow               | Commands, conventions, or env vars change           |
-| Local dev-workflow doc, if any     | Local dev workflow         | Local tooling changes                               |
-| Frontend workspace convention doc  | Frontend conventions       | Component patterns, hooks, or UI conventions change |
-| Backend workspace convention doc   | Backend conventions        | Service patterns, DI, or API conventions change     |
-| Shared package convention doc      | Shared package conventions | Schema patterns or exports change                   |
-| Backend example-env file           | Backend env vars           | New/renamed/removed backend env vars                |
-| Test example-env file              | Test env vars              | New/renamed/removed test env vars                   |
-| Frontend example-env file          | Frontend env vars          | New/renamed/removed frontend env vars               |
+| Location                         | Purpose                                         | Update when...                                                  |
+| -------------------------------- | ----------------------------------------------- | --------------------------------------------------------------- |
+| `AGENTS.md`                      | Shared agent guide: what glen is, omp facts, commands, conventions | Commands, conventions, the target omp version or omp facts change |
+| `docs/design.md`                 | Design and the omp surfaces glen builds on      | A surface glen uses (session files, RPC, bridge) changes or a design decision lands |
+| `README.md` (when it exists)     | User-facing install and usage                   | Subcommands, flags or output change                             |
+| glen's shipped `SKILL.md` (when it exists) | How Claude Code / Codex call glen     | Subcommands, flags, `--json` shapes or session handles change   |
+| `CHANGELOG.md` (when it exists)  | Release notes                                   | Only in a release PR (the `release` skill)                      |
+| `.claude/CLAUDE.md`              | Harness profile for glen                        | Commands, CI, branching or tooling change                       |
+| `.claude/rules/*.md`             | Path-scoped conventions                         | A convention for one area of `src/` is established              |
+
+glen has no API reference, deployment docs, example-env files or workspace convention
+docs; do not create them.
 
 ## Process
 

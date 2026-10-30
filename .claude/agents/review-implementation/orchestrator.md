@@ -26,8 +26,8 @@ enforced that inside the Implementer. The engines hunt real bugs.
 
 ## Step 1 — Base branch + gather the diff
 
-Standalone: ask the user which branch to diff against (`AskUserQuestion`, default
-`staging`). Inside `/implement`: use the default-branch merge-base, no prompt.
+Standalone: diff against `main` (glen's only long-lived branch) unless the user names
+another base. Inside `/implement`: use the `main` merge-base, no prompt.
 
 ```bash
 MERGE_BASE=$(git merge-base HEAD "$BASE")
@@ -40,10 +40,11 @@ uncommitted changes need reviewing too. Store the file list + HEAD SHA.
 
 ## Step 2 — Scope
 
-Note which domains the changed files touch (frontend `{{FRONTEND_DIR}}/**`, backend
-`{{BACKEND_DIR}}/**`, db/schema + migrations, background jobs, shared `{{SHARED_DIR}}/**`,
-infra `Dockerfile*` / `docker-compose*` / build config — adapt to this project's actual
-layout). This focuses the Claude reviewer; it no longer selects specialist agents (the
+Note which areas the changed files touch: the CLI entry and output (`src/main.rs` and
+command handlers), omp file discovery and parsing, omp RPC / bridge I/O (all under
+`src/`), tests (`tests/`, `tests/fixtures/`), and build/CI config (`Cargo.toml`,
+`Cargo.lock`, `.github/workflows/ci.yml`, `lefthook.yml`). glen has no frontend,
+database, background jobs or Docker. This focuses the Claude reviewer; it no longer selects specialist agents (the
 comprehensive reviewer covers all six domains).
 
 ## Step 3 — Pre-flight (graceful degradation)
@@ -52,6 +53,9 @@ comprehensive reviewer covers all six domains).
 command -v codex >/dev/null && echo "codex ok"        # native codex review
 command -v coderabbit >/dev/null && echo "coderabbit ok"
 ```
+
+In glen the CodeRabbit CLI is not installed, so expect a two-engine run (Claude ‖ Codex)
+and say so in the report.
 Any engine that's unavailable is simply skipped — the synthesizer notes which engines
 ran and adjusts confidence (cross-engine agreement needs ≥2 engines). Never silently
 claim three engines ran when one was down.
@@ -75,12 +79,12 @@ prompt: "Read .claude/agents/review-implementation/comprehensive-review.md and f
 
 **Codex engine** (Bash, background) — the plugin's native reviewer, NOT `codex exec`:
 ```bash
-codex review --base "$BASE" > reports/codex-review.txt 2>&1
+mkdir -p target/reports && codex review --base "$BASE" > target/reports/codex-review.txt 2>&1
 ```
 
 **CodeRabbit engine** (Bash, background) — structured agent output:
 ```bash
-coderabbit review --plain --agent --base "$BASE" > reports/coderabbit-review.txt 2>&1
+coderabbit review --plain --agent --base "$BASE" > target/reports/coderabbit-review.txt 2>&1
 ```
 
 Collect all three when they finish. If an engine errored, capture the error and treat
@@ -91,8 +95,8 @@ it as "did not run."
 Dispatch the synthesizer (Agent tool) with the three outputs + provenance inputs:
 ```
 prompt: "Read .claude/agents/review-implementation/synthesizer.md and follow it.
-         claude_review: {claude output}. codex_review: {reports/codex-review.txt}.
-         coderabbit_review: {reports/coderabbit-review.txt}. MERGE_BASE: {MERGE_BASE}.
+         claude_review: {claude output}. codex_review: {target/reports/codex-review.txt}.
+         coderabbit_review: {target/reports/coderabbit-review.txt}. MERGE_BASE: {MERGE_BASE}.
          BASE: {BASE}. Changed files: {list}. Produce the unified report + fix plan and
          make the memory-write decision."
 ```

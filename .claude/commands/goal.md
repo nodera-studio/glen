@@ -1,7 +1,7 @@
 ---
 allowed-tools: Read, Write, Edit
-description: Declare or update the auto-mode goal (objective + base branch) for the autonomous loop
-argument-hint: ship NOD-XXX on the main|staging branch
+description: Declare or update the auto-mode goal (objective, and whether it ends in a release tag) for the autonomous loop
+argument-hint: <objective, Glen board issue/module, or plan path> [and release v0.x.y]
 model: inherit
 ---
 
@@ -11,8 +11,8 @@ Goal: $ARGUMENTS
 
 Procedure:
 
-1. If `$ARGUMENTS` is empty, ask the user for the objective (and which base branch — `main` or `staging`) and stop.
-2. Parse the objective and whether this is a promotion. Treat ONLY explicit promotion phrasing — `to prod`, `promote staging to main`, `on the main branch` — as a `staging → main` promotion goal; everything else is a feature goal with base `staging`. A bare `on main` is ambiguous (it can mean "fix the bug on main"): ask the user to confirm rather than assuming a promotion. Default to `staging` when unstated — `main` work is always an explicit, confirmed promotion.
-3. Read `.claude/auto-mode/state.md` if it exists; otherwise create it from the state-file template in `.claude/skills/auto-mode/SKILL.md`.
-4. Write/overwrite the `## Goal` section with the objective, fill `Base branch` under `## Resolved goal` if known, and set `## Status` to `goal-set`. Preserve any existing wave ledger only if it still matches this goal; otherwise reset the ledger.
-5. Confirm in one line what the goal and base branch are, and that the user can now run `/auto-mode` to start.
+1. If `$ARGUMENTS` is empty, ask the user for the objective and stop.
+2. Parse the objective. Every goal targets `main` — glen's only long-lived branch; there is no base branch to choose and no staging or promotion step. Note what the goal points at: a Glen board module or issue (key, title or id), a plan under `.claude/plans/`, or a freeform objective. Treat the goal as a **release goal** only on explicit release phrasing — `release`, `tag v0.x.y`, `ship version 0.x.y`, `cut a release` — and record the version if one is named (otherwise "next patch/minor, decided at release time"). Anything else is a feature goal with no release.
+3. Read `.claude/auto-mode/state.md` if it exists; otherwise create it (and `.claude/auto-mode/`) from the state-file template in `.claude/skills/auto-mode/references/loop-procedures.md`. The file is git-ignored; never stage it.
+4. Write/overwrite the `## Goal` section with the objective, fill `Goal module / issue` and `Release` under `## Resolved goal` where known, and set `## Status` to `goal-set`. Preserve any existing wave ledger only if it still matches this goal; otherwise reset the ledger.
+5. Confirm in one line what the goal is and whether it ends in a release, and that the user can now run `/auto-mode` to start.

@@ -7,19 +7,24 @@ color: red
 ---
 
 <role>
-Root cause analyst for {{PROJECT_NAME}} ({{FRAMEWORK}}). You build evidence before
+Root cause analyst for glen (a Rust CLI built on clap 4). You build evidence before
 drawing conclusions — read code, check logs, verify state — and identify the true root
 cause, not just the symptom.
 </role>
 
 <context>
-[Fill this in from the project's own CLAUDE.md / README before relying on this agent —
-it is a template, not this project's actual architecture.]
+glen's structure (see `AGENTS.md` and `.claude/CLAUDE.md` for the full profile):
+  src/            → the crate: clap CLI entry (`main.rs`), omp session discovery,
+                    .jsonl transcript parsing, send/receive via omp RPC or the glen
+                    bridge extension, terminal and --json output
+  tests/          → integration tests; omp data from tests/fixtures/
+  no frontend, no service, no database, no queue, no Sentry
 
-Monorepo / service structure (example shape):
-  {{FRONTEND_DIR}}   → frontend framework, data-fetching layer, UI kit
-  {{BACKEND_DIR}}    → backend framework, ORM/database, background-job system
-  {{SHARED_DIR}}     → shared types/schemas, if a monorepo
+Runtime context for glen is a local reproduction: `cargo run -- <args>` against the
+installed omp (18.14.0), glen's own stderr (`RUST_BACKTRACE=1` for panics), and omp's files
+under `~/.omp` (sessions under the agent dir `~/.omp/agent`, profiles under
+`~/.omp/profiles/<name>/agent`). Read omp's behaviour in the reference clone at
+`../metis/references/oh-my-pi` (read-only). Never write to an omp session `.jsonl`.
 
 Key infrastructure to identify for this project:
 

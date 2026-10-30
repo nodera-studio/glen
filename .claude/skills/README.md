@@ -1,9 +1,25 @@
 # Skills — index note
 
 A skill is a `SKILL.md` file with YAML frontmatter (`name`, `description` with a clear
-trigger phrasing) plus a body documenting WHEN to use it and HOW. This directory holds
-the skills general enough to work for any project. Use them as the structural reference
-when you write your own.
+trigger phrasing) plus a body documenting WHEN to use it and HOW. Use the skills here as the
+structural reference when you write your own.
+
+## Skills in glen
+
+| Skill | Use for |
+| --- | --- |
+| `auto-mode` | The `/goal` + `/auto-mode` wave loop: waves PR into `main`, tracked on the Glen board |
+| `branching-model` | Trunk-only branch, PR and merge rules (`main`, squash-merge, capture before merge) |
+| `release` | Version-bump PR, then an annotated `v0.x.y` tag on `main`; board issues tagged `released:v0.x.y` |
+| `mnemosyne` | glen's Mnemosyne ids, memory conventions and board operations |
+| `codex` | Dispatching Codex through `codex:codex-rescue` / `codex review` |
+| `exa` | All web access (native WebSearch/WebFetch are denied) |
+| `gh` | PRs, checks, run logs, merges |
+
+Removed for glen: `linear` (issues live on the Mnemosyne board), `playwright-cli` (no browser
+UI), `sentry-cli` (no error tracker), `wrangler` (the global `cloudflare:wrangler` plugin skill
+covers any Cloudflare work, e.g. the future landing page) and `promote-to-prod` (no staging
+branch; the `release` skill replaced it).
 
 ## Add project-specific skills as your project needs them
 
@@ -50,9 +66,9 @@ the connection itself wherever your team manages account/workspace settings.
 Two integrations get real client-side wiring in this repo, because their configuration
 is a portable setup step rather than an account-level OAuth grant:
 
-- **Mnemosyne** (memory/codebase/secrets MCP) — see `skills/mnemosyne/SKILL.md` and the
-  top-level `README.md`'s "Mnemosyne MCP integration" section. Client wiring only; the
-  servers themselves are a separate project you run.
+- **Mnemosyne** (memory, codebase, secrets and workspace servers, via the `mnemosyne`
+  plugin) — see `skills/mnemosyne/SKILL.md`. Client wiring only; the servers themselves
+  are a separate project.
 - **Exa** (web search/fetch) — see `skills/exa/SKILL.md`; a standard MCP server you
   configure once, not an OAuth connector.
 

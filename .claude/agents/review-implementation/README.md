@@ -21,10 +21,12 @@ flowchart TD
 ```
 
 Total: 4 agents (3 engines + synthesizer) — no multi-pass voting, no shuffled diffs.
+In glen the CodeRabbit CLI is not installed, so the third engine is skipped and the report
+says so (Claude ‖ Codex + synthesizer).
 
 ## Branch awareness
 
-Reviews authored working-tree changes against the merge-base (default `staging`,
+Reviews authored working-tree changes against the merge-base (default `main`,
 including uncommitted + untracked files). For branches with merge commits, the engines
 see the full diff; the synthesizer flags any merge that dropped or duplicated work.
 
