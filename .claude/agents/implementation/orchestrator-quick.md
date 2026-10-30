@@ -57,8 +57,15 @@ Claude writes no product code — dispatch the **Codex Implementer** even on the
 
 ```
 Agent tool:
+  subagent_type: "impl-coder-codex"
+  run_in_background: true
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this small change (--fresh): {the user's task + the pattern file it copies}."
 ```
+
+Dispatch it in the background and wait for its completion notification: it reports failed
+Codex attempts by SendMessage to `main`, which works only from a background subagent
+(`orchestrator.md` → Role 1 → "Failed Implementer attempts"). A targeted fix gets exact line
+ranges (`orchestrator.md` → Role 2 → "Line-range fix briefs").
 
 Take the file snapshot from `/implement` (`orchestrator.md` → Role 1, "File snapshot") before
 this dispatch and check it after: any pre-existing file, tracked or untracked, that is gone is

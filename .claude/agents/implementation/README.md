@@ -48,7 +48,10 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
 
 Claude writes no product code, except design-heavy UI (`site/`, landing pages, web (non-Rust)
 visual components), which goes to a Claude Opus Implementer (`orchestrator.md` → UI implementation
-routing; `coder-ui.md`). The fused write→wire→harden→test→gate→fix loop runs in
+routing; `coder-ui.md`), and integrating two already-reviewed parallel waves, which may go to
+a Claude agent as a recorded routing deviation, followed by the gate, tests and a scoped
+Claude ‖ Codex review (`orchestrator.md` → Role 1; `loop-procedures.md` → "Shared seams").
+The fused write→wire→harden→test→gate→fix loop runs in
 **Codex** via `coder-codex.md` (`codex-companion.mjs task --json --write`), which
 forwards the `implementer.md` envelope + the repo-root `AGENTS.md` conventions. The
 former per-concern agents (`coder.md`, `wiring.md`, `error-handling.md`,

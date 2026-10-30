@@ -116,13 +116,16 @@ targeted fix with `path:start-end` ranges, add this block to the prompt, after `
 <read_scope>
 Read ONLY these line ranges (plus up to ~30 lines around each), e.g. with sed -n 'A,Bp':
 {path:start-end list from the brief}
+Also allowed: the test file or test module named here, where the regression tests go:
+{test file / module from the brief}
 Do NOT read any of these files in full, and read no other file beyond what a compile or
 test error points you to. Skip Mnemosyne recall. Edit within these ranges.
 </read_scope>
 ```
 
 If a range proves wrong (the code moved), read the nearest enclosing function only, never the
-whole file, and list the corrected range under "deviations".
+whole file, and list the corrected range under "deviations". On a `--resume-last` rework
+(Step 4), put the `<read_scope>` block at the top of the delta prompt.
 
 ## Step 4 — Run Codex (foreground, non-interactive, write-capable)
 
@@ -149,17 +152,25 @@ found only by polling `codex-companion status`. So:
 1. **Report before you retry.** After each failed attempt, before doing anything else,
    SendMessage to `main`: `impl-coder-codex <wave/slice>: Codex attempt <n>/2 failed:
    <error text, verbatim, last ~20 lines of rawOutput or stderr>. Worktree: <git status
-   --short summary>. Next: <retry | stopping>.`
-2. **Cap at 2 attempts** (the first run plus one retry; for a capacity error, wait about 60 s
-   first). Never a third.
-3. **After the second failure, stop** and return a report that leads with `BLOCKER: Codex
+   --short summary>. Next: <retry | stopping>.` SendMessage reaches `main` only when you
+   were dispatched in the background (the orchestrator does that). If SendMessage fails,
+   keep going and put every attempt report, verbatim, at the top of your final message.
+2. **Stop the failed run first.** The stall watchdog ends the companion call but does not
+   interrupt the server-side Codex turn, which can keep editing the worktree. Before each
+   retry, and before returning a BLOCKER, run "Cancelling a run" below, steps 0–3, for this
+   `WT`, and confirm the worktree has stopped changing.
+3. **Cap at 2 attempts** (the first run plus one retry; for a capacity error, wait about 60 s
+   first). The retry is `--fresh` with the same prompt. Never a third.
+4. **After the second failure, stop** and return a report that leads with `BLOCKER: Codex
    failed twice`, both error texts, what is on disk (uncommitted files, any commit), and a
    **suggested smaller delta**: the slice split into smaller steps, or the same fix as a
    line-range brief (Step 3) naming the exact `path:start-end` ranges. Claim no progress you
    have not verified.
 
-When the orchestrator SendMessages you for status, answer at once: current step, attempt
-number, Codex job state, uncommitted files, any stash you made.
+**Status requests.** A foreground Codex call blocks you, so you see an orchestrator message
+only when your current tool call returns. Answer it then, by SendMessage to `main`, before
+anything else: current step, attempt number, Codex job state, uncommitted files, any stash
+you made.
 
 ## Cancelling a run (stopping this agent does not stop Codex)
 
@@ -242,10 +253,25 @@ outside the sandbox:
    error), what the host re-run showed, and the verdict (sandbox artifact | real failure |
    Codex green but host red).
 5. **Stashes are temporary.** If you stash to compare (e.g. whether a failure predates
-   Codex's edits), tag it (`git stash push -u -m "<wave>-host-compare"`) and restore it
-   (`git stash pop`) before ending your turn; confirm `git stash list` no longer shows the
-   tag. Never end a turn with work only in a stash: W3's finished cycle-2 edits were left in
-   tagged stashes and had to be restored by SHA after its host was stopped.
+   Codex's edits), tag it, capture its SHA, restore it by SHA and drop it by its current
+   index before ending your turn. The stash stack is repo-wide (shared by every worktree), so
+   never `git stash pop` or a bare `stash@{0}`: another worktree may have stashed since.
+
+   ```bash
+   TAG="<wave>-host-compare-$(date +%s)"
+   git stash push -u -m "$TAG"
+   SHA="$(git stash list --format='%H %gs' | grep -F -- "$TAG" | head -1 | cut -d' ' -f1)"
+   # ... the comparison ...
+   if [ -n "$SHA" ]; then
+     git stash apply "$SHA"
+     REF="$(git stash list --format='%gd %gs' | grep -F -- "$TAG" | head -1 | cut -d' ' -f1)"
+     [ -n "$REF" ] && git stash drop "$REF"
+   fi
+   ```
+
+   Confirm `git stash list` no longer shows the tag. Never end a turn with work only in a
+   stash: W3's finished cycle-2 edits were left in tagged stashes and had to be restored by
+   SHA after its host was stopped.
 
 The `Bash` tool here runs outside Codex's sandbox; if your own environment blocks one of these
 too, say so instead of guessing.
@@ -262,11 +288,13 @@ too, say so instead of guessing.
 - Re-verify on the host after every run (Step 6): your gate and test results, not Codex's,
   decide green; sandbox-only failures are artifacts only when the host re-run is green; you
   are the single committer of Codex's work.
-- Report every failed Codex attempt to `main` (SendMessage, with the error text) before
-  retrying; at most 2 attempts, then stop with a suggested smaller delta.
+- Report every failed Codex attempt to `main` (SendMessage, with the error text; if that
+  fails, at the top of your final message) and cancel the run before retrying `--fresh`; at
+  most 2 attempts, then stop with a suggested smaller delta.
 - Line-range briefs: read only the given ranges, never the whole long file; no Mnemosyne
   recall.
-- Never end a turn with work left only in a stash.
+- Never end a turn with work left only in a stash; restore and drop by SHA and tag, never
+  `git stash pop`.
 - Keep the read-first + STOP-and-report gate on the Claude side; everything else is
   Codex's fused loop.
 - Never `--no-verify`; never weaken a test or silence the gate (enforced in the

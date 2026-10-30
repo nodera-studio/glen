@@ -247,11 +247,12 @@ a wave, add a line to the state file's **Harness friction log** (and log a gap i
 
 ### Independent waves in parallel
 
-An independent wave (one sharing no files with the current wave, e.g. the `site/`) can be
-planned and built in its own worktree while the main checkout carries the current CLI wave:
+Waves can run in parallel; if their files overlap, follow Shared seams below. A parallel wave
+is planned and built in its own worktree while the main checkout carries the current CLI wave:
 `git worktree add .claude/worktrees/<slug> -b <branch> origin/main`, then run the per-wave
-loop there. Each wave still PRs into `main` separately and is squash-merged on its own bar;
-rebase the later one if the first merge conflicts with it.
+loop there. Each wave still PRs into `main` separately and is squash-merged on its own bar. If
+the first merge conflicts with the later wave, bring `main` into it with
+`git merge origin/main`; a wave that merged another wave's branch early never rebases.
 
 **Shared seams.** W3 (live route) and W4 (agent surface) ran in parallel and both edited
 `send.rs`, `doctor.rs`, `cli.rs` and the conformance command-surface rows, which cost a 16-file
@@ -260,24 +261,29 @@ semantic merge at PR time. So, when planning waves to run in parallel:
 1. List each wave's touched files and seams from its plan (files to create or modify, plus
    shared surfaces: the clap command set in `cli.rs`, the visible-command set, doctor checks,
    the conformance command-surface rows) and flag every overlap in the state file's decision
-   log. With one path per line in each list:
+   log. Build each list (one path per line) from the plan's "files to create/modify" section,
+   or, once the wave's branch has commits, from `git diff --name-only origin/main...<branch>`:
 
    ```bash
+   PLANS="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)/.claude/plans"
    comm -12 <(sort -u "$PLANS/wave-a.files") <(sort -u "$PLANS/wave-b.files")
    ```
 
 2. Overlapping waves either run in sequence, or the second wave merges the first wave's
    branch early: right after the first wave's review gate (`/implement` Role 2 green),
    `git -C <second worktree> merge <first branch>`, then re-run the gate and tests there. Not
-   at PR time.
+   at PR time. Re-merge any later commits on the first wave's branch (its fix rounds) the
+   same way. Once the first wave is squash-merged, the second brings `main` in with
+   `git merge origin/main`, never a rebase, and only then opens or updates its PR.
 3. A shared surface list (the visible-command set, doctor checks, the conformance
    command-surface rows) has one owner wave per run. Only the owner edits it; another wave
    hands its entries to the owner's plan or adds them after the owner merges.
 4. Integrating two already-reviewed waves (the early merge, or a conflict left at PR time) may
    go to a Claude agent (`general-purpose`) instead of the Codex Implementer, since it is
-   merge resolution, not new product code. Record it as a routing deviation in the decision
-   log and the PR body, then re-run the gate and tests and a scoped `/code-review` of the
-   resolved files.
+   merge resolution, not new product code (the second exception to "Claude writes no
+   product code", next to UI; `implementation/orchestrator.md` → Role 1). Record it as a
+   routing deviation in the decision log and the PR body, then re-run the gate and tests and
+   a scoped Claude ‖ Codex `/code-review` of the resolved files.
 
 `.claude/plans/` is git-ignored, so the new worktree does not contain the wave's plan. Every
 brief for that wave (Implementer, fix, conformance, docs, reviewers) passes the plan by absolute
