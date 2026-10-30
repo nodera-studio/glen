@@ -27,6 +27,11 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 | RPC wire and official Rust client | `CA/modes/rpc/wire/rpc-wire.schema.json`, `sdk/rust/omp-rpc` | Prompt acknowledgements, result and settled frames |
 | Extensions | `CA/session/agent-session-types.ts:513-517`, `CA/session/agent-session.ts:10261-10300` | sendUserMessage deliverAs, registerTool, session_start/session_switch |
 | Duplicate host tool rejection | `CA/modes/rpc/rpc-mode.ts:2365-2369` | One glen_reply provider per process |
+| Headless RPC | `CA/cli/args.ts:392`, `CA/modes/rpc/rpc-mode.ts:1370-1373` | `--no-ui`: extensions have `hasUI=false` |
+| Event filtering | `CA/modes/rpc/rpc-mode.ts:2444-2460` | `set_event_filter` gates session events only |
+| Local prompt acknowledgement | `sdk/rust/omp-rpc/src/wire.rs` | `PromptAck.agentInvoked:false`: local completion, no result/settled wait |
+| Persistence notice | `CA/modes/rpc/rpc-mode.ts:1350-1365` | `notice` with `source:"session-persistence"`, no ids; re-read `get_state` |
+| RPC stdin EOF | `CA/modes/rpc/rpc-mode.ts:2937-2950` | EOF shuts omp down |
 | Directories | `packages/utils/src/dirs.ts` | §A12 |
 
 ## §A3 The three channels
@@ -62,18 +67,37 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
   - Polling avoids platform-specific FSEvents/inotify dependencies and survives replacement. Same-size title-slot edits intentionally do not trigger a reload. SIGINT ends the stream with `end` and exit 130; a second SIGINT exits 130 immediately.
 
 **RPC driver (W2)**
-- `omp-rpc` from git, tag `v18.14.0`.
-- **Per-job detached worker.** `glen send` writes the job, then spawns the hidden internal `glen __worker <job-id>`: `setsid`, stdin null, stdout/stderr to `jobs/<id>/worker.log`. This happens before any RPC client exists. The foreground `send`/`wait` only read `status.json`.
-- **The worker:**
-  1. Takes the glen per-session lock `run/locks/<sessionId>.lock` (blocking flock; status `queued` while waiting). This serialises glen requests per session.
-  2. Probes the owner lease immediately before spawning.
-  3. Spawns `omp --mode rpc --resume <file>`, with `--profile` passed through and env `GLEN_MANAGED=1`. For `@new`: no `--resume`, cwd = `--cwd`.
-  4. Calls `set_host_tools([glen_reply])`, then `prompt`.
-  5. On `PromptAck` → status `accepted`.
-  6. Completion = the `prompt_result` frame AND `session_settled`. `prompt_result.sessionSettled` may be false; keep waiting.
-  7. Writes `result.json` and a terminal status, then tears down omp's process group.
-- **Fork detection.** Compare the session id/file before and after (`get_state`), and watch for persistence `notice`/warning frames. A change → `status.forked = {from, to}` → exit 11.
-- **Tests** use a fake RPC peer through `GLEN_OMP_BIN`.
+- `omp-rpc` is pinned to git tag `v18.14.0` (not a path dependency).
+- **Per-job detached worker.** `send` creates a durable job, then re-execs hidden `glen __worker <job-id>` in its own session (`setsid`), with stdin `/dev/null` and stdout/stderr to private `worker.log`. Neither it nor omp inherits the foreground pipes. Foreground observers never cancel the worker on Ctrl-C.
+- **Worker lifecycle:**
+  1. Claim the queued job with `worker_pid` and its process start token; register SIGTERM/SIGINT/SIGHUP cancellation.
+  2. Hold glen's per-session flock through teardown. Poll every 200 ms while queued, checking abort and the absolute job deadline. Re-follow continuations after acquiring it; refuse a moved id with `session_moved` before starting omp.
+  3. Probe the owner lease using the `owners_dir` frozen in `job.json`; held or unknown becomes `no_route`.
+  4. Start `omp --mode rpc --no-ui [--profile NAME] [--resume <absolute file>]`, `GLEN_MANAGED=1`. An explicit profile removes `OMP_PROFILE` and `PI_PROFILE` from the child environment; otherwise both are inherited. Resume uses an existing header cwd, falling back to glen's cwd; `@new` uses `--cwd` or glen's cwd.
+  5. On a startup thread, wait for ready, register exactly one `glen_reply` host tool, set the event allowlist, then take a `get_state` baseline. The main thread polls controls and the deadline every 200 ms. Cancellation sets a shared abandon flag and writes terminal status plus the control acknowledgement immediately, then joins startup. Startup checks abandon after every call, drops any late client, and never prompts an abandoned job. Worker exit waits for teardown and the join.
+  6. Refuse a baseline id mismatch (`session_moved`); for `@new`, acquire the glen lock for the revealed id. Re-check cancellation/deadline and discard startup events. Do not re-probe our own child’s lease: startup recovery may already have claimed it.
+  7. Submit a prompt on a scoped thread under the cancellation mutex, with a 100 ms ack wait. Read the SDK event receiver directly on the polling loop; drain it before finalization so pre-ack output cannot lag behind completion. A late ack still arrives as an unmatched response. The first session event or completed outcome writes `accepted`. The event filter excludes message/tool streaming updates while retaining terminal messages and notices.
+  8. Complete on a completed `prompt_result` with `sessionSettled:true` or an observed post-prompt `session_settled`. An ack with `agentInvoked:false` completes locally without waiting for either; preserve `command_output`. A completed result frame with `agentInvoked:false` and an unsettled session waits at most 10 s, then completes with `settle_timeout`. Cancellation after a completed result preserves completion with `session_settled:false` and `settle_cancelled`. EOF after an unsettled completed result ends the wait immediately with `settle_timeout`; reconcile any outstanding prompt acknowledgement before treating EOF as failure. `final:true` replies never complete a job.
+  9. On every completed outcome, recheck identity with a separate 1 s budget (including completed-unsettled deadline and cancellation paths); skip this check for aborted or failed outcomes. Write `result.json` before terminal `status.json`, answer controls, close the client, then release the glen lock. `Client::close` terminates omp's private process group. Background commands the bash tool placed in separate groups can survive; glen does not hunt them.
+- **Fork detection.** Re-read `get_state` on persistence notices, changed `session_info_update` ids and before finishing. A change from the baseline records `{from,to}` and returns exit 11 with both ids and `to_handle`; never infer ids from notice prose. Tag running queries with increasing sequence numbers and ignore older results after a newer identity was applied. Unmatched responses from timed-out state calls cannot publish identity. Before recording a `glen_reply`, resolve identity through a fresh bounded state query on the worker, so a reply arriving during a fork query cannot enter the old inbox. Persistence errors add a warning.
+- **Pre-spawn probe (AC-207, revised for W2 review cycle 1).** When the glen lock is free, `send` re-probes the owner lease after reading stdin; held or unknown refuses with exit 6 before creating state, unless a fresh glen-lock check now finds a worker to queue behind. The worker probes again immediately before spawning; held or unknown fails `no_route` without prompting. There is no pre-prompt probe: omp startup recovery writes can claim our own child’s lease before ready. Baseline identity checks and post-start fork detection remain mandatory. This supersedes the two-probe AC-207 in the original W2 plan.
+- **Timeouts:**
+
+| Bound | Value | Outcome |
+|---|---|---|
+| Foreground send/wait | default 90 s, 0 for no-wait | exit 10; worker continues |
+| Null worker pid | 10 s spawn grace | reader persists lost |
+| Absolute job deadline | `GLEN_JOB_TIMEOUT`, default 60m, from creation | queued/startup: failed timeout; running: abort; completed-unsettled: completed with `settle_timeout` |
+| Owner lock wait | until job deadline, 200 ms polling | timeout or cancellation |
+| Ready | min(60 s, time left) | startup unavailable; abandoned startup joins before exit |
+| Setup calls | 10 s each | per-call error mapping |
+| Running state calls | off the polling thread; at most min(10 s, time left) | terminal status precedes a pending-call join; every completed outcome awaits a separate 1 s final identity check |
+| Abort calls and prompt ack | 100 ms each | late responses read from the event receiver; controls stay responsive |
+| Prompt result | absolute job deadline | polling loop aborts when the deadline passes |
+| Abort escalation | 10 s then SIGTERM; SIGKILL 1 s later | event receiver closes on EOF |
+| Client teardown | SIGTERM, 1 s; SIGKILL, 1 s; bounded reader join | log teardown errors |
+
+- Tests use the `fake_omp` example, never live omp (§A15).
 
 **Live route (W3)**
 - Bundled TypeScript extension at `extension/glen/index.ts` in the repo, embedded with `include_str!`. `glen install-extension` writes it to `<agent_dir>/extensions/glen/index.ts` (profile-aware). The written file bakes in the glen version and the resolved GLEN_HOME; `GLEN_HOME` set at omp runtime overrides it.
@@ -90,11 +114,12 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 ## §A4 Routing (`glen send`)
 1. Resolve the target (§A8) and follow continuations. `@new` → RPC with a fresh session.
 2. **Live endpoint.** If `run/live/<sessionId>.json` exists, connect and send `hello`. A matching `session_id` → live route. A dead pid, ECONNREFUSED or a missing socket → delete the registry (best effort) and continue.
-3. **Owner lease not held** → RPC route. The worker re-probes immediately before prompting; if it is held then, the job fails `no_route`.
-4. **Lease held and no endpoint** → refuse: exit 6 `no_route`, hint "run `glen install-extension`, then restart that omp session".
+3. A **held glen session lock** routes to RPC (queued) before consulting the owner lease: glen’s own child may hold that lease. Otherwise a free owner lease routes to RPC. The worker probes before spawning; held or unknown fails `no_route`. Startup may claim our own child’s lease, so it is not probed again before prompting.
+4. **Lease held and no endpoint** → refuse: exit 6 `no_route`. W2 hint: "close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)". W3 replaces the hint with installation guidance.
 5. **Probe result unknown** → refuse (`no_route`).
 
-**Residual race, stated plainly.** omp claims the owner lease on its first write, so probe → spawn → prompt is not atomic. If a TUI opens the same session between glen's probe and the RPC child's first write, one of the two writers continues in a sibling file. glen narrows the window (endpoint first, probe immediately before prompting, a per-session glen lock) and detects a fork afterwards (exit 11 `forked`, reporting both ids). It cannot prevent it. On macOS the probe itself holds the flock for microseconds; that is the same exposure `omp gc` has.
+**Residual race, stated plainly.** omp claims the owner lease on its first write, so probe → spawn → prompt is not atomic. If a TUI opens the same session between glen's probe and the RPC child's first write, one of the two writers continues in a sibling file. glen narrows the window (endpoint first, a fresh routing probe, a pre-spawn probe, a per-session glen lock) and detects a fork afterwards (exit 11 `forked`, reporting both ids). It cannot prevent it. On macOS the probe itself holds the flock for microseconds; that is the same exposure `omp gc` has.
+The same rule means an omp TUI that has **opened** a session but not yet written to it holds no lease: in W2, `ls` reports it `idle` and `send` goes through the RPC route (confirmed live against omp 18.14.0, W2 smoke step 5). Writes in that TUI afterwards continue from its in-memory leaf, so the two turns end up as sibling branches of one file rather than a forked file. The W3 glen extension closes this gap: it registers a live endpoint when the TUI starts, so `ls` shows `live` and `send` takes the live route before omp's first write.
 
 ## §A5 Reply channel (`glen_reply`)
 - **Tool** `glen_reply`, params `{text: string, final?: boolean}`. Description: "Send a message back to the agent that contacted you through glen (Claude Code or Codex). Use it to answer a glen request or report progress." It returns `"delivered"`.
@@ -102,39 +127,51 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
   - glen's RPC children run with `GLEN_MANAGED=1`; the extension skips its tool and socket there, and the worker supplies a host tool via `set_host_tools`.
   - TUI and print sessions with the extension installed use the extension's tool.
 - **Delivery:**
-  - RPC: the worker records replies in `result.json.replies` and appends them to the inbox.
-  - Live: the extension streams a `reply` event to a connected worker (when a glen request is active) and appends to `inbox/<sessionId>.ndjson`: `{v:1, id, session_id, job_id|null, request_id|null, text, final, at}`.
+  - RPC: append in call order to `jobs/<id>/replies.ndjson`, then the inbox, and include the same records in `result.json.replies`. A job append error returns a tool error without an in-memory record; inbox errors are logged and the job reply is retained.
+  - Live: the extension streams a `reply` event to a connected worker (when a glen request is active) and appends to `inbox/<sessionId>.ndjson`: `{v:1, id, session_id, job_id|null, request_id|null, tool_call_id|null, text, final, at}` — every field is always present; absent values are `null`, never omitted.
+- **Validation:** text must be a string, nonempty after trimming, at most 65,536 UTF-8 bytes; optional `final` must be boolean. Invalid calls record nothing and return a tool error. `final:true` is data only, not completion. W2 writes the private inbox; reading it ships in W3.
 - **Reading:** `glen inbox` shows unread messages, tracked by a per-session byte-offset cursor in `inbox/.read/<sessionId>`, and marks them read unless `--peek`. `--follow` streams NDJSON.
 
 ## §A6 glen state (`GLEN_HOME`)
 ```
 $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; relative → invalid_env (exit 2)
 ├── run/live/<sessionId>.json, run/live/<pid>.sock    W3 live endpoints
-├── run/locks/<sessionId>.lock                        W2 per-session request lock
+├── run/locks/<key>.lock                        W2 per-session request lock
 ├── jobs/<jobId>/{job.json,status.json,result.json,worker.log}   W2
-├── inbox/<sessionId>.ndjson, inbox/.read/<sessionId>             W3
+├── jobs/<jobId>/replies.ndjson, control/<name>.{json,done.json}   W2
+├── inbox/<sessionId>.ndjson                                    W2 writes
+├── inbox/.read/<sessionId>                                     W3 reads
 └── out/<unix-ms>-<command>-<pid>.{json,txt}                      W0 spilled output
 ```
+- **Lock keys:** a plain token session id is its own key; other ids use `h-<xxh64(id,0)>`. These are glen locks, never omp append gates. Lock files are never unlinked.
 - **Modes:** directories glen creates are 0700, files 0600. glen never chmods a GLEN_HOME that already exists; doctor warns about group/other bits.
 - **Atomic writes:** a temp file in the same directory, then rename.
 - **Socket paths:** `sun_path` holds at most 104 bytes on macOS. A socket path that is too long is refused, with a hint to shorten GLEN_HOME.
 - **Retention:**
   - `out/` files older than 7 days are pruned on every spill.
-  - Terminal jobs older than 7 days are pruned when a new job is created.
+  - Only terminal jobs (including lost) whose parsed status `updated_at` is more than 7 days old are pruned when a new job is created. Active or unreadable jobs are kept; pruning is best effort.
   - Inbox files are kept.
 
 ## §A7 Jobs
-- **Id:** a glen-generated uuidv7. **Handle:** `j` + the last 7 hex.
-- **`job.json`:** `{v, id, session_id|null, session_file|null, route: "rpc"|"live"|"new", deliver_as, text, cwd, created_at}`.
-- **`status.json`:** `{v, status, updated_at, worker_pid, request_id?, actual_session_id?, forked?: {from, to}, error?: {code, message}}`.
-- **`result.json`:** `{v, assistant_text, replies[], stop_reason, settled_at}`.
-- **Statuses:** `queued → accepted → completed | aborted | failed`, and `queued|accepted → lost`.
-- **`lost`** is detected by readers: a non-terminal status, plus the worker pid not alive (`kill(pid,0)` = ESRCH), plus `status.json` older than 2 s. The reader then persists `lost`.
-- **Exit mapping for `send`/`wait`:**
-  - completed → 0, or 11 if forked;
-  - aborted, failed or lost → 7 `job_failed` (`details.status`);
-  - still `queued` or `accepted` when the wait bound elapses → 10 (`ok:true`, `data.status:"running"`, `data.job`).
-  - SIGINT exits 130 (shell convention), and the worker keeps running.
+- **Id:** glen uuidv7; **handle:** `j` + last 7 hex. `wait` accepts a full uuid or `j` plus at least 7 hex suffix digits, case-insensitively. Multiple matches return `ambiguous` with candidates; bad shapes return usage with a `glen jobs` hint.
+- **`job.json`:** `{v,id,handle,created_at,route,session_id?,session_file?,session_handle?,deliver_as,text,cwd,omp_bin,profile_flag?,owners_dir,job_timeout_ms,deadline_at}`. W2 routes are `rpc|new` (W3 adds live). `owners_dir` and `omp_bin` are frozen absolute paths resolved by send. Optional disk fields are omitted when absent; readers tolerate unknown fields.
+- **`status.json`:** `{v,status,updated_at,worker_pid?,worker_start?,omp_pid?,request_id?,actual_session_id?,actual_session_file?,delivered_as?,waited_ms?,waiting_for_lock?,forked?:{from,to},error?:{code,message,hint?,details?},warnings:[]}`.
+- **`result.json`:** `{v,prompt_status?,agent_invoked,assistant_text?,replies:[],command_output:[],stop_reason?,session_settled,settled_at?}`. Result is published before terminal status.
+- **Queue display:** `waiting_for_lock:true` is published only after the blocking acquire encounters contention, and cleared on acquisition before omp startup or when cancellation/timeout ends the wait. `waited_ms` retains the acquired lock’s wait duration. Human observers show "queued behind another glen job" only while that marker is true, "starting omp" otherwise, and "waiting for the reply" after acceptance.
+- **Statuses:** `queued → accepted → completed|aborted|failed`, and `queued|accepted → lost`. A worker checks terminal state before claiming.
+- **Lost identity:** readers compare the pid and process start time (Linux `/proc/<pid>/stat` starttime; macOS `proc_pidinfo` start timestamp). A gone process, zombie or mismatched token persists `lost`. Unknown identity is not evidence of loss. With a null pid only, status older than 10 s exceeds spawn grace. A live matching worker is never marked lost. Loss detection re-reads status under the same status lock used by worker publications, preserving any newer terminal outcome.
+- **Unsupported platforms.** Only Linux and macOS provide process start tokens. On other Unix, or when a token cannot be read, a worker records its pid without `worker_start`; readers conservatively cannot mark that job lost, even if it later dies. The null-pid grace does not apply to a recorded pid. This limitation is unsupported-platform behavior, not a fallback to the null-pid grace.
+- **Deadline:** `GLEN_JOB_TIMEOUT` is parsed at job creation (1ms–24h, default 60m); invalid/zero values warn and use 60m. The recorded absolute deadline never resets. Before a result, timeout aborts and fails with `timeout`; after a completed result but before settlement it completes with `session_settled:false` and warning `settle_timeout`.
+- **Job error codes:** `no_route`, `timeout`, `cancelled`, `aborted`, `omp_error`, `omp_exited`, `omp_unavailable`, `reply_tool_rejected`, `session_moved`, `rpc_error`, `protocol`, `io`, `spawn`, `lost`, `internal`.
+- **Clarifications (W2 conformance, 2026-10-30):**
+  - *Never-ready omp vs the job deadline.* Whichever bound fires decides the code: the job deadline (`GLEN_JOB_TIMEOUT`) → `failed` `timeout`; the 60 s ready bound with deadline time left → `failed` `omp_unavailable`.
+  - *Job handle shape first.* `glen wait <arg>` validates the handle shape before any lookup: a malformed argument is exit 2 `usage` even when `GLEN_HOME` does not exist; a well-formed handle with no `GLEN_HOME` or no match is exit 3 `not_found`.
+  - *Lost detection age.* "older than 10 s" is measured on `status.json`'s `updated_at` field (the authoritative clock), not the file mtime.
+  - *Abort bound.* The worker writes the terminal `aborted` status within 1 s of the abort request or signal; tests allow 0.5 s of scheduling slack (1.5 s).
+  - *Worker cwd.* omp runs in the session header's `cwd` when it is an existing directory; otherwise in the `--cwd` directory when one was given; otherwise in glen's process cwd.
+- **Exit mapping:** completed → 0 (11 when forked); failed `no_route` → 6; other failed/aborted/lost → 7 `job_failed` with `{status,job,error,forked}` details. A bound expiring while queued/accepted → 10 with `ok:true` and a running document. Foreground SIGINT prints that document with `interrupted:true` and exits 130; worker/omp continue. Worker SIGTERM/SIGINT/SIGHUP abort with `cancelled`.
+- **Control seam:** atomically drop `jobs/<id>/control/<name>.json` with `{"v":1,"op":"abort"}`. The worker polls every 200 ms, including while queued or starting, and acknowledges `<name>.done.json` with `{"v":1,"ok":true}`, then removes the request. Unsupported/malformed operations return `{"v":1,"ok":false,"error":{"code":"unsupported_op","message":"…"}}` and continue the job. Dotfiles and `.done.json` are ignored. Startup cancellation publishes terminal status/ack before joining the bounded startup thread; no prompt follows abandonment.
+- **Reserved W3b operations (not implemented):** `set_model {provider,model_id}`, `set_thinking_level {level}`, `steer {text}`, `follow_up {text}`. Dispatch them on the same held client; never start a separate omp process for controls.
 
 ## §A8 Handles
 - **Session handle** = the **last 7 hex digits** of the dash-free session id.
@@ -160,15 +197,16 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | `glen ls [--all] [--cwd DIR] [-n N] [--live] [--since DUR]` | List sessions for the cwd bucket (`--all`: every bucket); `--all` conflicts with `--cwd`; `-n 0` lists all. Columns: handle, state, title, last turn, updated ("3m ago"), model; plus project with `--all` | W1 | W1 |
 | `glen show <session> [--thinking] [--tools collapsed\|full\|none] [--raw]` | Active-branch transcript; `--raw` = entries as JSON | W1 | W1 |
 | `glen tail <session> [-n N] [-f] [--thinking]` | Last N transcript items; `-f` follows (NDJSON in JSON mode); `-n 0` gives no backlog | W1 | W1 |
-| `glen send <session\|@latest\|@new> <message\|-> [--as auto\|steer\|follow-up] [--wait DUR\|--no-wait] [--cwd DIR]` | Send through the live route or RPC, then wait up to the bound (default 90s) | W2 (RPC), W3 (live) | hidden |
-| `glen wait <job> [--timeout DUR]` | Keep waiting for a job (default 90s) | W2 | hidden |
-| `glen jobs [--session S] [--active] [-n N]` | List glen's jobs | W2 | hidden |
+| `glen send <session\|@latest\|@new> <message\|-> [--as auto\|steer\|follow-up] [--steer\|--follow-up] [--wait DUR\|--no-wait] [--cwd DIR]` | Send through the live route or RPC, then wait up to the bound (default 90s) | W2 (RPC), W3 (live) | W2 |
+| `glen wait <job> [--timeout DUR]` | Keep waiting for a job (default 90s) | W2 | W2 |
+| `glen jobs [--session S] [--active] [-n N]` | List glen's jobs | W2 | W2 |
 | `glen inbox [--session S] [--peek] [--all] [-f]` | Messages omp sent back with `glen_reply` | W3 | hidden |
 | `glen watch [<session>]` | Full-screen live view (ratatui) | W5 | hidden |
 | `glen install-extension [--dry-run] [--force] [--uninstall]` | Install the bundled omp extension for the effective agent dir/profile | W3 | hidden |
 | `glen install-skill [--claude] [--codex] [--project] [--dry-run] [--force] [--uninstall]` | Write SKILL.md for Claude Code and/or Codex | W4 | hidden |
 | `glen doctor` | omp binary and version, resolved paths, glen home (later: extension, skill, endpoints) | W0 (extended W3/W4) | visible |
 | `glen completions <bash\|zsh\|fish\|elvish\|powershell>` | Shell completion script (raw) | W0 | visible |
+- **Send rules:** `--steer` / `--follow-up` alias `--as` and conflict with explicit `--as` or each other. `--cwd` applies only to `@new` (new session cwd, must exist) and `@latest` (project selection). Message `-` reads stdin; empty, non-UTF-8 or more than 512 KiB is usage. RPC auto/follow-up sends `streamingBehavior:followUp`, steer sends `steer`; idle baseline reports `delivered_as:prompt`.
 - **Global flags:** `--json`, `--human` (mutually exclusive), `--color auto|always|never`, `--profile NAME`, `-h`, `-V`.
 - **Defaults and aliases:** `--color` defaults to `auto`; `--profile` overrides `OMP_PROFILE` and `PI_PROFILE`. `ls` and `jobs` use `-n/--limit` (default 20); `tail` uses `-n/--lines` (default 10). `tail` and `inbox` accept `-f/--follow`. `show --tools` defaults to `collapsed`; `send --as` defaults to `auto`; `send --wait` and `wait --timeout` default to `90s`. `-h/--help` and `-V/--version` are available on every command. Unfinished commands remain hidden and return `not_implemented` (exit 8).
 - **Durations:** `<n>ms|s|m|h` or bare seconds, at most 24h. `--wait 0` equals `--no-wait`. `ls --since` accepts `<n>s|m|h|d|w` or bare seconds, at most 3650 days.
@@ -191,10 +229,15 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | Spilled | `{"v":1,"ok":true,"spilled":{"path","bytes","format":"json"|"text"}}` |
 
   - Pretty-printed on a TTY, compact otherwise.
-  - `ok:true` holds for exits 0, 10 and 11.
+  - `ok:true` holds for exits 0, 10, 11 and observer interruption 130.
 - **W0 doctor data:** `data.glen` contains `version`, `home` and `home_exists`; `data.omp` contains `bin` (path or null), `version` (string or null) and `tested_version` (`18.14.0`). `data.paths` contains the §A12 resolved paths, `profile` (name or null), `agent_dir_source` (`default|profile|env`) and `sessions_dir_source` (`agent_dir|xdg`). `data.checks` is an ordered array of `{name,status,value,detail}`, with status `ok|warn|fail|info`. `value` is the raw absolute path or check value; `detail` is the reason for the status, or an empty string when there is none. The checks are `omp_binary`, `omp_version`, `profile`, `agent_dir`, `sessions_dir`, `glen_home`. An untested version succeeds with warning `omp_version_untested`. A failed doctor returns `omp_unavailable`, with the same data under `error.details.report`, and its human table before the error line. Missing directories are reported without creating them.
 - **W1 reader documents.** `ls` returns `{scope:{all,cwd,bucket},sessions_dir,total,total_all,sessions:[]}`. Scope cwd/bucket are null with `--all`; total is after filtering but before limiting. Each session has `handle,id,path,bucket,cwd,title,first_message,created_at,updated_at,age_ms,size_bytes,model,last_turn,state,state_source,state_detail,continuation_of,parent_session`; nullable fields remain present as null. Future mtimes saturate age_ms at zero (human: `just now`).
   - `show` and document `tail` return `{session,continued_from,leaf_id,skipped_lines,items:[]}`. `show --raw` replaces items with active-branch `entries:[]`, including unknown entry kinds. `tail -n 0` returns an empty items array.
+- **W2 send/wait documents:** completed data is `{status:"completed",job,session:{id,handle,path},assistant_text,replies,command_output,stop_reason,session_settled,delivered_as,forked}`. `forked` is null or `{from,to,to_handle}`. RPC `session` identifies the resolved target after following continuations (the session the job was sent to, e.g. C when B continued in C); the new route uses the actual session identity. Nullable output fields remain present.
+  - Running/interrupted data is `{status:"running",job,session,next:"glen wait <handle>",interrupted}`; workers keep running after exits 10/130.
+  - Job view: `{id,handle,status,route,deliver_as,delivered_as,session_id,session_handle,actual_session_id,created_at,updated_at,elapsed_ms}`.
+  - `jobs` data: `{total,jobs:[]}`, newest first; total is after filters/before limit. Rows add `text_preview` (first line, controls dropped, up to 80 characters), `error` and `forked`. `-n 0` means all; active filtering runs after lost detection. `--session` matches original or actual id, or at least 4 hex suffix digits. Missing GLEN_HOME yields an empty list without creating it.
+  - Human job states: `○ queued`, `◐ running`, `✓ completed`, `✓ forked → <handle>`, `! aborted`, `✗ failed`, `✗ lost`; completed output includes assistant text and `↩` replies (`✓` on final).
 - **Transcript items.** Every item has `kind`, `id` and nullable UTC `timestamp`. Thinking is hidden by default; tool results are folded into matching tool calls when present in the same build.
 
 | Kind | Fields beyond the common fields |
@@ -260,12 +303,12 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | 3 | `not_found` | session, job or handle not found |
 | 4 | `ambiguous` | handle matches several; candidates in `details` |
 | 5 | `omp_unavailable` | omp missing, unrunnable or version unparseable |
-| 6 | `no_route` | live owner without a glen endpoint, or probe unknown; refusing to fork |
+| 6 | `no_route` (foreground or worker-side refusal) | live owner without a glen endpoint, or probe unknown; refusing to fork |
 | 7 | `job_failed` | omp reported aborted/error, or the worker was lost (`details.status`) |
 | 8 | `not_implemented` | subcommand declared but not in this build |
 | 10 | (ok) `running` | wait bound elapsed; job continues; use `glen wait <job>` |
 | 11 | (ok) `forked` | omp moved the session to a continuation; use the new handle |
-| 130 | — | interrupted (SIGINT); a detached job keeps running |
+| 130 | — | interrupted (SIGINT); send/wait print a running document with `interrupted:true`; a detached job keeps running |
 
 ## §A12 omp path resolution (port of `packages/utils/src/dirs.ts` @ v18.14.0)
 1. **home** = `$HOME` if non-empty, else the passwd entry. If neither exists → `invalid_env`.
@@ -313,7 +356,10 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 
 ## §A15 Testing strategy
 - Fixtures live under `tests/fixtures/` (see its README).
-- The `GLEN_OMP_BIN` seam supports the fake omp now and the fake RPC peer in W2.
+- `GLEN_OMP_BIN` points to the `fake_omp` cargo example (`tests/support/fake_omp.rs`). It supports version, RPC and `hold-lease` modes. `cargo test` builds examples; `tests/common::fake_omp_bin` rebuilds it once per integration-test process so filtered runs use the current source. It is not installed by cargo install.
+- `FAKE_OMP_SCENARIO`: ok, local, progress, bad_reply, unsettled, never_settles, error, aborted, crash, hang, wedge, fork, fork_silent, moved, reject_tools, reject_filter, no_ready, delayed_state, fork_reply, local_result_unsettled, unsettled_exit, local_exit, stale_state. Timing/shape knobs: `FAKE_OMP_DELAY_MS`, `FAKE_OMP_READY_DELAY_MS`, `FAKE_OMP_SETTLE_DELAY_MS`, `FAKE_OMP_REPLY_BYTES`, `FAKE_OMP_OWNERS_DIR`, `FAKE_OMP_V2=1|partial`. `FAKE_OMP_LOG` records start, inbound/outbound frames and exits as NDJSON. `FAKE_OMP_STARTUP_RECOVERY=1` makes the fake claim its lease and append a recovery record to the copied fixture before ready. `FAKE_OMP_STATE_DELAY_MS` delays running state replies without blocking abort. `FAKE_OMP_RUN_RELEASE` holds prompt work until a test-owned file exists. `FAKE_OMP_READY_RELEASE` holds ready until a test-owned file exists (20 s bound). `FAKE_OMP_PROMPT_SUBMIT_DELAY_MS` delays the debug worker’s submission thread to exercise the cancellation gate; `FAKE_OMP_ACK_FORWARD_DELAY_MS` delays acknowledgement forwarding. Release workers ignore both. `FAKE_OMP_LEASE_PROBE_GATE` gates the debug send after the glen-lock check until a test-owned file exists (5 s bound, `<path>.ready` signals entry). `FAKE_OMP_NEVER_SETTLE=1` keeps fork scenarios unsettled; `FAKE_OMP_RESULT_RELEASE` holds the fake before its result. `FAKE_OMP_OLD_STATE_DELAY_MS` controls the stale_state scenario’s old identity response.
+- Process tests wait for terminal status, worker exit and the omp group to disappear before dropping scratch directories. The startup-abort regression delays ready by 5 s and checks terminal status/ack within 1.5 s with no prompt.
+- Live Step 15 smoke is separate orchestrator evidence: use fresh scratch PI_CODING_AGENT_DIR and cwd, never resume a user session. It remains unverified in the sandbox.
 - An `Env` snapshot means code and tests never mutate the process environment.
 - Integration tests use `CARGO_BIN_EXE_glen` with `env_clear()`.
 - Conformance tests live in `tests/conformance.rs` (the `/implement` tail).
@@ -335,11 +381,13 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - [ ] Re-check session entry types, the title slot, `resolveSessionLeafId`, `findSessionContinuation` and `deriveSessionStatus`.
 - [ ] Re-check both `CA/session/session-storage.ts` `tryAcquireSessionLease` and `packages/utils/src/file-lock.ts` `getLockPath`.
 - [ ] Re-check the Linux abstract-socket name, datagram bind semantics and XXH64 golden vectors.
+- [ ] Verify `--no-ui`, event-filter scope, settlement after results for started runs, and `agentInvoked:false` local semantics.
+- [ ] Live scratch smoke: verify `omp --mode rpc --resume` does not claim its owner lease before the first prompt; retain Step 15 evidence (not yet run in the sandbox).
 - [ ] Re-check the RPC schema: `prompt_result`, `session_settled` and the `set_host_tools` duplicate rule.
 - [ ] Re-check the extension API: `sendUserMessage` deliverAs, `registerTool` and session events.
 - [ ] Bump `TESTED_OMP_VERSION` only after all of these checks.
 - **Open, owned by later waves:**
   - [x] W1: confirmed Linux abstract datagram bind semantics against `crates/pi-natives/src/file_lock/linux.rs:14-22` and the `.lock` suffix against `utils/src/file-lock.ts:31-33`. Tests cover both golden names and `<id>.lock` path suffixes.
-  - W2: a live pid alone does not prove the worker is alive (pids are reused). `lost` detection must check a worker identity beyond the pid, for example its process start time recorded in `status.json`.
-  - W3: confirm the extension can read busy/idle state and observe persistence continuations; replace disk-inferred busy with exact extension state.
+  - [x] W2: lost detection records pid plus process start time, rejects zombies/reused pids, and gives null-pid starts a 10 s grace.
+  - W3: `glen_reply` from the extension must stay disabled under `GLEN_MANAGED=1`. Confirm the extension can read busy/idle state and observe persistence continuations; replace disk-inferred busy with exact extension state.
   - W4: Codex's shell timeout and output cap; the Claude Code `allowed-tools` syntax.

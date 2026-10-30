@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -47,6 +47,7 @@ pub enum OkExit {
     Done,
     Running,
     Forked,
+    Interrupted,
 }
 impl OkExit {
     pub fn exit_code(self) -> u8 {
@@ -54,6 +55,7 @@ impl OkExit {
             Self::Done => 0,
             Self::Running => 10,
             Self::Forked => 11,
+            Self::Interrupted => 130,
         }
     }
 }
@@ -104,7 +106,7 @@ impl From<std::io::Error> for GlenError {
         Self::new(ErrorCode::Io, e.to_string())
     }
 }
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Warning {
     pub code: String,
     pub message: String,
@@ -133,5 +135,6 @@ mod tests {
         assert_eq!(OkExit::Done.exit_code(), 0);
         assert_eq!(OkExit::Running.exit_code(), 10);
         assert_eq!(OkExit::Forked.exit_code(), 11);
+        assert_eq!(OkExit::Interrupted.exit_code(), 130);
     }
 }

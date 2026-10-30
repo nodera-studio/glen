@@ -66,6 +66,7 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
 - Parse omp's formats leniently: unknown entry types and fields must be skipped, not fatal.
   omp adds entry types between releases.
 - Tests that need omp data use fixtures under `tests/fixtures/`, never a live `~/.omp`.
+- Tests that need an RPC peer use the `fake_omp` example (`tests/support/fake_omp.rs`) through `GLEN_OMP_BIN`, never a live omp.
 - Never mutate the process environment in code or tests (edition 2024 `set_var` is unsafe); read through `env::Env`.
 - Branch off `main`, PR into `main`. No direct pushes to `main`.
 - `site/` never imports `framer-motion`; motion comes from `motion/react` through `IslandRoot`.

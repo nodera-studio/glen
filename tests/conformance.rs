@@ -4,6 +4,8 @@
 //!   fixtures, output_contract, paths, repo_contracts, sanitize, state, width, write_failure.
 //! - W1 (`.claude/plans/v010-wave-1-reader.md`, AC-101…AC-126; §A3, §A8–§A11): ls, show, tail,
 //!   lease, with the shared `reader` harness.
+//! - W2 (`.claude/plans/v010-wave-2-rpc.md`, AC-201…AC-227; §A3–§A11, §A15): rpc, rpc_jobs, with
+//!   the `rpc_support` harness driving the `fake_omp` example peer through `GLEN_OMP_BIN`.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!
@@ -14,6 +16,8 @@
 
 #[path = "conformance/reader.rs"]
 mod reader;
+#[path = "conformance/rpc_support.rs"]
+mod rpc_support;
 #[path = "conformance/support.rs"]
 mod support;
 
@@ -35,6 +39,10 @@ mod output_contract;
 mod paths;
 #[path = "conformance/repo_contracts.rs"]
 mod repo_contracts;
+#[path = "conformance/rpc.rs"]
+mod rpc;
+#[path = "conformance/rpc_jobs.rs"]
+mod rpc_jobs;
 #[path = "conformance/sanitize.rs"]
 mod sanitize;
 #[path = "conformance/show.rs"]

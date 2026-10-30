@@ -20,7 +20,7 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | --- | --- |
 | `{{PROJECT_NAME}}` | glen |
 | `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. A small TypeScript omp extension may come later. |
-| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; rustix (lease probe, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix). Static Astro 7 with React 19 islands for `site/`. |
+| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; omp-rpc (git tag v18.14.0), uuid (v7 job ids), libc (Unix, process start time); rustix (lease probe and process feature, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix). Static Astro 7 with React 19 islands for `site/`. |
 | `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked`; npm for `site/` (`package-lock.json` committed, CI `npm ci`) |
 | `{{MONOREPO}}` | no Cargo workspace; `site/` is a separate npm project |
 | `{{FRONTEND_DIR}}` | `site/`: static Astro 7 site with React 19 islands and Tailwind v4; Node from `site/.nvmrc` |

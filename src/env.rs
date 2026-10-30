@@ -29,6 +29,11 @@ impl Env {
             cwd: cwd.to_path_buf(),
         }
     }
+    pub fn with_cwd(&self, cwd: &Path) -> Self {
+        let mut env = self.clone();
+        env.cwd = cwd.to_path_buf();
+        env
+    }
     pub fn get(&self, k: &str) -> Option<&str> {
         self.vars.get(k).map(String::as_str)
     }
