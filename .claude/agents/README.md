@@ -13,7 +13,7 @@ workflow below) once to adapt the templated files to that project's actual stack
 - Codebase audits use dual-engine (Claude + Codex) per group. Security audit additionally uses checklist perturbation.
 - **Model rides the session, not a hardcoded tier.** Every frontier role — orchestrators, planner/architect, the Implementer, reviewers, security/error finders, the debug investigator + adversary, and research — is `model: inherit`, so it runs on whatever the session runs. Never pin a frontier agent to a model that won't follow the session. Mechanical / summarization roles (test-runner, verifier, docs-updater, light audits, plan explorer/researcher) stay pinned `sonnet` — they don't need frontier compute. Effort: `high` is the default; `xhigh` is reserved for the Implementer, planner, and orchestrators on hard waves.
 
-**Core principle:** The user is ALWAYS in the driver's seat. Agents do the heavy lifting (research, code, review) but NEVER take autonomous actions on git or external systems. No auto-commits, no auto-pushes. Every workflow ends with "ready for your manual testing."
+**Core principle:** Specialist agents do the heavy lifting (research, code, review) but never touch git or external systems. The orchestrator (the main session) owns those actions: it commits and pushes as `/implement` and `/auto-mode` describe, and every outward action (opening or merging a PR, board updates, releases) follows the user's authorisation for the run.
 
 ---
 

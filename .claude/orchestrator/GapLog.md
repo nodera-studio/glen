@@ -1,0 +1,27 @@
+# Agent Gap Log
+
+Every time `/orchestrate` mode dispatches a one-off subagent because nothing in
+`.claude/agents/README.md` fits the task, `.claude/scripts/orchestrator/record-gap.mjs`
+appends a row here (and a matching JSON line to `gaps.jsonl`, which is what
+`/audit-agent-gaps` actually reads — this file is the human-skimmable index).
+
+A single gap is just a data point, not a verdict. `/audit-agent-gaps` periodically clusters
+the open gaps below; a recurring shape (3+ similar entries by default) becomes a proposed
+permanent agent, reported for approval before anything is written. See
+`.claude/agents/orchestrator/gap-auditor.md`.
+
+Do not hand-edit the tables below — use `record-gap.mjs` (append) or `/audit-agent-gaps`
+(promote). This file is meant to be checked in and accumulate as project history, same as
+`.claude/plans/` and `.claude/tech-debt/`.
+
+## Open gaps
+
+| ID | Date | Task | Closest agent | Why no fit | Ad-hoc agent | Tags |
+| --- | --- | --- | --- | --- | --- | --- |
+| g-mvucl7jw-fyv7 | 2026-10-30 | Fix logged harness friction in .claude/ (agent prompts, orchestrators, skills) in parallel with product waves — the harness self-improvement loop | .claude/agents/orchestrator/gap-auditor.md | gap-auditor only clusters gaps and proposes new agents; nothing edits harness prompts from the friction log | general-purpose | harness, self-improvement, prompt-maintenance |
+| g-pending-codex-handoff | 2026-10-30 | Hand a Codex planner/architect report (returned only as the codex:codex-rescue final message) to the plan judge-selector | .claude/agents/plan/judge-selector.md | the plan pipeline has no step that persists the Codex pass; the orchestrator had to jq-extract the transcript into .claude/plans/<slug>.codex.md | none (orchestrator shell step) | plan, codex, handoff |
+
+## Promoted
+
+| ID | Date | Task | Promoted to |
+| --- | --- | --- | --- |

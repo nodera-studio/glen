@@ -146,16 +146,27 @@ and continue. A 4th rarely pays; stay at 2 for ordinary specs (diminishing retur
 If Codex is unavailable (`codex login` needed), note it and proceed with the Claude
 architect alone — the judge step degrades to a pass-through.
 
+Briefs cite local file paths (research files under `.claude/research/`, plan files, the explorer
+and researcher reports once saved) rather than Mnemosyne IDs alone: not every agent has the
+Mnemosyne tools, and `codex:codex-rescue` has none.
+
+**Persist the reports.** `codex:codex-rescue` returns its report only as its final message, so the
+judge cannot read it unless you save it. Write each architect report to
+`.claude/plans/<slug>.arch-claude.md` and `.claude/plans/<slug>.arch-codex.md` before Step 4.5. A
+background agent's final message can be pulled from its transcript with
+`jq -r 'select(.type=="assistant") | .message.content[]? | select(.type=="text") | .text' <output_file>`.
+
 ### Step 4.5 — Judge-Select (select-then-graft)
 
-Dispatch the judge-selector with BOTH architect reports. A fresh context that did NOT
-generate either is the unbiased selector.
+Dispatch the judge-selector with the paths of BOTH architect reports, not their inline text
+(inline text bloats the orchestrator's context). A fresh context that did NOT generate either
+is the unbiased selector.
 ```
 Dispatch via Agent tool:
   prompt: "Read .claude/agents/plan/judge-selector.md and follow its instructions.
            Task: {task description}
-           Claude architect report: {claude architect output}
-           Codex architect report: {codex architect output}"
+           Claude architect report: .claude/plans/<slug>.arch-claude.md
+           Codex architect report: .claude/plans/<slug>.arch-codex.md"
 ```
 The judge returns the final 2-3 approaches — the stronger spine with any *separable*
 improvements from the other grafted in — plus a recommendation. Present THAT at Step 5.
@@ -228,16 +239,20 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            Return ordered steps with files-to-create vs modify, verification per step, and
            prerequisites. Plan only — no code. Return the plan as your final message."
 ```
-Then dispatch the judge-selector on BOTH plans (select the stronger plan, graft separable steps); its
-output is the plan presented at Step 7. If Codex is unavailable, proceed with the Claude plan alone
+Persist both plans as in Step 4 (`.claude/plans/<slug>.claude.md` and `.claude/plans/<slug>.codex.md`),
+then dispatch the judge-selector with those two paths (select the stronger plan, graft separable
+steps); its output is the plan presented at Step 7. If Codex is unavailable, proceed with the Claude plan alone
 (judge degrades to pass-through).
 
-### Step 7 — Review Plan (hard gate)
+### Step 7 — Review Plan (two operating paths)
 
-Present the plan: total steps, files to create vs. modify, risks or manual verification
-needed, and prerequisites (env vars, schema changes). Ask if it looks good or needs
-adjustments. Wait for the user. If adjustments are needed, re-dispatch the planner with
-specific feedback.
+**Manual mode (default, hard gate).** Present the plan: total steps, files to create vs. modify,
+risks or manual verification needed, and prerequisites (env vars, schema changes). Ask if it looks
+good or needs adjustments. Wait for the user. If adjustments are needed, re-dispatch the planner
+with specific feedback.
+
+**Auto-mode (`/auto-mode` — no human in the loop).** Skip the gate: **announce** the same plan
+summary (steps, files, risks, prerequisites) so the run stays auditable, and proceed to Step 8.
 
 ### Step 8 — Save Plan
 
@@ -250,9 +265,10 @@ when one is given. Tell the user:
 
 <rules>
 
-- Steps 5 and 7 are hard user gates. Never skip the user's approach choice or plan review.
+- Steps 5 and 7 are hard user gates in manual mode. Never skip the user's approach choice or
+  plan review outside `/auto-mode`; under `/auto-mode`, announce the choice and the plan instead.
 - Never implement. This workflow produces a PLAN only — no code changes, no file creation
-  except the plan file itself.
+  except the plan file and the persisted architect/planner reports under `.claude/plans/`.
 - Never override agent models. Each agent's frontmatter controls its model.
 - Explore before architecting — the architect needs real data, not assumptions.
 
