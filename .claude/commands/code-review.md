@@ -41,9 +41,15 @@ Steps:
      PI_CODING_AGENT_DIR at tests/fixtures or a scratch dir under $TMPDIR, or use
      the fake omp via GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch
      the model of a live omp session. Report severity + category + file:line + issue + impact
-     - fix + confidence. Read-only — report only, do not fix. Run in the foreground:
-     wait for the Codex task to finish and return the full review as your final
-     message, never only a background task id. --wait --effort high".
+     - fix + confidence. Read-only — report only, do not fix. Do NOT write any
+     file: return the full review as your final message text; the orchestrator
+     saves it. Run in the foreground: wait for the Codex task to finish and return
+     the full review as your final message, never only a background task id.
+     --wait --effort high".
+   - Never name an output path in the Codex brief: its sandbox is workspace-write,
+     does not escalate, and writes only inside its own cwd (your shell's directory
+     at dispatch, often a worktree), so a write elsewhere fails. Save the returned
+     text yourself if it must be on disk.
    - The `--wait` is load-bearing: without it the forwarder may background a long
      review and return at once with a task id. If a task id comes back anyway,
      fetch the review (`codex-companion.mjs status <id> --wait`, then `result <id>`)
