@@ -48,19 +48,27 @@ rendering (human/TTY output, tables, colour, spinners) — build and run it and 
 before you call it correct. A code trace alone is not enough: in W6 both review engines traced
 the terminal-demo code, approved it, and missed that 2 of its 4 scenes never appeared.
 
-- **Web (`site/`):** `npm run build && npm run preview` in `site/` (serves
-  `http://127.0.0.1:4321`), then screenshot with
-  `npx playwright screenshot --viewport-size=375,812 --color-scheme=dark --wait-for-timeout=<ms> <url> <out>.png`
+- **Web (`site/`):** `npm run build` in `site/`, then start the preview in the background on a
+  free port of your own (the Codex pass may be previewing at the same time), e.g.
+  `PORT=$((20000 + RANDOM % 20000)); npx astro preview --host 127.0.0.1 --port $PORT & PREVIEW_PID=$!`.
+  Screenshot with
+  `npx playwright screenshot --viewport-size=375,812 --color-scheme=dark --wait-for-timeout=<ms> http://127.0.0.1:$PORT/ <out>.png`
   (also 1280 wide, and light) and Read each PNG. For an animation or timed sequence, take
   screenshots spread across its full duration and confirm every scene and state appears.
+  Stop the preview afterwards (`kill $PREVIEW_PID`).
 - **CLI / TUI:** run under a pseudo-TTY so the TTY path runs, e.g.
   `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'`, at a narrow and a wide width
   and with `NO_COLOR=1`; let a live view run through its states.
+- **Never touch a live omp session.** Against the real `~/.omp` run only read verbs (list,
+  show, tail). Anything else runs against fixtures or a scratch omp home: point
+  `PI_CODING_AGENT_DIR` at `tests/fixtures/…` or a scratch dir under `$TMPDIR` (note that
+  `PI_CONFIG_DIR` is joined under `$HOME`, see `docs/design.md`), or use the fake omp via
+  `GLEN_OMP_BIN`. Never send, steer, follow-up, abort or switch the model of a live session.
 - Save what you looked at under `.claude/evidence/` and cite it in the finding. A visible
-  defect is a finding like any other (Category: Accessibility or Error Handling as fits,
-  `file:line` of the cause).
+  defect is a finding like any other (Category: Visual / Rendering, `file:line` of the cause).
 - If you cannot run it (build fails, no browser), say so in the report and mark the rendered
-  output UNVERIFIED; never return APPROVE on a UI diff you did not run.
+  output UNVERIFIED. An unverified UI diff gets **Recommendation: REVIEW_REQUIRED**, never
+  APPROVE or APPROVE_WITH_NOTES.
 
 ## Project Conventions (flagging convention-following code is a false positive)
 
@@ -178,7 +186,7 @@ HIGH-001: IDOR in `getCustomer` — no org filter
 #### [SEVERITY]-NNN: [concise title]
 
 - **Severity**: CRITICAL | HIGH | MEDIUM | LOW
-- **Category**: Security | Architecture | Data Flow | Performance | Accessibility | Error Handling | Tests
+- **Category**: Security | Architecture | Data Flow | Performance | Accessibility | Error Handling | Tests | Visual / Rendering
 - **File**: `path:Lstart-Lend`
 - **Issue**: [premise → execution trace → discrepancy]
 - **Impact**: [specific, measurable]

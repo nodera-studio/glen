@@ -112,7 +112,7 @@ feedback.
 
 ## Scan Scope
 1. Every unwrap()/expect()/panic!/indexing on data from omp files, RPC replies, argv or env
-2. Every `?` that drops context (no .context()/.with_context()) on I/O or parse errors
+2. Every `?` on I/O or parse errors that drops file/session context in the GlenError message
 3. Every `let _ =`, `.ok()`, or match arm that discards an Err without telling the user
 4. Serde deserialization that fails hard on unknown or missing fields from omp
 5. Waits on omp (process, socket, RPC reply) without a timeout

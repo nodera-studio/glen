@@ -139,5 +139,6 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
 - Never `--no-verify`; never weaken a test or silence the gate (enforced in the
   Codex envelope + AGENTS.md).
 - Never delete, move or revert files that this task did not create, tracked or untracked;
-  report them instead (the envelope carries this rule). If `touchedFiles` shows a deletion
-  of a file the plan did not name, report it to the orchestrator as a blocker.
+  report them instead (the envelope carries this rule). `touchedFiles` cannot show a
+  deletion; the orchestrator's before/after file snapshot (`orchestrator.md` → Role 1) is
+  the check.

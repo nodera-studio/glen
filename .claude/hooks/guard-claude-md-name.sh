@@ -12,6 +12,10 @@
 #   - <root>/CLAUDE.md and <root>/.claude/CLAUDE.md, where <root> is a git checkout
 #     (the repo root or a worktree under .claude/worktrees/<name>/)
 #   - ~/.claude/CLAUDE.md (the user's global instructions)
+#   - any file that already exists on disk (an existing nested CLAUDE.md such as
+#     ~/Developer/Apps/CLAUDE.md); only NEW claude.md names are refused
+# The path is normalised lexically (`..`, `.`) before the decision. Write tool only:
+# shell redirects and `mv` are covered by the prompts, not by this hook.
 #
 # Posture: FAIL OPEN on anything it cannot parse (no jq, no path); DENY only on a
 # claude.md basename outside those paths.
@@ -29,6 +33,13 @@ case "$FILE" in
   /*) abs=$FILE ;;
   *) abs="${CWD:-$PWD}/$FILE" ;;
 esac
+# Normalise `..` and `.` lexically so `reviews/../CLAUDE.md` is judged by where it lands.
+if command -v python3 >/dev/null 2>&1; then
+  abs=$(python3 -I -c 'import os, sys; print(os.path.normpath(sys.argv[1]))' "$abs" 2>/dev/null) || exit 0
+fi
+
+# Existing files (an intentional nested CLAUDE.md) are never blocked; only new names are.
+[ -e "$abs" ] && exit 0
 
 dir=$(dirname "$abs")
 if [ "$(basename "$dir")" = ".claude" ]; then
@@ -40,6 +51,6 @@ fi
 [ -e "$root/.git" ] && exit 0
 [ -n "${HOME:-}" ] && [ "$abs" = "$HOME/.claude/CLAUDE.md" ] && exit 0
 
-reason="Refused: '$FILE' is named claude.md. Claude Code loads any claude.md (any case, on macOS's case-insensitive filesystem) as a nested CLAUDE.md, so this file would be injected as project instructions. Name per-engine output <engine>-review.md or <engine>-plan.md (e.g. claude-review.md). Only <repo>/CLAUDE.md and <repo>/.claude/CLAUDE.md may carry that name."
+reason="Refused: '$FILE' is named claude.md. Claude Code loads any claude.md (any case, on macOS's case-insensitive filesystem) as a nested CLAUDE.md, so this file would be injected as project instructions. Name per-engine output <engine>-review.md or <engine>-plan.md (e.g. claude-review.md). Only <repo>/CLAUDE.md, <repo>/.claude/CLAUDE.md, ~/.claude/CLAUDE.md and CLAUDE.md files that already exist may carry that name."
 jq -n --arg r "$reason" '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:$r}}'
 exit 0

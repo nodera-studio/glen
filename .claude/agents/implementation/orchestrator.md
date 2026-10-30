@@ -166,6 +166,33 @@ Run that block in the wave's worktree BEFORE dispatching the Implementer, and te
 Implementer the steps are done: verify their results (files present, lockfile updated),
 do not re-run them.
 
+**File snapshot (pre-existing files survive the Implementer).** The envelope forbids the
+Implementer to delete, move or revert files it did not create, but `touchedFiles` cannot show
+a deletion (it lists paths with no change type, a shell `rm` never appears in it, and git
+cannot see a deleted untracked file). So check it yourself. Before each Implementer dispatch,
+in the checkout it will write to:
+
+```bash
+SNAP="${TMPDIR:-/tmp}/glen-impl-snap-$(date +%s)"; mkdir -p "$SNAP"
+EXCL='^(target|site/node_modules|site/dist)/'        # build output may legitimately vanish
+{ git ls-files; git ls-files --others; } | grep -vE "$EXCL" | sort -u \
+  | while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done > "$SNAP/before.txt"
+git ls-files --others | grep -vE "$EXCL" | grep -v '/$' \
+  | tar -czf "$SNAP/untracked.tgz" -T -              # untracked incl. ignored, for restore
+```
+
+(`--others` without `--exclude-standard` includes ignored files such as `.claude/launch.json`.)
+After it returns:
+
+```bash
+while IFS= read -r f; do [ -e "$f" ] || printf '%s\n' "$f"; done < "$SNAP/before.txt"
+```
+
+Every path printed that the plan did not tell it to delete or move goes in the Report as a
+deviation, and is restored: tracked with `git restore --source=HEAD --staged --worktree -- <f>`,
+untracked with `tar -xzf "$SNAP/untracked.tgz" <f>`. Say in the Report what was restored and
+what could not be.
+
 **Claude writes no product code — Codex does.** Do NOT dispatch separate coder /
 wiring / error-handling / test-writer / test-runner / verifier agents (those files
 were deleted); those concerns are fused into the Codex Implementer. The single most
@@ -207,8 +234,9 @@ verdict, and say so in the Report. Never drop the engine silently.
 **Review file names.** If you save the passes to disk, name them `claude-review.md` and
 `codex-review.md` (plan files `<engine>-plan.md`), never `claude.md`: on macOS's
 case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
-`CLAUDE.md`, which injects the review as project instructions. The
-`guard-claude-md-name.sh` hook refuses such a Write.
+`CLAUDE.md`, which injects the review as project instructions. This holds for every way
+of creating a file, including shell redirects and `mv`. The `guard-claude-md-name.sh`
+hook refuses such a name on the Write tool only.
 
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer

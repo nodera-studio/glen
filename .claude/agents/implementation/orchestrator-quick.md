@@ -59,6 +59,10 @@ Agent tool:
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this small change (--fresh): {the user's task + the pattern file it copies}."
 ```
 
+Take the file snapshot from `/implement` (`orchestrator.md` → Role 1, "File snapshot") before
+this dispatch and check it after: any pre-existing file, tracked or untracked, that is gone is
+reported and restored.
+
 Codex reads the affected area + the pattern file, makes the change, wires it, handles the error
 paths, writes/extends the unit test, runs `cargo test --locked` and
 `bash .claude/scripts/quality-gate.sh`, and fixes every failure and finding — looping in ITS context until
@@ -78,7 +82,11 @@ Agent tool (subagent_type: codex:codex-rescue):
            handling, multi-tenant / fiscal regressions. Not style/lint (the gate owns that).
            If the diff touches rendered output (site/, a TUI, terminal rendering), build and
            run it and look at the output (browser screenshot, or CLI output under a pty)
-           before calling it correct; a code trace alone is not enough.
+           before calling it correct; a code trace alone is not enough. Against the real
+           ~/.omp run only read verbs (list, show, tail); otherwise point PI_CODING_AGENT_DIR
+           at tests/fixtures or a scratch dir under $TMPDIR, or use the fake omp via
+           GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch the model of a live
+           omp session.
            Do NOT edit. Diff:\n{git diff of the change}"
 ```
 
