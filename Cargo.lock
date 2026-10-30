@@ -692,6 +692,7 @@ dependencies = [
  "tempfile",
  "terminal_size",
  "thiserror 2.0.21",
+ "unicode-segmentation",
  "unicode-width",
  "uuid",
  "xxhash-rust",
