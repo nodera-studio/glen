@@ -4,7 +4,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Read},
+    io::{BufRead, BufReader, Read, Write},
     process::Stdio,
     sync::mpsc,
     time::Duration,
@@ -47,7 +47,7 @@ fn examples() -> BTreeMap<String, Example> {
     }
     map
 }
-fn shape_eq(doc: &Value, real: &Value, path: &str) -> Result<(), String> {
+fn shape_eq(doc: &Value, real: &Value, lenient_errors: bool, path: &str) -> Result<(), String> {
     match (doc, real) {
         (Value::Null, _) | (_, Value::Null) => Ok(()),
         (Value::Object(a), Value::Object(b)) => {
@@ -69,12 +69,14 @@ fn shape_eq(doc: &Value, real: &Value, path: &str) -> Result<(), String> {
                         }
                     }
                 }
-                for (key, value) in a {
-                    if let Some(other) = b.get(key) {
-                        shape_eq(value, other, &format!("{path}.{key}"))?;
+                if lenient_errors {
+                    for (key, value) in a {
+                        if let Some(other) = b.get(key) {
+                            shape_eq(value, other, lenient_errors, &format!("{path}.{key}"))?;
+                        }
                     }
+                    return Ok(());
                 }
-                return Ok(());
             }
             let ak: BTreeSet<_> = a.keys().collect();
             let bk: BTreeSet<_> = b.keys().collect();
@@ -82,25 +84,40 @@ fn shape_eq(doc: &Value, real: &Value, path: &str) -> Result<(), String> {
                 return Err(format!("{path}: keys {ak:?} != {bk:?}"));
             }
             for (key, v) in a {
-                shape_eq(v, &b[key], &format!("{path}.{key}"))?;
+                shape_eq(v, &b[key], lenient_errors, &format!("{path}.{key}"))?;
             }
             Ok(())
         }
         (Value::Array(a), Value::Array(b)) => {
-            // Tail documents one shape per item kind; other arrays keep their existing checks.
+            // Tail documents variants by kind and key set; other arrays keep their existing checks.
             if path == "tail.data.items" && a.iter().chain(b).all(|item| item.get("kind").is_some())
             {
                 for (index, item) in b.iter().enumerate() {
+                    let keys: BTreeSet<_> = item.as_object().unwrap().keys().collect();
                     let example = a
                         .iter()
-                        .find(|example| example["kind"] == item["kind"])
+                        .find(|example| {
+                            example["kind"] == item["kind"]
+                                && example.as_object().unwrap().keys().collect::<BTreeSet<_>>()
+                                    == keys
+                        })
                         .ok_or_else(|| {
-                            format!("{path}[{index}]: undocumented kind {}", item["kind"])
+                            let variants: Vec<_> = a
+                                .iter()
+                                .filter(|example| example["kind"] == item["kind"])
+                                .map(|example| {
+                                    example.as_object().unwrap().keys().collect::<BTreeSet<_>>()
+                                })
+                                .collect();
+                            format!(
+                                "{path}[{index}]: undocumented kind {} or key set {keys:?}; expected {variants:?}",
+                                item["kind"]
+                            )
                         })?;
-                    shape_eq(example, item, &format!("{path}[{index}]"))?;
+                    shape_eq(example, item, lenient_errors, &format!("{path}[{index}]"))?;
                 }
             } else if let (Some(a), Some(b)) = (a.first(), b.first()) {
-                shape_eq(a, b, &format!("{path}[0]"))?;
+                shape_eq(a, b, lenient_errors, &format!("{path}[0]"))?;
             }
             Ok(())
         }
@@ -243,7 +260,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     );
     let full: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(full["ok"], true);
-    shape_eq(&all["show"][0], &full, "spilled.content").unwrap();
+    shape_eq(&all["show"][0], &full, false, "spilled.content").unwrap();
     all.insert("spilled".into(), vec![stub]);
     for (id, scenario, exit) in [
         ("send.completed", "ok", 0),
@@ -329,10 +346,10 @@ fn ac412_examples_match_real_envelopes() {
                     .iter()
                     .find(|v| &v["event"] == event)
                     .unwrap_or_else(|| panic!("{id}: missing event {event}"));
-                shape_eq(doc, value, &format!("{id}.{event}")).unwrap();
+                shape_eq(doc, value, false, &format!("{id}.{event}")).unwrap();
             }
         } else {
-            shape_eq(&example.values[0], &actual[0], &id).unwrap();
+            shape_eq(&example.values[0], &actual[0], false, &id).unwrap();
         }
     }
 }
@@ -371,10 +388,54 @@ fn ac412_command_sections_and_exit_codes() {
     assert!(common::exit_code_errors(text, 3).is_empty());
 }
 #[test]
+fn tail_full_fixture_matches_documented_item_variants() {
+    let b = OmpBox::new();
+    let args = ["tail", "e27c0de", "-n", "1000"];
+    let out = b.glen(&args, &b.alpha());
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    let original = json(&out);
+    // Extend only the temporary copy of A; the shared catalog keeps its entry counts.
+    let mut session = fs::OpenOptions::new()
+        .append(true)
+        .open(original["data"]["session"]["path"].as_str().unwrap())
+        .unwrap();
+    session
+        .write_all(include_bytes!("fixtures/tail-items.jsonl"))
+        .unwrap();
+    let out = b.glen(&args, &b.alpha());
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    let actual = json(&out);
+    assert_eq!(actual["data"]["leaf_id"], "1000000f");
+    assert_eq!(actual["data"]["skipped_lines"], 0);
+    let items = actual["data"]["items"].as_array().unwrap();
+    assert_eq!(items.len(), 11);
+    for kind in [
+        "tool_result",
+        "python",
+        "developer",
+        "custom",
+        "file_mention",
+        "reset",
+    ] {
+        assert!(
+            items.iter().any(|item| item["kind"] == kind),
+            "missing {kind}"
+        );
+    }
+    for has_tools in [false, true] {
+        assert!(items.iter().any(
+            |item| item["kind"] == "assistant" && item.get("tool_calls").is_some() == has_tools
+        ));
+    }
+    let docs = examples();
+    shape_eq(&docs["tail"].values[0], &actual, false, "tail").unwrap();
+}
+#[test]
 fn shape_checker_reports_path() {
     let err = shape_eq(
         &serde_json::json!({"data":{"field":1}}),
         &serde_json::json!({"data":{"renamed":1}}),
+        false,
         "root",
     )
     .unwrap_err();
@@ -387,26 +448,38 @@ fn tail_shape_checker_matches_every_item_by_kind() {
     let mut reordered = items.as_array().unwrap().clone();
     reordered.reverse();
     reordered.push(reordered[0].clone());
-    assert!(shape_eq(items, &serde_json::json!(reordered), "tail.data.items").is_ok());
-    assert!(shape_eq(items, &serde_json::json!([]), "tail.data.items").is_ok());
+    assert!(
+        shape_eq(
+            items,
+            &serde_json::json!(reordered),
+            false,
+            "tail.data.items"
+        )
+        .is_ok()
+    );
+    assert!(shape_eq(items, &serde_json::json!([]), false, "tail.data.items").is_ok());
 
     // A later malformed item must fail even when the first item matches.
     let mut malformed = items.clone();
     malformed[1].as_object_mut().unwrap().remove("id");
-    let err = shape_eq(items, &malformed, "tail.data.items").unwrap_err();
+    let err = shape_eq(items, &malformed, false, "tail.data.items").unwrap_err();
     assert!(err.contains("tail.data.items[1]") && err.contains("id"));
     let mut malformed = items.clone();
     malformed[1]["extra"] = serde_json::json!(true);
-    assert!(shape_eq(items, &malformed, "tail.data.items").is_err());
+    assert!(shape_eq(items, &malformed, false, "tail.data.items").is_err());
     let mut malformed = items.clone();
     malformed[1]["id"] = serde_json::json!(42);
-    assert!(shape_eq(items, &malformed, "tail.data.items").is_err());
+    assert!(shape_eq(items, &malformed, false, "tail.data.items").is_err());
+    let mut malformed = items.clone();
+    malformed[1]["tool_calls"][0]["result"]["chars"] = serde_json::json!("wrong");
+    let err = shape_eq(items, &malformed, false, "tail.data.items").unwrap_err();
+    assert!(err.contains("tail.data.items[1].tool_calls[0].result.chars"));
 
     let mut unknown = items.clone();
     unknown[1]["kind"] = serde_json::json!("undocumented_item");
-    let err = shape_eq(items, &unknown, "tail.data.items").unwrap_err();
+    let err = shape_eq(items, &unknown, false, "tail.data.items").unwrap_err();
     assert!(err.contains("tail.data.items[1]") && err.contains("undocumented_item"));
-    assert!(shape_eq(&serde_json::json!([]), &unknown, "tail.data.items").is_err());
+    assert!(shape_eq(&serde_json::json!([]), &unknown, false, "tail.data.items").is_err());
 }
 #[test]
 fn shape_checker_untagged_arrays_keep_first_item_behavior() {
@@ -417,12 +490,13 @@ fn shape_checker_untagged_arrays_keep_first_item_behavior() {
             serde_json::json!([{"id": "real"}, {"different": true}]),
         ),
     ] {
-        assert!(shape_eq(&doc, &real, "tail.data.items").is_ok());
+        assert!(shape_eq(&doc, &real, false, "tail.data.items").is_ok());
     }
     assert!(
         shape_eq(
             &serde_json::json!([1]),
             &serde_json::json!(["wrong"]),
+            false,
             "tail.data.items"
         )
         .is_err()
@@ -433,8 +507,11 @@ fn evidence_error_shapes() {
     let docs = examples();
     let example = &docs["error.usage"].values[0];
     let call = serde_json::json!({
-        "ok": false,
+        "t": "end",
+        "id": "usage",
+        "argv": ["glen", "tail", "--json", "--cwd"],
         "exit": 2,
+        "ms": 1,
         "stdout": {
             "v": 1,
             "ok": false,
@@ -445,19 +522,19 @@ fn evidence_error_shapes() {
             }
         }
     });
-    assert!(shape_eq(example, &call["stdout"], "error.usage").is_ok());
+    assert!(shape_eq(example, &call["stdout"], false, "error.usage").is_ok());
     let mut missing_code = call["stdout"].clone();
     missing_code["error"]
         .as_object_mut()
         .unwrap()
         .remove("code");
-    assert!(shape_eq(example, &missing_code, "error.usage").is_err());
+    assert!(shape_eq(example, &missing_code, false, "error.usage").is_err());
     let mut extra_field = call["stdout"].clone();
     extra_field["error"]["extra"] = serde_json::json!(true);
-    assert!(shape_eq(example, &extra_field, "error.usage").is_err());
+    assert!(shape_eq(example, &extra_field, false, "error.usage").is_err());
     let mut invalid_details = call["stdout"].clone();
     invalid_details["error"]["details"] = serde_json::json!("not an object");
-    assert!(shape_eq(example, &invalid_details, "error.usage").is_err());
+    assert!(shape_eq(example, &invalid_details, false, "error.usage").is_err());
 }
 #[test]
 fn error_shape_optional_fields_are_validated_on_both_sides() {
@@ -468,9 +545,17 @@ fn error_shape_optional_fields_are_validated_on_both_sides() {
         "hint": "try --help",
         "details": {"text": "usage"}
     });
-    for (doc, real) in [(&required, &optional), (&optional, &required)] {
-        assert!(shape_eq(doc, real, "error.usage.error").is_ok());
-        assert!(shape_eq(doc, real, "other").is_err());
+    let mut hint_only = optional.clone();
+    hint_only.as_object_mut().unwrap().remove("details");
+    let mut details_only = optional.clone();
+    details_only.as_object_mut().unwrap().remove("hint");
+    for fields in [&hint_only, &details_only, &optional] {
+        for (doc, real) in [(&required, fields), (fields, &required)] {
+            assert!(shape_eq(doc, real, true, "error.usage.error").is_ok());
+            assert!(shape_eq(doc, real, false, "error.usage.error").is_err());
+            assert!(shape_eq(doc, real, true, "other").is_err());
+            assert!(shape_eq(doc, real, false, "other").is_err());
+        }
     }
     for (key, value) in [
         ("code", serde_json::json!(42)),
@@ -479,14 +564,19 @@ fn error_shape_optional_fields_are_validated_on_both_sides() {
         ("details", serde_json::json!("not an object")),
         ("extra", serde_json::json!(true)),
     ] {
-        let mut invalid = required.clone();
+        let mut invalid = optional.clone();
         invalid[key] = value;
-        assert!(shape_eq(&required, &invalid, "error.usage.error").is_err());
-        assert!(shape_eq(&invalid, &required, "error.usage.error").is_err());
+        for lenient_errors in [false, true] {
+            assert!(shape_eq(&optional, &invalid, lenient_errors, "error.usage.error").is_err());
+            assert!(shape_eq(&invalid, &optional, lenient_errors, "error.usage.error").is_err());
+        }
     }
     let mut mismatched = optional.clone();
     mismatched["details"]["text"] = serde_json::json!(42);
-    assert!(shape_eq(&optional, &mismatched, "error.usage.error").is_err());
+    for lenient_errors in [false, true] {
+        assert!(shape_eq(&optional, &optional, lenient_errors, "error.usage.error").is_ok());
+        assert!(shape_eq(&optional, &mismatched, lenient_errors, "error.usage.error").is_err());
+    }
 }
 fn is_help_invocation(args: &[Value]) -> bool {
     args.iter()
@@ -512,11 +602,19 @@ fn evidence_help_is_skipped_while_contract_is_checked() {
     let example = &docs["error.usage"].values[0];
     let calls = [
         serde_json::json!({
+            "t": "end",
+            "id": "help",
             "argv": ["glen", "inbox", "--help"],
+            "exit": 0,
+            "ms": 1,
             "stdout": "Usage: glen inbox [OPTIONS]"
         }),
         serde_json::json!({
+            "t": "end",
+            "id": "usage",
             "argv": ["glen", "tail", "--json", "--cwd"],
+            "exit": 2,
+            "ms": 1,
             "stdout": example
         }),
     ];
@@ -525,7 +623,7 @@ fn evidence_help_is_skipped_while_contract_is_checked() {
         if is_help_invocation(call["argv"].as_array().unwrap()) {
             continue;
         }
-        shape_eq(example, &call["stdout"], "error.usage").unwrap();
+        shape_eq(example, &call["stdout"], true, "error.usage").unwrap();
         checked += 1;
     }
     assert_eq!(checked, 1);
@@ -572,8 +670,7 @@ fn evidence_shapes() {
                 ""
             }
         );
-        let id = if call["ok"] == false
-            || call["stdout"]["ok"] == false
+        let id = if call["stdout"]["ok"] == false
             || !matches!(call["exit"].as_i64(), Some(0 | 10 | 11 | 130))
         {
             error_id.as_str()
@@ -590,7 +687,7 @@ fn evidence_shapes() {
         let example = docs
             .get(id)
             .unwrap_or_else(|| panic!("no contract for {id}"));
-        shape_eq(&example.values[0], &call["stdout"], id).unwrap();
+        shape_eq(&example.values[0], &call["stdout"], true, id).unwrap();
         checked += 1;
     }
     assert!(checked > 0, "no contract calls in evidence");
