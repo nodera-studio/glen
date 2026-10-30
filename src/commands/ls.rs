@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::{path::Path, time::SystemTime};
 pub fn refine_held(summary: &mut Summary, lease: &Lease) {
     if matches!(lease, Lease::Held)
-        && summary.last_turn == TurnStatus::Unknown
+        && (!summary.tail_has_message || summary.tail_redirects_leaf)
         && let Ok(s) = Session::load(&summary.file.path)
     {
         let b = s.active_branch();
@@ -38,6 +38,18 @@ struct Row {
     handle: String,
     lease: Lease,
     state: State,
+}
+fn read_row(mut summary: Summary, owners: &Path) -> Option<Row> {
+    scan_tail(&mut summary).ok()?;
+    let lease = lease::probe(owners, &summary.id);
+    refine_held(&mut summary, &lease);
+    let state = lease::infer_state(&lease, summary.in_flight);
+    Some(Row {
+        summary,
+        handle: String::new(),
+        lease,
+        state,
+    })
 }
 pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
@@ -69,20 +81,15 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         if !args.live && args.limit > 0 && rows.len() >= args.limit {
             break;
         }
-        let mut s = s.clone();
-        scan_tail(&mut s)?;
-        let l = lease::probe(&paths.session_owners_dir, &s.id);
-        refine_held(&mut s, &l);
-        let state = lease::infer_state(&l, s.in_flight);
-        if args.live && !matches!(state, State::Live | State::Busy) {
+        let Some(mut row) = read_row(s.clone(), &paths.session_owners_dir) else {
+            total = total.saturating_sub(1);
+            continue;
+        };
+        if args.live && !matches!(row.state, State::Live | State::Busy) {
             continue;
         }
-        rows.push(Row {
-            handle: catalog.handle(&s.id),
-            summary: s,
-            lease: l,
-            state,
-        });
+        row.handle = catalog.handle(&s.id);
+        rows.push(row);
     }
     if args.live {
         total = rows.len();
@@ -214,7 +221,8 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
             .filter(|r| matches!(r.state, State::Live | State::Busy))
             .count();
         let footer = format!(
-            "{total} sessions · {live} live{}",
+            "{total} {} · {live} live{}",
+            if total == 1 { "session" } else { "sessions" },
             if rows.len() < total {
                 format!(" · showing {} of {total}; -n 0 for all", rows.len())
             } else {
@@ -300,5 +308,114 @@ mod tests {
         std::fs::remove_file(p).unwrap();
         refine_held(&mut s, &Lease::Free);
         assert_eq!(s.last_turn, TurnStatus::Unknown);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::omp::{
+        fixtures,
+        listing::{SessionFile, scan_head},
+    };
+    use serde_json::json;
+    use std::fs;
+
+    #[test]
+    fn vanished_tail_row_is_skipped_while_healthy_rows_survive() {
+        let tree = fixtures::tree();
+        let a = fixtures::path(&tree, 'A');
+        let b = fixtures::path(&tree, 'B');
+        let rows = [&a, &b].map(|p| scan_head(SessionFile::at(p).unwrap()).unwrap());
+        fs::remove_file(a).unwrap();
+        let rows = rows
+            .into_iter()
+            .filter_map(|s| read_row(s, tree.path()))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].summary.file.path, b);
+    }
+
+    #[test]
+    fn held_state_follows_redirected_leaf_in_both_directions() {
+        let tree = tempfile::tempdir().unwrap();
+        let path = tree.path().join("branch.jsonl");
+        for (leaf, busy) in [
+            (json!("done"), false),
+            (json!("pending"), true),
+            (Value::Null, false),
+            (json!("missing"), true),
+        ] {
+            let entries = [
+                json!({"type":"session","version":3,"id":"x"}),
+                json!({"type":"message","id":"done","message":{"role":"assistant","content":[]}}),
+                json!({"type":"message","id":"pending","message":{"role":"user","content":"next"}}),
+                json!({"type":"model_usage","id":"usage","activeLeafId":leaf}),
+            ];
+            fs::write(
+                &path,
+                entries.iter().map(|e| format!("{e}\n")).collect::<String>(),
+            )
+            .unwrap();
+            let mut summary = scan_head(SessionFile::at(&path).unwrap()).unwrap();
+            scan_tail(&mut summary).unwrap();
+            assert!(summary.tail_has_message);
+            assert!(summary.tail_redirects_leaf);
+            refine_held(&mut summary, &Lease::Held);
+            let loaded = Session::load(&path).unwrap();
+            assert_eq!(
+                summary.last_turn,
+                TurnStatus::of_branch(&loaded.active_branch())
+            );
+            assert_eq!(summary.in_flight, busy);
+            assert_eq!(
+                lease::infer_state(&Lease::Held, summary.in_flight),
+                if busy { State::Busy } else { State::Live }
+            );
+        }
+    }
+
+    #[test]
+    fn known_message_with_unknown_status_does_not_reload() {
+        let tree = tempfile::tempdir().unwrap();
+        let path = tree.path().join("developer.jsonl");
+        fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n{\"type\":\"message\",\"id\":\"d\",\"message\":{\"role\":\"developer\"}}\n").unwrap();
+        let mut summary = scan_head(SessionFile::at(&path).unwrap()).unwrap();
+        scan_tail(&mut summary).unwrap();
+        assert!(summary.tail_has_message);
+        assert_eq!(summary.last_turn, TurnStatus::Unknown);
+        // If refinement reloads it will see this different, completed branch.
+        fs::write(&path, "{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n{\"type\":\"message\",\"id\":\"a\",\"message\":{\"role\":\"assistant\"}}\n").unwrap();
+        refine_held(&mut summary, &Lease::Held);
+        assert_eq!(summary.last_turn, TurnStatus::Unknown);
+        assert!(summary.in_flight);
+    }
+}
+
+#[cfg(test)]
+mod branch_parent_tests {
+    use super::*;
+    #[test]
+    fn trailing_entry_parent_chain_can_skip_last_physical_message() {
+        let tree = tempfile::tempdir().unwrap();
+        let path = tree.path().join("branch.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"session\",\"id\":\"x\",\"version\":3}\n",
+                "{\"type\":\"message\",\"id\":\"done\",\"message\":{\"role\":\"assistant\"}}\n",
+                "{\"type\":\"message\",\"id\":\"pending\",\"message\":{\"role\":\"user\"}}\n",
+                "{\"type\":\"future\",\"id\":\"leaf\",\"parentId\":\"done\"}\n"
+            ),
+        )
+        .unwrap();
+        let mut summary =
+            crate::omp::listing::scan_head(crate::omp::listing::SessionFile::at(&path).unwrap())
+                .unwrap();
+        scan_tail(&mut summary).unwrap();
+        assert!(summary.tail_redirects_leaf);
+        refine_held(&mut summary, &Lease::Held);
+        assert_eq!(summary.last_turn, TurnStatus::Complete);
+        assert!(!summary.in_flight);
     }
 }

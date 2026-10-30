@@ -2,41 +2,61 @@ use std::collections::{HashMap, HashSet};
 fn compact(id: &str) -> String {
     id.replace('-', "").to_ascii_lowercase()
 }
-fn uuid(id: &str) -> bool {
-    let s = compact(id);
-    s.len() == 32 && s.bytes().all(|b| b.is_ascii_hexdigit())
+/// Adjacent sorted keys bound the longest shared prefix, avoiding pairwise scans.
+fn shared_prefixes(keys: &[Vec<char>]) -> Vec<usize> {
+    let mut order = (0..keys.len()).collect::<Vec<_>>();
+    order.sort_unstable_by(|a, b| keys[*a].cmp(&keys[*b]));
+    let mut shared = vec![0; keys.len()];
+    for pair in order.windows(2) {
+        let (a, b) = (pair[0], pair[1]);
+        let n = keys[a]
+            .iter()
+            .zip(&keys[b])
+            .take_while(|(a, b)| a == b)
+            .count();
+        shared[a] = shared[a].max(n);
+        shared[b] = shared[b].max(n);
+    }
+    shared
 }
+#[cfg(test)]
+std::thread_local! { pub(crate) static ASSIGN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 pub fn assign<'a>(ids: impl IntoIterator<Item = &'a str>) -> HashMap<String, String> {
-    let ids = ids.into_iter().collect::<HashSet<_>>();
+    #[cfg(test)]
+    ASSIGN_CALLS.with(|count| count.set(count.get() + 1));
+    let ids = ids
+        .into_iter()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let normalized = ids.iter().map(|id| compact(id)).collect::<Vec<_>>();
+    let prefixes = ids
+        .iter()
+        .map(|id| id.chars().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let suffixes = normalized
+        .iter()
+        .map(|id| id.chars().rev().collect::<Vec<_>>())
+        .collect::<Vec<_>>();
+    let prefix_shared = shared_prefixes(&prefixes);
+    let suffix_shared = shared_prefixes(&suffixes);
     ids.iter()
-        .map(|id| {
-            let s = if uuid(id) { compact(id) } else { (*id).into() };
-            let chars = s.chars().collect::<Vec<_>>();
-            let mut k = 7.min(chars.len());
-            while k < chars.len() {
-                let h = if uuid(id) {
-                    chars[chars.len() - k..].iter().collect::<String>()
-                } else {
-                    chars[..k].iter().collect()
-                };
-                if !ids.iter().any(|other| {
-                    other != id
-                        && if uuid(id) {
-                            compact(other).ends_with(&h)
-                        } else {
-                            other.starts_with(&h)
-                        }
-                }) {
-                    break;
-                }
-                k += 1
-            }
-            let h = if uuid(id) {
-                chars[chars.len() - k..].iter().collect()
+        .enumerate()
+        .map(|(i, id)| {
+            let uuid =
+                normalized[i].len() == 32 && normalized[i].bytes().all(|b| b.is_ascii_hexdigit());
+            let (chars, shared) = if uuid {
+                (&suffixes[i], suffix_shared[i])
             } else {
-                chars[..k].iter().collect()
+                (&prefixes[i], prefix_shared[i])
             };
-            ((*id).into(), h)
+            let n = 7.max(shared + 1).min(chars.len());
+            let handle = if uuid {
+                chars[..n].iter().rev().collect()
+            } else {
+                chars[..n].iter().collect()
+            };
+            ((*id).to_owned(), handle)
         })
         .collect()
 }
@@ -114,10 +134,16 @@ pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenE
         return if SessionFile::at(&p).ok().and_then(scan_head).is_some() {
             Ok(p)
         } else {
-            Err(GlenError::new(
-                ErrorCode::NotFound,
-                format!("not an omp session file: {}", p.display()),
-            ))
+            let continued = super::continuation::follow(&p)?;
+            if continued.path != p {
+                // Keep the original path so open records continued_from.
+                Ok(p)
+            } else {
+                Err(GlenError::new(
+                    ErrorCode::NotFound,
+                    format!("not an omp session file: {}", p.display()),
+                ))
+            }
         };
     }
     let hex = a.len() >= 4 && a.bytes().all(|b| b.is_ascii_hexdigit());
@@ -133,7 +159,11 @@ pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenE
                 .file_stem()
                 .map(|v| v.to_string_lossy().to_lowercase())
                 .unwrap_or_default();
-            (id == a
+            (catalog
+                .handles
+                .get(&s.id)
+                .is_some_and(|h| h.to_lowercase() == a)
+                || id == a
                 || (hex && compact(&id).ends_with(&a))
                 || (a.len() >= 8
                     && (id.starts_with(&a)
@@ -212,5 +242,70 @@ mod resolution_tests {
             let s = scan_head(SessionFile::at(&p).unwrap()).unwrap();
             assert_eq!(catalog.handle(&s.id), s.id.replace('-', "")[25..]);
         }
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::omp::fixtures;
+    use std::{fs, path::Path};
+
+    #[test]
+    fn every_assigned_handle_resolves_including_legacy_and_widened() {
+        let tree = fixtures::tree();
+        for id in [
+            "legacy-session-one",
+            "legacy-session-two",
+            "short",
+            "界界界界界界界一",
+            "界界界界界界界二",
+            "00000000-0000-0000-0000-00001abcdef0",
+            "00000000-0000-0000-0000-00002abcdef0",
+        ] {
+            fs::write(
+                tree.path().join("-work-alpha").join(format!("{id}.jsonl")),
+                format!("{{\"type\":\"session\",\"id\":\"{id}\",\"version\":3}}\n"),
+            )
+            .unwrap();
+        }
+        let catalog = Catalog::scan(tree.path()).unwrap();
+        let env = Env::for_test(Some(Path::new("/fixture")), Path::new("/fixture"), &[]);
+        for s in &catalog.sessions {
+            assert_eq!(
+                resolve(&catalog.handle(&s.id), &catalog, &env).unwrap(),
+                s.file.path
+            );
+        }
+        let original = &catalog.sessions[0];
+        let duplicate = original.file.path.with_file_name("duplicate.jsonl");
+        fs::copy(&original.file.path, duplicate).unwrap();
+        let catalog = Catalog::scan(tree.path()).unwrap();
+        assert_eq!(
+            resolve(&catalog.handle(&original.id), &catalog, &env)
+                .unwrap_err()
+                .code,
+            ErrorCode::Ambiguous
+        );
+    }
+
+    #[test]
+    fn sorted_assignment_handles_five_thousand_sessions() {
+        let ids = (0..5000)
+            .map(|i| format!("00000000-0000-0000-0000-{i:012x}"))
+            .collect::<Vec<_>>();
+        let handles = assign(ids.iter().map(String::as_str));
+        assert_eq!(handles.len(), 5000);
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(handles[id], format!("{i:07x}"));
+        }
+        // Mixed suffix/prefix collisions must count legacy ids too.
+        let h = assign([
+            "00000000-0000-0000-0000-00001abcdef0",
+            "legacy-abcdef0",
+            "legacy-abcdef1",
+        ]);
+        assert_eq!(h["00000000-0000-0000-0000-00001abcdef0"], "1abcdef0");
+        assert_eq!(h["legacy-abcdef0"], "legacy-abcdef0");
     }
 }

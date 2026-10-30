@@ -252,3 +252,198 @@ fn follow_never_spills_and_broken_pipe() {
     }
     sb.clean();
 }
+
+#[test]
+fn snapshots_wait_for_newlines_at_start_reload_and_continuation() {
+    let sb = OmpBox::new();
+    let path = sb.session('A');
+    let base = fs::read_to_string(&path).unwrap();
+    let pending = message("startup-partial", "10000009", "startup");
+    fs::write(&path, base.clone() + pending.trim_end_matches('\n')).unwrap();
+    // Single-document parsing remains lenient.
+    let doc = data(&sb.glen(&["show", path.to_str().unwrap()], &sb.alpha()));
+    assert_eq!(
+        doc["items"].as_array().unwrap().last().unwrap()["id"],
+        "startup-partial"
+    );
+    let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    f.backlog();
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    append(&path, "\n");
+    assert_eq!(f.event()["item"]["id"], "startup-partial");
+
+    let partial = message("reload-partial", "startup-partial", "rewrite");
+    let staged = path.with_file_name(".partial-rewrite.tmp");
+    let content = fs::read_to_string(&path).unwrap() + partial.trim_end_matches('\n');
+    fs::write(&staged, &content).unwrap();
+    fs::rename(staged, &path).unwrap();
+    assert_eq!(f.event()["event"], "rewritten");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    append(&path, "\n");
+    assert_eq!(f.event()["item"]["id"], "reload-partial");
+
+    let old = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+    let new = "01a0f6b2-2680-7a3c-8b21-4a1f9e27c0df";
+    let partial = message("continue-partial", "reload-partial", "continued")
+        .replace("2026-10-10T00:00:00Z", "2026-10-11T00:00:00Z");
+    let content = fs::read_to_string(&path).unwrap().replace(
+        &format!("\"id\":\"{old}\""),
+        &format!("\"id\":\"{new}\",\"continuationOf\":\"{old}\""),
+    ) + partial.trim_end_matches('\n');
+    let next = path
+        .parent()
+        .unwrap()
+        .join(format!("2026-10-11T00-00-00-000Z_{new}.jsonl"));
+    fs::write(&next, content).unwrap();
+    assert_eq!(f.event()["event"], "continued");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    append(&next, "\n");
+    assert_eq!(f.event()["item"]["id"], "continue-partial");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+}
+
+#[test]
+fn replaced_header_and_garbage_recover_original_continuation() {
+    for garbage in [false, true] {
+        let sb = OmpBox::new();
+        let path = sb.session('A');
+        let original = fs::read_to_string(&path).unwrap();
+        let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+        f.backlog();
+        let staged = path.with_file_name(".replacement.tmp");
+        fs::write(
+            &staged,
+            if garbage {
+                "garbage\n".into()
+            } else {
+                original.replace("01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de", "unrelated-session")
+                    + &message("unrelated-entry", "10000009", "must never emit")
+            },
+        )
+        .unwrap();
+        fs::rename(staged, &path).unwrap();
+        assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+        let old = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+        let new = "01a0f6b2-2680-7a3c-8b21-4a1f9e27c0df";
+        let content = original.replace(
+            &format!("\"id\":\"{old}\""),
+            &format!("\"id\":\"{new}\",\"continuationOf\":\"{old}\""),
+        ) + &message("recovered-entry", "10000009", "recovered");
+        let next = path
+            .parent()
+            .unwrap()
+            .join(format!("2026-10-10T00-00-00-000Z_{new}.jsonl"));
+        fs::write(next, content).unwrap();
+        let e = f.event();
+        assert_eq!(e["event"], "continued");
+        assert_eq!(e["from"], old);
+        assert_eq!(e["to"], new);
+        assert_eq!(f.event()["item"]["id"], "recovered-entry");
+        assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    }
+}
+
+#[test]
+fn replacement_without_continuation_observes_five_second_grace() {
+    for garbage in [false, true] {
+        let sb = OmpBox::new();
+        let path = sb.session('A');
+        let mut f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+        f.backlog();
+        let staged = path.with_file_name(".replacement.tmp");
+        fs::write(
+            &staged,
+            if garbage {
+                "garbage\n"
+            } else {
+                "{\"type\":\"session\",\"id\":\"different\"}\n"
+            },
+        )
+        .unwrap();
+        let start = Instant::now();
+        fs::rename(staged, &path).unwrap();
+        let e = f.event();
+        assert!(start.elapsed() >= Duration::from_secs(5));
+        assert_eq!(e["error"]["code"], "not_found");
+        assert!(
+            e["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(path.to_str().unwrap())
+        );
+        assert_eq!(f.wait().code(), Some(3));
+    }
+}
+
+#[test]
+fn removed_bucket_uses_disappearance_grace_and_path_error() {
+    let sb = OmpBox::new();
+    let path = sb.session('A');
+    let mut f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    f.backlog();
+    let bucket = path.parent().unwrap();
+    let start = Instant::now();
+    fs::rename(bucket, bucket.with_file_name("removed-bucket")).unwrap();
+    let e = f.event();
+    assert!(start.elapsed() >= Duration::from_secs(5));
+    assert_eq!(e["error"]["code"], "not_found");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(path.to_str().unwrap())
+    );
+    assert_eq!(f.wait().code(), Some(3));
+}
+
+#[test]
+fn session_precedes_environment_warnings() {
+    let sb = OmpBox::new();
+    let mut child = sb
+        .command(&["tail", "e27c0de", "-f", "--json", "-n", "0"], &sb.alpha())
+        .env("GLEN_MAX_OUTPUT", "invalid")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pipe = child.stdout.take().unwrap();
+    let (tx, lines) = mpsc::channel();
+    thread::spawn(move || {
+        for l in BufReader::new(pipe).lines() {
+            let Ok(l) = l else { break };
+            if tx.send(l).is_err() {
+                break;
+            }
+        }
+    });
+    let f = Following { child, lines };
+    assert_eq!(f.event()["event"], "session");
+    let warning = f.event();
+    assert_eq!(warning["event"], "warning");
+    assert_eq!(warning["code"], "invalid_env");
+}
+
+#[test]
+fn rejected_in_place_reload_stays_rejected_after_regrowth() {
+    let sb = OmpBox::new();
+    let path = sb.session('A');
+    let original = fs::read_to_string(&path).unwrap();
+    let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    f.backlog();
+    fs::write(&path, "garbage\n").unwrap();
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    let unrelated = original.replace(
+        "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+        "00000000-0000-0000-0000-000000000000",
+    ) + &message("unrelated-regrown", "10000009", "must never emit");
+    fs::write(&path, unrelated).unwrap();
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    fs::write(
+        &path,
+        original + &message("original-restored", "10000009", "safe"),
+    )
+    .unwrap();
+    assert_eq!(f.event()["event"], "rewritten");
+    assert_eq!(f.event()["item"]["id"], "original-restored");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+}
