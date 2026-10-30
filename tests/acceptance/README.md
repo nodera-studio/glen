@@ -89,15 +89,15 @@ indirect shell reads. Then check b and teardown to `$E/b-claude`.
 recipe in the prompt. The wrapper named glen is first on PATH. Skill/Read loading must be in
 the transcript. Any denied glen Bash call fails, including one before skill invocation;
 allowed-tools grants apply only to the invoking turn.
-Claude Code 2.1.309 denies the model's own Skill tool call under `dontAsk`, so
-`--allowedTools Skill` is required for a discovered skill to load.
+Claude Code 2.1.309 supports the scoped `--allowedTools "Skill(glen)"` grant under
+`dontAsk`; this run uses it to permit loading only glen. Every Skill call must name glen.
 Bash is deliberately NOT allowed on the command line: glen's Bash permission must come only
 from the skill's own `allowed-tools: Bash(glen *)` grant, not from the harness.
 
 ```bash
 S=$($A/acc.sh setup b3)
 (cd "$S/project" && PATH="$S/bin:$PATH" claude -p "$(cat "$S/prompt-b3.md")" \
-  --permission-mode dontAsk --allowedTools Skill --output-format stream-json --verbose) > "$S/b3.jsonl"
+  --permission-mode dontAsk --allowedTools "Skill(glen)" --output-format stream-json --verbose) > "$S/b3.jsonl"
 jq -r 'select(.type=="result") | .result' "$S/b3.jsonl" > "$S/report.md"
 $A/acc.sh check b3 "$S"
 $A/acc.sh teardown "$S" "$E/b3-claude-discover"

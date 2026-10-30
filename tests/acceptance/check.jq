@@ -17,7 +17,9 @@ def norm: ascii_downcase | gsub("-"; "");
 def is_target($m;$k):
   (target|norm) as $t | ($m[$k].id|norm) as $id |
   ($t != "" and ($id|endswith($t))) or (output).data.job.session_id == $m[$k].id;
-def texts: [(output).data.assistant_text // "", ((output).data.replies[]?.text // "")] | join("\n");
+def texts:
+  ([(output).data.assistant_text, (output).data.replies[]?.text] | map(strings | select(length>0)) | join("\n")) as $text |
+  if $text != "" then $text elif (.stdout|type)=="string" then .stdout|tostring else "" end;
 def nonce($n): texts | contains($n);
 def is_usage_rejected: .exit==2 and (output).error.code=="usage";
 def final($ends):
@@ -40,11 +42,11 @@ $m[0] as $manifest | $calls as $all |
 [$sends[]|select(is_usage_rejected|not)] as $delivery_attempts |
 [$delivery_attempts[]|select(is_target($manifest;"R"))] as $r |
 [$delivery_attempts[]|select(is_target($manifest;"L"))] as $l |
-[$sends[]|select(is_target($manifest;"X"))] as $x |
+[$delivery_attempts[]|select(is_target($manifest;"X"))] as $x |
 (if $mode == "b2" then
   uses($probe) as $pu | results($probe) as $pr | uses($control) as $cu | results($control) as $cr |
   [$pu[]|select(.name=="Bash" and ((.input.command // "")|if type=="string" then startswith("glen ") else false end))] as $pc |
-  [$cu[]|select(.name=="Bash" and (.input.command|startswith("glen ")))] as $cc |
+  [$cu[]|select(.name=="Bash" and ((.input.command // "")|if type=="string" then startswith("glen ") else false end))] as $cc |
   [check("AC-416-probe"; any($pc[]; .id as $id | any($pr[]; .tool_use_id==$id and (denied|not) and probe_success)); "glen Bash result must succeed"),
    check("AC-416-control-denied"; any($cc[]; .id as $id | any($cr[]; .tool_use_id==$id and denied)); "otherwise inconclusive; never pass")]
  elif $mode == "a" then
@@ -69,7 +71,7 @@ $m[0] as $manifest | $calls as $all |
      check("AC-415-read-R"; any($content[];(cmd=="show" or cmd=="tail") and .exit==0 and (output).data.session.id==$manifest.R.id); "read R"),
      check("nonce_R"; any($r[];final($content)|.exit==0 and (output).data.job.route=="rpc" and nonce($manifest.NONCE_R)); "RPC final answer contains NONCE_R"),
      check("nonce_L"; any($l[];final($content)|.exit==0 and (output).data.job.route=="live" and nonce($manifest.NONCE_L)); "live reply contains NONCE_L"),
-     check("nonce_T"; any($content[];cmd=="inbox" and .exit==0 and (output|tostring|contains($manifest.NONCE_T))); "inbox contains NONCE_T"),
+     check("nonce_T"; any($content[];cmd=="inbox" and .exit==0 and (nonce($manifest.NONCE_T) or (output|tostring|contains($manifest.NONCE_T)))); "inbox contains NONCE_T"),
      check("AC-415-X"; ($x|length)>=1 and ($x|length)<=2 and all($x[];.exit==6); "one or two refused X sends"),
      check("AC-415-report"; all([$manifest.NONCE_R,$manifest.NONCE_L,$manifest.NONCE_T][];. as $n|$report|contains($n)) and any($x[];(output).error.hint as $hint|$hint!=null and ($report|contains($hint))); "report quotes nonces and X hint")]
    end)
@@ -85,6 +87,7 @@ $m[0] as $manifest | $calls as $all |
     elif $mode=="b3" then
      uses($discovered) as $tools | results($discovered) as $results |
      [check("AC-420-loaded"; any($tools[];(.name=="Skill" and ((.input.skill // .input.name // "")|test("(^|:)glen$")) and (.id as $id | any($results[];.tool_use_id==$id and (.is_error|not) and (denied|not)))) or (.name=="Read" and (.input.file_path|endswith("/skills/glen/SKILL.md")))); "discovered skill must load"),
+      check("AC-420-only-glen-skill"; all($tools[];if .name=="Skill" then ((.input.skill // .input.name // "")|test("(^|:)glen$")) else true end); "every Skill call must name glen"),
       check("AC-420-permission"; all($tools[];if .name=="Bash" and (.input.command|test("(^|[ /])glen ")) then .id as $id | all($results[];if .tool_use_id==$id then denied|not else true end) else true end); "any denied glen call, before or after load, fails")]
     else [] end)
  end) as $checks |

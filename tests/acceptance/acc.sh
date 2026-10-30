@@ -199,7 +199,7 @@ teardown() {
     mkdir -p "$evidence"
     local file
     for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
-    copy_transcript "$S/transcript.jsonl" "$evidence/transcript.jsonl"
+    copy_transcript "$S/transcript.jsonl" "$evidence/transcript.jsonl" || { printf 'FAIL transcript copy\n' >&2; status=1; }
     for file in "$S"/prompt-*.md "$S"/*.typescript "$S"/*.screen.txt; do [[ ! -f $file ]] || cp "$file" "$evidence/"; done
     jq -r '.buckets[]' "$S/manifest.json" > "$evidence/scratch-buckets.txt"
     jq -r --slurpfile m "$S/manifest.json" '.[] | .path as $path | select(any($m[0].buckets[]; . as $b|$path|startswith($b+"/"))) | .path' "$S/owner-sessions.after.json" > "$evidence/sessions-left.txt"

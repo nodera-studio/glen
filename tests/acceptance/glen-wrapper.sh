@@ -19,7 +19,7 @@ refuse() {
 command_name='' target='' cwd='' dry=false project=false
 args=("$@")
 help=false
-for arg in "${args[@]}"; do
+for arg in "$@"; do
     case "$arg" in
         --) break ;;
         --help|--version|-V) help=true; break ;;
