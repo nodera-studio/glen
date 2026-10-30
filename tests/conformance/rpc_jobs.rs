@@ -325,6 +325,13 @@ fn ac214_readers_mark_lost_only_on_identity_evidence_or_an_expired_spawn_grace()
             ]),
             false,
         );
+        // §A7: the spawn-grace age is `updated_at`, never the file mtime; make them disagree.
+        let status_file = rb.job_dir(&id).join("status.json");
+        match secs {
+            11 => set_mtime(&status_file, SystemTime::now()),
+            2 => set_mtime(&status_file, ago(Duration::from_secs(60))),
+            _ => {}
+        }
         ids.push((id, status, lost));
     }
     let d = jobs(&rb, &["-n", "0"]);
@@ -416,8 +423,12 @@ fn ac221_wait_accepts_j_suffixes_and_full_ids_case_insensitively() {
 }
 
 #[test]
-fn ac221_wait_without_glen_home_is_not_found_and_creates_nothing() {
+fn ac221_without_glen_home_bad_shapes_are_usage_and_good_ones_not_found() {
     let rb = RpcBox::new();
+    // §A7: the handle shape is checked before any lookup, even without GLEN_HOME.
+    for bad in [A.handle, "j123", "jxyz1234", "job"] {
+        failed(&rb.glen(["wait", bad, "--json"]).run(), "usage");
+    }
     failed(&rb.glen(["wait", "j1234567", "--json"]).run(), "not_found");
     failed(
         &rb.glen(["wait", "01a20000-0000-7000-8000-000000000221", "--json"])

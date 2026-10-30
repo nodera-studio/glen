@@ -522,18 +522,36 @@ pub fn assert_job_failed(err: &Value, status: &str, code: &str) {
     assert_eq!(d["job"]["status"], status, "details.job.status: {err}");
 }
 
-/// A §A5 reply record.
+/// A §A5 reply record: every field present (absent values are `null`); the RPC route has no
+/// request id.
 pub fn assert_reply(r: &Value, session: &str, job: &str, call: &str, text: &str, fin: bool) {
+    let o = r
+        .as_object()
+        .unwrap_or_else(|| panic!("reply is not an object: {r}"));
+    for k in [
+        "v",
+        "id",
+        "session_id",
+        "job_id",
+        "request_id",
+        "tool_call_id",
+        "text",
+        "final",
+        "at",
+    ] {
+        assert!(
+            o.contains_key(k),
+            "reply lacks `{k}` (nulls are never omitted): {r}"
+        );
+    }
     assert_eq!(r["v"], 1, "{r}");
     assert!(r["id"].as_str().is_some_and(|s| !s.is_empty()), "{r}");
     assert_eq!(r["session_id"], session, "{r}");
     assert_eq!(r["job_id"], job, "{r}");
+    assert!(r["request_id"].is_null(), "{r}");
     assert_eq!(r["tool_call_id"], call, "{r}");
     assert_eq!(r["text"], text, "{r}");
     assert_eq!(r["final"], fin, "{r}");
-    if let Some(q) = r.get("request_id") {
-        assert!(q.is_null() || q.is_string(), "{r}");
-    }
     utc(&r["at"]);
 }
 

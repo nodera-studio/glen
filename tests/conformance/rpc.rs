@@ -3,7 +3,7 @@
 
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -605,6 +605,29 @@ fn ac207_a_live_owner_is_refused_before_any_job_or_omp_exists() {
     assert!(rb.starts().is_empty(), "omp was started\n{}", rb.diag());
 }
 
+/// §A3 (AC-207 revised): with the glen lock free, `send` probes the owner lease again after it has
+/// read stdin, so an omp that opened the session meanwhile is still refused before any state.
+#[test]
+fn ac207_send_reprobes_the_owner_lease_after_reading_stdin() {
+    let rb = RpcBox::new();
+    let mut cmd = rb.command(&["send", A.handle, "-", "--json"]);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    // `send` resolves (and probes) the target before it blocks on stdin; give it time to get
+    // there. A slower start only makes this row less discriminating, never wrongly red.
+    std::thread::sleep(Duration::from_millis(500));
+    let _lease = hold_lease(&rb.bx.owners(), A.id);
+    stdin.write_all(b"hi").unwrap();
+    drop(stdin);
+    let out = finish(child, "send - (owner appears while stdin is read)", LONG);
+    failed(&out, "no_route");
+    assert!(!rb.bx.glen_home.exists(), "GLEN_HOME was created");
+    assert!(rb.starts().is_empty(), "omp was started\n{}", rb.diag());
+}
+
 #[test]
 fn ac207_the_worker_probes_again_before_spawning_omp() {
     let rb = RpcBox::new();
@@ -629,31 +652,78 @@ fn ac207_the_worker_probes_again_before_spawning_omp() {
     assert!(rb.starts().is_empty(), "omp was spawned\n{}", rb.diag());
 }
 
+/// §A3 (AC-207 revised): there is no pre-prompt probe. omp's startup recovery may write to the
+/// session and claim the owner lease before `ready`; that lease is glen's own child's, so the job
+/// runs. (Supersedes the original plan's "probe right before prompting" row.)
 #[test]
-fn ac207_the_worker_probes_again_right_before_prompting() {
+fn ac207_a_lease_claimed_by_omps_own_startup_recovery_does_not_refuse_the_job() {
     let rb = RpcBox::new();
+    let release = rb.bx.root.join("run-release");
     let d = data_of(
-        &rb.glen(["send", A.handle, "hi", "--no-wait", "--json"])
-            .env("FAKE_OMP_READY_DELAY_MS", "2000")
+        &rb.glen(["send", A.handle, "hello", "--no-wait", "--json"])
+            .env("FAKE_OMP_STARTUP_RECOVERY", "1")
+            .env("FAKE_OMP_OWNERS_DIR", s(&rb.bx.owners()))
+            .env("FAKE_OMP_RUN_RELEASE", &release)
             .run(),
         10,
     );
     let id = job_id(&d);
-    rb.wait_log("the fake omp start", |r| !starts(r).is_empty());
-    let _lease = hold_lease(&rb.bx.owners(), A.id);
-    let out = rb
-        .glen(["wait", &job_handle(&id), "--timeout", "20s", "--json"])
-        .run();
-    failed(&out, "no_route");
-    let st = rb.wait_terminal(&id);
-    assert_eq!(st["status"], "failed", "{st}");
-    assert_eq!(st["error"]["code"], "no_route", "{st}");
-    rb.assert_quiet();
+    let recs = rb.wait_log("the prompt", |r| {
+        r.iter().any(|x| is_frame(x, "in", "prompt"))
+    });
+    let recovered = index_of(&recs, |r| r["event"] == "startup_recovery")
+        .expect("the fake claimed the lease and wrote a recovery record during startup");
+    let ready = index_of(&recs, |r| is_frame(r, "out", "ready")).expect("ready");
+    let prompt = index_of(&recs, |r| is_frame(r, "in", "prompt")).unwrap();
+    assert!(recovered < ready && ready < prompt, "{}", rb.diag());
+    // The prompt went out while glen's own omp child held the owner lease (W1 probe via ls).
+    let ls = data_of(&rb.glen(["ls", "--json"]).run(), 0);
+    let state = row(&ls, A.id)["state"].as_str().unwrap_or("").to_owned();
     assert!(
-        rb.inbound("prompt").is_empty(),
-        "a prompt was sent\n{}",
-        rb.diag()
+        ["live", "busy"].contains(&state.as_str()),
+        "omp's own lease is held during the run: state {state}"
     );
+    fs::write(&release, "").unwrap();
+    let w = data_of(
+        &rb.glen(["wait", &job_handle(&id), "--timeout", "20s", "--json"])
+            .run(),
+        0,
+    );
+    assert_eq!(w["status"], "completed", "{w}");
+    assert_eq!(w["assistant_text"], "pong: hello", "{w}");
+    assert!(w["forked"].is_null(), "{w}");
+    rb.assert_quiet();
+}
+
+/// §A7 queue display: `waiting_for_lock` is published once the worker has seen the glen lock
+/// held, cleared when it gets the lock, and `waited_ms` keeps the wait.
+#[test]
+fn a7_a_queued_job_publishes_waiting_for_lock_until_it_gets_the_lock() {
+    let rb = RpcBox::new();
+    let lock = rb.hold_glen_lock(A.id);
+    let id = job_id(&data_of(
+        &rb.glen(["send", A.handle, "hi", "--no-wait", "--json"])
+            .run(),
+        10,
+    ));
+    let st = rb.wait_status(&id, "waiting_for_lock", LONG, |s| {
+        s["waiting_for_lock"] == true
+    });
+    assert_eq!(st["status"], "queued", "{st}");
+    std::thread::sleep(Duration::from_millis(300));
+    drop(lock);
+    data_of(
+        &rb.glen(["wait", &job_handle(&id), "--timeout", "20s", "--json"])
+            .run(),
+        0,
+    );
+    let st = rb.status(&id);
+    assert_ne!(st["waiting_for_lock"], true, "cleared on acquisition: {st}");
+    assert!(
+        st["waited_ms"].as_u64().is_some_and(|ms| ms >= 300),
+        "waited_ms keeps the lock wait: {st}"
+    );
+    rb.assert_quiet();
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -836,6 +906,50 @@ fn ac209_cwd_applies_only_to_new_and_latest_and_must_be_a_directory() {
     );
     assert_eq!(d["session"]["id"], E.id, "{d}");
     assert_omp_argv(&rb.starts()[0]["argv"], Some(&rb.bx.path(&E)), None);
+    let cwd = rb.starts()[0]["cwd"].as_str().unwrap().to_owned();
+    assert!(
+        same_file(Path::new(&cwd), &rb.bx.beta),
+        "§A7: E's header cwd does not exist, so omp runs in --cwd DIR, not {cwd}"
+    );
+    rb.assert_quiet();
+}
+
+/// §A7 worker cwd: an existing header cwd wins over `--cwd DIR`.
+#[test]
+fn a7_an_existing_header_cwd_wins_over_the_cwd_flag() {
+    let rb = RpcBox::new();
+    let gamma = rb.bx.work("gamma");
+    let delta = rb.bx.work("delta");
+    let id = uuid(0xa7_0207);
+    let path = rb.bx.add(
+        "-work-gamma",
+        "2026-10-06T11:00:00.000Z",
+        &id,
+        Some(&s(&delta)),
+        &[user("aa000002", None, "2026-10-06T11:00:01.000Z", "hi")],
+    );
+    let d = data_of(
+        &rb.glen([
+            "send",
+            "@latest",
+            "hi",
+            "--cwd",
+            &s(&gamma),
+            "--wait",
+            "20s",
+            "--json",
+        ])
+        .run(),
+        0,
+    );
+    assert_eq!(d["session"]["id"], id.as_str(), "{d}");
+    let st = &rb.starts()[0];
+    assert_omp_argv(&st["argv"], Some(&path), None);
+    let cwd = st["cwd"].as_str().unwrap();
+    assert!(
+        same_file(Path::new(cwd), &delta),
+        "omp cwd {cwd} is not the header cwd"
+    );
     rb.assert_quiet();
 }
 
@@ -1303,7 +1417,15 @@ fn worker_signal_cancels(sig: Signal) {
     rb.wait_log("the prompt", |r| {
         r.iter().any(|x| is_frame(x, "in", "prompt"))
     });
+    let t = Instant::now();
     signal(st["worker_pid"].as_i64().unwrap(), sig);
+    let fin = rb.wait_status(&id, "terminal", LONG, is_terminal);
+    let took = t.elapsed();
+    assert_eq!(fin["status"], "aborted", "{fin}");
+    assert!(
+        took <= ABORT_BOUND,
+        "§A7: aborted within 1 s of the signal, took {took:?}"
+    );
     let out = rb
         .glen(["wait", &job_handle(&id), "--timeout", "20s", "--json"])
         .run();
@@ -1957,11 +2079,8 @@ fn plan_an_omp_that_never_becomes_ready_fails_the_job_without_a_prompt() {
         .env("GLEN_JOB_TIMEOUT", "2s")
         .run();
     let err = failed(&out, "job_failed");
-    let code = err["details"]["error"]["code"].as_str().unwrap_or("");
-    // Spec gap: the ready bound is min(60 s, time left), so it coincides with the job deadline;
-    // Step 6 maps a ready timeout to omp_unavailable, the §A3 table says startup → timeout.
-    assert!(["omp_unavailable", "timeout"].contains(&code), "{err}");
-    assert_eq!(err["details"]["status"], "failed", "{err}");
+    // §A7: whichever bound fires decides the code; the 2 s job deadline beats the 60 s ready bound.
+    assert_job_failed(&err, "failed", "timeout");
     rb.assert_quiet();
     assert!(rb.inbound("prompt").is_empty());
 }
