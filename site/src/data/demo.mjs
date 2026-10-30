@@ -2,8 +2,8 @@
 // The hero terminal script. Every line of glen stdout comes from demo-capture.json: real glen
 // output, captured by tests/site_demo.rs from the synthetic sessions in tests/fixtures/demo and
 // decoded here (ansi.mjs). Time is compressed. The only hand-authored glen text is what glen
-// writes to a TTY's stderr, which a capture cannot see: the send spinner and its progress
-// messages (src/commands/send.rs, wait.rs) and the tail -f diagnostic (src/commands/tail.rs).
+// writes to a TTY's stderr, which a capture cannot see: the send/wait spinner messages
+// (src/commands/wait.rs job_progress) and the tail -f diagnostic (src/commands/tail.rs).
 // terminal-player.test.mjs checks each of those strings against glen's source.
 // Refresh the capture with `npm run demo:refresh`.
 import capture from './demo-capture.json' with { type: 'json' };
@@ -81,8 +81,17 @@ export const message = items(76)[sendAt].slice(1).map(l => plain(l).trim()).join
 /** Text of the reply line the selection cue highlights: glen's `↩ <reply>` line without its tick. */
 export const selection = plain(/** @type {Line} */ (completedBlock(76).find(l => plain(l).startsWith('↩ ')))).replace(/ ✓$/, '');
 
-/** wait.rs progress(): the spinner message for each job state (TTY stderr, not captured). */
-export const PROGRESS = { queued: 'starting omp', locked: 'queued behind another glen job', accepted: 'waiting for the reply' };
+/**
+ * wait.rs job_progress() on the live route: the spinner's format string for each job state (TTY
+ * stderr, not captured). The demo session is live, so glen send and glen wait both show these.
+ */
+export const LIVE_PROGRESS = { queued: 'delivering to {} (live) · {}', accepted: 'delivered as {}; omp is working' };
+/** How the glen extension takes a message for an idle TUI session (extension/glen/index.ts). */
+export const deliveredAs = 'prompt';
+/** Fill a Rust format string's `{}` placeholders in order. @param {string} f @param {...string} args */
+const format = (f, ...args) => args.reduce((out, a) => out.replace('{}', () => a), f);
+/** The demo job's spinner messages, in job order: queued while glen delivers, then accepted. */
+export const PROGRESS = { queued: format(LIVE_PROGRESS.queued, session, job), accepted: format(LIVE_PROGRESS.accepted, deliveredAs) };
 
 export const prompt = [s(cwd, 'accent_2'), s(' '), s('❯', 'accent'), s(' ')];
 const sendCmd = `glen send ${session} "${message}"`;
@@ -109,11 +118,10 @@ export const script = [
  { k: 'title', dt: 90, v: 'zsh' },
  { k: 'cmd', p: 'a', id: 'send', dt: 0, think: 350, text: sendCmd },
  { k: 'title', after: 'send', v: 'glen' },
- { k: 'spin', p: 'a', id: 'spin', after: 'send', dt: 30, v: `sending to ${session} · ${job}` },
+ // The spinner starts on the queued job while glen delivers through the session's glen
+ // extension, then switches once the extension accepts it, just before omp shows the message.
+ { k: 'spin', p: 'a', id: 'spin', after: 'send', dt: 30, v: PROGRESS.queued },
  { k: 'event', p: 'b', after: 'send', dt: 500, lines: w => item(turn(w).user) },
- // The spinner starts on its send message, then follows the job: queued while omp starts,
- // accepted once omp takes the prompt (the user message lands in the omp pane).
- { k: 'msg', after: 'send', dt: 200, v: PROGRESS.queued },
  { k: 'msg', after: 'send', dt: 480, v: PROGRESS.accepted },
  { k: 'focus', p: 'b', after: 'send', dt: 540 },
  { k: 'event', p: 'b', after: 'send', dt: 1400, lines: w => item(turn(w).head) },
