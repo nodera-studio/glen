@@ -106,4 +106,7 @@ after a crash or compaction.
 - Run tests on the host with cargo: `cargo test --locked` (filter with `cargo test <name>`); omp data comes from `tests/fixtures/`, never a live `~/.omp`.
 - User-facing messages, errors and logs are in English.
 - Never `--no-verify`; never weaken a test or silence the gate to go green.
+- Never delete, move, rename or revert a file you did not create in this task, tracked or
+  untracked, even if it looks unrelated to the plan (an untracked `.claude/launch.json`
+  was once deleted as "unrelated"). Leave it untouched and list it in the Report instead.
 - Match the surrounding code; read before you write.

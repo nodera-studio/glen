@@ -82,7 +82,10 @@ Run the WHOLE fused loop in your own context, until green:
 
 <action_safety>
 Stay strictly within the plan's scope — no unrelated refactors, no dependency bumps,
-no dead-code rewrites. Never use --no-verify. If you hit an architectural surprise,
+no dead-code rewrites. Never use --no-verify. NEVER delete, move, rename or revert a
+file you did not create in this task, tracked or untracked, even if it looks unrelated
+to the plan (e.g. an untracked .claude/launch.json): leave it untouched and list it under
+"deviations" as a file you noticed. If you hit an architectural surprise,
 a scope contradiction, or a decision the plan did not authorize: STOP and describe
 it in your final message instead of guessing.
 </action_safety>
@@ -135,3 +138,6 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
   Codex's fused loop.
 - Never `--no-verify`; never weaken a test or silence the gate (enforced in the
   Codex envelope + AGENTS.md).
+- Never delete, move or revert files that this task did not create, tracked or untracked;
+  report them instead (the envelope carries this rule). If `touchedFiles` shows a deletion
+  of a file the plan did not name, report it to the orchestrator as a blocker.

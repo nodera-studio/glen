@@ -152,7 +152,12 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    Implementer's cargo loop and `.claude/scripts/quality-gate.sh`, the local
    `/code-review` gate (1 Claude ‖ 1 Codex pass, 2-vote), the conformance tail
    (`cargo test --test conformance`) and the docs updater. This local gate is the code
-   review; nothing on GitHub reviews the PR.
+   review; nothing on GitHub reviews the PR. Saved review or plan files per engine are
+   named `<engine>-review.md` / `<engine>-plan.md` (e.g.
+   `.claude/plans/reviews/<wave>/claude-review.md`), never `claude.md`: Claude Code loads
+   any `claude.md` as a nested `CLAUDE.md` on macOS's case-insensitive filesystem. If the
+   Codex review pass hits a capacity or rate error, the gate retries once and then runs
+   single-engine (see `.claude/commands/code-review.md`); record that in the wave-end note.
 4. **Pre-push check.**
    `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings && cargo test --locked`
    (or `/run-ci`). Fix red before pushing; a red CI cycle costs a two-runner round trip.

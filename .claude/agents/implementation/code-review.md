@@ -41,6 +41,27 @@ If the run already committed per-wave, diff against the merge-base with the
 default branch instead. Examine every changed file and every hunk — subtle bugs
 hide in utility functions, cleanup logic, and config. Do not skip files.
 
+## Rendered output: run it and look (UI diffs)
+
+When the diff touches anything with rendered output — `site/`, a TUI or live view, or terminal
+rendering (human/TTY output, tables, colour, spinners) — build and run it and look at the output
+before you call it correct. A code trace alone is not enough: in W6 both review engines traced
+the terminal-demo code, approved it, and missed that 2 of its 4 scenes never appeared.
+
+- **Web (`site/`):** `npm run build && npm run preview` in `site/` (serves
+  `http://127.0.0.1:4321`), then screenshot with
+  `npx playwright screenshot --viewport-size=375,812 --color-scheme=dark --wait-for-timeout=<ms> <url> <out>.png`
+  (also 1280 wide, and light) and Read each PNG. For an animation or timed sequence, take
+  screenshots spread across its full duration and confirm every scene and state appears.
+- **CLI / TUI:** run under a pseudo-TTY so the TTY path runs, e.g.
+  `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'`, at a narrow and a wide width
+  and with `NO_COLOR=1`; let a live view run through its states.
+- Save what you looked at under `.claude/evidence/` and cite it in the finding. A visible
+  defect is a finding like any other (Category: Accessibility or Error Handling as fits,
+  `file:line` of the cause).
+- If you cannot run it (build fails, no browser), say so in the report and mark the rendered
+  output UNVERIFIED; never return APPROVE on a UI diff you did not run.
+
 ## Project Conventions (flagging convention-following code is a false positive)
 
 <conventions>
@@ -149,6 +170,7 @@ HIGH-001: IDOR in `getCustomer` — no org filter
 ## Code Review (Claude pass): {scope}
 
 **Files reviewed**: {list}
+**Rendered output**: {evidence paths under .claude/evidence/} | n/a (no UI in the diff) | UNVERIFIED ({why})
 **Risk level**: LOW | MEDIUM | HIGH | CRITICAL
 
 ### Findings
@@ -192,6 +214,8 @@ project has no such pipeline, skip this section entirely.
 
 <rules>
 - ONE pass, ALL categories. Do not fix code — report findings only.
+- A UI diff (`site/`, TUI, terminal rendering) is reviewed by running it and looking at the
+  output, not by a code trace alone (see "Rendered output").
 - Report everything your trace surfaces as unhandled OR uncertain, each with a
   confidence tier — do not silently drop a finding. Still EXCLUDE code your trace
   proves is handled (convention, fallback, comment) and parked code: those are

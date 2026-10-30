@@ -111,6 +111,15 @@
             "command": ".claude/hooks/block-old-codex.sh"
           }
         ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/guard-claude-md-name.sh"
+          }
+        ]
       }
     ],
     "PostToolUse": [

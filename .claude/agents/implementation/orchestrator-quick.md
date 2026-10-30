@@ -76,10 +76,16 @@ quick path. Prefer the Codex diff reviewer for an uncorrelated read:
 Agent tool (subagent_type: codex:codex-rescue):
   prompt: "READ-ONLY review of THIS diff for REAL bugs only — logic, edge cases, missing error
            handling, multi-tenant / fiscal regressions. Not style/lint (the gate owns that).
+           If the diff touches rendered output (site/, a TUI, terminal rendering), build and
+           run it and look at the output (browser screenshot, or CLI output under a pty)
+           before calling it correct; a code trace alone is not enough.
            Do NOT edit. Diff:\n{git diff of the change}"
 ```
 
-(Or `codex review --base <default-branch merge-base>`.) Fix any real bug it finds in THIS context.
+(Or `codex review --base <default-branch merge-base>`.) On a capacity or rate error ("Selected
+model is at capacity", 429), retry once after about 60 s; if it fails again, run the Claude
+`impl-code-review` pass instead and say in the summary that Codex was unavailable. Never skip the
+review silently. Fix any real bug it finds in THIS context.
 If the review reveals the change is bigger or riskier than it looked, stop and escalate to
 `/implement`.
 

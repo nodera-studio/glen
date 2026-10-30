@@ -192,6 +192,24 @@ one must-fix / recommended / notes report. No lint/type/style re-check — the
 deterministic gate already enforced that inside the Implementer; the engines hunt
 real bugs.
 
+**UI diffs are reviewed by running them.** When the diff touches rendered output
+(`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
+at the output (a browser screenshot, or real CLI/TUI output under a pty) before calling
+it correct; a code trace alone is not enough. In W6 both engines traced the terminal
+demo, approved it, and missed 2 of its 4 scenes never appearing. This is in addition to
+the Visual verification step below, not a substitute for it.
+
+**Codex capacity.** If the Codex pass fails on capacity or rate ("Selected model is at
+capacity", 429, rate limit), retry it once after a short wait (about 60 s). If the retry
+fails too, record Codex as unavailable, proceed with the Claude pass as a single-engine
+verdict, and say so in the Report. Never drop the engine silently.
+
+**Review file names.** If you save the passes to disk, name them `claude-review.md` and
+`codex-review.md` (plan files `<engine>-plan.md`), never `claude.md`: on macOS's
+case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
+`CLAUDE.md`, which injects the review as project instructions. The
+`guard-claude-md-name.sh` hook refuses such a Write.
+
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer
 ‖ `codex review` ‖ `coderabbit review --plain --agent` → synthesizer) only when

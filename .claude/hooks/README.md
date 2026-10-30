@@ -19,6 +19,7 @@ deliberately per hook:
 | `block-old-codex.sh` | `PreToolUse` (`Bash`, `Skill`) | hard block | Blocks legacy/duplicate Codex dispatch paths, redirects to the canonical one |
 | `steer-bash.sh` | `PreToolUse` (`Bash`) | warn (steers) | Redirects risky/inefficient bash patterns (`sed -i` → Edit tool, raw `cat`/`head` of code including `.rs` → Read tool, `.env` reads → Mnemosyne secrets, external `curl` → an allowlisted host check) toward better tools |
 | `capture-before-merge.sh` | `PreToolUse` (`Bash`, on `gh pr merge`) | hard block | Blocks a PR merge until a Mnemosyne `memory_store` call referencing the PR/branch exists in-session |
+| `guard-claude-md-name.sh` | `PreToolUse` (`Write`) | hard block | Refuses a file whose basename is `claude.md` in any case, except `<repo>/CLAUDE.md`, `<repo>/.claude/CLAUDE.md` (per checkout or worktree) and `~/.claude/CLAUDE.md`: Claude Code loads any such file as a nested `CLAUDE.md` on macOS's case-insensitive filesystem. Name per-engine output `<engine>-review.md` / `<engine>-plan.md` |
 | `shellcheck-on-edit.sh` | `PostToolUse` (`Edit\|Write`) | warn-don't-block | Lints edited shell scripts if shellcheck is installed |
 
 Not wired in glen:
