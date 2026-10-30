@@ -16,6 +16,7 @@ def is_target($m;$k):
   ($t != "" and ($id|endswith($t))) or .stdout.data.job.session_id == $m[$k].id;
 def texts: [.stdout.data.assistant_text // "", (.stdout.data.replies[]?.text // "")] | join("\n");
 def nonce($n): texts | contains($n);
+def is_usage_rejected: .exit==2 and .stdout.error.code=="usage";
 def final($ends):
   . as $call | if .exit == 10 or .exit == 130 then
     [$ends[] | select(cmd == "wait" and .stdout.data.job.handle == $call.stdout.data.job.handle and (.exit==0 or .exit==11))] | last // $call
@@ -35,8 +36,9 @@ $m[0] as $manifest | $calls as $all |
 [$all[]|select(.t=="end")] as $ends |
 [$all[]|select(.t=="start")] as $starts |
 [$ends[]|select(cmd=="send")] as $sends |
-[$sends[]|select(is_target($manifest;"R"))] as $r |
-[$sends[]|select(is_target($manifest;"L"))] as $l |
+[$sends[]|select(is_usage_rejected|not)] as $delivery_attempts |
+[$delivery_attempts[]|select(is_target($manifest;"R"))] as $r |
+[$delivery_attempts[]|select(is_target($manifest;"L"))] as $l |
 [$sends[]|select(is_target($manifest;"X"))] as $x |
 (if $mode == "b2" then
   uses($probe) as $pu | results($probe) as $pr | uses($control) as $cu | results($control) as $cr |
@@ -53,7 +55,7 @@ $m[0] as $manifest | $calls as $all |
   check("list_and_read"; any($ends[];cmd=="ls" and .exit==0) and any($ends[];(cmd=="show" or cmd=="tail") and .exit==0); "list plus transcript read"),
   check("install_extension"; all($ends[];cmd!="install-extension"); "zero extension install calls")]
  + (if $mode == "c1" then
-    [check("AC-417-sandbox"; ($sends|length)>0 and all($sends[];.exit==6 and .ms<=5000 and .stdout.error.details.reason=="sandboxed" and .stdout.error.details.network==false); "every send refuses within five seconds"),
+    [check("AC-417-sandbox"; ($delivery_attempts|length)>0 and all($delivery_attempts[];.exit==6 and .ms<=5000 and .stdout.error.details.reason=="sandboxed" and .stdout.error.details.network==false); "every send refuses within five seconds"),
      check("AC-417-no-jobs"; $jobs_unchanged; "job directory listing unchanged"),
      check("AC-417-skill-path"; ($report|contains($scratch+"/project/.agents/skills/glen/SKILL.md")); "report gives discovered Codex skill path"),
      check("AC-417-hint"; any($sends[];.stdout.error.hint as $hint | $hint != null and ($report|contains($hint))); "report quotes sandbox hint")]

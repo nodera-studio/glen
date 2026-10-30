@@ -18,6 +18,13 @@ refuse() {
 }
 command_name='' target='' cwd='' dry=false project=false
 args=("$@")
+help=false
+for arg in "${args[@]}"; do
+    case "$arg" in
+        --) break ;;
+        --help|-h) help=true; break ;;
+    esac
+done
 i=0
 while ((i < ${#args[@]})); do
     arg=${args[i]}
@@ -33,24 +40,26 @@ while ((i < ${#args[@]})); do
     esac
     ((i+=1))
 done
-case "$command_name" in
-    install-extension) $dry || refuse 'install-extension would change omp configuration' ;;
-    install-skill) $project || refuse 'user skill installation is outside the scratch project'; [[ $(pwd -P) == "$ACC_S"/* ]] || refuse 'project install cwd is outside scratch' ;;
-    send|abort|stop|models|model|thinking|compact)
-        # Canonical cwd check rejects ../ escapes and directory symlinks out of scratch.
-        canonical=''
-        if [[ -n $cwd ]]; then canonical=$(cd -- "$cwd" 2>/dev/null && pwd -P) || refuse 'cwd does not exist'; fi
-        case "$target" in
-            @new) [[ $canonical == "$ACC_S"/* ]] || refuse '@new requires a scratch --cwd' ;;
-            @latest) [[ $canonical == "$ACC_S/project" ]] || refuse '@latest requires --cwd project' ;;
-            *)
-                normalized=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]' | tr -d '-')
-                [[ $normalized =~ ^[0-9a-f]{4,}$ ]] || refuse 'target is not a manifest handle'
-                jq -e --arg t "$normalized" '[.R,.L,.X] | map(select((.id|ascii_downcase|gsub("-";""))|endswith($t))) | length == 1' "$MANIFEST" >/dev/null || refuse 'target is outside manifest'
-                ;;
-        esac
-        ;;
-esac
+if ! $help; then
+    case "$command_name" in
+        install-extension) $dry || refuse 'install-extension would change omp configuration' ;;
+        install-skill) $project || refuse 'user skill installation is outside the scratch project'; [[ $(pwd -P) == "$ACC_S"/* ]] || refuse 'project install cwd is outside scratch' ;;
+        send|abort|stop|models|model|thinking|compact)
+            # Canonical cwd check rejects ../ escapes and directory symlinks out of scratch.
+            canonical=''
+            if [[ -n $cwd ]]; then canonical=$(cd -- "$cwd" 2>/dev/null && pwd -P) || refuse 'cwd does not exist'; fi
+            case "$target" in
+                @new) [[ $canonical == "$ACC_S"/* ]] || refuse '@new requires a scratch --cwd' ;;
+                @latest) [[ $canonical == "$ACC_S/project" ]] || refuse '@latest requires --cwd project' ;;
+                *)
+                    normalized=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]' | tr -d '-')
+                    [[ $normalized =~ ^[0-9a-f]{4,}$ ]] || refuse 'target is not a manifest handle'
+                    jq -e --arg t "$normalized" '[.R,.L,.X] | map(select((.id|ascii_downcase|gsub("-";""))|endswith($t))) | length == 1' "$MANIFEST" >/dev/null || refuse 'target is outside manifest'
+                    ;;
+            esac
+            ;;
+    esac
+fi
 start=$(now_ms)
 # A unique call id pairs records even if an agent starts overlapping calls.
 call_id="$$-$start"

@@ -87,6 +87,24 @@ jq -cn '{message:{content:[{type:"tool_use",id:"probe",name:"Bash",input:{comman
   {type:"tool_result",tool_use_id:"probe",content:({v:1,ok:false,error:{message:"Permission denied"}}|tojson)}]}}' > "$S/b2-probe.jsonl"
 if "$A/acc.sh" check b2 "$S"; then echo 'denied b2 recording passed' >&2; exit 1; fi
 jq -e '(.pass|not) and (.checks|any(.id=="AC-416-probe" and (.pass|not)))' "$S/verdict.json" >/dev/null
+# Usage rejections are not delivery attempts; sandboxed sends still count.
+jq -cn --arg s "$S" '
+  [ {a:["ls"],out:{data:{sessions:[]}},exit:0},
+    {a:["tail","aaaaaaa"],out:{data:{}},exit:0},
+    {a:["send","aaaaaaa","hi","--cwd",($s+"/project")],out:{error:{code:"usage"}},exit:2},
+    {a:["send","aaaaaaa","hi"],out:{error:{hint:"sandbox hint",details:{reason:"sandboxed",network:false}}},exit:6},
+    {a:["send","bbbbbbb","hi"],out:{error:{hint:"sandbox hint",details:{reason:"sandboxed",network:false}}},exit:6}
+  ] | to_entries[] | .key as $i | .value as $v |
+  {t:"start",id:($i|tostring),argv:$v.a,ts:($i*10)},
+  {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$S/calls.ndjson"
+"$A/acc.sh" check c1 "$S" >/dev/null || true
+jq -e '.checks|any(.id=="AC-417-sandbox" and .pass)' "$S/verdict.json" >/dev/null
+cp "$S/calls.ndjson" "$S/c1-mixed.ndjson"
+# Usage errors alone must not satisfy the nonempty delivery-attempt requirement.
+jq -c 'select(.argv[0]!="send" or (.argv|index("--cwd")))' "$S/c1-mixed.ndjson" > "$S/calls.ndjson"
+if "$A/acc.sh" check c1 "$S"; then echo 'usage-only c1 recording passed' >&2; exit 1; fi
+jq -e '.checks|any(.id=="AC-417-sandbox" and (.pass|not))' "$S/verdict.json" >/dev/null
+cp "$S/good.ndjson" "$S/calls.ndjson"
 # Missing recordings must retain every mode's check IDs in a valid failing verdict.
 for mode in a b b2 b3 c1 c2; do
     "$A/acc.sh" check "$mode" "$S" >/dev/null || true
@@ -102,6 +120,26 @@ printf '#!/usr/bin/env bash\nprintf '\''{"v":1,"ok":true,"data":{}}\\n'\''\n' > 
 chmod +x "$S/glen-bin/glen"
 printf '#!/usr/bin/env bash\nACC_S=%q\n' "$S" > "$S/bin/glen"
 tail -n +2 "$A/glen-wrapper.sh" >> "$S/bin/glen"; chmod +x "$S/bin/glen"
+# c2 help calls bypass the guard but retain normal paired recordings.
+: > "$S/calls.ndjson"
+for help in --help -h; do
+    "$S/bin/glen" send "$help" >/dev/null
+done
+"$S/bin/glen" send --as --help >/dev/null
+jq -se '. as $calls | length==6 and all(.[];.t!="guard_refused") and
+  ([.[]|select(.t=="start")]|length)==3 and
+  all(.[]|select(.t=="start"); . as $s | any($calls[];.t=="end" and .id==$s.id and .argv==$s.argv and .exit==0 and .stdout=={v:1,ok:true,data:{}}))' "$S/calls.ndjson" >/dev/null
+"$A/acc.sh" check c2 "$S" >/dev/null || true
+jq -e '.checks|any(.id=="guard_refused" and .pass)' "$S/verdict.json" >/dev/null
+# Help after the separator is a target, and foreign handles remain guarded.
+for target in --help -h deadbeef; do
+    if "$S/bin/glen" send -- "$target" hi >/dev/null 2>&1; then
+        echo 'unguarded c2 target allowed' >&2; exit 1
+    else
+        [[ $? == 99 ]] || { echo 'unexpected c2 guard exit' >&2; exit 1; }
+    fi
+done
+jq -se '[.[]|select(.t=="guard_refused")]|length==3' "$S/calls.ndjson" >/dev/null
 "$S/bin/glen" send --as auto aaaaaaa hi >/dev/null
 "$S/bin/glen" send @new hi --cwd "$S/project" >/dev/null
 if "$S/bin/glen" send @new hi --cwd "$S/project/../.." >/dev/null 2>&1; then echo 'escape allowed' >&2; exit 1; fi
