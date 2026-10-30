@@ -76,6 +76,7 @@ pub fn to_glen_error(e: OpError, ctx: &ErrCtx<'_>) -> GlenError {
         ops::OMP_ERROR => (ErrorCode::ControlFailed, ops::OMP_ERROR),
         ops::TIMEOUT => (ErrorCode::ControlFailed, ops::TIMEOUT),
         ops::JOB_ENDED => (ErrorCode::ControlFailed, ops::JOB_ENDED),
+        ops::OUTCOME_UNKNOWN => (ErrorCode::ControlFailed, ops::OUTCOME_UNKNOWN),
         _ => (ErrorCode::ControlFailed, "protocol"),
     };
     let mut details = e
@@ -112,6 +113,10 @@ pub fn to_glen_error(e: OpError, ctx: &ErrCtx<'_>) -> GlenError {
                 ctx.job.unwrap_or("j…")
             ))
         }
+        ops::OUTCOME_UNKNOWN => Some(format!(
+            "the change may have been applied; check `glen models {}`",
+            ctx.handle
+        )),
         ops::JOB_ENDED => Some("the glen job ended; retry on the session".into()),
         "protocol" => Some("check the omp and glen versions, then retry".into()),
         _ => None,
@@ -129,6 +134,23 @@ mod tests {
     use super::*;
     fn models() -> Vec<omp_rpc::ModelInfo> {
         serde_json::from_str(include_str!("../../tests/support/fake_models.json")).unwrap()
+    }
+    #[test]
+    fn c2_1_unknown_outcome_maps_to_control_failed_with_check_hint() {
+        let error = to_glen_error(
+            OpError::new(ops::OUTCOME_UNKNOWN, "disconnected"),
+            &ErrCtx {
+                handle: "abc",
+                route: "job",
+                ..ErrCtx::default()
+            },
+        );
+        assert_eq!(error.code, ErrorCode::ControlFailed);
+        assert_eq!(error.details.unwrap()["reason"], "outcome_unknown");
+        assert_eq!(
+            error.hint.as_deref(),
+            Some("the change may have been applied; check `glen models abc`")
+        );
     }
     #[test]
     fn resolution_exact_pairs_before_case_insensitive_union() {

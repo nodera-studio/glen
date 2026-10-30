@@ -39,6 +39,7 @@ pub const BUSY: &str = "busy";
 pub const OMP_ERROR: &str = "omp_error";
 pub const TIMEOUT: &str = "timeout";
 pub const JOB_ENDED: &str = "job_ended";
+pub const OUTCOME_UNKNOWN: &str = "outcome_unknown";
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SetModelArgs {
     pub provider: String,
@@ -76,6 +77,8 @@ pub struct ModelsData {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ModelSetData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::error::Warning>,
     pub session_id: String,
     pub model: ModelName,
     pub previous: Option<ModelRef>,
@@ -91,6 +94,8 @@ pub struct ModelName {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ThinkingSetData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::error::Warning>,
     pub session_id: String,
     pub thinking_level: Option<String>,
     pub previous: Option<String>,
@@ -100,6 +105,8 @@ pub struct ThinkingSetData {
 }
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CompactData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<crate::error::Warning>,
     pub session_id: String,
     pub tokens_before: Option<i64>,
     pub tokens_after: Option<i64>,
@@ -364,6 +371,7 @@ mod control_tests {
             json!({"session_id":"s","current":null,"thinking_level":null,"models":[]})
         );
         let data = CompactData {
+            warnings: vec![],
             session_id: "s".into(),
             tokens_before: None,
             tokens_after: None,

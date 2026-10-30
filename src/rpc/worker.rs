@@ -812,17 +812,25 @@ impl Worker {
                         self.control_in_flight = Some(req.path.clone());
                         let op = op.clone();
                         let tx = control_tx.clone();
-                        let deadline = req.deadline_ms.and_then(|end| {
-                            Instant::now().checked_add(Duration::from_millis(end.saturating_sub(
-                                jiff::Timestamp::now().as_millisecond().max(0) as u64,
-                            )))
-                        });
+                        let deadline = req
+                            .deadline_ms
+                            .and_then(|end| {
+                                Instant::now().checked_add(Duration::from_millis(
+                                    end.saturating_sub(
+                                        jiff::Timestamp::now().as_millisecond().max(0) as u64,
+                                    ),
+                                ))
+                            })
+                            .map_or(self.deadline, |request| request.min(self.deadline));
+                        let stop = Arc::clone(&self.cancel);
                         scope.spawn(move || {
                             let result = crate::ctl::exec::exec_until(
                                 client,
                                 &op,
                                 req.expect_session_id.as_deref(),
-                                deadline,
+                                Some(deadline),
+                                &stop,
+                                None,
                             );
                             if tx.send((req, result)).is_err() {
                                 eprintln!("worker control receiver closed");

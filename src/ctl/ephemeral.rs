@@ -176,6 +176,7 @@ pub struct Ephemeral {
     deadline: Instant,
     stop: Arc<AtomicBool>,
     warnings: Vec<Warning>,
+    applied_session: Option<String>,
 }
 pub(crate) fn stopped(deadline: Instant, stop: &AtomicBool) -> Result<(), OpError> {
     if stop.load(Ordering::SeqCst) {
@@ -343,6 +344,7 @@ impl Ephemeral {
                         deadline,
                         stop,
                         warnings: vec![],
+                        applied_session: None,
                     });
                 }
                 Ok(Err(error)) => {
@@ -370,7 +372,14 @@ impl Ephemeral {
             return;
         };
         if Arc::strong_count(&client) > 1 {
-            let end = Instant::now() + Duration::from_secs(1);
+            // Stop the peer first so a blocked call releases its client reference.
+            if let Err(error) = self.process.stop(Duration::ZERO) {
+                self.warnings.push(Warning {
+                    code: "teardown_error".into(),
+                    message: format!("cannot stop omp with a blocked control thread: {error}"),
+                });
+            }
+            let end = Instant::now() + Duration::from_millis(100);
             while Arc::strong_count(&client) > 1 && Instant::now() < end {
                 std::thread::sleep(Duration::from_millis(10));
             }
@@ -387,7 +396,7 @@ impl Ephemeral {
             Err(client) => {
                 self.warnings.push(Warning {
                     code: "teardown_error".into(),
-                    message: "omp was stopped but its control thread has not returned".into(),
+                    message: "omp control thread did not return during process teardown".into(),
                 });
                 drop(client);
             }
@@ -406,28 +415,47 @@ impl Ephemeral {
             .ok_or_else(|| OpError::new(ops::OMP_ERROR, "omp client is closed"))?
             .clone();
         let deadline = self.deadline;
+        let stop = Arc::clone(&self.stop);
+        let applied = Arc::new(AtomicBool::new(false));
+        let thread_applied = Arc::clone(&applied);
         std::thread::spawn(move || {
             let result = match op {
-                Some(op) => {
-                    super::exec::exec_until(&client, &op, expect.as_deref(), Some(deadline))
-                }
+                Some(op) => super::exec::exec_until(
+                    &client,
+                    &op,
+                    expect.as_deref(),
+                    Some(deadline),
+                    &stop,
+                    Some(&thread_applied),
+                ),
                 None => super::exec::state(&client).and_then(|s| {
                     serde_json::to_value(s).map_err(|e| OpError::new(ops::INTERNAL, e.to_string()))
                 }),
             };
-            if tx.send(result).is_err() {
-                drop(client);
+            drop(client);
+            if let Err(late) = tx.send(result) {
+                drop(late);
             }
         });
         let result = loop {
-            if let Err(error) = stopped(self.deadline, &self.stop) {
+            if let Ok(result) = rx.try_recv() {
+                break result;
+            }
+            // Once omp confirms application, let the bounded post-state read
+            // finish even if the overall deadline has just passed.
+            if let Err(error) = stopped(self.deadline, &self.stop)
+                && (self.stop.load(Ordering::SeqCst) || !applied.load(Ordering::SeqCst))
+            {
                 self.terminate();
                 break Err(error);
             }
-            match rx.recv_timeout(
+            let wait = if applied.load(Ordering::SeqCst) {
                 Duration::from_millis(100)
-                    .min(self.deadline.saturating_duration_since(Instant::now())),
-            ) {
+            } else {
+                Duration::from_millis(100)
+                    .min(self.deadline.saturating_duration_since(Instant::now()))
+            };
+            match rx.recv_timeout(wait) {
                 Ok(result) => break result,
                 Err(RecvTimeoutError::Timeout) => (),
                 Err(_) => break Err(OpError::new(ops::INTERNAL, "omp control thread ended")),
@@ -455,10 +483,22 @@ impl Ephemeral {
         &self.baseline.session_id
     }
     pub fn call(&mut self, op: &Op, expect: Option<&str>) -> Result<Value, OpError> {
-        self.run(Some(op.clone()), expect.map(str::to_owned))
+        let data = self.run(Some(op.clone()), expect.map(str::to_owned))?;
+        if matches!(
+            op,
+            Op::SetModel(_) | Op::SetThinkingLevel(_) | Op::Compact(_)
+        ) {
+            self.applied_session = data["session_id"].as_str().map(str::to_owned);
+        }
+        Ok(data)
     }
     pub fn finish(mut self) -> Result<(Option<Forked>, Vec<Warning>), OpError> {
-        let final_state = self.run(None, None)?;
+        let final_state = if let Some(id) = &self.applied_session {
+            // The executor already read the post-mutation identity successfully.
+            serde_json::json!({"sessionId":id})
+        } else {
+            self.run(None, None)?
+        };
         let to = final_state["sessionId"]
             .as_str()
             .ok_or_else(|| OpError::new(ops::INTERNAL, "final omp state has no session id"))?;

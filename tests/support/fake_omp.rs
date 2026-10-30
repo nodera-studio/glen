@@ -236,6 +236,7 @@ fn run() -> io::Result<u8> {
     let mut replies: Vec<Value> = vec![];
     let mut reply_index = 0;
     let mut running_queries = 0;
+    let mut state_queries = 0;
     loop {
         if scenario != "wedge" && terminated.load(Ordering::SeqCst) {
             break;
@@ -256,11 +257,17 @@ fn run() -> io::Result<u8> {
                     }
                     "set_event_filter" => response(&f, json!({"events":f["events"]}))?,
                     "get_state" => {
+                        state_queries += 1;
                         let data = json!({"sessionId":id,"sessionFile":session_file,"isStreaming":stage!=0&&stage!=4,"isCompacting":false,"isSettled":stage==0||stage==4,"messageCount":0,"model":model,"thinkingLevel":thinking,"queuedMessageCount":0,"contextUsage":{"tokens":tokens,"contextWindow":200000,"percent":0.617}});
                         if stage != 0 {
                             running_queries += 1;
                         }
-                        let delay = if scenario == "stale_state" && running_queries == 1 {
+                        let delay = if knob("FAKE_OMP_STATE_DELAY_AT")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            == Some(state_queries)
+                        {
+                            ms("FAKE_OMP_PREFLIGHT_DELAY_MS", 0)
+                        } else if scenario == "stale_state" && running_queries == 1 {
                             id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
                             ms("FAKE_OMP_OLD_STATE_DELAY_MS", 1500)
                         } else if stage != 0 {
@@ -329,7 +336,22 @@ fn run() -> io::Result<u8> {
                                 if scenario == "fork_control" {
                                     id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
                                 }
+                                if !delay_while_alive(
+                                    ms("FAKE_OMP_SET_MODEL_DELAY_MS", 0),
+                                    &terminated,
+                                ) {
+                                    break;
+                                }
+                                if knob("FAKE_OMP_SET_MODEL_DROP").as_deref()
+                                    == Some("before_reply")
+                                {
+                                    return Ok(0);
+                                }
                                 response(&f, model.clone())?;
+                                if knob("FAKE_OMP_SET_MODEL_DROP").as_deref() == Some("after_reply")
+                                {
+                                    return Ok(0);
+                                }
                             }
                         } else {
                             reject(

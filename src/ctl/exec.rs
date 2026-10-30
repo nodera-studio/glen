@@ -13,6 +13,7 @@ use omp_rpc::{
 };
 use serde::Serialize;
 use serde_json::{Value, json};
+use std::sync::atomic::{AtomicBool, Ordering};
 polling_command!(ListModels30, GetAvailableModelsCommand, 30_000);
 polling_command!(SetModel30, SetModelCommand, 30_000);
 polling_command!(Levels10, GetAvailableThinkingLevelsCommand, 10_000);
@@ -83,129 +84,178 @@ fn check(state: &SessionState, expect: Option<&str>) -> Result<(), OpError> {
     Ok(())
 }
 pub fn exec(client: &Client, op: &Op, expect: Option<&str>) -> Result<Value, OpError> {
-    exec_until(client, op, expect, None)
+    exec_until(client, op, expect, None, &AtomicBool::new(false), None)
 }
 pub(crate) fn exec_until(
     client: &Client,
     op: &Op,
     expect: Option<&str>,
     deadline: Option<std::time::Instant>,
+    stop: &AtomicBool,
+    applied: Option<&AtomicBool>,
 ) -> Result<Value, OpError> {
     let remaining = || {
-        if deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-            Err(OpError::new(ops::TIMEOUT, "the control deadline passed"))
+        if let Some(deadline) = deadline {
+            super::ephemeral::stopped(deadline, stop)
+        } else if stop.load(Ordering::SeqCst) {
+            Err(OpError::new(
+                "interrupted",
+                "the glen command was interrupted",
+            ))
         } else {
             Ok(())
         }
     };
-    remaining()?;
-    // Check before every mutating call; the final state supplies the post-op id
-    // so the CLI can report an omp fork instead of silently accepting it.
-    let before = state(client)?;
-    check(&before, expect)?;
-    match op {
-        Op::ListModels => {
-            remaining()?;
-            let models = client
-                .call(&ListModels30(GetAvailableModelsCommand {}))
-                .map_err(rpc_error)?;
-            remaining()?;
-            let after = state(client)?;
-            value(ModelsData {
-                session_id: after.session_id.clone(),
-                current: model_ref(&after),
-                thinking_level: thinking(&after),
-                models: models.iter().map(super::row_from_info).collect(),
-            })
+    let mut submitted = false;
+    let result = (|| {
+        remaining()?;
+        // Check before every mutating call; the final state supplies the post-op id
+        // so the CLI can report an omp fork instead of silently accepting it.
+        let before = state(client)?;
+        check(&before, expect)?;
+        match op {
+            Op::ListModels => {
+                remaining()?;
+                let models = client
+                    .call(&ListModels30(GetAvailableModelsCommand {}))
+                    .map_err(rpc_error)?;
+                remaining()?;
+                let after = state(client)?;
+                value(ModelsData {
+                    session_id: after.session_id.clone(),
+                    current: model_ref(&after),
+                    thinking_level: thinking(&after),
+                    models: models.iter().map(super::row_from_info).collect(),
+                })
+            }
+            Op::SetModel(args) => {
+                remaining()?;
+                submitted = true;
+                let model = client
+                    .call(&SetModel30(SetModelCommand {
+                        provider: args.provider.clone(),
+                        model_id: args.model_id.clone(),
+                    }))
+                    .map_err(rpc_error)?;
+                if let Some(applied) = applied {
+                    applied.store(true, Ordering::SeqCst);
+                }
+                let after = state(client)?;
+                let row = super::row_from_info(&model);
+                value(ModelSetData {
+                    warnings: vec![],
+                    session_id: after.session_id.clone(),
+                    model: ModelName {
+                        provider: model.provider,
+                        id: model.id,
+                        name: model.name,
+                    },
+                    previous: model_ref(&before),
+                    thinking_level: thinking(&after),
+                    thinking_levels: row.thinking_levels,
+                    busy: busy(&after),
+                })
+            }
+            Op::SetThinkingLevel(args) => {
+                remaining()?;
+                let available: Vec<_> = client
+                    .call(&Levels10(GetAvailableThinkingLevelsCommand {}))
+                    .map_err(rpc_error)?
+                    .iter()
+                    .map(|l| l.as_str().to_owned())
+                    .collect();
+                if !ops::THINKING_LEVELS.contains(&args.level.as_str())
+                    || !available.contains(&args.level)
+                {
+                    return Err(OpError::new(
+                        ops::INVALID_LEVEL,
+                        format!(
+                            "thinking level {} is unavailable for the current model",
+                            args.level
+                        ),
+                    )
+                    .with_details(json!({"available":available,"model":model_ref(&before)})));
+                }
+                let level = serde_json::from_value(json!(args.level)).map_err(|e| {
+                    OpError::new(ops::BAD_REQUEST, format!("invalid thinking level: {e}"))
+                })?;
+                remaining()?;
+                submitted = true;
+                client
+                    .call(&Thinking10(SetThinkingLevelCommand { level }))
+                    .map_err(rpc_error)?;
+                if let Some(applied) = applied {
+                    applied.store(true, Ordering::SeqCst);
+                }
+                let after = state(client)?;
+                value(ThinkingSetData {
+                    warnings: vec![],
+                    session_id: after.session_id.clone(),
+                    thinking_level: thinking(&after),
+                    previous: thinking(&before),
+                    model: model_ref(&after),
+                    available,
+                    busy: busy(&after),
+                })
+            }
+            Op::Compact(args) => {
+                if busy(&before) || before.is_compacting {
+                    return Err(OpError::new(
+                        ops::BUSY,
+                        "the session is streaming, compacting or has queued messages",
+                    ));
+                }
+                remaining()?;
+                submitted = true;
+                let result = client
+                    .call(&CompactLong(CompactCommand {
+                        custom_instructions: args.instructions.clone(),
+                    }))
+                    .map_err(rpc_error)?;
+                if let Some(applied) = applied {
+                    applied.store(true, Ordering::SeqCst);
+                }
+                let after = state(client)?;
+                value(CompactData {
+                    warnings: vec![],
+                    session_id: after.session_id,
+                    tokens_before: Some(result.tokens_before),
+                    tokens_after: after.context_usage.map(|u| u.tokens),
+                })
+            }
+            _ => Err(OpError::new(
+                ops::UNSUPPORTED_OP,
+                format!("{} is not an RPC control executor op", op.name()),
+            )),
         }
-        Op::SetModel(args) => {
-            remaining()?;
-            let model = client
-                .call(&SetModel30(SetModelCommand {
-                    provider: args.provider.clone(),
-                    model_id: args.model_id.clone(),
-                }))
-                .map_err(rpc_error)?;
-            remaining()?;
-            let after = state(client)?;
-            let row = super::row_from_info(&model);
-            value(ModelSetData {
-                session_id: after.session_id.clone(),
-                model: ModelName {
-                    provider: model.provider,
-                    id: model.id,
-                    name: model.name,
-                },
-                previous: model_ref(&before),
-                thinking_level: thinking(&after),
-                thinking_levels: row.thinking_levels,
-                busy: busy(&after),
-            })
-        }
-        Op::SetThinkingLevel(args) => {
-            remaining()?;
-            let available: Vec<_> = client
-                .call(&Levels10(GetAvailableThinkingLevelsCommand {}))
-                .map_err(rpc_error)?
-                .iter()
-                .map(|l| l.as_str().to_owned())
-                .collect();
-            if !ops::THINKING_LEVELS.contains(&args.level.as_str())
-                || !available.contains(&args.level)
+    })();
+    result
+        .map(|mut data| {
+            if submitted && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
+                data["warnings"] = json!([crate::error::Warning {
+                    code: "deadline_passed_after_apply".into(),
+                    message: "the control deadline passed after the change was applied".into(),
+                }]);
+            }
+            data
+        })
+        .map_err(|error| {
+            if submitted
+                && error.code == ops::OMP_ERROR
+                && error
+                    .details
+                    .as_ref()
+                    .is_some_and(|d| d["transport_closed"] == true)
             {
-                return Err(OpError::new(
-                    ops::INVALID_LEVEL,
-                    format!(
-                        "thinking level {} is unavailable for the current model",
-                        args.level
-                    ),
+                OpError::new(
+                    ops::OUTCOME_UNKNOWN,
+                    "omp disconnected after the change was submitted",
                 )
-                .with_details(json!({"available":available,"model":model_ref(&before)})));
+                .with_details(json!({"reason":ops::OUTCOME_UNKNOWN}))
+            } else {
+                error
             }
-            let level = serde_json::from_value(json!(args.level)).map_err(|e| {
-                OpError::new(ops::BAD_REQUEST, format!("invalid thinking level: {e}"))
-            })?;
-            remaining()?;
-            client
-                .call(&Thinking10(SetThinkingLevelCommand { level }))
-                .map_err(rpc_error)?;
-            remaining()?;
-            let after = state(client)?;
-            value(ThinkingSetData {
-                session_id: after.session_id.clone(),
-                thinking_level: thinking(&after),
-                previous: thinking(&before),
-                model: model_ref(&after),
-                available,
-                busy: busy(&after),
-            })
-        }
-        Op::Compact(args) => {
-            if busy(&before) || before.is_compacting {
-                return Err(OpError::new(
-                    ops::BUSY,
-                    "the session is streaming, compacting or has queued messages",
-                ));
-            }
-            remaining()?;
-            let result = client
-                .call(&CompactLong(CompactCommand {
-                    custom_instructions: args.instructions.clone(),
-                }))
-                .map_err(rpc_error)?;
-            remaining()?;
-            let after = state(client)?;
-            value(CompactData {
-                session_id: after.session_id,
-                tokens_before: Some(result.tokens_before),
-                tokens_after: after.context_usage.map(|u| u.tokens),
-            })
-        }
-        _ => Err(OpError::new(
-            ops::UNSUPPORTED_OP,
-            format!("{} is not an RPC control executor op", op.name()),
-        )),
-    }
+        })
 }
 #[cfg(all(test, unix))]
 mod tests {
@@ -567,6 +617,8 @@ mod fix_cycle_tests {
                 &op,
                 Some("s"),
                 Some(Instant::now() + Duration::from_millis(100)),
+                &AtomicBool::new(false),
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code, ops::TIMEOUT);
@@ -574,5 +626,211 @@ mod fix_cycle_tests {
             client.close().unwrap();
             thread.join().unwrap();
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod c2_tests {
+    use super::*;
+    use std::{
+        io::{BufRead, BufReader, Write},
+        os::unix::net::UnixStream,
+        sync::Arc,
+        time::{Duration, Instant},
+    };
+
+    // None closes the peer at the requested command; the optional hook runs before
+    // its response, so cancellation and deadline races have a deterministic order.
+    fn peer(
+        op: &Op,
+        replies: Vec<(&str, Option<Value>)>,
+        hook: Option<(usize, bool)>,
+    ) -> Result<Value, OpError> {
+        let replies: Vec<_> = replies
+            .into_iter()
+            .map(|(c, v)| (c.to_owned(), v))
+            .collect();
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer_stop = Arc::clone(&stop);
+        let (io, mut server) = UnixStream::pair().unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let thread = std::thread::spawn(move || {
+            writeln!(server, "{}", json!({"type":"ready","protocolVersion":1})).unwrap();
+            let mut reader = BufReader::new(server.try_clone().unwrap());
+            for (index, (command, data)) in replies.into_iter().enumerate() {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let req: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(req["type"], command);
+                if let Some((at, cancel)) = hook
+                    && at == index
+                {
+                    if cancel {
+                        peer_stop.store(true, Ordering::SeqCst);
+                    } else {
+                        std::thread::sleep(Duration::from_millis(300));
+                    }
+                }
+                let Some(data) = data else {
+                    break;
+                };
+                if let Some(error) = data.get("error") {
+                    writeln!(server, "{}", json!({"type":"response","id":req["id"],"command":command,"success":false,"error":error})).unwrap();
+                } else {
+                    writeln!(server, "{}", json!({"type":"response","id":req["id"],"command":command,"success":true,"data":data})).unwrap();
+                }
+            }
+            server.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let (client, _events) = Client::from_io(
+            io.try_clone().unwrap(),
+            io,
+            omp_rpc::ClientOptions {
+                tools: vec![],
+                uris: vec![],
+                ready_timeout: Duration::from_secs(2),
+                default_timeout: Duration::from_secs(1),
+            },
+        )
+        .unwrap();
+        let deadline = hook
+            .filter(|(_, cancel)| !cancel)
+            .map(|_| Instant::now() + Duration::from_millis(200));
+        let result = exec_until(&client, op, Some("s"), deadline, &stop, None);
+        client.close().unwrap();
+        thread.join().unwrap();
+        result
+    }
+    fn mutations() -> Vec<(Op, &'static str, Value)> {
+        let models: Vec<Value> =
+            serde_json::from_str(include_str!("../../tests/support/fake_models.json")).unwrap();
+        vec![
+            (
+                Op::SetModel(ops::SetModelArgs {
+                    provider: "fake".into(),
+                    model_id: "fake-2".into(),
+                }),
+                "set_model",
+                models[1].clone(),
+            ),
+            (
+                Op::SetThinkingLevel(ops::ThinkingArgs {
+                    level: "high".into(),
+                }),
+                "set_thinking_level",
+                json!({}),
+            ),
+            (
+                Op::Compact(ops::CompactArgs::default()),
+                "compact",
+                json!({"summary":"short","firstKeptEntryId":"a","tokensBefore":1234}),
+            ),
+        ]
+    }
+    fn preflight(op: &Op) -> Vec<(&'static str, Option<Value>)> {
+        let mut script = vec![(
+            "get_state",
+            Some(json!({"sessionId":"s","thinkingLevel":"medium"})),
+        )];
+        if matches!(op, Op::SetThinkingLevel(_)) {
+            script.push((
+                "get_available_thinking_levels",
+                Some(json!({"levels":["off","high"]})),
+            ));
+        }
+        script
+    }
+    #[test]
+    fn c2_1_submitted_disconnects_never_become_job_ended() {
+        for (op, command, response) in mutations() {
+            for after_reply in [false, true] {
+                let mut script = preflight(&op);
+                script.push((command, after_reply.then_some(response.clone())));
+                if after_reply {
+                    script.push(("get_state", None));
+                }
+                let error = peer(&op, script, None).unwrap_err();
+                for terminal in [false, true] {
+                    let error = job_error(error.clone(), terminal);
+                    assert_eq!(error.code, ops::OUTCOME_UNKNOWN);
+                    assert_eq!(error.details.unwrap()["reason"], ops::OUTCOME_UNKNOWN);
+                }
+            }
+        }
+    }
+    #[test]
+    fn c2_1_preflight_disconnects_still_become_job_ended() {
+        for (op, _, _) in mutations() {
+            let error = peer(&op, vec![("get_state", None)], None).unwrap_err();
+            assert_eq!(job_error(error, true).code, ops::JOB_ENDED);
+        }
+        let op = &mutations()[1].0;
+        let mut script = preflight(op);
+        script[1].1 = None;
+        assert_eq!(
+            job_error(peer(op, script, None).unwrap_err(), true).code,
+            ops::JOB_ENDED
+        );
+    }
+    #[test]
+    fn c2_2_cancelled_preflight_never_submits_but_submitted_work_finishes() {
+        for (op, command, response) in mutations() {
+            for at in 0..preflight(&op).len() {
+                let script = preflight(&op).into_iter().take(at + 1).collect();
+                assert_eq!(
+                    peer(&op, script, Some((at, true))).unwrap_err().code,
+                    "interrupted"
+                );
+            }
+            let mut script = preflight(&op);
+            let at = script.len();
+            script.push((command, Some(response)));
+            script.push((
+                "get_state",
+                Some(json!({"sessionId":"s","thinkingLevel":"high"})),
+            ));
+            assert!(peer(&op, script, Some((at, true))).is_ok());
+        }
+    }
+    #[test]
+    fn c2_9_deadline_after_apply_warns_and_preserves_success() {
+        for (op, command, response) in mutations() {
+            let mut script = preflight(&op);
+            let at = script.len();
+            script.push((command, Some(response)));
+            script.push((
+                "get_state",
+                Some(json!({"sessionId":"forked","thinkingLevel":"high"})),
+            ));
+            let data = peer(&op, script, Some((at, false))).unwrap();
+            assert_eq!(data["session_id"], "forked");
+            assert_eq!(data["warnings"][0]["code"], "deadline_passed_after_apply");
+            let normalized = match op {
+                Op::SetModel(_) => value(serde_json::from_value::<ModelSetData>(data).unwrap()),
+                Op::SetThinkingLevel(_) => {
+                    value(serde_json::from_value::<ThinkingSetData>(data).unwrap())
+                }
+                _ => value(serde_json::from_value::<CompactData>(data).unwrap()),
+            }
+            .unwrap();
+            assert_eq!(
+                normalized["warnings"][0]["code"],
+                "deadline_passed_after_apply"
+            );
+        }
+    }
+    #[test]
+    fn c2_9_post_apply_state_errors_remain_errors() {
+        let (op, command, response) = mutations().remove(0);
+        let mut script = preflight(&op);
+        let at = script.len();
+        script.push((command, Some(response)));
+        script.push(("get_state", Some(json!({"error":"state unavailable"}))));
+        assert_eq!(
+            peer(&op, script, Some((at, false))).unwrap_err().code,
+            ops::OMP_ERROR
+        );
     }
 }

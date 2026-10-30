@@ -1416,3 +1416,217 @@ fn fix4_startup_stderr_is_drained_into_json_warnings() {
         assert!(!warning(&value, "teardown_error"));
     }
 }
+
+#[test]
+fn c2_1_disconnect_after_submission_reports_unknown_without_retry() {
+    for drop_at in ["before_reply", "after_reply"] {
+        let b = RpcBox::new();
+        let value = checked(
+            command(&b, &["model", "e27c0de", "fake/fake-2", "--json"])
+                .env("FAKE_OMP_SET_MODEL_DROP", drop_at)
+                .output()
+                .unwrap(),
+            7,
+        );
+        assert_eq!(value["error"]["code"], "control_failed");
+        assert_eq!(value["error"]["details"]["reason"], "outcome_unknown");
+        assert_eq!(
+            value["error"]["hint"],
+            "the change may have been applied; check `glen models e27c0de`"
+        );
+        assert_eq!(b.frames_in("set_model").len(), 1);
+        assert_eq!(
+            b.fake_log()
+                .iter()
+                .filter(|r| r["event"] == "start")
+                .count(),
+            1
+        );
+    }
+}
+
+#[test]
+fn c2_1_terminal_job_submitted_control_never_retries() {
+    let b = RpcBox::new();
+    let launched = checked(
+        command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
+            .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
+            .env("FAKE_OMP_SET_MODEL_DELAY_MS", "20000")
+            .output()
+            .unwrap(),
+        10,
+    );
+    let id = job_id(&launched);
+    accepted(&b, id);
+    let child = command(
+        &b,
+        &[
+            "model",
+            "e27c0de",
+            "fake/fake-2",
+            "--timeout",
+            "25s",
+            "--json",
+        ],
+    )
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    poll(Duration::from_secs(3), || {
+        (!b.frames_in("set_model").is_empty()).then_some(())
+    });
+    fs::write(
+        b.job_dir(id).join("control/stop.json"),
+        r#"{"v":1,"op":"abort"}"#,
+    )
+    .unwrap();
+    b.wait_terminal(id, Duration::from_secs(13));
+    let error = checked(child.wait_with_output().unwrap(), 7);
+    assert_eq!(error["error"]["code"], "control_failed");
+    assert_eq!(error["error"]["details"]["reason"], "outcome_unknown");
+    assert_eq!(b.frames_in("set_model").len(), 1);
+    assert_eq!(
+        b.fake_log()
+            .iter()
+            .filter(|r| r["event"] == "start")
+            .count(),
+        1
+    );
+    b.wait_worker_gone(id);
+}
+
+#[test]
+fn c2_2_sigint_during_preflight_exits_130_without_set_model() {
+    let b = RpcBox::new();
+    let child = command(
+        &b,
+        &[
+            "model",
+            "e27c0de",
+            "fake/fake-2",
+            "--timeout",
+            "30s",
+            "--json",
+        ],
+    )
+    .env("FAKE_OMP_STATE_DELAY_AT", "4")
+    .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "20000")
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+    poll(Duration::from_secs(3), || {
+        (b.frames_in("get_state").len() == 4).then_some(())
+    });
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let value = checked(child.wait_with_output().unwrap(), 130);
+    assert_eq!(value["data"]["interrupted"], true);
+    assert!(b.frames_in("set_model").is_empty());
+}
+
+#[test]
+fn c2_4_compact_timeout_unblocks_teardown_promptly() {
+    let b = RpcBox::new();
+    let start = Instant::now();
+    let value = checked(
+        command(&b, &["compact", "e27c0de", "--timeout", "1s", "--json"])
+            .env("FAKE_OMP_COMPACT_DELAY_MS", "20000")
+            .output()
+            .unwrap(),
+        7,
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(1500),
+        "elapsed: {:?}",
+        start.elapsed()
+    );
+    assert_eq!(value["error"]["details"]["reason"], "timeout");
+    assert_eq!(b.frames_in("compact").len(), 1);
+    let pid = b.fake_log().iter().find(|r| r["event"] == "start").unwrap()["pid"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        rustix::process::test_kill_process_group(
+            rustix::process::Pid::from_raw(pid as i32).unwrap()
+        ),
+        Err(rustix::io::Errno::SRCH)
+    );
+}
+
+#[test]
+fn c2_7_inbox_controls_cannot_outlive_job_deadline() {
+    for request_deadline in [Some(json!(u64::MAX)), None, Some(json!("malformed"))] {
+        let b = RpcBox::new();
+        let launched = checked(
+            command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
+                .env("GLEN_JOB_TIMEOUT", "2s")
+                .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
+                .env("FAKE_OMP_STATE_DELAY_MS", "3000")
+                .env("FAKE_OMP_SERIAL", "0")
+                .output()
+                .unwrap(),
+            10,
+        );
+        let id = job_id(&launched);
+        accepted(&b, id);
+        let dir = b.job_dir(id).join("control");
+        fs::create_dir_all(&dir).unwrap();
+        let mut request = json!({"v":1,"op":"set_thinking_level","args":{"level":"high"}});
+        let malformed = request_deadline.as_ref().is_some_and(Value::is_string);
+        if let Some(deadline) = request_deadline {
+            request["deadline_ms"] = deadline;
+        }
+        fs::write(
+            dir.join("c2-deadline.json"),
+            serde_json::to_vec(&request).unwrap(),
+        )
+        .unwrap();
+        let ack = poll(Duration::from_secs(8), || {
+            fs::read(dir.join("c2-deadline.done.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
+        });
+        assert_eq!(
+            ack["error"]["code"],
+            if malformed { "bad_request" } else { "timeout" }
+        );
+        assert!(b.frames_in("set_thinking_level").is_empty());
+        b.wait_terminal(id, Duration::from_secs(8));
+        b.wait_worker_gone(id);
+    }
+}
+
+#[test]
+fn c2_9_success_after_apply_deadline_reaches_cli_with_warning() {
+    let b = RpcBox::new();
+    let value = checked(
+        command(
+            &b,
+            &[
+                "model",
+                "e27c0de",
+                "fake/fake-2",
+                "--timeout",
+                "1s",
+                "--json",
+            ],
+        )
+        // Fifth state request is the post-mutation read (after baseline and listing).
+        .env("FAKE_OMP_STATE_DELAY_AT", "5")
+        .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "1200")
+        .output()
+        .unwrap(),
+        0,
+    );
+    assert_eq!(value["data"]["model"]["id"], "fake-2");
+    assert_eq!(
+        value["data"]["warnings"][0]["code"],
+        "deadline_passed_after_apply"
+    );
+    assert_eq!(b.frames_in("set_model").len(), 1);
+}
