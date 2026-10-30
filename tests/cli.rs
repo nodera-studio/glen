@@ -397,7 +397,7 @@ fn bare_glen_is_a_json_usage_error() {
 }
 
 #[test]
-fn raw_errors_are_human_and_completions_do_not_resolve_glen_home() {
+fn raw_errors_are_human_and_a_relative_glen_home_is_invalid_env_for_completions_too() {
     for args in [
         vec!["completions", "bad"],
         vec!["completions"],
@@ -414,11 +414,32 @@ fn raw_errors_are_human_and_completions_do_not_resolve_glen_home() {
         assert_eq!(json(&o)["error"]["code"], "usage");
         assert!(o.stderr.is_empty());
     }
+    // AC-020 has no trigger restriction: a relative GLEN_HOME is resolved (and rejected) while
+    // building the run, before dispatch, so it is `invalid_env` for `completions` too. An error
+    // is never a script (LOW-004): without `--json`, stdout must stay empty so
+    // `glen completions zsh >> ~/.zshrc` can never append an envelope, and the error renders as
+    // human text on stderr instead.
     let o = glen(&["completions", "bash"], &[("GLEN_HOME", "relative")]);
-    assert!(o.status.success());
-    assert!(!o.stdout.is_empty());
-    assert!(!o.stdout.starts_with(b"{"));
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty());
+    let text = String::from_utf8(o.stderr).unwrap();
+    assert!(text.starts_with("error:"));
+    assert!(text.contains("invalid_env") || text.contains("GLEN_HOME"));
+
+    let o = glen(
+        &["completions", "bash", "--json"],
+        &[("GLEN_HOME", "relative")],
+    );
+    assert_eq!(o.status.code(), Some(2));
     assert!(o.stderr.is_empty());
+    let v = json(&o);
+    assert_eq!(v["error"]["code"], "invalid_env");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("GLEN_HOME")
+    );
 }
 
 #[test]

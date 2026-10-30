@@ -25,6 +25,11 @@ pub fn run() -> ExitCode {
             );
         }
     };
+    // AC-020: a relative GLEN_HOME is invalid for every command, not only ones that touch the
+    // glen home directory. Validate before dispatch; `resolve` never creates the directory.
+    if let Err(e) = glen_home::resolve(&env) {
+        return output::emit_error(&ctx, e);
+    }
     match commands::dispatch(&cli, &env, &ctx) {
         Ok(o) => output::emit(&ctx, o, cli.command.name()),
         Err(e) => output::emit_error(&ctx, e),

@@ -37,7 +37,14 @@ fn writers(
     (
         anstream::AutoStream::new(
             io::stdout().lock(),
-            if ctx.stdout_color { Always } else { Never },
+            // JSON and raw script output never carry ANSI (serde escapes ESC; completion
+            // scripts are static) and must round-trip untrusted bytes such as DEL exactly, so
+            // they bypass stripping rather than going through `Never`.
+            if ctx.stdout_color || matches!(ctx.mode, Mode::Json | Mode::Raw) {
+                Always
+            } else {
+                Never
+            },
         ),
         anstream::AutoStream::new(
             io::stderr().lock(),
@@ -222,7 +229,16 @@ pub fn emit_error_to(
     out: &mut dyn Write,
     err: &mut dyn Write,
 ) -> ExitCode {
-    if ctx.mode == Mode::Json {
+    // `Mode::Raw` only governs successful script output (§A10): stdout must stay pure script
+    // bytes, so an error (env errors included, not just clap usage errors) always renders as
+    // human text on stderr, never a JSON envelope on stdout, for a raw command without
+    // `--json`. `decide_mode` only yields `Raw` when `--json` was not requested.
+    let mode = if ctx.mode == Mode::Raw {
+        Mode::Human
+    } else {
+        ctx.mode
+    };
+    if mode == Mode::Json {
         let mut object = json!({"code":error.code,"message":error.message});
         if let Some(hint) = error.hint {
             object["hint"] = json!(hint);

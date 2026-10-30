@@ -175,7 +175,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - an MCP server: not needed for v0.1.0.
 
 ## §A10 Output contract
-- **Modes.** `--json` → JSON; `--human` → human; otherwise human when stdout is a TTY and JSON when it is not. Raw commands (`completions`) print raw unless `--json` is given. `--help` and `--version` are always text.
+- **Modes.** `--json` → JSON; `--human` → human; otherwise human when stdout is a TTY and JSON when it is not. Raw commands (`completions`) print raw unless `--json` is given. `--help` and `--version` are always text. Without `--json`, a raw command renders every error — usage, env (e.g. a relative `GLEN_HOME`, AC-020) and internal alike — as human text on stderr with an empty stdout, so stdout is never anything but the script itself (e.g. `glen completions zsh >> ~/.zshrc` can never append an envelope); with `--json` the error is the usual JSON envelope on stdout.
 - **Streams.** stdout carries only the result. stderr carries diagnostics, warnings (human mode) and spinners. In JSON mode stderr stays empty except for panics.
 - **Envelope** (`v` = contract version 1; fields are append-only; keys are snake_case; timestamps are RFC 3339 UTC; durations are `*_ms` integers; JSON paths are absolute):
 
