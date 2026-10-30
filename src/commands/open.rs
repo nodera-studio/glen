@@ -69,7 +69,7 @@ pub(crate) fn open(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError>
 pub(crate) fn open_follow(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
     open_mode(cli, env, arg, true, true)
 }
-pub(crate) fn open_for_send(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
+pub(crate) fn open_unprobed(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
     open_mode(cli, env, arg, false, false)
 }
 fn open_mode(
@@ -104,7 +104,10 @@ fn open_mode(
         let lease = if probe {
             lease::probe(&paths.session_owners_dir, &summary.id)
         } else {
-            Lease::Unknown("not probed".into())
+            Lease::Unknown {
+                reason: "not probed".into(),
+                errno: None,
+            }
         };
         if explicit_path {
             catalog.assign_handles(Some(&summary.id));
@@ -164,7 +167,10 @@ fn open_mode(
     let lease = if probe {
         lease::probe(&paths.session_owners_dir, &session.header.id)
     } else {
-        Lease::Unknown("not probed".into())
+        Lease::Unknown {
+            reason: "not probed".into(),
+            errno: None,
+        }
     };
     let extension = if probe {
         endpoint_state(&registries, &session.header.id)

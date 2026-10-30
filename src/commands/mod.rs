@@ -2,6 +2,7 @@ pub mod completions;
 pub mod doctor;
 pub mod inbox;
 pub mod install_extension;
+pub mod install_skill;
 pub mod jobs;
 pub mod ls;
 mod open;
@@ -29,6 +30,7 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
         Command::Tail(a) => tail::run(cli, a, env, ctx),
         Command::Show(a) => show::run(cli, a, env, ctx),
         Command::Ls(a) => ls::run(cli, a, env, ctx),
+        Command::InstallSkill(a) => install_skill::run(a, env, ctx),
         Command::Doctor(_) => doctor::run(cli, env, ctx),
         Command::Completions(args) => completions::run(args),
         cmd => Err(GlenError::new(

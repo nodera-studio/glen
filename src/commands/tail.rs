@@ -293,7 +293,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
             return stream.end(130);
         }
         thread::sleep(POLL);
-        match open::open_for_send(cli, env, &o.session.header.id) {
+        match open::open_unprobed(cli, env, &o.session.header.id) {
             Ok(next) if !next.not_yet_persisted => o = next,
             Ok(_) => endpoint_missing = None,
             Err(e) if e.code == ErrorCode::NotFound => {

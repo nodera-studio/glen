@@ -77,6 +77,8 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
 - Branch off `main`, PR into `main`. No direct pushes to `main`.
 - `site/` never imports `framer-motion`; motion comes from `motion/react` through `IslandRoot`.
   morphin items are refreshed in `site/vendor/morphin/` and ported by hand (`site/morphin.json`).
+- The agent skill template is `skill/glen/SKILL.md`; edit it there, never an installed copy.
+  `cargo test --test skill_contract` keeps it honest. The JSON contract is [docs/json.md](docs/json.md).
 - The CLI palette lives in `src/render/palette.json`; `palette_contract` keeps `style()` in step.
 
 ## Mnemosyne

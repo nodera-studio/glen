@@ -15,6 +15,18 @@ pub enum ErrorCode {
     NotImplemented,
 }
 impl ErrorCode {
+    pub const ALL: [Self; 10] = [
+        Self::Internal,
+        Self::Io,
+        Self::Usage,
+        Self::InvalidEnv,
+        Self::NotFound,
+        Self::Ambiguous,
+        Self::OmpUnavailable,
+        Self::NoRoute,
+        Self::JobFailed,
+        Self::NotImplemented,
+    ];
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Internal => "internal",
@@ -118,7 +130,7 @@ mod tests {
     use super::*;
     #[test]
     fn mappings() {
-        for (c, n, name) in [
+        let table = [
             (ErrorCode::Internal, 1, "internal"),
             (ErrorCode::Io, 1, "io"),
             (ErrorCode::Usage, 2, "usage"),
@@ -129,7 +141,10 @@ mod tests {
             (ErrorCode::NoRoute, 6, "no_route"),
             (ErrorCode::JobFailed, 7, "job_failed"),
             (ErrorCode::NotImplemented, 8, "not_implemented"),
-        ] {
+        ];
+        assert_eq!(table.len(), ErrorCode::ALL.len());
+        for (c, (expected, n, name)) in ErrorCode::ALL.into_iter().zip(table) {
+            assert_eq!(c, expected);
             assert_eq!(c.exit_code(), n);
             assert_eq!(c.as_str(), name);
             assert_eq!(serde_json::to_string(&c).unwrap(), format!("\"{name}\""));

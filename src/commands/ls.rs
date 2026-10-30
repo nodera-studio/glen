@@ -57,7 +57,10 @@ fn read_endpoint_row(
         return Some(Row {
             summary,
             handle: String::new(),
-            lease: Lease::Unknown("extension".into()),
+            lease: Lease::Unknown {
+                reason: "extension".into(),
+                errno: None,
+            },
             state: if h.busy { State::Busy } else { State::Live },
             source: "extension",
             detail: h.mode.clone(),

@@ -42,6 +42,7 @@ fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
             "help",
             "inbox",
             "install-extension",
+            "install-skill",
             "jobs",
             "ls",
             "send",

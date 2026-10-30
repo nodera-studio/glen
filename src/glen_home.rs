@@ -52,6 +52,9 @@ impl GlenHome {
     }
 }
 pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic(path, bytes, 0o600)
+}
+pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name required"))?
@@ -67,7 +70,7 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(mode);
     }
     let mut file = options.open(&tmp)?;
     let result = (|| {

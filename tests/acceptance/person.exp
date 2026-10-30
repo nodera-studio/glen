@@ -1,0 +1,111 @@
+#!/usr/bin/expect -f
+# The real binary must own stdout's pty; a tee wrapper would select JSON instead.
+set plan {
+  {glen --version => 0}
+  {glen doctor => 0}
+  {glen ls => 0; R/L/X, live glyph and ANSI}
+  {glen show R => 0; Acceptance R}
+  {glen tail R -n 2 => 0}
+  {glen send R NONCE_A1 => 0; answer nonce}
+  {glen send R sleep-15 NONCE_A2 --wait 2s => 10; capture job}
+  {glen wait JOB --timeout 120s => 0; answer nonce}
+  {glen jobs => 0}
+  {glen send L glen_reply NONCE_A3 => 0; reply arrow and nonce}
+  {glen inbox => 0; nonce}
+  {glen send X hello => 6; stderr error and hint}
+  {glen install-skill --project --dry-run => 0; would install}
+  {glen install-skill --project => 0; installed twice}
+  {glen install-skill --project => 0; unchanged twice}
+  {glen completions zsh | head -1 => 0; #compdef glen}
+  {if controls visible: models R => 0; send L sleep --no-wait => 10; abort L => 0}
+}
+if {[info exists env(ACC_DRY)] && $env(ACC_DRY) eq "1"} {
+  puts [join $plan "\n"]
+  exit 0
+}
+if {$argc != 1} {puts stderr "usage: person.exp S (or ACC_DRY=1)"; exit 2}
+set S [file normalize [lindex $argv 0]]
+proc field {name} {global S; return [exec jq -r $name "$S/manifest.json"]}
+set P [field .project]
+set R [field .R.handle]; set L [field .L.handle]; set X [field .X.handle]
+set n1 "A1-[clock seconds]"; set n2 "A2-[clock seconds]"; set n3 "A3-[clock seconds]"
+set started [clock milliseconds]
+set number 0
+proc quote {value} {return "'[string map [list ' '\\''] $value]'"}
+proc fail {message} {
+  global S
+  set f [open "$S/person-verdict.json" w]; puts $f {"pass":false}; close $f
+  puts stderr "FAIL AC-414: $message"
+  exit 1
+}
+proc step {command code {pattern {}} {human 1}} {
+  global number started expect_out
+  if {[clock milliseconds]-$started > 900000} {fail "15-minute budget exceeded"}
+  incr number
+  set timeout 150
+  # Consume the terminal echo separately: nonces in commands cannot prove a reply.
+  send -- "$command; printf '\\n__GLEN_EXIT_$number=%s__\\n' \$?\r"
+  expect -re {\r?\n}
+  expect {
+    -re "\r?\n__GLEN_EXIT_$number=(\[0-9\]+)__\r?\n" {
+      set got $expect_out(1,string); set output $expect_out(buffer)
+      if {$got != $code} {fail "$command: exit $got, wanted $code"}
+    }
+    timeout {fail "$command timed out"}
+    eof {fail "$command closed the shell"}
+  }
+  if {[string match *panicked* $output]} {fail "panic"}
+  if {$human && [regexp {(^|\n)\{"v"} $output]} {fail "JSON in human step"}
+  if {$pattern ne "" && ![regexp -- $pattern $output]} {fail "$command missing $pattern"}
+  expect -exact "acc> "
+  return $output
+}
+unset -nocomplain env(OMP_PROFILE) env(PI_PROFILE)
+set env(GLEN_HOME) "$S/home"
+set env(PI_CODING_AGENT_DIR) [field .agent_dir]
+set env(TERM) xterm-256color
+set env(COLUMNS) 100
+set env(PATH) "$S/glen-bin:$env(PATH)"
+cd $P
+log_file -noappend "$S/a-person.typescript"
+spawn bash --norc --noprofile -i
+set timeout 10
+expect -re {[$#] }
+send -- "PS1='acc> '\r"
+expect -re {\r?\n}
+expect -exact "acc> "
+step {glen --version} 0 {glen [0-9]}
+step {glen doctor} 0 {glen doctor}
+set listing [step {glen ls} 0 {●|◐}]
+if {![regexp {\x1b\[} $listing]} {fail "ls has no ANSI escape"}
+foreach h [list $R $L $X] {if {![string match *$h* $listing]} {fail "ls missing $h"}}
+step "glen show $R" 0 {Acceptance R}
+step "glen tail $R -n 2" 0
+step "glen send $R [quote "Reply with exactly $n1"]" 0 $n1
+set running [step "glen send $R [quote "Use the bash tool to run sleep 15, then reply with exactly $n2"] --wait 2s" 10 {glen wait j[0-9a-f]{7}}]
+if {![regexp {glen wait (j[0-9a-f]{7})} $running -> job]} {fail "missing running job"}
+step "glen wait $job --timeout 120s" 0 $n2
+step {glen jobs} 0
+step "glen send $L [quote "Call glen_reply with text $n3 and final true, then answer done."]" 0 "↩\[^\r\n\]*$n3"
+step {glen inbox} 0 $n3
+set refused [step "glen send $X hello" 6 {error:}]
+if {![string match *hint:* $refused]} {fail "missing refusal hint"}
+step {glen install-skill --project --dry-run} 0 {would install}
+set installed [step {glen install-skill --project} 0 {installed}]
+if {[regexp -all {installed} $installed] < 2} {fail "expected two installed skills"}
+set unchanged [step {glen install-skill --project} 0 {unchanged}]
+if {[regexp -all {unchanged} $unchanged] < 2} {fail "expected two unchanged skills"}
+step {glen completions zsh | head -1} 0 {#compdef glen} 0
+set help [step {glen --help} 0]
+if {[regexp {\n +abort +} $help]} {
+  step "glen models $R" 0
+  step "glen send $L [quote {Use the bash tool to run sleep 30, then answer late.}] --no-wait" 10
+  step "glen abort $L" 0
+}
+send -- "exit\r"
+expect eof
+log_file
+exec perl -pe {s/\e\[[0-9;?]*[ -\/]*[@-~]//g} "$S/a-person.typescript" > "$S/a-person.stripped.typescript"
+set f [open "$S/person-verdict.json" w]
+puts $f "\{\"pass\":true,\"duration_ms\":[expr {[clock milliseconds]-$started}],\"steps\":$number\}"
+close $f

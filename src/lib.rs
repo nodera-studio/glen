@@ -8,6 +8,8 @@ pub mod omp;
 pub mod output;
 pub mod render;
 pub mod rpc;
+pub mod sandbox;
+pub mod skill;
 use clap::Parser;
 use std::{ffi::OsString, process::ExitCode};
 pub fn run() -> ExitCode {

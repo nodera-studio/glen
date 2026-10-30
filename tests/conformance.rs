@@ -10,6 +10,8 @@
 //!   amendment and the conformance clarifications; §A3–§A11, §A15): live,
 //!   extension, inbox, w3_surface, with the `live_support` harness driving the `fake_ext` example
 //!   peer and in-test unix-socket endpoints.
+//! - W4 (`.claude/plans/v010-wave-4-agent.md`, AC-401…AC-413 and AC-419; O3, O5–O7; §A9–§A13 and
+//!   `docs/json.md`): agent. The acceptance modes (AC-414…AC-418, AC-420, AC-421) need real omp.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!
@@ -27,6 +29,8 @@ mod rpc_support;
 #[path = "conformance/support.rs"]
 mod support;
 
+#[path = "conformance/agent.rs"]
+mod agent;
 #[path = "conformance/cli_surface.rs"]
 mod cli_surface;
 #[path = "conformance/color.rs"]

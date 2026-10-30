@@ -117,7 +117,7 @@ For each inconsistency, report:
 
 Dispatch via the Agent tool with `subagent_type: "codex:codex-rescue"`, read-only (state it
 in the prompt), in the foreground: end the prompt with
-"--wait. Run in the foreground: wait for the Codex task to finish and return its full result;
+"Do NOT write any file: return the full result as your final message text. --wait. Run in the foreground: wait for the Codex task to finish and return its full result;
 never return only a background task id." Never `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook
 blocks both.
 

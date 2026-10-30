@@ -352,7 +352,8 @@ fn ac027_commands_do_not_create_glen_home_or_omp_dirs() {
         (&["install-extension", "--dry-run"], false),
         (&["inbox"], false),
         (&["inbox", "--peek"], false),
-        (&["install-skill"], false),
+        (&["install-skill", "--dry-run"], false),
+        (&["install-skill", "--project", "--dry-run"], false),
         (&["completions", "zsh"], false),
         (&["bogus"], false),
     ];

@@ -20,7 +20,7 @@ dual-engine dispatch (`.claude/agents/debug/{investigator|queue}.md` +
 
 <rules>
 - Dual-engine is mandatory — always dispatch both the Claude agent AND Codex.
-  The `codex:codex-rescue` brief ends with "--wait. Run in the foreground: wait for the
+  The `codex:codex-rescue` brief ends with "Do NOT write any file: return the full result as your final message text. --wait. Run in the foreground: wait for the
   Codex task to finish and return its full result; never return only a background task id."
   Cross-model consensus is the point of /deep-debug.
 - The adversarial loop is mandatory (separate Agent dispatch, fresh context).

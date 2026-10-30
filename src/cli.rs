@@ -20,7 +20,13 @@ pub struct GlobalArgs {
     pub json: bool,
     #[arg(long, global = true, help = "Print human-readable output")]
     pub human: bool,
-    #[arg(long, global = true, value_enum, default_value = "auto")]
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        default_value = "auto",
+        help = "when to colour output"
+    )]
     pub color: ColorWhen,
     #[arg(
         long,
@@ -89,18 +95,24 @@ pub enum Command {
   glen install-extension --uninstall"
     )]
     InstallExtension(InstallExtensionArgs),
-    #[command(hide = true, about = "Install glen agent skills")]
+    #[command(
+        about = "Install the glen skill for Claude Code and Codex",
+        after_help = "Examples:\n  glen install-skill\n  glen install-skill --codex --project\n  glen install-skill --dry-run\n  glen install-skill --uninstall"
+    )]
     InstallSkill(InstallSkillArgs),
-    #[command(about = "Check omp, paths and glen home")]
+    #[command(about = "Check omp, paths, glen home, skills and the shell sandbox")]
     Doctor(DoctorArgs),
-    #[command(about = "Generate shell completions")]
+    #[command(
+        about = "Generate shell completions",
+        after_help = "Install:\n  glen completions zsh > ~/.zfunc/_glen\n  glen completions bash > ~/.local/share/bash-completion/completions/glen\n  glen completions fish > ~/.config/fish/completions/glen.fish"
+    )]
     Completions(CompletionsArgs),
 }
 #[derive(Debug, Args)]
 pub struct LsArgs {
-    #[arg(long, conflicts_with = "cwd")]
+    #[arg(long, conflicts_with = "cwd", help = "list every project")]
     pub all: bool,
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "list this project directory")]
     pub cwd: Option<PathBuf>,
     #[arg(
         short = 'n',
@@ -109,9 +121,9 @@ pub struct LsArgs {
         help = "maximum rows (0 = no limit)"
     )]
     pub limit: usize,
-    #[arg(long)]
+    #[arg(long, help = "show open sessions only")]
     pub live: bool,
-    #[arg(long,value_name="DUR",value_parser=parse_since)]
+    #[arg(long,value_name="DUR",value_parser=parse_since,help="updated within this duration")]
     pub since: Option<Duration>,
 }
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -122,16 +134,23 @@ pub enum Tools {
 }
 #[derive(Debug, Args)]
 pub struct ShowArgs {
+    #[arg(help = "session handle or @latest")]
     pub session: String,
-    #[arg(long)]
+    #[arg(long, help = "include model thinking")]
     pub thinking: bool,
-    #[arg(long, value_enum, default_value = "collapsed")]
+    #[arg(
+        long,
+        value_enum,
+        default_value = "collapsed",
+        help = "tool-call detail"
+    )]
     pub tools: Tools,
-    #[arg(long)]
+    #[arg(long, help = "return omp records unchanged")]
     pub raw: bool,
 }
 #[derive(Debug, Args)]
 pub struct TailArgs {
+    #[arg(help = "session handle or @latest")]
     pub session: String,
     #[arg(
         short = 'n',
@@ -140,9 +159,9 @@ pub struct TailArgs {
         help = "items (0 = only new with -f)"
     )]
     pub lines: usize,
-    #[arg(short = 'f', long)]
+    #[arg(short = 'f', long, help = "follow new items until interrupted")]
     pub follow: bool,
-    #[arg(long)]
+    #[arg(long, help = "include model thinking")]
     pub thinking: bool,
 }
 #[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq)]
@@ -179,6 +198,7 @@ pub struct SendArgs {
     #[arg(
         long,
         value_name = "DIR",
+        value_hint = clap::ValueHint::DirPath,
         help = "with @new: the new session’s directory; with @latest: the project to pick from"
     )]
     pub cwd: Option<PathBuf>,
@@ -245,23 +265,27 @@ pub struct InstallExtensionArgs {
 }
 #[derive(Debug, Args)]
 pub struct InstallSkillArgs {
-    #[arg(long)]
+    #[arg(long, help = "only Claude Code")]
     pub claude: bool,
-    #[arg(long)]
+    #[arg(long, help = "only Codex")]
     pub codex: bool,
-    #[arg(long)]
+    #[arg(
+        long,
+        help = "write into this directory’s .claude/skills and .agents/skills"
+    )]
     pub project: bool,
-    #[arg(long)]
+    #[arg(long, help = "show what would change")]
     pub dry_run: bool,
-    #[arg(long)]
+    #[arg(long, help = "replace a modified, newer or foreign SKILL.md")]
     pub force: bool,
-    #[arg(long)]
+    #[arg(long, help = "remove the skill")]
     pub uninstall: bool,
 }
 #[derive(Debug, Args)]
 pub struct DoctorArgs {}
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
+    #[arg(help = "shell to generate completions for")]
     pub shell: clap_complete::Shell,
 }
 impl Command {
@@ -424,5 +448,28 @@ mod rpc_tests {
                 .get_subcommands()
                 .any(|c| c.get_name() == "__worker")
         );
+    }
+}
+
+#[cfg(test)]
+mod help_tests {
+    #[test]
+    fn every_visible_arg_has_help() {
+        let mut cmd = super::public_command();
+        cmd.build();
+        for command in std::iter::once(&cmd).chain(cmd.get_subcommands()) {
+            for arg in command
+                .get_arguments()
+                .filter(|a| !a.is_hide_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+            {
+                assert!(
+                    arg.get_help()
+                        .is_some_and(|h| !h.to_string().trim().is_empty()),
+                    "{} {}",
+                    command.get_name(),
+                    arg.get_id()
+                );
+            }
+        }
     }
 }

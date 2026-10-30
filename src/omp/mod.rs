@@ -69,3 +69,5 @@ pub(crate) mod fixtures {
             .path
     }
 }
+
+pub mod dotenv;

@@ -92,6 +92,18 @@ return its full result as your final message; never return only a background tas
 pass. Use `--background` only when the user asks for it; a user's own `/codex` request keeps
 whatever mode they chose.
 
+### Artifacts come back as text, never as files
+
+The `codex:codex-rescue` sandbox is workspace-write and does not escalate: Codex can write
+only inside its own cwd, which follows your shell's current directory at dispatch time (often
+a worktree). A planner told to write its plan into the main checkout's
+`.claude/plans/<slug>.private/plan-2.md` failed on that write. So every codex-rescue brief that
+produces an artifact (planner, architect, reviewer, auditor, advisor) says "do NOT write any
+file; return the full artifact as your final message text", and never names an output path
+outside Codex's cwd (in practice: names none). The orchestrator saves the returned text where
+it belongs. This does not apply to the Implementer (`coder-codex.md`), whose job is writing
+product code inside the worktree it runs in.
+
 ### Cancelling a Codex job (TaskStop is not enough)
 
 Stopping the Claude agent that launched Codex (TaskStop on `impl-coder-codex`, or a
@@ -111,6 +123,11 @@ processes keep running and keep editing the worktree. Whenever you stop a Codex-
    --pid-file` as a fixed string, so neither your own shell nor other worktrees' brokers are
    hit. It is in `.claude/agents/implementation/coder-codex.md` → "Cancelling a run".
 3. Confirm `git -C <worktree> status --short` is unchanged 30 s later before reusing it.
+
+The broker also survives a run that ended normally and the removal of its worktree. Before
+removing a worktree any Codex run used, stop its broker and then sweep orphans (brokers whose
+`--cwd` no longer exists, only under this repo's `.claude/worktrees/`):
+`implementation/orchestrator.md` → Role 1 → "Removing a worktree".
 
 Resolve `COMPANION` as in `coder-codex.md` Step 2:
 

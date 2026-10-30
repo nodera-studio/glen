@@ -53,6 +53,9 @@ Modes: `--version`, `--mode rpc [--no-ui] [--profile NAME] [--resume FILE]`, and
 `in` / `out` carry a frame; `exit` carries the reason. Tests poll these records and status files as readiness
 signals, then wait for worker and omp teardown before releasing their temporary directories.
 
+W4 JSON contract runners reuse these reader fixtures and the `fake_omp` scenarios
+(ok, delayed, fork, error and hold-lease); no contract test reads a live omp home.
+
 ## Fake extension peer (`fake_ext` example)
 
 `tests/support/fake_ext.rs` binds a private Unix socket and publishes a session registry under a test-owned short GLEN_HOME. It never opens an omp transcript or append gate. `LiveBox` starts it, waits for ready, and kills/reaps it at teardown.

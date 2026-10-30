@@ -69,6 +69,7 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
         "help",
         "inbox",
         "install-extension",
+        "install-skill",
         "jobs",
         "ls",
         "send",

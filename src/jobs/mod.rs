@@ -209,43 +209,58 @@ impl JobStore {
         self.root.is_dir()
     }
     pub fn create(&self, job: &Job) -> Result<(), GlenError> {
-        let id = JobId::parse(&job.id)
-            .ok_or_else(|| GlenError::new(ErrorCode::Internal, "invalid job id"))?;
-        self.home.ensure_dir("jobs").map_err(|e| {
+        self.create_mapped(job, |path, e| {
             GlenError::new(
                 ErrorCode::Io,
-                format!("cannot create {}: {e}", self.root.display()),
+                format!("cannot write {}: {e}", path.display()),
             )
-        })?;
+        })
+    }
+    pub fn create_for_send(&self, job: &Job, env: &crate::env::Env) -> Result<(), GlenError> {
+        self.create_mapped(job, |path, e| {
+            let mut error = crate::sandbox::map_home_write(env, "send", e);
+            error.message = format!("{} (write target {})", error.message, path.display());
+            error
+        })
+    }
+    fn create_mapped(
+        &self,
+        job: &Job,
+        map: impl Fn(&Path, io::Error) -> GlenError,
+    ) -> Result<(), GlenError> {
+        let id = JobId::parse(&job.id)
+            .ok_or_else(|| GlenError::new(ErrorCode::Internal, "invalid job id"))?;
+        self.home
+            .ensure_dir("jobs")
+            .map_err(|e| map(&self.root, e))?;
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(self.dir(&id)).map_err(|e| {
-            GlenError::new(
-                if e.kind() == io::ErrorKind::AlreadyExists {
-                    ErrorCode::Internal
-                } else {
-                    ErrorCode::Io
-                },
-                format!(
-                    "cannot create job {} at {}: {e}",
-                    id.as_str(),
-                    self.dir(&id).display()
-                ),
-            )
+        let dir = self.dir(&id);
+        builder.create(&dir).map_err(|e| {
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                GlenError::new(
+                    ErrorCode::Internal,
+                    format!("cannot create job {} at {}: {e}", job.handle, dir.display()),
+                )
+            } else {
+                map(&dir, e)
+            }
         })?;
-        write_json(&self.dir(&id).join("job.json"), job)?;
-        self.write_status(
-            &id,
+        write_json_mapped(&dir.join("job.json"), job, &map)?;
+        let _lock = self.status_lock_mapped(&id, &map)?;
+        write_json_mapped(
+            &dir.join("status.json"),
             &Status {
                 v: 1,
                 status: State::Queued,
                 updated_at: job.created_at.clone(),
                 ..Status::default()
             },
+            &map,
         )
     }
     pub fn read_job(&self, id: &JobId) -> Result<Job, GlenError> {
@@ -262,6 +277,13 @@ impl JobStore {
         write_json(&self.dir(id).join("status.json"), s)
     }
     pub(crate) fn status_lock(&self, id: &JobId) -> Result<fs::File, GlenError> {
+        self.status_lock_mapped(id, &|_, e| GlenError::from(e))
+    }
+    fn status_lock_mapped(
+        &self,
+        id: &JobId,
+        map: &impl Fn(&Path, io::Error) -> GlenError,
+    ) -> Result<fs::File, GlenError> {
         let path = self.dir(id).join("status.lock");
         let mut opts = OpenOptions::new();
         opts.read(true).write(true).create(true).truncate(false);
@@ -271,15 +293,18 @@ impl JobStore {
             opts.mode(0o600);
         }
         let file = opts.open(&path).map_err(|e| {
-            GlenError::new(
-                ErrorCode::Io,
-                format!("cannot open {} for writing: {e}", path.display()),
+            map(
+                &path,
+                io::Error::new(
+                    e.kind(),
+                    format!("cannot open {} for writing: {e}", path.display()),
+                ),
             )
         })?;
         file.lock().map_err(|e| {
-            GlenError::new(
-                ErrorCode::Io,
-                format!("cannot lock {}: {e}", path.display()),
+            map(
+                &path,
+                io::Error::new(e.kind(), format!("cannot lock {}: {e}", path.display())),
             )
         })?;
         Ok(file)
@@ -383,16 +408,26 @@ fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, GlenError> {
         .map_err(|e| GlenError::new(ErrorCode::Internal, format!("{}: {e}", path.display())))
 }
 pub(crate) fn write_json<T: Serialize>(path: &Path, value: &T) -> Result<(), GlenError> {
-    let mut b = serde_json::to_vec_pretty(value)
-        .map_err(|e| GlenError::new(ErrorCode::Internal, e.to_string()))?;
-    b.push(b'\n');
-    write_private_atomic(path, &b).map_err(|e| {
+    write_json_mapped(path, value, &|path, e| {
         GlenError::new(
             ErrorCode::Io,
             format!("cannot write {}: {e}", path.display()),
         )
+    })
+}
+fn write_json_mapped<T: Serialize>(
+    path: &Path,
+    value: &T,
+    map: &impl Fn(&Path, io::Error) -> GlenError,
+) -> Result<(), GlenError> {
+    let mut b = serde_json::to_vec_pretty(value).map_err(|e| {
+        GlenError::new(
+            ErrorCode::Internal,
+            format!("cannot serialize {}: {e}", path.display()),
+        )
     })?;
-    Ok(())
+    b.push(b'\n');
+    write_private_atomic(path, &b).map_err(|e| map(path, e))
 }
 pub(crate) fn append_line(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut opts = OpenOptions::new();

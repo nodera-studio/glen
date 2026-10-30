@@ -105,6 +105,22 @@ fn human_warnings(ctx: &OutputCtx, warnings: &[Warning], err: &mut dyn Write) ->
     }
     err.flush()
 }
+fn home_write_error(
+    ctx: &OutputCtx,
+    command: &str,
+    path: &std::path::Path,
+    action: &str,
+    e: io::Error,
+) -> GlenError {
+    if crate::sandbox::restricted(&ctx.env, &e) {
+        crate::sandbox::map_home_write(&ctx.env, command, e)
+    } else {
+        GlenError::new(
+            ErrorCode::Io,
+            format!("cannot {action} {}: {e}", path.display()),
+        )
+    }
+}
 fn spill(
     ctx: &OutputCtx,
     bytes: &[u8],
@@ -133,21 +149,13 @@ fn spill(
     } else {
         Value::Null
     };
-    home.ensure_dir("out").map_err(|e| {
-        GlenError::new(
-            ErrorCode::Io,
-            format!("cannot create {}: {e}", dir.display()),
-        )
-    })?;
+    home.ensure_dir("out")
+        .map_err(|e| home_write_error(ctx, command, &dir, "create", e))?;
     // Human output can be explicitly forced to colour on a pipe. Spill files stay plain.
     let plain = anstream::adapter::strip_str(std::str::from_utf8(bytes).map_err(io::Error::other)?)
         .to_string();
-    write_private_atomic(&path, plain.as_bytes()).map_err(|e| {
-        GlenError::new(
-            ErrorCode::Io,
-            format!("cannot write {}: {e}", path.display()),
-        )
-    })?;
+    write_private_atomic(&path, plain.as_bytes())
+        .map_err(|e| home_write_error(ctx, command, &path, "write", e))?;
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             if entry.path() != path
@@ -203,7 +211,8 @@ pub fn emit_to(
         Ok(bytes) => bytes,
         Err(e) => return emit_error_to(ctx, e.into(), out, err),
     };
-    let bytes = if !ctx.stdout_tty
+    let bytes = if !(command == "install-skill" && outcome.data["dry_run"] == true)
+        && !ctx.stdout_tty
         && ctx.mode != Mode::Raw
         && ctx.max_output.is_some_and(|max| {
             anstream::adapter::strip_str(&String::from_utf8_lossy(&bytes))
@@ -355,6 +364,25 @@ mod tests {
             },
         )
         .unwrap()
+    }
+    #[test]
+    fn readonly_spill_failure_maps_for_host_network_disabled_commands() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = ctx(t.path(), Mode::Json, false);
+        c.env = crate::env::Env::for_test(
+            Some(t.path()),
+            t.path(),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        let error = home_write_error(
+            &c,
+            "show",
+            &t.path().join("out"),
+            "write",
+            io::ErrorKind::ReadOnlyFilesystem.into(),
+        );
+        assert_eq!(error.code, ErrorCode::NoRoute);
+        assert_eq!(error.details.unwrap()["glen_home_writable"], false);
     }
     #[test]
     fn success_contract_and_warnings() {

@@ -55,6 +55,7 @@ fn ac001_help_lists_exactly_the_visible_commands() {
                 "help",
                 "inbox",
                 "install-extension",
+                "install-skill",
                 "jobs",
                 "ls",
                 "send",
@@ -108,6 +109,7 @@ fn a9_every_command_accepts_help_and_version() {
         "jobs",
         "inbox",
         "install-extension",
+        "install-skill",
         "doctor",
         "completions",
     ]
@@ -141,7 +143,7 @@ fn hidden_commands_still_have_help_pages() {
 #[test]
 fn ac002_hidden_commands_exit_8_not_implemented() {
     let sb = Sandbox::new();
-    let invocations: [&[&str]; 2] = [&["watch"], &["install-skill"]];
+    let invocations: [&[&str]; 1] = [&["watch"]];
     for args in invocations {
         let out = sb.glen(args).run();
         let err = out.error_envelope("not_implemented");
@@ -168,18 +170,7 @@ fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
 #[test]
 fn a9_declared_arguments_of_hidden_commands_parse() {
     let sb = Sandbox::new();
-    let valid: &[&[&str]] = &[
-        &["watch", "abc1234"],
-        &[
-            "install-skill",
-            "--claude",
-            "--codex",
-            "--project",
-            "--dry-run",
-            "--force",
-            "--uninstall",
-        ],
-    ];
+    let valid: &[&[&str]] = &[&["watch", "abc1234"]];
     for args in valid {
         sb.glen(*args).run().error_envelope("not_implemented");
     }
@@ -290,6 +281,7 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "jobs",
             "inbox",
             "install-extension",
+            "install-skill",
         ] {
             assert!(contains_command_word(&script, name), "{shell} lacks {name}");
         }
@@ -376,6 +368,25 @@ fn a9_live_arguments_parse() {
     for args in [
         vec!["inbox", "--session", "abc1234", "--peek", "--all"],
         vec!["install-extension", "--dry-run", "--force", "--uninstall"],
+    ] {
+        sb.glen(args).run().ok_data();
+    }
+}
+
+#[test]
+fn a9_install_skill_arguments_parse() {
+    let sb = Sandbox::new();
+    for args in [
+        vec![
+            "install-skill",
+            "--claude",
+            "--codex",
+            "--project",
+            "--dry-run",
+            "--force",
+            "--uninstall",
+        ],
+        vec!["install-skill", "--dry-run"],
     ] {
         sb.glen(args).run().ok_data();
     }

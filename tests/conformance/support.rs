@@ -20,11 +20,11 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
-/// The two commands still hidden after W3 (AC-301).
-pub const HIDDEN: [&str; 2] = ["watch", "install-skill"];
+/// The one command still hidden after W3 and W4 (AC-301, AC-401).
+pub const HIDDEN: [&str; 1] = ["watch"];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
-pub const DOCTOR_CHECKS: [&str; 8] = [
+pub const DOCTOR_CHECKS: [&str; 12] = [
     "omp_binary",
     "omp_version",
     "profile",
@@ -33,6 +33,10 @@ pub const DOCTOR_CHECKS: [&str; 8] = [
     "glen_home",
     "extension",
     "live_endpoints",
+    "omp_env_files",
+    "skill_claude",
+    "skill_codex",
+    "sandbox",
 ];
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
