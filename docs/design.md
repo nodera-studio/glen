@@ -117,6 +117,7 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 5. **Probe result unknown** → refuse (`no_route`).
 
 **Residual race, stated plainly.** omp claims the owner lease on its first write, so probe → spawn → prompt is not atomic. If a TUI opens the same session between glen's probe and the RPC child's first write, one of the two writers continues in a sibling file. glen narrows the window (endpoint first, probe immediately before prompting, a per-session glen lock) and detects a fork afterwards (exit 11 `forked`, reporting both ids). It cannot prevent it. On macOS the probe itself holds the flock for microseconds; that is the same exposure `omp gc` has.
+The same rule means an omp TUI that has **opened** a session but not yet written to it holds no lease: in W2, `ls` reports it `idle` and `send` goes through the RPC route (confirmed live against omp 18.14.0, W2 smoke step 5). Writes in that TUI afterwards continue from its in-memory leaf, so the two turns end up as sibling branches of one file rather than a forked file. The W3 glen extension closes this gap: it registers a live endpoint when the TUI starts, so `ls` shows `live` and `send` takes the live route before omp's first write.
 
 ## §A5 Reply channel (`glen_reply`)
 - **Tool** `glen_reply`, params `{text: string, final?: boolean}`. Description: "Send a message back to the agent that contacted you through glen (Claude Code or Codex). Use it to answer a glen request or report progress." It returns `"delivered"`.
