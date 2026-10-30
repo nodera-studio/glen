@@ -41,15 +41,44 @@ If the run already committed per-wave, diff against the merge-base with the
 default branch instead. Examine every changed file and every hunk — subtle bugs
 hide in utility functions, cleanup logic, and config. Do not skip files.
 
+## Rendered output: run it and look (UI diffs)
+
+When the diff touches anything with rendered output — `site/`, a TUI or live view, or terminal
+rendering (human/TTY output, tables, colour, spinners) — build and run it and look at the output
+before you call it correct. A code trace alone is not enough: in W6 both review engines traced
+the terminal-demo code, approved it, and missed that 2 of its 4 scenes never appeared.
+
+- **Web (`site/`):** `npm run build` in `site/`, then start the preview in the background on a
+  free port of your own (the Codex pass may be previewing at the same time), e.g.
+  `PORT=$((20000 + RANDOM % 20000)); npx astro preview --host 127.0.0.1 --port $PORT & PREVIEW_PID=$!`.
+  Screenshot with
+  `npx playwright screenshot --viewport-size=375,812 --color-scheme=dark --wait-for-timeout=<ms> http://127.0.0.1:$PORT/ <out>.png`
+  (also 1280 wide, and light) and Read each PNG. For an animation or timed sequence, take
+  screenshots spread across its full duration and confirm every scene and state appears.
+  Stop the preview afterwards (`kill $PREVIEW_PID`).
+- **CLI / TUI:** run under a pseudo-TTY so the TTY path runs, e.g.
+  `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'`, at a narrow and a wide width
+  and with `NO_COLOR=1`; let a live view run through its states.
+- **Never touch a live omp session.** Against the real `~/.omp` run only read verbs (list,
+  show, tail). Anything else runs against fixtures or a scratch omp home: point
+  `PI_CODING_AGENT_DIR` at `tests/fixtures/…` or a scratch dir under `$TMPDIR` (note that
+  `PI_CONFIG_DIR` is joined under `$HOME`, see `docs/design.md`), or use the fake omp via
+  `GLEN_OMP_BIN`. Never send, steer, follow-up, abort or switch the model of a live session.
+- Save what you looked at under `.claude/evidence/` and cite it in the finding. A visible
+  defect is a finding like any other (Category: Visual / Rendering, `file:line` of the cause).
+- If you cannot run it (build fails, no browser), say so in the report and mark the rendered
+  output UNVERIFIED. An unverified UI diff gets **Recommendation: REVIEW_REQUIRED**, never
+  APPROVE or APPROVE_WITH_NOTES.
+
 ## Project Conventions (flagging convention-following code is a false positive)
 
 <conventions>
 glen's conventions (from `AGENTS.md` and `.claude/CLAUDE.md`; re-read them if this block
 looks stale):
 
-- **Errors**: `anyhow` with `.context()` in the binary (`main.rs`, command handlers);
-  `thiserror` enums in library modules. A `?` without context on I/O or omp data is a
-  finding; `anyhow` in a library module is a finding.
+- **Errors**: `GlenError` (`thiserror`) throughout, binary and library. A `?` without
+  file/session context on I/O or omp data is a finding; any use of `anyhow`, and any
+  error without file/session context in its message, is a finding.
 - **Lenient omp parsing**: unknown omp entry types and fields are skipped, not fatal
   (omp adds entry types between releases). A truncated last `.jsonl` line (omp
   mid-write) is skipped. `deny_unknown_fields` on omp data is a bug.
@@ -149,6 +178,7 @@ HIGH-001: IDOR in `getCustomer` — no org filter
 ## Code Review (Claude pass): {scope}
 
 **Files reviewed**: {list}
+**Rendered output**: {evidence paths under .claude/evidence/} | n/a (no UI in the diff) | UNVERIFIED ({why})
 **Risk level**: LOW | MEDIUM | HIGH | CRITICAL
 
 ### Findings
@@ -156,7 +186,7 @@ HIGH-001: IDOR in `getCustomer` — no org filter
 #### [SEVERITY]-NNN: [concise title]
 
 - **Severity**: CRITICAL | HIGH | MEDIUM | LOW
-- **Category**: Security | Architecture | Data Flow | Performance | Accessibility | Error Handling | Tests
+- **Category**: Security | Architecture | Data Flow | Performance | Accessibility | Error Handling | Tests | Visual / Rendering
 - **File**: `path:Lstart-Lend`
 - **Issue**: [premise → execution trace → discrepancy]
 - **Impact**: [specific, measurable]
@@ -192,6 +222,8 @@ project has no such pipeline, skip this section entirely.
 
 <rules>
 - ONE pass, ALL categories. Do not fix code — report findings only.
+- A UI diff (`site/`, TUI, terminal rendering) is reviewed by running it and looking at the
+  output, not by a code trace alone (see "Rendered output").
 - Report everything your trace surfaces as unhandled OR uncertain, each with a
   confidence tier — do not silently drop a finding. Still EXCLUDE code your trace
   proves is handled (convention, fallback, comment) and parked code: those are

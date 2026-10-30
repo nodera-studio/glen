@@ -172,7 +172,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **Resolving `<session>` arguments:**
   1. `@latest` = the newest session (by mtime) in the bucket of the cwd, or of `--cwd`.
   2. A path (contains `/` or ends `.jsonl`) = that file.
-  3. Otherwise match case-insensitively over all sessions in `sessions_dir`. Take the union of: the full id; a hex suffix of the dash-free id (at least 4 hex); an omp-style prefix of the id or file name (at least 8 chars).
+  3. Otherwise match case-insensitively over all sessions in `sessions_dir`. Take the union of: the full id; a hex suffix of the dash-free id (at least 4 hex); an omp-style prefix of the id or file name (at least 8 chars); a session whose catalog-assigned handle (as `ls` prints it, including a 7-char legacy prefix) equals the argument. Every handle `ls` prints therefore resolves back to its session.
      - One match → resolved.
      - Several → exit 4 `ambiguous`, with the candidates in `error.details.candidates`.
      - Two files whose headers carry the same session id (a copied file) are two candidates even for a full-id match. glen never picks one silently, because omp keys the lease by id and both copies share it.

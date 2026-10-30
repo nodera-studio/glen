@@ -7,7 +7,7 @@ use crate::{
         continuation,
         items::{self, Item, ItemOpts},
         listing::{self, SessionFile, Summary},
-        session::Session,
+        session::{LoadError, Session},
     },
     output::{self, Mode, Outcome, OutputCtx, stream::EventStream},
     render::{
@@ -18,7 +18,7 @@ use crate::{
 use serde_json::{Map, Value, json};
 use std::{
     collections::HashSet,
-    fs::{self, File, Metadata},
+    fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
     process::ExitCode,
     sync::{
@@ -101,6 +101,8 @@ struct Follower {
     emitted: HashSet<String>,
     last_on_branch: Option<String>,
     prev_model: Option<String>,
+    entries: continuation::EntryCache,
+    reload_pending: bool,
 }
 impl Follower {
     fn unseen(
@@ -134,17 +136,19 @@ impl Follower {
         args: &TailArgs,
         ctx: &OutputCtx,
     ) -> Result<bool, GlenError> {
-        let c = continuation::follow_known(&self.session.path, Some(&self.summary))?;
+        let c =
+            continuation::follow_known(&self.session.path, Some(&self.summary), &mut self.entries)?;
         if c.path == self.session.path {
             return Ok(false);
         }
-        let session = open::load(&c.path)?;
-        let summary = listing::scan_head(SessionFile::at(&c.path)?).ok_or_else(|| {
-            GlenError::new(
-                ErrorCode::NotFound,
-                format!("not an omp session file: {}", c.path.display()),
-            )
-        })?;
+        let (session, metadata) = match open::load_snapshot(&c.path, true) {
+            Ok(snapshot) => snapshot,
+            Err(e) if e.code == ErrorCode::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let file = SessionFile::from_metadata(&c.path, &metadata)
+            .map_err(|e| GlenError::read(&c.path, e))?;
+        let summary = listing::summarize(file, &session);
         let handle = crate::omp::handle::assign([session.header.id.as_str()])
             .remove(&session.header.id)
             .unwrap_or_else(|| session.header.id.clone());
@@ -156,10 +160,11 @@ impl Follower {
             Token::Muted,
             &format!("── continued in {} ──", crate::render::sanitize(&handle)),
         ))?;
-        self.identity = identity(&fs::metadata(&c.path)?);
+        self.identity = identity(&metadata);
         self.offset = session.consumed;
         self.session = session;
         self.summary = summary;
+        self.reload_pending = false;
         self.unseen(stream, args, ctx)?;
         Ok(true)
     }
@@ -168,10 +173,20 @@ impl Follower {
         stream: &mut EventStream,
         args: &TailArgs,
         ctx: &OutputCtx,
+        file: &mut File,
         m: &Metadata,
-    ) -> Result<(), GlenError> {
-        if m.len() < self.offset || identity(m) != self.identity {
-            self.session = open::load(&self.session.path)?;
+    ) -> Result<bool, GlenError> {
+        if self.reload_pending || m.len() < self.offset || identity(m) != self.identity {
+            let session = match open::snapshot(&self.session.path, file, m, true) {
+                Ok(session) if session.header.id == self.session.header.id => session,
+                Ok(_) | Err(LoadError::NotSession) => {
+                    self.reload_pending = true;
+                    return Ok(false);
+                }
+                Err(e) => return Err(open::load_error(&self.session.path, e)),
+            };
+            self.session = session;
+            self.reload_pending = false;
             self.identity = identity(m);
             self.offset = self.session.consumed;
             stream.event("rewritten", fields(json!({"path":self.session.path})))?;
@@ -181,10 +196,12 @@ impl Follower {
             )?;
             self.unseen(stream, args, ctx)?;
         } else if m.len() > self.offset {
-            let mut file = File::open(&self.session.path)?;
-            file.seek(SeekFrom::Start(self.offset))?;
+            file.seek(SeekFrom::Start(self.offset))
+                .map_err(|e| GlenError::read(&self.session.path, e))?;
             let mut bytes = vec![];
-            file.take(m.len() - self.offset).read_to_end(&mut bytes)?;
+            file.take(m.len() - self.offset)
+                .read_to_end(&mut bytes)
+                .map_err(|e| GlenError::read(&self.session.path, e))?;
             if let Some(end) = bytes.iter().rposition(|b| *b == b'\n') {
                 self.session.append(&bytes[..=end]);
                 self.offset += (end + 1) as u64;
@@ -203,7 +220,7 @@ impl Follower {
                 self.unseen(stream, args, ctx)?;
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 #[cfg(unix)]
@@ -217,13 +234,9 @@ impl Drop for Signals {
     }
 }
 pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCode {
-    let o = match open::open(cli, env, &args.session) {
+    let o = match open::open_follow(cli, env, &args.session) {
         Ok(o) => o,
         Err(e) => return output::emit_error(ctx, e),
-    };
-    let metadata = match fs::metadata(&o.session.path) {
-        Ok(m) => m,
-        Err(e) => return output::emit_error(ctx, e.into()),
     };
     let mut stream = EventStream::new(ctx);
     let stop = Arc::new(AtomicBool::new(false));
@@ -242,8 +255,8 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         };
     }
     let init = (|| -> std::io::Result<()> {
-        stream.warnings(&ctx.warnings)?;
         stream.event("session",fields(json!({"session":session_json(&o.summary,&o.handle,&o.lease,o.state,SystemTime::now()),"continued_from":o.continued_from,"skipped_lines":o.session.skipped_lines})))?;
+        stream.warnings(&ctx.warnings)?;
         stream.text(&transcript::render_header(
             &open::header(&o),
             env,
@@ -281,12 +294,14 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     }
     let mut follower = Follower {
         offset: o.session.consumed,
-        identity: identity(&metadata),
+        identity: identity(&o.metadata),
         last_on_branch: o.session.leaf_id().map(str::to_owned),
         session: o.session,
         summary: o.summary,
         emitted,
         prev_model,
+        entries: continuation::EntryCache::default(),
+        reload_pending: false,
     };
     let mut ticks = 0u8;
     let mut missing: Option<Instant> = None;
@@ -300,28 +315,31 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         }
         ticks = (ticks + 1) % 8;
         let result = (|| -> Result<(), GlenError> {
-            match fs::metadata(&follower.session.path) {
-                Ok(m) => {
+            let path = follower.session.path.clone();
+            let available = match File::open(&path) {
+                Ok(mut file) => {
+                    let metadata = file.metadata().map_err(|e| GlenError::read(&path, e))?;
+                    follower.tick(&mut stream, args, ctx, &mut file, &metadata)?
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                Err(e) => return Err(GlenError::read(&path, e)),
+            };
+            if !available {
+                let since = missing.get_or_insert_with(Instant::now);
+                if follower.continued(&mut stream, args, ctx)? {
                     missing = None;
-                    follower.tick(&mut stream, args, ctx, &m)?;
+                } else if since.elapsed() >= Duration::from_secs(5) {
+                    return Err(GlenError::new(
+                        ErrorCode::NotFound,
+                        format!(
+                            "session file disappeared or was replaced: {}",
+                            path.display()
+                        ),
+                    ));
                 }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    let since = missing.get_or_insert_with(Instant::now);
-                    if follower.continued(&mut stream, args, ctx)? {
-                        missing = None;
-                    } else if since.elapsed() >= Duration::from_secs(5) {
-                        return Err(GlenError::new(
-                            ErrorCode::NotFound,
-                            format!(
-                                "session file disappeared: {}",
-                                follower.session.path.display()
-                            ),
-                        ));
-                    }
-                    return Ok(());
-                }
-                Err(e) => return Err(e.into()),
+                return Ok(());
             }
+            missing = None;
             if ticks == 0 {
                 follower.continued(&mut stream, args, ctx)?;
             }
@@ -330,5 +348,93 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         if let Err(e) = result {
             return stream.fail(e);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        cli::GlobalArgs,
+        omp::fixtures,
+        output::{OutputKind, Terminal},
+    };
+    use std::{fs, io::Write};
+    #[test]
+    fn incremental_read_uses_open_fd_after_path_is_replaced() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let (session, metadata) = open::load_snapshot(&path, true).unwrap();
+        let summary = listing::summarize(
+            SessionFile::from_metadata(&path, &metadata).unwrap(),
+            &session,
+        );
+        let mut follower = Follower {
+            offset: session.consumed,
+            identity: identity(&metadata),
+            emitted: session.entries.iter().map(|e| e.id.clone()).collect(),
+            last_on_branch: session.leaf_id().map(str::to_owned),
+            session,
+            summary,
+            prev_model: None,
+            entries: continuation::EntryCache::default(),
+            reload_pending: false,
+        };
+        let line = concat!(
+            "{\"type\":\"message\",\"id\":\"old-fd-entry\",\"parentId\":\"10000009\",",
+            "\"message\":{\"role\":\"user\",\"content\":\"same descriptor\"}}\n"
+        );
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(line.as_bytes())
+            .unwrap();
+        // Model the exact rename window: open first, replace the pathname,
+        // then fstat and consume the still-open original file.
+        let mut fd = File::open(&path).unwrap();
+        let replacement = path.with_file_name(".new.tmp");
+        fs::write(&replacement, fixtures::bytes('G')).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let metadata = fd.metadata().unwrap();
+        let env = Env::for_test(Some(tree.path()), tree.path(), &[]);
+        let ctx = OutputCtx::new(
+            &GlobalArgs::default(),
+            OutputKind::Document,
+            &env,
+            &Terminal {
+                stdout_tty: false,
+                stderr_tty: false,
+                stdout_cols: None,
+            },
+        )
+        .unwrap();
+        let mut stream = EventStream::with_writers(
+            true,
+            Box::new(Vec::<u8>::new()),
+            Box::new(Vec::<u8>::new()),
+            ctx.painter.clone(),
+        );
+        let args = TailArgs {
+            session: path.to_string_lossy().into(),
+            lines: 0,
+            follow: true,
+            thinking: false,
+        };
+        assert!(
+            follower
+                .tick(&mut stream, &args, &ctx, &mut fd, &metadata)
+                .unwrap()
+        );
+        assert_eq!(follower.session.leaf_id(), Some("old-fd-entry"));
+        assert!(follower.session.header.id.ends_with("e27c0de"));
+        let mut replacement = File::open(&path).unwrap();
+        let metadata = replacement.metadata().unwrap();
+        assert!(
+            !follower
+                .tick(&mut stream, &args, &ctx, &mut replacement, &metadata)
+                .unwrap()
+        );
+        assert_eq!(follower.session.leaf_id(), Some("old-fd-entry"));
     }
 }

@@ -13,9 +13,9 @@ code and evidence, not claims.
 
 <context>
 glen is a single-crate Rust CLI (`src/`, tests in `tests/` with omp fixtures in
-`tests/fixtures/`). Errors: `anyhow` + `.context()` in the binary, `thiserror` in library
-modules. No service, database, queue, request tracing or Sentry: runtime evidence is a
-local reproduction (`cargo run -- <args>` against the installed omp 18.14.0, stderr,
+`tests/fixtures/`). Errors: `GlenError` (`thiserror`) throughout, no `anyhow`; context is in
+the message (file, session or action). No service, database, queue, request tracing or
+Sentry: runtime evidence is a local reproduction (`cargo run -- <args>` against the installed omp 18.14.0, stderr,
 `RUST_BACKTRACE=1`) and omp's own files under `~/.omp`. omp's behaviour is in the
 read-only reference clone at `../metis/references/oh-my-pi`. The Sentry MCP step below is
 n/a for glen; use the local reproduction instead.

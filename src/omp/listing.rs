@@ -19,7 +19,9 @@ pub struct SessionFile {
 }
 impl SessionFile {
     pub fn at(path: &Path) -> io::Result<Self> {
-        let m = fs::metadata(path)?;
+        Self::from_metadata(path, &fs::metadata(path)?)
+    }
+    pub fn from_metadata(path: &Path, m: &fs::Metadata) -> io::Result<Self> {
         Ok(Self {
             path: path.into(),
             bucket: path
@@ -82,6 +84,8 @@ pub struct Summary {
     pub last_turn: TurnStatus,
     pub in_flight: bool,
     pub model: Option<String>,
+    pub tail_has_message: bool,
+    pub tail_redirects_leaf: bool,
 }
 pub fn scan_head(file: SessionFile) -> Option<Summary> {
     let mut f = File::open(&file.path).ok()?;
@@ -101,35 +105,43 @@ pub fn scan_head(file: SessionFile) -> Option<Summary> {
             parse(&b)?
         }
     };
-    let title = if s.slot_title.is_some() || s.header.title.is_some() {
-        s.title()
-    } else {
+    Some(summarize(file, &s))
+}
+pub fn summarize(file: SessionFile, s: &Session) -> Summary {
+    let (title, first_message) = titles(s);
+    Summary {
+        file,
+        id: s.header.id.clone(),
+        cwd: s.header.cwd.clone(),
+        created: s.header.timestamp.as_deref().and_then(|s| s.parse().ok()),
+        title,
+        first_message,
+        parent_session: s.header.parent_session.clone(),
+        continuation_of: s.header.continuation_of.clone(),
+        last_turn: TurnStatus::Unknown,
+        in_flight: false,
+        model: None,
+        tail_has_message: false,
+        tail_redirects_leaf: false,
+    }
+}
+/// Shared title resolution for the bounded listing head and full snapshots.
+pub fn titles(s: &Session) -> (Option<String>, Option<String>) {
+    let title = s.title().or_else(|| {
         s.entries
             .iter()
             .rev()
             .find(|e| e.kind == "compaction")
             .and_then(|e| e.raw["shortSummary"].as_str())
             .and_then(display_name)
-    };
+    });
     let first_message = s
         .entries
         .iter()
         .find(|e| e.kind == "message" && e.raw["message"]["role"] == "user")
         .and_then(|e| display_name(&text_of(&e.raw["message"]["content"], " ")))
         .map(|s| s.chars().take(200).collect());
-    Some(Summary {
-        file,
-        id: s.header.id,
-        cwd: s.header.cwd,
-        created: s.header.timestamp.and_then(|s| s.parse().ok()),
-        title,
-        first_message,
-        parent_session: s.header.parent_session,
-        continuation_of: s.header.continuation_of,
-        last_turn: TurnStatus::Unknown,
-        in_flight: false,
-        model: None,
-    })
+    (title, first_message)
 }
 pub fn model_of(message: &serde_json::Value) -> Option<String> {
     Some(format!(
@@ -154,11 +166,25 @@ pub fn scan_tail(s: &mut Summary) -> io::Result<()> {
     };
     let end = b.iter().rposition(|v| *v == b'\n').map_or(start, |i| i + 1);
     let mut found = false;
+    s.tail_redirects_leaf = false;
+    let mut newest_entry = true;
+    let mut next_parent = None;
     let mut changed = None;
     for line in b[start..end].split(|v| *v == b'\n').rev() {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
             continue;
         };
+        if v["type"].is_string() && v["id"].is_string() && !found {
+            if newest_entry {
+                s.tail_redirects_leaf = v.get("activeLeafId").is_some_and(|leaf| leaf != &v["id"]);
+                newest_entry = false;
+            } else if next_parent.as_deref() != v["id"].as_str() {
+                // The leaf's parent chain skipped the physical last message,
+                // or the chain cannot be resolved inside this tail window.
+                s.tail_redirects_leaf = true;
+            }
+            next_parent = v["parentId"].as_str().map(str::to_owned);
+        }
         if v["type"] == "message" {
             let m = &v["message"];
             if !found {
@@ -176,6 +202,7 @@ pub fn scan_tail(s: &mut Summary) -> io::Result<()> {
     if s.model.is_none() {
         s.model = changed
     }
+    s.tail_has_message = found;
     Ok(())
 }
 pub fn parse_session_file_name(name: &str) -> Option<(jiff::Timestamp, String)> {
@@ -218,16 +245,23 @@ pub struct Catalog {
 }
 impl Catalog {
     pub fn scan(dir: &Path) -> Result<Self, GlenError> {
+        let mut catalog = Self::read(dir)?;
+        catalog.assign_handles(None);
+        Ok(catalog)
+    }
+    pub(crate) fn assign_handles(&mut self, extra: Option<&str>) {
+        self.handles = handle::assign(self.sessions.iter().map(|s| s.id.as_str()).chain(extra));
+    }
+    pub(crate) fn read(dir: &Path) -> Result<Self, GlenError> {
         let files = discover(dir).map_err(|e| {
             GlenError::new(ErrorCode::Io, format!("cannot read {}: {e}", dir.display()))
         })?;
         let mut sessions = files.into_iter().filter_map(scan_head).collect::<Vec<_>>();
         sort_newest_first(&mut sessions);
-        let handles = handle::assign(sessions.iter().map(|s| s.id.as_str()));
         Ok(Self {
             sessions_dir: dir.into(),
             sessions,
-            handles,
+            handles: HashMap::new(),
         })
     }
     pub fn handle(&self, id: &str) -> String {
@@ -328,5 +362,43 @@ mod tests {
         )
         .unwrap();
         assert!(scan_head(SessionFile::at(&p).unwrap()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use serde_json::{Value, json};
+    #[test]
+    fn title_slot_normalization_and_compaction_fallback() {
+        let tree = tempfile::tempdir().unwrap();
+        let path = tree.path().join("title.jsonl");
+        for (slot, want) in [
+            (json!("  "), "summary"),
+            (json!(""), "summary"),
+            (Value::Null, "header"),
+            (json!(42), "header"),
+            (json!({}), "header"),
+            (json!("slot"), "slot"),
+        ] {
+            let content = format!(
+                "{}\n{}\n{}\n",
+                json!({"type":"title","title":slot}),
+                json!({"type":"session","version":3,"id":"x","title":"header"}),
+                json!({"type":"compaction","id":"c","shortSummary":"summary"})
+            );
+            fs::write(&path, &content).unwrap();
+            let summary = scan_head(SessionFile::at(&path).unwrap()).unwrap();
+            assert_eq!(summary.title.as_deref(), Some(want));
+            assert_eq!(
+                titles(&Session::parse(&path, content.as_bytes()).unwrap()).0,
+                summary.title
+            );
+        }
+        fs::write(&path, "{\"type\":\"title\",\"title\":\" \"}\n{\"type\":\"session\",\"id\":\"x\",\"title\":\"header\"}\n").unwrap();
+        assert_eq!(
+            scan_head(SessionFile::at(&path).unwrap()).unwrap().title,
+            None
+        );
     }
 }

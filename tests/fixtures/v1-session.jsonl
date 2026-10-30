@@ -1,0 +1,4 @@
+{"type":"session","id":"legacy-v1","title":"Old session"}
+{"type":"message","message":{"role":"user","content":"old prompt"}}
+{"type":"future_kind","opaque":true}
+{"type":"message","message":{"role":"assistant","provider":"test","model":"old","content":[{"type":"text","text":"old answer"}]}}

@@ -262,6 +262,7 @@ pub fn build(entries: &[&Entry], opts: &ItemOpts) -> Vec<Item> {
                                     })
                                 }
                             }
+                            Some("image" | "fallback" | "anthropicServerTool") => {}
                             Some(t) => prose.push(format!("[{t}]")),
                             None => {}
                         }
@@ -432,5 +433,54 @@ mod tests {
         assert_eq!(r.text.chars().count(), 500);
         assert_eq!(r.chars, 600);
         assert!(r.truncated);
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use crate::omp::session::Session;
+    use serde_json::json;
+    use std::path::Path;
+    #[test]
+    fn unknown_blocks_survive_all_text_message_paths() {
+        let mut bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n".to_vec();
+        let mut previous = Value::Null;
+        for (i, role) in ["user", "developer", "custom", "toolResult", "assistant"]
+            .iter()
+            .enumerate()
+        {
+            let id = i.to_string();
+            let e = json!({"type":"message", "id":id,"parentId":previous,"message":{"role":role,"display":true,
+                "content":[{"type":"text","text":"visible"},{"type":"future_block"},{"type":"image"},
+                    {"type":"thinking"},{"type":"redactedThinking"},{"type":"toolCall"},
+                    {"type":"fallback"},{"type":"anthropicServerTool"}]}});
+            bytes.extend(format!("{e}\n").bytes());
+            previous = id.into();
+        }
+        bytes.extend(format!("{}\n",json!({"type":"custom_message","id":"custom-entry","parentId":"4","display":true,"content":[{"type":"future_block"}]})).bytes());
+        let s = Session::parse(Path::new("blocks"), &bytes).unwrap();
+        let items = serde_json::to_value(build(
+            &s.active_branch(),
+            &ItemOpts {
+                thinking: false,
+                tools: Tools::Full,
+            },
+        ))
+        .unwrap();
+        for item in items.as_array().unwrap() {
+            assert!(
+                item["text"].as_str().unwrap().contains("[future_block]"),
+                "{item}"
+            );
+        }
+        for item in &items.as_array().unwrap()[..5] {
+            let sep = if item["kind"] == "assistant" {
+                "\n\n"
+            } else {
+                "\n"
+            };
+            assert_eq!(item["text"], format!("visible{sep}[future_block]"));
+        }
     }
 }

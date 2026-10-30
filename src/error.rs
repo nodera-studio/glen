@@ -69,6 +69,16 @@ pub struct GlenError {
     pub report: Option<String>,
 }
 impl GlenError {
+    pub fn read(path: &std::path::Path, error: std::io::Error) -> Self {
+        Self::new(
+            if error.kind() == std::io::ErrorKind::NotFound {
+                ErrorCode::NotFound
+            } else {
+                ErrorCode::Io
+            },
+            format!("cannot read {}: {error}", path.display()),
+        )
+    }
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,

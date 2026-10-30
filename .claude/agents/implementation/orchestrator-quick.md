@@ -59,6 +59,10 @@ Agent tool:
   prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this small change (--fresh): {the user's task + the pattern file it copies}."
 ```
 
+Take the file snapshot from `/implement` (`orchestrator.md` → Role 1, "File snapshot") before
+this dispatch and check it after: any pre-existing file, tracked or untracked, that is gone is
+reported and restored.
+
 Codex reads the affected area + the pattern file, makes the change, wires it, handles the error
 paths, writes/extends the unit test, runs `cargo test --locked` and
 `bash .claude/scripts/quality-gate.sh`, and fixes every failure and finding — looping in ITS context until
@@ -76,10 +80,20 @@ quick path. Prefer the Codex diff reviewer for an uncorrelated read:
 Agent tool (subagent_type: codex:codex-rescue):
   prompt: "READ-ONLY review of THIS diff for REAL bugs only — logic, edge cases, missing error
            handling, multi-tenant / fiscal regressions. Not style/lint (the gate owns that).
+           If the diff touches rendered output (site/, a TUI, terminal rendering), build and
+           run it and look at the output (browser screenshot, or CLI output under a pty)
+           before calling it correct; a code trace alone is not enough. Against the real
+           ~/.omp run only read verbs (list, show, tail); otherwise point PI_CODING_AGENT_DIR
+           at tests/fixtures or a scratch dir under $TMPDIR, or use the fake omp via
+           GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch the model of a live
+           omp session.
            Do NOT edit. Diff:\n{git diff of the change}"
 ```
 
-(Or `codex review --base <default-branch merge-base>`.) Fix any real bug it finds in THIS context.
+(Or `codex review --base <default-branch merge-base>`.) On a capacity or rate error ("Selected
+model is at capacity", 429), retry once after about 60 s; if it fails again, run the Claude
+`impl-code-review` pass instead and say in the summary that Codex was unavailable. Never skip the
+review silently. Fix any real bug it finds in THIS context.
 If the review reveals the change is bigger or riskier than it looked, stop and escalate to
 `/implement`.
 

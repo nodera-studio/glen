@@ -82,7 +82,7 @@ impl Session {
         let mut raw: Value = serde_json::from_slice(lines.next().ok_or(LoadError::NotSession)?)
             .map_err(|_| LoadError::NotSession)?;
         let slot_title = if raw["type"] == "title" {
-            let t = Some(string(&raw, "title"));
+            let t = string(&raw, "title").map(|t| display_name(&t));
             raw = serde_json::from_slice(lines.next().ok_or(LoadError::NotSession)?)
                 .map_err(|_| LoadError::NotSession)?;
             t
@@ -121,7 +121,19 @@ impl Session {
         if line.iter().all(u8::is_ascii_whitespace) {
             return;
         }
-        if let Some(e) = serde_json::from_slice(line).ok().and_then(entry) {
+        let parsed = serde_json::from_slice::<Value>(line)
+            .ok()
+            .and_then(|mut raw| {
+                // v1 predates the tree format. Rebuild its linear chain in
+                // memory, including records carrying stale ids or parents.
+                if self.header.raw["version"].as_u64().unwrap_or(1) < 2 && raw["type"].is_string() {
+                    let previous = self.entries.last().map(|e| e.id.clone());
+                    raw["id"] = Value::String(format!("v1-{:08}", self.entries.len() + 1));
+                    raw["parentId"] = previous.map_or(Value::Null, Value::String);
+                }
+                entry(raw)
+            });
+        if let Some(e) = parsed {
             self.entries.push(e)
         } else {
             self.skipped_lines += 1
@@ -196,8 +208,19 @@ pub fn text_of(content: &Value, sep: &str) -> String {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|v| v["type"] == "text")
-            .filter_map(|v| v["text"].as_str())
+            .filter_map(|v| match v["type"].as_str() {
+                Some("text") => v["text"].as_str().map(str::to_owned),
+                Some(
+                    "image"
+                    | "thinking"
+                    | "redactedThinking"
+                    | "toolCall"
+                    | "fallback"
+                    | "anthropicServerTool",
+                ) => None,
+                Some(t) => Some(format!("[{t}]")),
+                None => None,
+            })
             .collect::<Vec<_>>()
             .join(sep)
     }
@@ -261,7 +284,7 @@ mod tests {
     }
     #[test]
     fn lenient_and_incremental() {
-        let mut s=parse(b"{\"type\":\"session\",\"id\":\"x\"}\n{\"type\":\"message\",\"id\":\"a\",\"message\":\"\xff\"}\n{\"type\":\"future\",\"id\":\"b\"}\nbad");
+        let mut s=parse(b"{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n{\"type\":\"message\",\"id\":\"a\",\"message\":\"\xff\"}\n{\"type\":\"future\",\"id\":\"b\"}\nbad");
         assert_eq!(s.skipped_lines, 2);
         assert_eq!(s.leaf_id(), Some("b"));
         assert!(s.consumed < 1000);
@@ -293,7 +316,7 @@ mod tests {
                 Some("b"),
             ),
         ] {
-            let mut b = b"{\"type\":\"session\",\"id\":\"x\"}\n".to_vec();
+            let mut b = b"{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n".to_vec();
             for e in entries {
                 b.extend(serde_json::to_vec(&e).unwrap());
                 b.push(b'\n');
@@ -361,6 +384,78 @@ mod fixture_tests {
         assert_eq!(
             TurnStatus::of_branch(&b.active_branch()),
             TurnStatus::Pending
+        );
+    }
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn user_images_do_not_become_text_placeholders() {
+        let message = json!({"role":"user","content":[
+            {"type":"text","text":"look"},
+            {"type":"image","data":"opaque","mimeType":"image/png"}
+        ]});
+        assert_eq!(text_of(&message["content"], "\n"), "look");
+    }
+    #[test]
+    fn only_unknown_blocks_become_text_placeholders() {
+        let content = json!([
+            {"type":"text","text":"visible"},
+            {"type":"image"},
+            {"type":"thinking"},
+            {"type":"redactedThinking"},
+            {"type":"toolCall"},
+            {"type":"fallback"},
+            {"type":"anthropicServerTool"},
+            {"type":"future_block"},
+            {"type":"text"},
+            {}
+        ]);
+        assert_eq!(text_of(&content, "\n"), "visible\n[future_block]");
+    }
+    #[test]
+    fn v1_idless_entries_get_stable_linear_ids_in_memory() {
+        let bytes = include_bytes!("../../tests/fixtures/v1-session.jsonl");
+        for version in [None, Some(0), Some(1)] {
+            let mut lines = bytes.split(|b| *b == b'\n');
+            let mut header: Value = serde_json::from_slice(lines.next().unwrap()).unwrap();
+            if let Some(version) = version {
+                header["version"] = version.into();
+            }
+            let mut content = serde_json::to_vec(&header).unwrap();
+            content.push(b'\n');
+            content
+                .extend_from_slice(&bytes[bytes.iter().position(|b| *b == b'\n').unwrap() + 1..]);
+            let mut s = Session::parse(Path::new("v1"), &content).unwrap();
+            assert_eq!(s.skipped_lines, 0);
+            assert_eq!(s.active_branch().len(), 3);
+            assert_eq!(s.entries[0].id, "v1-00000001");
+            assert_eq!(s.entries[0].parent_id, None);
+            assert_eq!(s.entries[2].parent_id.as_deref(), Some("v1-00000002"));
+            s.append(
+                b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"next\"}}\n",
+            );
+            assert_eq!(s.active_branch().len(), 4);
+            assert_eq!(s.entries[3].raw["parentId"], "v1-00000003");
+            let with_stale_ids = String::from_utf8(content.clone()).unwrap().replace(
+                "\"type\":\"message\"",
+                "\"type\":\"message\",\"id\":\"stale\",\"parentId\":\"missing\"",
+            );
+            let migrated = Session::parse(Path::new("v1"), with_stale_ids.as_bytes()).unwrap();
+            assert_eq!(migrated.active_branch().len(), 3);
+            assert_eq!(
+                migrated.entries[2].parent_id.as_deref(),
+                Some("v1-00000002")
+            );
+            let again = Session::parse(Path::new("v1"), &content).unwrap();
+            assert_eq!(s.entries[0].id, again.entries[0].id);
+        }
+        assert_eq!(
+            include_bytes!("../../tests/fixtures/v1-session.jsonl"),
+            bytes
         );
     }
 }

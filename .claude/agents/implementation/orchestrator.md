@@ -166,6 +166,33 @@ Run that block in the wave's worktree BEFORE dispatching the Implementer, and te
 Implementer the steps are done: verify their results (files present, lockfile updated),
 do not re-run them.
 
+**File snapshot (pre-existing files survive the Implementer).** The envelope forbids the
+Implementer to delete, move or revert files it did not create, but `touchedFiles` cannot show
+a deletion (it lists paths with no change type, a shell `rm` never appears in it, and git
+cannot see a deleted untracked file). So check it yourself. Before each Implementer dispatch,
+in the checkout it will write to:
+
+```bash
+SNAP="${TMPDIR:-/tmp}/glen-impl-snap-$(date +%s)"; mkdir -p "$SNAP"
+EXCL='^(target|site/node_modules|site/dist)/'        # build output may legitimately vanish
+{ git ls-files; git ls-files --others; } | grep -vE "$EXCL" | sort -u \
+  | while IFS= read -r f; do [ -e "$f" ] && printf '%s\n' "$f"; done > "$SNAP/before.txt"
+git ls-files --others | grep -vE "$EXCL" | grep -v '/$' \
+  | tar -czf "$SNAP/untracked.tgz" -T -              # untracked incl. ignored, for restore
+```
+
+(`--others` without `--exclude-standard` includes ignored files such as `.claude/launch.json`.)
+After it returns:
+
+```bash
+while IFS= read -r f; do [ -e "$f" ] || printf '%s\n' "$f"; done < "$SNAP/before.txt"
+```
+
+Every path printed that the plan did not tell it to delete or move goes in the Report as a
+deviation, and is restored: tracked with `git restore --source=HEAD --staged --worktree -- <f>`,
+untracked with `tar -xzf "$SNAP/untracked.tgz" <f>`. Say in the Report what was restored and
+what could not be.
+
 **Claude writes no product code — Codex does.** Do NOT dispatch separate coder /
 wiring / error-handling / test-writer / test-runner / verifier agents (those files
 were deleted); those concerns are fused into the Codex Implementer. The single most
@@ -191,6 +218,25 @@ transcript. By default run the lean **`/code-review` dual-engine gate** (see
 one must-fix / recommended / notes report. No lint/type/style re-check — the
 deterministic gate already enforced that inside the Implementer; the engines hunt
 real bugs.
+
+**UI diffs are reviewed by running them.** When the diff touches rendered output
+(`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
+at the output (a browser screenshot, or real CLI/TUI output under a pty) before calling
+it correct; a code trace alone is not enough. In W6 both engines traced the terminal
+demo, approved it, and missed 2 of its 4 scenes never appearing. This is in addition to
+the Visual verification step below, not a substitute for it.
+
+**Codex capacity.** If the Codex pass fails on capacity or rate ("Selected model is at
+capacity", 429, rate limit), retry it once after a short wait (about 60 s). If the retry
+fails too, record Codex as unavailable, proceed with the Claude pass as a single-engine
+verdict, and say so in the Report. Never drop the engine silently.
+
+**Review file names.** If you save the passes to disk, name them `claude-review.md` and
+`codex-review.md` (plan files `<engine>-plan.md`), never `claude.md`: on macOS's
+case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
+`CLAUDE.md`, which injects the review as project instructions. This holds for every way
+of creating a file, including shell redirects and `mv`. The `guard-claude-md-name.sh`
+hook refuses such a name on the Write tool only.
 
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer
@@ -252,6 +298,27 @@ own domain-specific gate" pattern applied to the security audit; this is the
 `/implement`-pipeline analog. If no such artifact class exists in this project, skip
 this arm entirely — it is optional, not a stub to fill mechanically.
 
+### Visual verification (rendered UI — required before the PR)
+
+Any change with a rendered result — site pages, the TUI, human (TTY) CLI output — gets a
+human-style look at the real rendered output before the PR, by you or a dispatched agent with a
+browser. Tests, smoke suites and Lighthouse scores do not substitute: a W6 terminal demo shipped
+with two of its four scenes never appearing, past 12 unit tests, a 16-test Playwright smoke and
+Lighthouse 1.00; only a visual check caught it.
+
+- **Web pages:** open the built page in the built-in browser (`mcp__Claude_Browser__*`) or
+  chrome-devtools. Check mobile (~375px) and desktop widths, light and dark themes. Let
+  animations and timed sequences run to completion (wait out the full duration, then screenshot)
+  and confirm every scene and state appears.
+- **CLI / TUI:** run the binary under a pseudo-TTY so the TTY code path runs, e.g.
+  `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'` (macOS), at a narrow and a
+  wide width, with and without `NO_COLOR`. Let a live view run through its states. Compare with
+  the plan's intended output.
+- Save what you looked at (screenshots or captured output) under `.claude/evidence/` and name it
+  in the Report. A defect found here goes to a fresh Implementer like a must-fix review finding.
+
+Skip only when the diff changes no rendered output, and say so in the Report.
+
 ### Role 4 — Re-index (after the merge, at wave close)
 
 glen's code index reads a clean clone of `main`, so re-indexing before the merge would
@@ -306,7 +373,8 @@ Plans are **kept after implementation** — they accumulate as project history. 
   spec. Split large work at slice boundaries (fresh Codex Implementer via
   `--fresh`), never mid write→test→fix loop; rework resumes Codex via `--resume-last`.
 - The user-approval gate (Step 4; announced instead under `/auto-mode`), the Review
-  gate (Role 2), and the conformance gate (Role 3) are mandatory — do not skip them. Any optional domain-rubric gate this
+  gate (Role 2), the conformance gate (Role 3) and, for any change with rendered output, the
+  visual verification are mandatory — do not skip them. Any optional domain-rubric gate this
   project wires up (Role 3 arm 3) is mandatory *when its trigger predicate fires*; on
   persistent FAIL it BLOCKS the pipeline. Code is written only after the plan is
   approved.
