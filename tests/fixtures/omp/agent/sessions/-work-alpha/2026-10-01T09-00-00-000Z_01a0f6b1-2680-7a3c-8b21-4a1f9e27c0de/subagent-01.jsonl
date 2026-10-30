@@ -1,2 +1,2 @@
-{"type":"session","version":3,"id":"01a0f6b5-ba60-7012-8f3b-3f7a9c1e5b20","timestamp":"2026-10-01T09:00:05.000Z","cwd":"/home/fixture/work/alpha","runtime":{"version":"18.14.0"}}
-{"type":"message","id":"80000001","parentId":null,"timestamp":"2026-10-01T09:00:06.000Z","runtime":{"version":"18.14.0"},"message":{"role":"user","content":[{"type":"text","text":"Placeholder subagent task."}],"attribution":"user","timestamp":1730000000000}}
+{"type":"session","version":3,"id":"01a0f6b5-ba60-7012-8f3b-3f7a9c1e5b20","timestamp":"2026-10-01T09:00:05.000Z","cwd":"/home/fixture/work/alpha"}
+{"type":"message","id":"80000001","parentId":null,"timestamp":"2026-10-01T09:00:06.000Z","runtime":{"version":"18.14.0"},"message":{"role":"user","content":[{"type":"text","text":"Placeholder subagent task."}],"attribution":"user","timestamp":1790845206000}}

@@ -5,7 +5,8 @@ pub mod table;
 use std::{borrow::Cow, path::Path};
 pub use table::Table;
 pub fn sanitize(text: &str) -> Cow<'_, str> {
-    if !text.chars().any(|c| c.is_control()) {
+    let bidi = |c| matches!(c, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{200e}' | '\u{200f}' | '\u{061c}');
+    if !text.chars().any(|c| c.is_control() || bidi(c)) {
         return Cow::Borrowed(text);
     }
     let mut result = String::new();
@@ -18,7 +19,12 @@ pub fn sanitize(text: &str) -> Cow<'_, str> {
                 use std::fmt::Write;
                 let _ = write!(result, "\\x{:02x}", c as u32);
             }
-            '\u{80}'..='\u{9f}' => {
+            '\u{80}'..='\u{9f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            | '\u{200e}'
+            | '\u{200f}'
+            | '\u{061c}' => {
                 use std::fmt::Write;
                 let _ = write!(result, "\\u{{{:02x}}}", c as u32);
             }
@@ -55,5 +61,18 @@ mod tests {
             tilde(Path::new("/h/a\x1b"), Some(Path::new("/h"))),
             r"~/a\x1b"
         );
+    }
+    #[test]
+    fn bidi_controls() {
+        for c in ['\u{061c}', '\u{200e}', '\u{200f}']
+            .into_iter()
+            .chain('\u{202a}'..='\u{202e}')
+            .chain('\u{2066}'..='\u{2069}')
+        {
+            assert_eq!(
+                sanitize(&format!("a{c}b")),
+                format!("a\\u{{{:02x}}}b", c as u32)
+            );
+        }
     }
 }

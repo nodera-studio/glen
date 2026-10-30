@@ -6,6 +6,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{self, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
 };
 #[derive(Clone, Debug)]
 pub struct GlenHome {
@@ -55,7 +56,12 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name required"))?
         .to_string_lossy();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
+    static NEXT_TEMP: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_file_name(format!(
+        ".{name}.{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+    ));
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -67,7 +73,13 @@ pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let result = (|| {
         file.write_all(bytes)?;
         file.sync_all()?;
-        fs::rename(&tmp, path)
+        fs::rename(&tmp, path)?;
+        fs::File::open(
+            path.parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or_else(|| Path::new(".")),
+        )?
+        .sync_all()
     })();
     if result.is_err() {
         let _ = fs::remove_file(&tmp);
@@ -152,5 +164,29 @@ mod tests {
             0o755
         );
         assert_eq!(mode_is_private(t.path()), Some(false));
+    }
+    #[test]
+    fn concurrent_atomic_writes_do_not_share_temp_files() {
+        use std::sync::{Arc, Barrier};
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("shared");
+        let barrier = Arc::new(Barrier::new(8));
+        let writers: Vec<_> = (0..8)
+            .map(|n| {
+                let file = file.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    write_private_atomic(&file, &vec![n; 65536])
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap().unwrap();
+        }
+        let bytes = fs::read(&file).unwrap();
+        assert_eq!(bytes.len(), 65536);
+        assert!(bytes.iter().all(|v| *v == bytes[0]));
+        assert_eq!(fs::read_dir(t.path()).unwrap().count(), 1);
     }
 }

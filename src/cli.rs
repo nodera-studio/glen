@@ -11,9 +11,14 @@ pub struct Cli {
 }
 #[derive(Debug, Args, Default)]
 pub struct GlobalArgs {
-    #[arg(long, global = true, conflicts_with = "human")]
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "human",
+        help = "Print a JSON envelope"
+    )]
     pub json: bool,
-    #[arg(long, global = true)]
+    #[arg(long, global = true, help = "Print human-readable output")]
     pub human: bool,
     #[arg(long, global = true, value_enum, default_value = "auto")]
     pub color: ColorWhen,

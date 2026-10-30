@@ -3,7 +3,6 @@ use crate::{
     cli::{ColorWhen, GlobalArgs},
     env::Env,
     error::{ErrorCode, GlenError, Warning},
-    glen_home::{self, GlenHome},
     render::palette::{ColorDepth, Theme},
     render::style::Painter,
 };
@@ -57,9 +56,12 @@ pub fn decide_color(flag: ColorWhen, env: &Env, is_tty: bool) -> bool {
         ColorWhen::Always => true,
         ColorWhen::Never => false,
         ColorWhen::Auto => {
-            if env.non_empty("NO_COLOR").is_some() {
+            if env.get("NO_COLOR").is_some_and(|v| !v.is_empty()) {
                 false
-            } else if env.non_empty("CLICOLOR_FORCE").is_some() {
+            } else if env
+                .get("CLICOLOR_FORCE")
+                .is_some_and(|v| !v.is_empty() && v != "0")
+            {
                 true
             } else if env.get("CLICOLOR") == Some("0") {
                 false
@@ -132,7 +134,7 @@ pub struct OutputCtx {
     pub stdout_tty: bool,
     pub stderr_tty: bool,
     pub max_output: Option<usize>,
-    pub glen_home: GlenHome,
+    pub env: Env,
     pub home: Option<PathBuf>,
     pub warnings: Vec<Warning>,
 }
@@ -173,7 +175,7 @@ impl OutputCtx {
             stdout_tty: term.stdout_tty,
             stderr_tty: term.stderr_tty,
             max_output,
-            glen_home: glen_home::resolve(env)?,
+            env: env.clone(),
             home: env.home().map(|p| p.to_path_buf()),
             warnings: warning.into_iter().collect(),
         })
@@ -189,42 +191,108 @@ impl OutputCtx {
             stdout_tty: term.stdout_tty,
             stderr_tty: term.stderr_tty,
             max_output: None,
-            glen_home: GlenHome {
-                root: env
-                    .home()
-                    .unwrap_or_else(|| std::path::Path::new("/"))
-                    .join(".glen"),
-            },
+            env: env.clone(),
             home: env.home().map(|p| p.to_path_buf()),
             warnings: vec![],
         }
     }
 }
-pub fn pre_mode(argv: &[OsString], term: &Terminal) -> Mode {
-    let tokens: Vec<_> = argv.iter().take_while(|a| a.as_os_str() != "--").collect();
-    if tokens.iter().any(|a| a.as_os_str() == "--json") {
-        Mode::Json
-    } else if tokens.iter().any(|a| a.as_os_str() == "--human") || term.stdout_tty {
-        Mode::Human
-    } else {
-        Mode::Json
+// Inspect only complete flags, consuming global option values and respecting `--`.
+fn pre_options(argv: &[OsString]) -> (bool, bool, ColorWhen, OutputKind) {
+    let (mut json, mut human, mut color) = (false, false, ColorWhen::Auto);
+    let mut kind = OutputKind::Document;
+    let mut command_seen = false;
+    let mut tokens = argv.iter().skip(1);
+    while let Some(token) = tokens.next() {
+        let token = token.to_string_lossy();
+        match token.as_ref() {
+            "--" => break,
+            "--json" => json = true,
+            "--human" => human = true,
+            "--profile" => {
+                tokens.next();
+            }
+            "--color" => {
+                color = match tokens.next().and_then(|v| v.to_str()) {
+                    Some("always") => ColorWhen::Always,
+                    Some("never") => ColorWhen::Never,
+                    _ => ColorWhen::Auto,
+                };
+            }
+            value if value.starts_with("--color=") => {
+                color = match value.trim_start_matches("--color=") {
+                    "always" => ColorWhen::Always,
+                    "never" => ColorWhen::Never,
+                    _ => ColorWhen::Auto,
+                };
+            }
+            value if !value.starts_with('-') && !command_seen => {
+                command_seen = true;
+                if value == "completions" {
+                    kind = OutputKind::Raw;
+                }
+            }
+            _ => {}
+        }
     }
+    (json, human, color, kind)
 }
-pub fn clap_error(e: clap::Error, mode: Mode) -> ExitCode {
-    use clap::error::ErrorKind;
-    if matches!(
-        e.kind(),
-        ErrorKind::DisplayHelp
-            | ErrorKind::DisplayVersion
-            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
-    ) {
-        return if e.print().is_ok() {
-            ExitCode::from(e.exit_code() as u8)
-        } else {
-            ExitCode::from(1)
+pub fn pre_mode(argv: &[OsString], term: &Terminal) -> Mode {
+    let (json, human, _, kind) = pre_options(argv);
+    decide_mode(json, human, kind, term.stdout_tty)
+}
+pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Terminal) -> ExitCode {
+    use clap::{Parser, error::ErrorKind};
+    let mode = pre_mode(argv, term);
+    let text_only = matches!(e.kind(), ErrorKind::DisplayHelp | ErrorKind::DisplayVersion);
+    if mode != Mode::Json || text_only {
+        // Rebuild diagnostics from escaped arguments, leaving successful parsing untouched.
+        // This keeps clap's trusted layout and styles while escaping only external text.
+        let safe_args: Vec<OsString> = argv
+            .iter()
+            .map(|a| {
+                crate::render::sanitize(&a.to_string_lossy())
+                    .into_owned()
+                    .into()
+            })
+            .collect();
+        e = match crate::cli::Cli::try_parse_from(safe_args) {
+            Err(safe) => safe,
+            Ok(_) => clap::Error::raw(e.kind(), "invalid arguments"),
         };
+        let (_, _, color, _) = pre_options(argv);
+        let tty = if e.use_stderr() {
+            term.stderr_tty
+        } else {
+            term.stdout_tty
+        };
+        let choice = if decide_color(color, env, tty) {
+            anstream::ColorChoice::Always
+        } else {
+            anstream::ColorChoice::Never
+        };
+        let mut stream = anstream::AutoStream::new(
+            if e.use_stderr() {
+                Box::new(io::stderr().lock()) as Box<dyn Write>
+            } else {
+                Box::new(io::stdout().lock()) as Box<dyn Write>
+            },
+            choice,
+        );
+        let rendered = e.render().ansi().to_string();
+        return ExitCode::from(
+            if stream
+                .write_all(rendered.as_bytes())
+                .and_then(|_| stream.flush())
+                .is_ok()
+            {
+                e.exit_code() as u8
+            } else {
+                1
+            },
+        );
     }
-    if mode == Mode::Json {
+    {
         let rendered = e.render().to_string();
         let plain = anstream::adapter::strip_str(&rendered).to_string();
         let message = plain
@@ -247,10 +315,6 @@ pub fn clap_error(e: clap::Error, mode: Mode) -> ExitCode {
         } else {
             1
         })
-    } else if e.print().is_ok() {
-        ExitCode::from(2)
-    } else {
-        ExitCode::from(1)
     }
 }
 #[cfg(test)]
@@ -290,6 +354,16 @@ mod tests {
             (vec![("NO_COLOR", "1"), ("TERM", "xterm")], true, false),
             (vec![("NO_COLOR", ""), ("TERM", "xterm")], true, true),
             (vec![("CLICOLOR_FORCE", "1")], false, true),
+            (vec![("CLICOLOR_FORCE", " ")], false, true),
+            (vec![("CLICOLOR_FORCE", "0")], false, false),
+            (vec![("CLICOLOR_FORCE", "0"), ("TERM", "xterm")], true, true),
+            (vec![("CLICOLOR_FORCE", "")], false, false),
+            (vec![("CLICOLOR_FORCE", " 0 ")], false, true),
+            (
+                vec![("NO_COLOR", " "), ("CLICOLOR_FORCE", "1")],
+                true,
+                false,
+            ),
             (
                 vec![("NO_COLOR", "1"), ("CLICOLOR_FORCE", "1")],
                 true,
@@ -371,6 +445,19 @@ mod tests {
             (vec!["glen", "send", "x", "--", "--json"], true, Mode::Human),
             (vec!["glen", "--jsonx"], true, Mode::Human),
             (vec!["glen", "--json=1"], true, Mode::Human),
+            (vec!["glen", "completions", "bad"], false, Mode::Raw),
+            (
+                vec!["glen", "--profile", "work", "completions"],
+                false,
+                Mode::Raw,
+            ),
+            (
+                vec!["glen", "--profile=completions", "doctor"],
+                false,
+                Mode::Json,
+            ),
+            (vec!["glen", "completions", "--json"], false, Mode::Json),
+            (vec!["glen", "--", "completions"], false, Mode::Json),
         ] {
             assert_eq!(
                 pre_mode(

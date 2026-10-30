@@ -194,8 +194,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **Spill.** Single-document output on a non-TTY stdout that exceeds `GLEN_MAX_OUTPUT` (default 24000 bytes, below Claude Code's 30000-char Bash cap; `0` disables; an invalid value uses the default plus warning `invalid_env`) is written to `$GLEN_HOME/out/…` (0600, no ANSI). glen prints the spilled envelope instead, or in human mode `output is <N> KB; full output in <path>`.
 - **Colour** (per stream; JSON is never coloured), in precedence order:
   1. `--color always|never`
-  2. `NO_COLOR` non-empty → off
-  3. `CLICOLOR_FORCE` non-empty → on
+  2. `NO_COLOR` with any non-empty literal value (including whitespace) → off
+  3. `CLICOLOR_FORCE` with any non-empty literal value other than `"0"` (including whitespace) → on
   4. `CLICOLOR=0` → off
   5. TTY and (`TERM` set and not `dumb`, or `CLICOLOR` set and not `0`, or `CI` set)
   - Every write goes through `anstream::AutoStream`.
@@ -259,6 +259,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 7. **Session owners** = `<XDG_STATE_HOME>/omp/run/session-owners` if `XDG_STATE_HOME` is non-empty and `<XDG_STATE_HOME>/omp` exists, else `base/run/session-owners`. This is shared across profiles and ignores the agent-dir override.
 8. **Extensions** = `agent_dir/extensions` (no XDG redirect).
 9. **Known gap.** omp fills *unset* `PI_CODING_AGENT_DIR`/`XDG_*_HOME` from `.env` files (cwd `.env`, `<agent_dir>/.env`, `<config_root>/.env`, `~/.env`; `utils/src/env.ts:289-316`). glen reads only its own environment. Doctor (W4) warns when those files define these keys.
+
+- **Environment handling difference.** glen drops non-UTF-8 environment keys/values and treats whitespace-only path values as unset; omp uses JavaScript strings and treats whitespace-only values as set. Profile names are still trimmed. `NO_COLOR` and `CLICOLOR_FORCE` use literal values as specified in §A10.
 
 - **omp executable:** `GLEN_OMP_BIN` (non-empty) accepts an absolute file path or a bare executable name searched on PATH; otherwise glen searches PATH for executable `omp`. `doctor` runs `--version` with a 10 s deadline. The first stdout line must be `n.n.n`, optionally prefixed by `omp/`. Failure, timeout or unparseable output is `omp_unavailable`.
 

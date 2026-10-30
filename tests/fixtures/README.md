@@ -16,7 +16,7 @@ Buckets represent `$HOME/work/alpha` and `$HOME/work/beta`; headers use `/home/f
 | S | `-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de/subagent-01.jsonl` | `01a0f6b5-ba60-7012-8f3b-3f7a9c1e5b20` | n/a | nested subagent artifact, header only plus user message; discovery skips it |
 
 Every non-legacy top-level session has a title slot of exactly 256 bytes including newline.
-S is a nested artifact transcript, with no title slot. Every JSON object carries runtime.version.
+S is a nested artifact transcript, with no title slot. Only entries carry runtime.version; title slots and session headers do not.
 B's string-form user message also appears verbatim in C's copied history. All other user content uses text-block arrays.
 A and F share the last four hex digits `c0de` but have unique seven-hex tails. A and S share prefix `01a0f6b`.
 D's active branch is 40000001, 40000002, 40000005, 40000006, 40000007, 40000008.

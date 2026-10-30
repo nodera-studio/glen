@@ -93,10 +93,11 @@ fn slots_headers_runtime_and_entry_shape() {
         let mut previous = "".to_string();
         let mut ids = BTreeSet::new();
         for v in objects(key) {
-            assert_eq!(v["runtime"]["version"], "18.14.0");
             if v["type"] == "session" || v["type"] == "title" {
+                assert!(v.get("runtime").is_none());
                 continue;
             }
+            assert_eq!(v["runtime"]["version"], "18.14.0");
             let id = v["id"].as_str().unwrap();
             assert!(
                 id.len() == 8
@@ -130,6 +131,53 @@ fn malformed_lines_are_deliberate() {
             assert!(!text.ends_with('\n'));
         } else {
             assert!(malformed.is_empty(), "{key}");
+        }
+    }
+}
+#[test]
+fn message_timestamps_match_their_own_entries() {
+    let leap = |year: u64| {
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400))
+    };
+    for (key, _, _) in FILES {
+        for v in objects(key) {
+            let Some(message) = v.get("message") else {
+                continue;
+            };
+            let iso = v["timestamp"].as_str().unwrap();
+            let parts: Vec<u64> = iso
+                .split(|c: char| !c.is_ascii_digit())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.parse().unwrap())
+                .collect();
+            let [year, month, day, hour, minute, second, millis] = parts[..] else {
+                panic!("unexpected timestamp {iso}")
+            };
+            let months = [
+                31,
+                if leap(year) { 29 } else { 28 },
+                31,
+                30,
+                31,
+                30,
+                31,
+                31,
+                30,
+                31,
+                30,
+                31,
+            ];
+            let days = (1970..year)
+                .map(|y| if leap(y) { 366 } else { 365 })
+                .sum::<u64>()
+                + months[..month as usize - 1].iter().sum::<u64>()
+                + day
+                - 1;
+            let epoch_ms = (((days * 24 + hour) * 60 + minute) * 60 + second) * 1000 + millis;
+            assert_eq!(message["timestamp"], epoch_ms, "{key}: {iso}");
+            if message["role"] == "bashExecution" {
+                assert!(message.get("content").is_none());
+            }
         }
     }
 }

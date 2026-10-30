@@ -114,6 +114,16 @@ fn doctor_unavailable() {
         let v = json(&o);
         assert_eq!(v["error"]["code"], "omp_unavailable");
         assert!(v["error"]["details"]["report"]["checks"].is_array());
+        assert!(
+            v["error"]["details"]["report"]["checks"][0]["detail"]
+                .as_str()
+                .unwrap()
+                .contains(if vars.is_empty() {
+                    "PATH"
+                } else {
+                    "/nonexistent"
+                })
+        );
         assert!(o.stderr.is_empty());
     }
     for version in ["bad", "18.14", "18.14.0\u{1b}[31m"] {
@@ -288,4 +298,215 @@ fn external_controls_escaped() {
     assert!(!text.contains('\x07'));
     assert!(!text.contains('\u{9b}'));
     assert!(text.contains(r"\x1b[31m\x07\u{9b}"));
+}
+
+#[test]
+fn help_and_usage_follow_glen_color_policy() {
+    for args in [vec!["--help"], vec!["--human", "bogus"]] {
+        for (flags, vars, colored) in [
+            (
+                vec!["--color", "never"],
+                vec![("CLICOLOR_FORCE", "1")],
+                false,
+            ),
+            (vec!["--color=always"], vec![("NO_COLOR", "1")], true),
+            (vec![], vec![("CLICOLOR_FORCE", "1")], true),
+            (
+                vec![],
+                vec![("NO_COLOR", " "), ("CLICOLOR_FORCE", "1")],
+                false,
+            ),
+            (vec![], vec![("CLICOLOR_FORCE", " ")], true),
+            (vec![], vec![("CLICOLOR_FORCE", "0")], false),
+        ] {
+            let mut command = flags;
+            command.extend_from_slice(&args);
+            let o = glen(&command, &vars);
+            let (text, other) = if args.contains(&"--help") {
+                assert!(o.status.success());
+                (&o.stdout, &o.stderr)
+            } else {
+                assert_eq!(o.status.code(), Some(2));
+                (&o.stderr, &o.stdout)
+            };
+            assert_eq!(text.contains(&27), colored, "{command:?} {vars:?}");
+            assert!(other.is_empty());
+        }
+    }
+    let help = glen(&["--help"], &[]);
+    let help = String::from_utf8(help.stdout).unwrap();
+    assert!(help.contains("Print a JSON envelope"));
+    assert!(help.contains("Print human-readable output"));
+}
+
+#[test]
+fn clap_external_argument_controls_are_escaped() {
+    let bad = "bad\nforged\r\u{9b}\x1b\u{202e}\u{2066}";
+    for args in [
+        vec!["--human", bad],
+        vec!["--human", "doctor", bad],
+        vec!["completions", bad],
+        vec!["--human", "--color", bad, "doctor"],
+    ] {
+        let o = glen(&args, &[]);
+        assert_eq!(o.status.code(), Some(2));
+        assert!(o.stdout.is_empty());
+        let text = String::from_utf8(o.stderr).unwrap();
+        assert!(
+            text.contains(r"bad\nforged\r\u{9b}\x1b\u{202e}\u{2066}"),
+            "{text:?}"
+        );
+        for c in ['\r', '\u{9b}', '\x1b', '\u{202e}', '\u{2066}'] {
+            assert!(!text.contains(c), "{text:?}");
+        }
+        assert!(!text.lines().any(|line| line.starts_with("forged")));
+    }
+}
+
+#[test]
+fn bare_glen_is_a_json_usage_error() {
+    let o = glen(&[], &[]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stderr.is_empty());
+    let v = json(&o);
+    assert_eq!(v["error"]["code"], "usage");
+    assert!(
+        v["error"]["details"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Usage:")
+    );
+}
+
+#[test]
+fn raw_errors_are_human_and_completions_do_not_resolve_glen_home() {
+    for args in [
+        vec!["completions", "bad"],
+        vec!["completions"],
+        vec!["completions", "bash", "--bad"],
+    ] {
+        let o = glen(&args, &[("GLEN_HOME", "relative")]);
+        assert_eq!(o.status.code(), Some(2));
+        assert!(o.stdout.is_empty());
+        assert!(o.stderr.starts_with(b"error:"));
+        let mut args = args;
+        args.push("--json");
+        let o = glen(&args, &[]);
+        assert_eq!(o.status.code(), Some(2));
+        assert_eq!(json(&o)["error"]["code"], "usage");
+        assert!(o.stderr.is_empty());
+    }
+    let o = glen(&["completions", "bash"], &[("GLEN_HOME", "relative")]);
+    assert!(o.status.success());
+    assert!(!o.stdout.is_empty());
+    assert!(!o.stdout.starts_with(b"{"));
+    assert!(o.stderr.is_empty());
+}
+
+#[test]
+fn doctor_json_details_keep_raw_paths() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().to_str().unwrap();
+    let bin = t.path().join("omp\x1b\u{202e}");
+    fs::copy(fake(), &bin).unwrap();
+    let o = glen(
+        &["doctor"],
+        &[
+            ("HOME", home),
+            ("GLEN_OMP_BIN", bin.to_str().unwrap()),
+            ("GLEN_HOME", home),
+        ],
+    );
+    assert!(o.status.success());
+    let v = json(&o);
+    for (name, expected) in [
+        ("omp_binary", bin),
+        ("agent_dir", t.path().join(".omp/agent")),
+        ("sessions_dir", t.path().join(".omp/agent/sessions")),
+        ("glen_home", t.path().to_path_buf()),
+    ] {
+        let check = v["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == name)
+            .unwrap();
+        assert_eq!(check["detail"], expected.to_str().unwrap());
+    }
+    let o = glen(
+        &["doctor", "--human"],
+        &[
+            ("HOME", home),
+            ("GLEN_OMP_BIN", &fake()),
+            ("GLEN_HOME", home),
+        ],
+    );
+    assert!(o.status.success());
+    assert!(
+        String::from_utf8(o.stdout)
+            .unwrap()
+            .contains("~/.omp/agent")
+    );
+}
+
+#[test]
+fn doctor_colored_rows_have_no_empty_spans_or_trailing_padding() {
+    let agent = fixture("omp/agent");
+    let o = glen(
+        &["doctor", "--human", "--color", "always"],
+        &[
+            ("GLEN_OMP_BIN", &fake()),
+            ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+        ],
+    );
+    assert!(o.status.success());
+    let text = String::from_utf8(o.stdout).unwrap();
+    assert!(text.contains('\x1b'));
+    assert!(!text.contains("m\x1b[0m"), "{text:?}");
+    let plain = anstream::adapter::strip_str(&text).to_string();
+    for line in plain.lines() {
+        assert_eq!(line, line.trim_end(), "{line:?}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_flag_prevents_inherited_profile_conflicts_in_omp() {
+    use std::os::unix::fs::PermissionsExt;
+    let t = tempfile::tempdir().unwrap();
+    let bin = t.path().join("omp");
+    fs::write(&bin, "#!/bin/sh\nif [ \"${OMP_PROFILE+x}\" = x ] || [ \"${PI_PROFILE+x}\" = x ]; then exit 64; fi\necho omp/18.14.0\n").unwrap();
+    fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+    for profile in ["work", "default", "  work  "] {
+        let o = glen(
+            &["--profile", profile, "doctor"],
+            &[
+                ("GLEN_OMP_BIN", bin.to_str().unwrap()),
+                ("OMP_PROFILE", "Bad Name"),
+                ("PI_PROFILE", "../bad"),
+            ],
+        );
+        assert!(o.status.success(), "{o:?}");
+        assert_eq!(json(&o)["data"]["omp"]["version"], "18.14.0");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn non_utf8_home_is_an_error_envelope_without_panic() {
+    use std::os::unix::ffi::OsStringExt;
+    let t = tempfile::tempdir().unwrap();
+    let home = t
+        .path()
+        .join(std::ffi::OsString::from_vec(b"home\xff".to_vec()));
+    let o = Command::new(env!("CARGO_BIN_EXE_glen"))
+        .arg("doctor")
+        .env_clear()
+        .env("HOME", &home)
+        .env("GLEN_OMP_BIN", fake())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(2), "{o:?}");
+    assert_eq!(json(&o)["error"]["code"], "invalid_env");
+    assert!(o.stderr.is_empty());
 }

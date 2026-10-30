@@ -26,19 +26,28 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         checks.push(Check {
             name,
             status,
-            detail: if detail.is_empty() {
-                value.clone()
-            } else {
+            detail: if status == "fail" && !detail.is_empty() {
                 detail.clone()
+            } else {
+                value.clone()
             },
         });
+        let value = if matches!(
+            name,
+            "omp_binary" | "agent_dir" | "sessions_dir" | "glen_home"
+        ) && Path::new(&value).is_absolute()
+        {
+            render::tilde(Path::new(&value), env.home())
+        } else {
+            value
+        };
         rows.push((name, status, value, detail));
     };
     let (binary, binary_error) = match bin::find_omp(env) {
         Ok(b) => (Some(b), None),
         Err(e) => (None, Some(e)),
     };
-    let path_value = |p: &Path| render::tilde(p, env.home());
+    let path_value = |p: &Path| p.to_string_lossy().into_owned();
     add(
         "omp_binary",
         if binary.is_some() { "ok" } else { "fail" },
@@ -50,7 +59,7 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
     );
     let version = if let Some(bin) = &binary {
         let spinner = Spinner::start(ctx.mode == Mode::Human && ctx.stderr_tty, "checking omp");
-        let result = bin::omp_version(bin, Duration::from_secs(10));
+        let result = bin::omp_version(bin, Duration::from_secs(10), cli.global.profile.as_deref());
         spinner.finish();
         match result {
             Ok(version) => {
@@ -140,7 +149,13 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             String::new()
         },
     );
-    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root,"home_exists":exists},"omp":{"bin":binary.as_deref(),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":paths,"checks":checks});
+    let json_paths = serde_json::to_value(&paths).map_err(|e| {
+        GlenError::new(
+            ErrorCode::InvalidEnv,
+            format!("cannot serialize omp paths: {e}"),
+        )
+    })?;
+    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":json_paths,"checks":checks});
     let p = &ctx.painter;
     let mut table = render::Table::new(p, ctx.width);
     for (name, status, value, detail) in rows {
@@ -154,7 +169,11 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             glyph,
             name.replace('_', " "),
             render::sanitize(&value).into_owned(),
-            p.paint(Token::Muted, &render::sanitize(&detail)),
+            if detail.is_empty() {
+                String::new()
+            } else {
+                p.paint(Token::Muted, &render::sanitize(&detail))
+            },
         ]);
     }
     let footer = format!(

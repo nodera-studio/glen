@@ -14,7 +14,7 @@ pub fn run() -> ExitCode {
     let argv: Vec<OsString> = std::env::args_os().collect();
     let cli = match cli::Cli::try_parse_from(&argv) {
         Ok(c) => c,
-        Err(e) => return output::clap_error(e, output::pre_mode(&argv, &term)),
+        Err(e) => return output::clap_error(e, &argv, &env, &term),
     };
     let ctx = match output::OutputCtx::new(&cli.global, cli.command.output_kind(), &env, &term) {
         Ok(c) => c,

@@ -94,11 +94,6 @@ impl From<std::io::Error> for GlenError {
         Self::new(ErrorCode::Io, e.to_string())
     }
 }
-impl From<anyhow::Error> for GlenError {
-    fn from(e: anyhow::Error) -> Self {
-        Self::new(ErrorCode::Internal, format!("{e:#}"))
-    }
-}
 #[derive(Clone, Debug, Serialize)]
 pub struct Warning {
     pub code: String,

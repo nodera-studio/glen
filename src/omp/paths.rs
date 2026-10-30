@@ -106,7 +106,7 @@ pub fn resolve(env: &Env, profile_flag: Option<&str>) -> Result<OmpPaths, GlenEr
         .map(|p| base_config_root.join("profiles").join(p).join("agent"));
     let agent_override = env
         .non_empty("PI_CODING_AGENT_DIR")
-        .filter(|raw| derived.as_deref() != Some(Path::new(raw)));
+        .filter(|raw| derived.as_deref().and_then(Path::to_str) != Some(*raw));
     let (agent_dir, agent_dir_source) = if profile.is_some() {
         (default_agent.clone(), AgentDirSource::Profile)
     } else if let Some(raw) = agent_override {
@@ -303,6 +303,21 @@ mod tests {
             .agent_dir,
             Path::new("/h/.omp/agent")
         );
+    }
+    #[test]
+    fn profile_derived_override_requires_raw_string_equality() {
+        for raw in [
+            "/h/.omp/profiles/work/./agent",
+            "/h/.omp/profiles/work//agent",
+        ] {
+            let p = resolve_vars(&[
+                ("OMP_PROFILE", ""),
+                ("PI_PROFILE", "work"),
+                ("PI_CODING_AGENT_DIR", raw),
+            ]);
+            assert_eq!(p.agent_dir, Path::new("/h/.omp/profiles/work/agent"));
+            assert_eq!(p.agent_dir_source, AgentDirSource::Env);
+        }
     }
     #[test]
     fn xdg_data_present() {

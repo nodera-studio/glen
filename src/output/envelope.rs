@@ -1,7 +1,7 @@
 use super::{Mode, OutputCtx};
 use crate::{
-    error::{GlenError, OkExit, Warning},
-    glen_home::write_private_atomic,
+    error::{ErrorCode, GlenError, OkExit, Warning},
+    glen_home::{self, write_private_atomic},
     render::{palette::Token, sanitize},
 };
 use serde_json::{Value, json};
@@ -96,8 +96,14 @@ fn human_warnings(ctx: &OutputCtx, warnings: &[Warning], err: &mut dyn Write) ->
     }
     err.flush()
 }
-fn spill(ctx: &OutputCtx, bytes: &[u8], command: &str) -> io::Result<Vec<u8>> {
-    let dir = ctx.glen_home.ensure_dir("out")?;
+fn spill(
+    ctx: &OutputCtx,
+    bytes: &[u8],
+    command: &str,
+    warnings: &[Warning],
+) -> Result<Vec<u8>, GlenError> {
+    let home = glen_home::resolve(&ctx.env)?;
+    let dir = home.root.join("out");
     let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(io::Error::other)?
@@ -108,10 +114,31 @@ fn spill(ctx: &OutputCtx, bytes: &[u8], command: &str) -> io::Result<Vec<u8>> {
         std::process::id(),
         if is_json { "json" } else { "txt" }
     ));
+    let json_path = if is_json {
+        serde_json::to_value(&path).map_err(|e| {
+            GlenError::new(
+                ErrorCode::InvalidEnv,
+                format!("cannot serialize spill path {}: {e}", path.display()),
+            )
+        })?
+    } else {
+        Value::Null
+    };
+    home.ensure_dir("out").map_err(|e| {
+        GlenError::new(
+            ErrorCode::Io,
+            format!("cannot create {}: {e}", dir.display()),
+        )
+    })?;
     // Human output can be explicitly forced to colour on a pipe. Spill files stay plain.
     let plain = anstream::adapter::strip_str(std::str::from_utf8(bytes).map_err(io::Error::other)?)
         .to_string();
-    write_private_atomic(&path, plain.as_bytes())?;
+    write_private_atomic(&path, plain.as_bytes()).map_err(|e| {
+        GlenError::new(
+            ErrorCode::Io,
+            format!("cannot write {}: {e}", path.display()),
+        )
+    })?;
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             if entry.path() != path
@@ -129,9 +156,9 @@ fn spill(ctx: &OutputCtx, bytes: &[u8], command: &str) -> io::Result<Vec<u8>> {
     }
     if is_json {
         json_bytes(
-            &json!({"v":1,"ok":true,"spilled":{"path":path,"bytes":plain.len(),"format":"json"}}),
+            &with_warnings(json!({"v":1,"ok":true,"spilled":{"path":json_path,"bytes":plain.len(),"format":"json"}}), warnings),
             false,
-        )
+        ).map_err(GlenError::from)
     } else {
         Ok(format!(
             "output is {} KB; full output in {}\n",
@@ -168,11 +195,15 @@ pub fn emit_to(
     };
     let bytes = if !ctx.stdout_tty
         && ctx.mode != Mode::Raw
-        && ctx.max_output.is_some_and(|max| bytes.len() > max)
-    {
-        match spill(ctx, &bytes, command) {
+        && ctx.max_output.is_some_and(|max| {
+            anstream::adapter::strip_str(&String::from_utf8_lossy(&bytes))
+                .to_string()
+                .len()
+                > max
+        }) {
+        match spill(ctx, &bytes, command, &warnings) {
             Ok(b) => b,
-            Err(e) => return emit_error_to(ctx, e.into(), out, err),
+            Err(e) => return emit_error_to(ctx, e, out, err),
         }
     } else {
         bytes
@@ -487,5 +518,174 @@ mod tests {
                 .is_some()
         );
         assert!(!t.path().join(".glen").exists());
+    }
+    #[test]
+    fn spill_stub_keeps_context_and_outcome_warnings() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = ctx(t.path(), Mode::Json, false);
+        c.max_output = Some(1);
+        c.warnings.push(Warning {
+            code: "invalid_env".into(),
+            message: "context".into(),
+        });
+        let mut outcome = Outcome::new(json!({"long": "x".repeat(100)}), "unused");
+        outcome.warnings.push(Warning {
+            code: "omp_version_untested".into(),
+            message: "outcome".into(),
+        });
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            emit_to(&c, outcome, "test", &mut out, &mut err),
+            ExitCode::SUCCESS
+        );
+        let stub: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(stub["warnings"].as_array().unwrap().len(), 2);
+        let full: Value =
+            serde_json::from_slice(&fs::read(stub["spilled"]["path"].as_str().unwrap()).unwrap())
+                .unwrap();
+        assert_eq!(stub["warnings"], full["warnings"]);
+        assert!(err.is_empty());
+    }
+    #[test]
+    fn human_spill_threshold_ignores_ansi_bytes() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = ctx(t.path(), Mode::Human, false);
+        c.max_output = Some(5);
+        let text = "\x1b[31mabcd\x1b[0m";
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            emit_to(
+                &c,
+                Outcome::new(json!(null), text),
+                "test",
+                &mut out,
+                &mut err
+            ),
+            ExitCode::SUCCESS
+        );
+        assert_eq!(out, format!("{text}\n").as_bytes());
+        assert!(!t.path().join(".glen").exists());
+        c.max_output = Some(4);
+        out.clear();
+        assert_eq!(
+            emit_to(
+                &c,
+                Outcome::new(json!(null), text),
+                "test",
+                &mut out,
+                &mut err
+            ),
+            ExitCode::SUCCESS
+        );
+        let path = fs::read_dir(t.path().join(".glen/out"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        assert_eq!(fs::read(path).unwrap(), b"abcd\n");
+    }
+    #[test]
+    fn home_resolution_is_deferred_until_spilling_and_errors_name_the_path() {
+        let t = tempfile::tempdir().unwrap();
+        let mut c = ctx(t.path(), Mode::Json, false);
+        c.env = Env::for_test(Some(t.path()), t.path(), &[("GLEN_HOME", "relative")]);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let code = emit_to(
+            &c,
+            Outcome::new(json!(1), "unused"),
+            "test",
+            &mut out,
+            &mut err,
+        );
+        assert_eq!(code, ExitCode::SUCCESS, "{}", String::from_utf8_lossy(&out));
+        c.max_output = Some(1);
+        out.clear();
+        assert_eq!(
+            emit_to(
+                &c,
+                Outcome::new(json!(1), "unused"),
+                "test",
+                &mut out,
+                &mut err
+            ),
+            ExitCode::from(2)
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(&out).unwrap()["error"]["code"],
+            "invalid_env"
+        );
+        let root = t.path().join("blocked");
+        fs::write(&root, b"not a directory").unwrap();
+        c.env = Env::for_test(
+            Some(t.path()),
+            t.path(),
+            &[("GLEN_HOME", root.to_str().unwrap())],
+        );
+        out.clear();
+        assert_eq!(
+            emit_to(
+                &c,
+                Outcome::new(json!(1), "unused"),
+                "test",
+                &mut out,
+                &mut err
+            ),
+            ExitCode::from(1)
+        );
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["error"]["code"], "io");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(root.join("out").to_str().unwrap())
+        );
+        assert!(err.is_empty());
+        let out_dir = t.path().join(".glen/out");
+        fs::create_dir_all(&out_dir).unwrap();
+        let e = spill(
+            &ctx(t.path(), Mode::Json, false),
+            b"{}",
+            "missing/child",
+            &[],
+        )
+        .unwrap_err();
+        assert_eq!(e.code, ErrorCode::Io);
+        assert!(e.message.starts_with("cannot write "));
+        assert!(e.message.contains(out_dir.to_str().unwrap()));
+        assert!(e.message.contains("missing/child"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_spill_path_does_not_panic() {
+        use std::os::unix::ffi::OsStringExt;
+        let t = tempfile::tempdir().unwrap();
+        let home = t
+            .path()
+            .join(std::ffi::OsString::from_vec(b"home\xff".to_vec()));
+        let mut c = ctx(&home, Mode::Json, false);
+        c.max_output = Some(1);
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            emit_to(
+                &c,
+                Outcome::new(json!(1), "unused"),
+                "test",
+                &mut out,
+                &mut err
+            ),
+            ExitCode::from(2)
+        );
+        let value: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(value["error"]["code"], "invalid_env");
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot serialize spill path")
+        );
+        assert!(err.is_empty());
+        assert!(!home.exists());
     }
 }
