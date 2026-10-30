@@ -270,7 +270,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - Every write goes through `anstream::AutoStream`.
 - **Depth:** `COLORTERM` truecolor/24bit → 24-bit; `TERM` containing `256color` → 256; otherwise 16.
 - **Theme:** `GLEN_THEME=dark|light`, then the last semicolon-separated integer in `COLORFGBG` (0–6 or 8 → dark; 7 or 9–15 → light), then dark.
-- **Palette.** Foreground only; body text keeps the terminal's default colour. Sourced from the Nodex redesign content tone (research `93cec9de` rev 2):
+- **Palette.** Foreground only; body text keeps the terminal's default colour. Sourced from the Nodex redesign content tone (research `93cec9de` rev 2). The values live in `src/render/palette.json`. `palette_contract` (tests only) checks them against `style()`, and the site reads the dark values at build. This table mirrors that file:
 
 | Token | Light hex | Dark hex | xterm L/D | ANSI-16 |
 |---|---|---|---|---|
@@ -371,7 +371,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **W3** live route: the bundled extension, install-extension, endpoint-first routing, inbox, talk-back from the TUI.
 - **W4** agent surface: SKILL.md (two variants), install-skill, extended doctor, completions polish, acceptance runs with Claude Code and Codex.
 - **W5** `glen watch` TUI.
-- **W6** site (Astro; Nodex redesign + morphin motion).
+- **W6** site: `site/`, static Astro in the Nodex-redesign look; a CSS-compiled terminal demo; morphin islands; palette from `src/render/palette.json`; CI job `site`.
 - **W7** deploy + release workflow.
 - **W8** audits + release v0.1.0.
 - Every wave leaves `main` green and usable. Unfinished subcommands stay hidden.

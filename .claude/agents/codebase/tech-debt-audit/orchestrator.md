@@ -116,7 +116,9 @@ For each inconsistency, report:
 ### Group 2 -- Code Complexity (Codex Scanner)
 
 Dispatch via the Agent tool with `subagent_type: "codex:codex-rescue"`, read-only (state it
-in the prompt). Never `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook
+in the prompt), in the foreground: end the prompt with
+"--wait. Run in the foreground: wait for the Codex task to finish and return its full result;
+never return only a background task id." Never `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook
 blocks both.
 
 ```

@@ -1,0 +1,102 @@
+/* The hero terminal. glen's output is always shown on a dark terminal (palette.json dark hexes
+   arrive as --glen-* on the figure). Column counts are real: the wide layout is a 76 + 64 column
+   split, the narrow one 44 columns, and the font scales so each pane holds exactly its columns. */
+.term { margin: 0; min-width: 0 }
+.term-win {
+ position: relative; container: term / inline-size; overflow: hidden; border-radius: 12px;
+ background: var(--term-bg); color: var(--term-fg);
+ border: 1px solid rgb(0 0 0 / .55);
+ box-shadow: var(--frame-shadow), inset 0 0 0 1px rgb(255 255 255 / .06);
+}
+
+/* Title bar: traffic lights, the process title, and the player controls. */
+.term-bar { position: relative; display: flex; align-items: center; height: 38px; padding: 0 12px; background: var(--term-bar) }
+.term-lights { display: flex; gap: 8px }
+.term-lights i { width: 12px; height: 12px; border-radius: 50%; background: #ff5f57; box-shadow: inset 0 0 0 .5px rgb(0 0 0 / .25) }
+.term-lights i:nth-child(2) { background: #febc2e }
+.term-lights i:nth-child(3) { background: #28c840 }
+.term-title { position: absolute; inset: 0; display: grid; place-items: center; pointer-events: none; font: 500 12.5px/1 var(--font-sans); color: rgb(222 222 227 / .7); white-space: nowrap }
+.term-ctl { position: relative; display: flex; gap: 2px; margin-left: auto }
+.term-ctl button { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 6px; color: rgb(222 222 227 / .7); transition: background-color 120ms var(--ease-out-quart), color 120ms var(--ease-out-quart), transform 120ms var(--ease-out-quart) }
+.term-ctl button:hover { background: rgb(255 255 255 / .08); color: var(--term-fg) }
+.term-ctl button:active { transform: scale(.94) }
+.term-ctl button:disabled { opacity: .4; pointer-events: none }
+.term-ctl svg, .term-tab svg { width: 16px; height: 16px; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round }
+.term-pause .i-play, .term-pause[aria-pressed=true] .i-pause { display: none }
+.term-pause[aria-pressed=true] .i-play { display: block }
+.term-ctl .focus-ring:focus-visible, .term-tab.focus-ring:focus-visible { outline-color: var(--glen-focus); outline-offset: -2px }
+
+/* Tabs double as pane titles: in the split they sit over their pane; narrow, they switch panes. */
+.term-tabs { display: grid; grid-template-columns: 76fr 64fr; height: 32px; background: var(--term-bar); box-shadow: inset 0 -1px var(--term-line) }
+.term-tab { position: relative; display: flex; align-items: center; gap: 8px; min-width: 0; padding: 0 12px; border-top: 2px solid transparent; font: 12px/1 var(--font-sans); color: rgb(222 222 227 / .58); white-space: nowrap; transition: color 160ms var(--ease-out-quart), background-color 160ms var(--ease-out-quart) }
+.term-tab + .term-tab { box-shadow: inset 1px 0 var(--term-line) }
+.term-tab[aria-selected=true] { background: var(--term-bg); color: var(--term-fg); border-top-color: var(--glen-accent) }
+.term-tab .live { width: 6px; height: 6px; border-radius: 50%; background: var(--glen-success); box-shadow: 0 0 0 3px color-mix(in oklch, var(--glen-success) 18%, transparent) }
+.term[data-term=static] .term-tab { color: var(--term-fg); background: var(--term-bg); border-top-color: transparent }
+
+/* Panes. */
+.term-body { position: relative }
+.term-v {
+ display: grid; grid-template-columns: 76fr 64fr;
+ font: clamp(10px, (100cqi - 74px) / 84, 13px)/1.5385 "Geist Mono", ui-monospace, "SF Mono", SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+ font-variant-ligatures: none; font-feature-settings: "liga" 0, "calt" 0; font-variant-numeric: tabular-nums;
+}
+.term-v[data-v=n] { display: none }
+.term-pane { min-width: 0; padding: 12px 16px; contain: content }
+.term-pane + .term-pane { box-shadow: inset 1px 0 var(--term-line) }
+.term-vp { overflow: hidden }
+.js .term-vp { height: calc(var(--rows) * 1lh) }
+.term-scroll { transition: transform 220ms var(--ease-out-quart) }
+.tl { position: relative; z-index: 0; height: 1lh; white-space: pre }
+.g { display: inline-block; width: 1ch; text-align: center; font-style: normal }
+.b { font-weight: 600 }
+.c-muted { color: var(--glen-muted) }
+.c-accent { color: var(--glen-accent) }
+.c-accent_2 { color: var(--glen-accent_2) }
+.c-success { color: var(--glen-success) }
+.c-warning { color: var(--glen-warning) }
+.c-danger { color: var(--glen-danger) }
+.c-focus { color: var(--glen-focus) }
+
+/* Playback state. Rows that have not happened yet keep their line but stay invisible. */
+.term:not([data-term=static]) .tl:not(.on) { visibility: hidden }
+.tl[data-k=spin]:not(.on), .tl.off, .term[data-term=static] .spare { display: none }
+.cur { display: inline-block; width: 1ch; height: 1.15em; vertical-align: -.22em; background: var(--glen-accent); opacity: .85; visibility: visible; animation: term-blink 1060ms steps(1) infinite }
+.cur.solid, .cur.hollow { animation: none }
+.cur.fin { animation-iteration-count: 6 }
+.cur.hollow { background: none; box-shadow: inset 0 0 0 1px var(--glen-accent) }
+.term[data-term=paused] .cur { animation-play-state: paused }
+.term[data-term=static] .cur { animation: none }
+.term[data-term=static] [data-p=b] .cur { display: none }
+@keyframes term-blink { 50% { opacity: 0 } }
+.sel { position: absolute; z-index: -1; inset: 0 auto 0 0; width: 0; background: color-mix(in oklch, var(--glen-focus) 32%, transparent); color: inherit }
+.term-dot { position: absolute; top: -3px; left: -3px; width: 6px; height: 6px; border-radius: 50%; background: var(--glen-accent_2); box-shadow: 0 0 10px 1px var(--glen-accent_2); opacity: 0; pointer-events: none; will-change: transform }
+.term-dot::after { content: ''; position: absolute; top: 1px; right: 3px; width: 18px; height: 4px; border-radius: 2px; background: linear-gradient(to left, var(--glen-accent_2), transparent) }
+
+/* Medium: the 44-column layout, split. Narrow: one pane at a time behind the tabs. */
+@container term (width < 1040px) {
+ .term-v[data-v=w] { display: none }
+ .term-v[data-v=n] { display: grid; grid-template-columns: 1fr 1fr; font-size: min(13px, (100cqi - 68px) / 52.8) }
+ .term-tabs { grid-template-columns: 1fr 1fr }
+}
+@container term (width < 760px) {
+ .term-body { --narrow: 1 }
+ .term-v[data-v=n] { grid-template-columns: minmax(0, 1fr); font-size: min(12px, (100cqi - 26px) / 26.4) }
+ .term-pane { padding: 10px 12px }
+ .term-pane + .term-pane { box-shadow: inset 0 1px var(--term-line) }
+ .term-tabs { display: flex }
+ .term[data-focus=a]:not([data-term=static]) .term-pane[data-p=b],
+ .term[data-focus=b]:not([data-term=static]) .term-pane[data-p=a] { display: none }
+ .term-bar { padding-inline: 10px }
+ .term-lights i { width: 10px; height: 10px }
+ .term-title { font-size: 12px }
+}
+
+.term figcaption { margin-top: 14px; max-width: 72ch; font: 13px/20px var(--font-sans); color: var(--ink-subdued); text-wrap: pretty }
+
+@media (prefers-reduced-motion: reduce) {
+ .js .term-vp { height: auto }
+ .term-scroll { transform: none !important; transition: none }
+ .term *, .term-dot, .sel { animation-name: none !important }
+ .term-dot, .sel, .term-ctl { display: none }
+}

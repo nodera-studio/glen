@@ -51,6 +51,9 @@ and compatibility concerns." For integrating a new external service, adopting a 
 library, a feature with no existing pattern, or a major architectural change.
 </depth>
 
+A UI wave that names a component library or design reference runs at least **standard**, even
+when the other signals say minimal: the researcher owns the catalogue survey (Step 3).
+
 Announce the decision before dispatching: "Triage: **{depth}** — {one-sentence reason}."
 </triage_protocol>
 
@@ -92,6 +95,17 @@ Dispatch via Agent tool (parallel):
            Task: {task description}"
 ```
 
+**UI waves: survey the catalogue before anyone picks components.** For a wave with
+design-heavy UI (`site/`, landing pages, web (non-Rust) visual components) that names a
+component library or design reference (triaged at least standard, Step 2), the researcher
+brief adds: "Survey the WHOLE catalogue of {library}: list every
+component with a fit rating for this page (use / maybe / no) and a one-line reason, and inventory
+the design reference(s) — tokens (type scale, colours, spacing, radii, motion) and signature
+patterns — with `path:line` or URL + selector citations." The site plan picked components without
+surveying the catalogue, and the page passed every gate yet read as "meh". Pass the survey and
+the inventory to the architects and the planner; components are chosen only from the survey.
+The planner then adds the reference-fidelity verification step (see `planner.md` → UI waves).
+
 ### Step 4 — Architecture (dual-engine: parallel generation → judge-select)
 
 Wait for explorer (and researcher, if dispatched) to finish. Then generate approaches with
@@ -127,8 +141,16 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            assumptions and failure modes a single model would miss. Approaches only —
            no code changes. Keep it compact (about 120 lines at most); no web fetches —
            the research is already in the reports above. Return the analysis as your
-           final message."
+           final message. --wait. Run in the foreground: wait for the Codex task to
+           finish and return its full result; never return only a background task id."
 ```
+
+**Codex runs in the foreground.** The `codex:codex-rescue` forwarder picks background mode for
+any task that looks long unless the brief says `--wait`; then it returns at once with a task id
+("file doesn't exist yet") and you are left polling for output. Every codex-rescue brief in this
+pipeline (architect, planner) carries the `--wait` line above. If one still returns only a task
+id, fetch the result (`codex-companion.mjs status <id> --wait`, then `result <id>`) before
+persisting it; never hand the judge a candidate you have not read.
 
 Each architect returns 2-3 approaches, so the judge sees a **4-candidate pool** — the move from a
 homogeneous ~0.51 pool (one model, nothing for a selector to exploit) to a diverse ~0.81-class pool.
@@ -267,7 +289,8 @@ Dispatch via Agent tool (subagent_type: codex:codex-rescue):
            Return ordered steps with files-to-create vs modify, verification per step, and
            prerequisites. Plan only — no code. Keep it compact (about 120 lines at most);
            no web fetches — the research is already in the reports above. Return the plan
-           as your final message."
+           as your final message. --wait. Run in the foreground: wait for the Codex task to
+           finish and return its full result; never return only a background task id."
 ```
 Persist and anonymise both plans as in Step 4: raw plans to `.claude/plans/<slug>.private/plan-claude.md`
 and `plan-codex.md`, a fresh coin flip (independent of the Step 4 one), anonymised copies to
@@ -309,6 +332,8 @@ when one is given. Tell the user:
   never engine names or the mapping; reveal the mapping only after its verdict.
 - Never override agent models. Each agent's frontmatter controls its model.
 - Explore before architecting — the architect needs real data, not assumptions.
+- Every `codex:codex-rescue` brief runs foreground (`--wait`) and returns the full result.
+- UI waves get the catalogue survey and reference inventory before components are chosen.
 
 </rules>
 

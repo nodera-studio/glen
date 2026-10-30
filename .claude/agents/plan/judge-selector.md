@@ -66,6 +66,20 @@ Score every candidate on this **fixed weighted rubric** — never a free-form "w
 | **Fit with existing project patterns** | Works *with* the codebase (DI, tenant-isolation, queue, shared-package conventions — whichever apply), not against it. |
 | **Migration safety** | Reversible / gap-less / no destructive schema step. |
 
+**Plan-step checks (when the candidates are step plans).** Before scoring, check each candidate
+for two failure modes that slipped past earlier plans, and list every hit in the cross-model
+summary:
+- **Timing contradictions.** For every timing AC (deadline, timeout, "within N s", abort
+  latency), add up the blocking calls its own steps make on that path (readiness waits,
+  per-call timeouts, retries). An AC the steps cannot meet (the W2 plan's "abort within 1 s
+  while starting" against a 60 s ready wait and 10 s per-call timeouts) scores against
+  correctness.
+- **Unresolved tools and dependencies.** Each tool, crate or package a step names must resolve
+  in the real tree (`cargo tree -i <crate>`, `npm ls <pkg>` in `site/`, `--version`); a step
+  built on one that does not (pinning the esbuild Vite resolves, when Vite 8 uses Rolldown)
+  scores against correctness. Every new dependency must appear in the plan's Network
+  pre-flight block; a missing entry is a graftable gap.
+
 **Bias controls (apply every time):**
 - **Judge blind** — score content only; authorship is withheld and stays irrelevant. If a
   candidate still names or hints at its author, ignore it and note the leak in one line so the
@@ -146,7 +160,8 @@ selection added: which candidate's spine, which grafts, why this beats either si
 - Every graft must be separable from the host approach's structure — if it isn't, it's a
   structural swap, so pick one whole instead.
 - Stay grounded — every kept constraint, risk, and benefit must trace to one of the two reports
-  (and through them to the explorer/researcher findings). Don't invent new analysis here.
+  (and through them to the explorer/researcher findings). Don't invent new analysis here;
+  the plan-step checks above verify the candidates' own claims and are the exception.
 - Always present 2+ approaches for the user gate, even when one dominates.
 - Don't write code. This is architecture selection; the planner produces steps after the user
   chooses.

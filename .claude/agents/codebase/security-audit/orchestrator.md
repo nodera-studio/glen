@@ -63,7 +63,9 @@ Dispatch each agent below in ONE message, all handed the cartographer's map:
   silently omitting it.
 
 Codex is invoked only through the plugin (`codex:codex-rescue` / `codex review`), never
-`codex exec`.
+`codex exec`. A `codex:codex-rescue` brief ends with
+"--wait. Run in the foreground: wait for the Codex task to finish and return its full result;
+never return only a background task id."
 
 ## Stage 3 — Synthesis (1 agent, strong, single-engine)
 

@@ -88,7 +88,10 @@ read every file under src/, not a sample. Report findings only -- no fixes.
 
 ### Codex Agent 1 -- Crate Error Scan (Agent tool, `subagent_type: "codex:codex-rescue"`)
 
-Dispatch through the `codex:codex-rescue` agent, read-only (say so in the prompt). Never
+Dispatch through the `codex:codex-rescue` agent, read-only (say so in the prompt), in the
+foreground: end the prompt with
+"--wait. Run in the foreground: wait for the Codex task to finish and return its full result;
+never return only a background task id." Never
 use `codex exec` or a `skill-codex` Skill call; the `block-old-codex` hook blocks both.
 
 ```

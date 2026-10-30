@@ -19,8 +19,8 @@ Product direction (owner, 2026-10-30; details in the Glen project's Ideas in Mne
   subcommands, short session handles, human output on a TTY and `--json` for agents, and a
   shipped agent skill (`SKILL.md`) for Claude Code and Codex. No MCP server needed to use it.
 - **It has to look good.** Polished terminal output and a live full-screen session view.
-- **An Astro landing page** that blends Mnemosyne's design language with morphin.dev motion
-  components.
+- **An Astro landing page** (`site/`) in the Nodex redesign's look (`apps/mockup-nodex`;
+  Mnemosyne decision `f6a568ef`), with morphin.dev motion components.
 
 Design and the omp surfaces it builds on: [`docs/design.md`](docs/design.md).
 
@@ -46,8 +46,19 @@ cargo clippy --all-targets -- -D warnings           # lint (warnings fail CI)
 cargo fmt --all                                     # format
 ```
 
+Site:
+
+```bash
+cd site && npm ci   # Node from site/.nvmrc
+npm run dev
+npm run verify      # astro check, build, timeline tests, budgets
+npm run test:e2e    # Playwright smoke; npx playwright install chromium once
+npm run lhci        # Lighthouse CI, mobile, light and dark
+```
+
 `lefthook install` once per clone: pre-commit checks rustfmt and scans for secrets, pre-push runs
-clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS.
+clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS (the
+`site` job runs on Linux only).
 
 ## Conventions
 
@@ -58,6 +69,9 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
 - Tests that need an RPC peer use the `fake_omp` example (`tests/support/fake_omp.rs`) through `GLEN_OMP_BIN`, never a live omp.
 - Never mutate the process environment in code or tests (edition 2024 `set_var` is unsafe); read through `env::Env`.
 - Branch off `main`, PR into `main`. No direct pushes to `main`.
+- `site/` never imports `framer-motion`; motion comes from `motion/react` through `IslandRoot`.
+  morphin items are refreshed in `site/vendor/morphin/` and ported by hand (`site/morphin.json`).
+- The CLI palette lives in `src/render/palette.json`; `palette_contract` keeps `style()` in step.
 
 ## Mnemosyne
 

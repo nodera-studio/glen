@@ -1,0 +1,35 @@
+:root[data-theme] { color-scheme: dark;
+  --frame: #ededed;
+  --frame-raised: #dedede;
+  --frame-border: #c2c2c2;
+  --frame-fg: #292929;
+  --frame-fg-subdued: #505050;
+  --content: #191a1c;
+  --layer-1: #222326;
+  --layer-2: #303136;
+  --control-hover: #3c3e44;
+  --line: #393b40;
+  --line-strong: #45474d;
+  --ink: #dedee3;
+  --ink-heading: #f4f4f6;
+  --ink-subdued: #b4b5bd;
+  --ink-disabled: #73757e;
+  --focus: #94adff;
+  --brand: #7170ff;
+  --brand-fg: #131313;
+  --brand-hover: color-mix(in oklch, var(--brand) 92%, white);
+  --success: oklch(73.1% 0.2158 148.29);
+  --danger: oklch(69.96% 0.2136 22.03);
+  --shadow-1: 0 1px 2px rgb(0 0 0/.35);
+  --shadow-2: 0 4px 12px rgb(0 0 0/.45);
+  --shadow-3: 0 16px 48px rgb(0 0 0/.56);
+  --frame-shadow: 0 2px 4px rgb(0 0 0/.5),0 10px 18px -6px rgb(0 0 0/.55),0 54px 70px -28px rgb(0 0 0/.8);
+  --frame-floor: rgba(202,208,220,.10);
+  --warning: oklch(78% .15 70);
+  --card-shadow: 0 1px 2px rgb(0 0 0/25%), 0 0 0 1px rgb(255 255 255/5%);
+}
+:root[data-theme] [data-tone='shell'] { color-scheme: light; --focus: #4069fd }
+:root[data-theme] [data-tone='content'] { color-scheme: dark }
+
+:root[data-theme] .exit-badge {background:color-mix(in oklch,var(--content) 80%,black)}
+:root[data-theme] .term-win {border-color:color-mix(in oklch,var(--line-strong) 60%,white)}
