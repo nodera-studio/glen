@@ -153,7 +153,9 @@ lost all of it. So:
    group.
 2. Run one Codex turn per group. The first is `--fresh` with the whole plan in `<task>` and
    "Steps N–M only"; each later group is `--resume-last` with a delta prompt ("Now implement
-   Steps N–M of the plan; the earlier steps are committed"), never the whole plan again.
+   Steps N–M of the plan; the earlier steps are committed"), never the whole plan again. A
+   retry of a later group (k > 1) cannot resume the failed turn: it is `--fresh` with the whole
+   plan in `<task>` plus "Steps N–M only; Steps 1..N-1 are committed".
 3. After each group, run host re-verification (Step 6). When it is green, make a WIP commit
    of exactly the files Codex reported for that group (Step 6 → item 4), message
    `wip: <wave> steps N–M`, plus the project's trailer. A group that is not green goes back to
@@ -179,7 +181,9 @@ found only by polling `codex-companion status`. So:
    retry, and before returning a BLOCKER, run "Cancelling a run" below, steps 0–3, for this
    `WT`, and confirm the worktree has stopped changing.
 3. **Cap at 2 attempts** (the first run plus one retry; for a capacity error, wait about 60 s
-   first). The retry is `--fresh` with the same prompt. Never a third.
+   first). The retry is `--fresh`: for the first step group, the same prompt; for a later
+   group, the whole plan plus "Steps N–M only; Steps 1..N-1 are committed" (Step groups,
+   item 2). Never a third.
 4. **After the second failure, stop** and return a report that leads with `BLOCKER: Codex
    failed twice`, both error texts, what is on disk (uncommitted files, any commit), and a
    **suggested smaller delta**: the slice split into smaller steps, or the same fix as a
@@ -196,10 +200,10 @@ you made.
 TaskStop on this agent ends the Claude host only. The codex-companion job, its
 `app-server-broker.mjs` broker, the `codex app-server` and the sandbox processes it spawned
 keep running, and keep editing the worktree. Whoever stops this agent (the orchestrator, or
-you on an abort) must cancel the Codex side too, with `COMPANION` resolved as in Step 2 and
-`WT` = the absolute worktree path:
+you on an abort) must cancel the Codex side too, with `WT` = the absolute worktree path:
 
 ```bash
+COMPANION="$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | sort -V | tail -1)scripts/codex-companion.mjs"
 # 0. Guard. The companion turns an empty --cwd into its own cwd, so an unset WT would cancel
 #    the main checkout's jobs. WT must be an absolute worktree root and not the main checkout.
 : "${WT:?set WT to the absolute worktree path}"
@@ -208,9 +212,10 @@ case "$WT" in /*) ;; *) echo "refuse: WT must be absolute" >&2; exit 1 ;; esac
   || { echo "refuse: $WT is not a git worktree root" >&2; exit 1; }
 MAIN="$(cd "$(git -C "$WT" rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)"
 [ "$(cd "$WT" && pwd -P)" != "$MAIN" ] || { echo "refuse: $WT is the main checkout" >&2; exit 1; }
-# 1. Interrupt the turn and kill the job's process tree (the companion's own cancel).
-for id in $(node "$COMPANION" status --cwd "$WT" --json | jq -r '.running[].id'); do
-  node "$COMPANION" cancel "$id" --cwd "$WT" --json
+# 1. Interrupt the turn and kill the job's process tree (the companion's own cancel). Unset the
+#    session id so status and cancel see every Claude session's jobs for this worktree.
+for id in $(env -u CODEX_COMPANION_SESSION_ID node "$COMPANION" status --cwd "$WT" --json | jq -r '.running[].id'); do
+  env -u CODEX_COMPANION_SESSION_ID node "$COMPANION" cancel "$id" --cwd "$WT" --json
 done
 # 2. If anything still runs, kill the broker for THIS worktree and all its descendants.
 #    Match only a node process running the broker (not this shell, whose command line also
@@ -225,14 +230,15 @@ ps -axo pid=,command= \
 # 3. Verify: no broker left for $WT, and `git -C "$WT" status --short` is unchanged 30 s later.
 ```
 
-The `status` call lists only the current Claude session's jobs; if it shows nothing while
-the worktree is still changing, go straight to step 2. In this cancel path, never kill a
-broker whose `--cwd` is not the worktree you stopped. (The orphan sweep run when a worktree is
-removed is the one deliberate exception; see below.)
+With `CODEX_COMPANION_SESSION_ID` unset, `status` lists every session's jobs for `$WT`; if it
+shows nothing while the worktree is still changing, go straight to step 2. In this cancel path,
+never kill a broker whose `--cwd` is not the worktree you stopped. The orphan sweep is a
+separate script with its own checks, run at worktree removal and at every wave end (see
+below).
 
 Removing a worktree is the orchestrator's job, not yours: it runs
-`.claude/scripts/remove-worktree.sh`, then `.claude/scripts/sweep-codex-orphans.sh`
-(`orchestrator.md` → Role 1 → "Removing a worktree").
+`.claude/scripts/remove-worktree.sh`, then `.claude/scripts/sweep-codex-orphans.sh` (brokers
+only; tasks are report-only) (`orchestrator.md` → Role 1 → "Removing a worktree").
 
 ## Step 5 — Parse + report
 
@@ -267,7 +273,8 @@ outside the sandbox:
    read code, narrow a failure to `path:start-end`. It never edits. Every code or test change,
    however small, goes back to Codex as a `--resume-last` delta prompt with the line range
    (Step 3 → "Line-range briefs"). Your only writes are `git add` / `git commit` of the files
-   Codex touched (item 4), and a manifest change that needs the network (`cargo add
+   Codex touched (item 4), a tagged stash for a comparison (item 6, restored and dropped before
+   your turn ends), and a manifest change that needs the network (`cargo add
    <crate>@<version>`), which Codex's sandbox cannot run. "Small and targeted" is never a
    reason to write code yourself: on 2026-10-30 wrappers did three times (Rust fix `7729bad`,
    and two tests fixed on the host).
@@ -310,7 +317,8 @@ too, say so instead of guessing.
 - You write NO product code and no tests, however small the fix. If Codex is unavailable,
   STOP and report — never hand-write the change, never `codex exec`. Host re-verification
   diagnoses; every change goes back to Codex as a line-range delta prompt. Your only writes
-  are `git add`/`git commit` of Codex's files and network-only manifest changes (`cargo add`).
+  are `git add`/`git commit` of Codex's files, a tagged comparison stash (Step 6 item 6) and
+  network-only manifest changes (`cargo add`).
 - One Codex turn per step group of at most about 4 plan steps; a WIP commit
   (`wip: <wave> steps N–M`, with the trailer) after each group passes host verification.
 - Foreground dispatch only; pin `--effort high`; pin `--model` via `CODEX_MODEL`

@@ -115,9 +115,10 @@ processes keep running and keep editing the worktree. Whenever you stop a Codex-
    rev-parse --show-toplevel` equals it) and not the main checkout. The companion turns an
    empty `--cwd` into its own cwd, so an unset path would cancel the main checkout's jobs. The
    guard is step 0 of the recipe in `coder-codex.md`.
-1. `node "$COMPANION" status --cwd <worktree> --json`, then for each id in `.running[]`:
-   `node "$COMPANION" cancel <id> --cwd <worktree> --json` (interrupts the turn and kills
-   the job's process tree).
+1. `env -u CODEX_COMPANION_SESSION_ID node "$COMPANION" status --cwd <worktree> --json`
+   (every session's jobs), then for each id in `.running[]`:
+   `env -u CODEX_COMPANION_SESSION_ID node "$COMPANION" cancel <id> --cwd <worktree> --json`
+   (interrupts the turn and kills the job's process tree). `COMPANION` is resolved below.
 2. If the worktree still changes, kill that worktree's broker tree only. The exact recipe
    matches only a node process running `app-server-broker.mjs serve`, then `--cwd <worktree>
    --pid-file` as a fixed string, so neither your own shell nor other worktrees' brokers are
@@ -127,8 +128,10 @@ processes keep running and keep editing the worktree. Whenever you stop a Codex-
 The broker also survives a run that ended normally and the removal of its worktree, and a
 `codex-companion.mjs task` process can outlive its finished job. Remove a worktree any Codex
 run used only with `bash "$MAIN/.claude/scripts/remove-worktree.sh" <worktree> [<branch>]`
-(stops that worktree's brokers and tasks, then removes it), then run
-`.claude/scripts/sweep-codex-orphans.sh` (this repo's orphaned brokers and tasks):
+(`MAIN` = the main checkout; it cancels that worktree's jobs through the companion and stops
+their processes, brokers and task-workers, then removes it), then run
+`.claude/scripts/sweep-codex-orphans.sh` (stops this repo's orphaned brokers; reports suspected
+orphan tasks without stopping them):
 `implementation/orchestrator.md` → Role 1 → "Removing a worktree".
 
 Resolve `COMPANION` as in `coder-codex.md` Step 2:

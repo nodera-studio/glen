@@ -219,12 +219,13 @@ also fails twice, stop and report to the user.
 cycle 2 was finished with only the commit left when its host was stopped, and its edits sat
 in tagged git stashes that had to be restored by SHA. Before you stop one:
 
-1. Look at the worktree (`WT` = its absolute path, `COMPANION` as in `coder-codex.md` Step 2):
+1. Look at the worktree (`WT` = its absolute path):
 
    ```bash
+   COMPANION="$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ 2>/dev/null | sort -V | tail -1)scripts/codex-companion.mjs"
    git -C "$WT" status --short
    git -C "$WT" stash list --format='%H %gs'      # stashes are repo-wide: match the wave's tags
-   node "$COMPANION" status --cwd "$WT" --json
+   env -u CODEX_COMPANION_SESSION_ID node "$COMPANION" status --cwd "$WT" --json   # every session's jobs
    ```
 
 2. SendMessage the agent asking for its status (step, attempt, Codex job state, uncommitted
@@ -262,24 +263,31 @@ the broker's SIGTERM handler runs the same clean shutdown as the `broker/shutdow
 plugin's SessionEnd hook sends, so the scripts send SIGTERM. Whenever you remove a wave, fix or
 harness worktree (after its merge, or when abandoning it), from the main checkout:
 
-1. If `node "$COMPANION" status --cwd "$WT" --json` lists a running job, cancel it first
-   (`coder-codex.md` → "Cancelling a run", steps 0–1), so the server-side turn is interrupted.
-2. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]`. In order, it stops every
-   broker and task process whose `--cwd` (or, for a task without `--cwd`, process cwd) is
-   exactly `$WT`, with their descendants (TERM, wait, KILL); confirms none remain (exit 1,
-   nothing removed, if any do); runs `git worktree remove --force`; and with `<branch>`,
-   `git branch -D`. It refuses any path not directly under `.claude/worktrees/`. Removal
-   discards uncommitted changes, so commit or push first. Use the main checkout's copy, never
-   the one inside the worktree being removed (it refuses that too).
-3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"` (add `--dry-run` to only list). It
-   stops orphans of this repo only: brokers whose `--cwd` under `.claude/worktrees/` no longer
-   exists, and `task` / `task-worker` processes whose worktree (from `--cwd`, else the process
-   cwd, else the single worktree path in the prompt) no longer exists or whose job the
-   companion `status` reports finished. It never stops by command-line pattern alone.
+`MAIN` is the main checkout (`MAIN="$(cd "$(git rev-parse --path-format=absolute
+--git-common-dir)/.." && pwd -P)"`); run both scripts from there, never from inside `$WT`.
+
+1. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` lists and
+   changes nothing). It refuses unless `$WT` is a worktree registered in this repo's
+   `git worktree list --porcelain`, directly under `.claude/worktrees/` (canonical paths), and
+   your cwd is outside it. With `<branch>`, it refuses unless that branch is checked out in
+   `$WT` and is merged into `origin/main` or has an upstream. It then cancels every running
+   companion job of `$WT` with the companion's own `cancel` (found in the companion state, never
+   on a command line), stops that job's process and every broker and task-worker whose
+   fixed-position `--cwd` is `$WT` or below it (TERM, wait, KILL; a pid whose start time or
+   command changed since listing is skipped), confirms nothing is left (else exit 1, nothing
+   removed), runs `git worktree remove --force` and, with `<branch>`, `git branch -D`. Removal
+   discards uncommitted changes, so commit or push first. If the companion state
+   (`$CLAUDE_PLUGIN_DATA/state`) is missing it refuses; `--force-no-state` goes on without
+   cancelling jobs.
+2. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"` (`--dry-run` to only list). It stops
+   only brokers whose `--cwd` under `.claude/worktrees/` no longer exists and that no live job
+   references. Tasks are report-only: it lists suspected orphan `task` / `task-worker`
+   processes and stale job records with the evidence. Stop a listed task yourself only after
+   checking it (`coder-codex.md` → "Cancelling a run").
 
 **Wave end: sweep orphans.** At the end of every wave (after its last Implementer returns, and
-again at wave close after the merge), run step 3 even when no worktree is removed: a `task`
-process can outlive its finished job in a worktree that still exists.
+again at wave close after the merge), run step 2 even when no worktree is removed, and act on
+its task report: a `task` process can outlive its finished job in a worktree that still exists.
 
 **Host re-verification (never trust Codex's red or green).** The Implementer's sandbox
 reports failures that are not real: `EPERM` on Unix-socket bind/connect (socket tests
@@ -516,8 +524,10 @@ over 6 runs after its wave. So:
 
 - **One live smoke in the building wave.** Any test harness that drives a real TUI, a real
   agent CLI (omp, Claude Code, Codex) or a real network service gets one live smoke run inside
-  the wave that builds it, before the PR. Fixture and fake-peer tests do not substitute. Save
-  the recording or transcript under `.claude/evidence/<wave>/` and name it in the Report.
+  the wave that builds it, before the PR. Fixture and fake-peer tests do not substitute. Run it
+  against a scratch omp home (`PI_CONFIG_DIR` / `PI_CODING_AGENT_DIR` under a temp dir) and
+  scratch sessions only, never a live `~/.omp` session. Save the recording or transcript under
+  `.claude/evidence/<wave>/` and name it in the Report.
 - **Replay before re-running live.** After any checker change, replay the stored recordings
   offline against the changed checker before doing another live run. A live run is the
   expensive confirmation, not the debugger.
@@ -588,8 +598,8 @@ Plans are **kept after implementation** — they accumulate as project history. 
   exact line ranges, forbid full-file reads beyond them and skip Mnemosyne recall.
 - Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
   alone leaves Codex editing the worktree. Removing a worktree goes through
-  `.claude/scripts/remove-worktree.sh`, then `sweep-codex-orphans.sh`; the sweep also runs at
-  every wave end (Role 1 → "Removing a worktree").
+  `.claude/scripts/remove-worktree.sh`, then `sweep-codex-orphans.sh` (brokers only; tasks are
+  report-only); the sweep also runs at every wave end (Role 1 → "Removing a worktree").
 - Never trust the Implementer's red or green: its host re-runs the gate and tests and is the
   single committer of Codex's work; you re-run them once more before review as a deliberate
   check and never commit Implementer output yourself. A sandbox-only failure is an artifact

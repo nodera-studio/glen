@@ -214,8 +214,8 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    `git push origin --delete <branch>` and `git switch main && git pull --ff-only`. If the
    wave ran in a worktree (a parallel wave, or a fix worktree), remove it per "Removing a
    worktree" below (`.claude/scripts/remove-worktree.sh`), which stops its Codex processes
-   first. Either way, finish with `bash .claude/scripts/sweep-codex-orphans.sh`: a finished
-   job's `task` process can outlive it in a worktree that still exists.
+   first. Either way, finish with `bash .claude/scripts/sweep-codex-orphans.sh` and act on its
+   task report: a finished job's `task` process can outlive it in a worktree that still exists.
 10. **Advance** to the next wave without asking. 2–3 line status at wave boundaries only;
     silent during polling.
 
@@ -304,16 +304,19 @@ Every Codex run in a worktree leaves a codex-companion broker (`app-server-broke
 deleted; 7 such orphans were once killed by hand, and a finished job's `codex-companion.mjs
 task` process was once still alive 8.5 h later. For each wave, fix or harness worktree you
 remove, follow `implementation/orchestrator.md` → Role 1 → "Removing a worktree" with `WT` =
-its absolute path, from the main checkout (`MAIN`):
+its absolute path, from the main checkout
+(`MAIN="$(cd "$(git rev-parse --path-format=absolute --git-common-dir)/.." && pwd -P)"`):
 
-1. If the companion `status --cwd "$WT"` lists a running job, cancel it
-   (`implementation/coder-codex.md` → "Cancelling a run", steps 0–1).
-2. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]`: stops every broker and
-   task process whose `--cwd` is exactly `$WT` (TERM, wait, KILL), confirms none remain, then
-   `git worktree remove --force` and, with `<branch>`, `git branch -D`. It refuses paths
-   outside `.claude/worktrees/`. Never do these steps by hand or in another order.
-3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"`: stops this repo's orphaned brokers
-   and `task` processes (worktree gone, or job finished per the companion `status`).
+1. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` first if in
+   doubt). It refuses unless `$WT` is a registered worktree directly under `.claude/worktrees/`
+   and your cwd is outside it; with `<branch>`, unless that branch is checked out there and is
+   merged into `origin/main` or has an upstream. It cancels `$WT`'s running jobs through the
+   companion, stops their processes and `$WT`'s brokers and task-workers (TERM, wait, KILL),
+   confirms nothing is left, then `git worktree remove --force` and `git branch -D`. Never do
+   these steps by hand or in another order.
+2. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"`: stops this repo's brokers whose
+   worktree is gone and that no live job references; lists suspected orphan tasks and stale
+   job records without stopping them.
 
 ## Shipping tags (`shipped:main` / `released:v0.x.y`)
 
