@@ -81,7 +81,7 @@ assert_contains 'probe run root under home reason' 'run root under $HOME' "$STDO
 assert 'probe fast paths invoke neither glen nor omp' test ! -e "$SMOKE_UNEXPECTED_CALL"
 
 SRC="$WORK/source" DEST="$WORK/snapshot"
-mkdir -p "$SRC/.claude" "$SRC/.omp/extensions"
+mkdir -p "$SRC/.claude" "$SRC/.omp/extensions" "$SRC/.agent/rules"
 git -C "$SRC" init -q --initial-branch=main
 printf 'tracked\n' > "$SRC/tracked file.txt"
 printf 'old\n' > "$SRC/modified.txt"
@@ -90,6 +90,8 @@ printf 'ignored.txt\n' > "$SRC/.gitignore"
 printf '{}\n' > "$SRC/.claude/settings.json"
 printf '// fixture\n' > "$SRC/.omp/extensions/x.ts"
 printf '{}\n' > "$SRC/.mcp.json"
+printf 'agent rule\n' > "$SRC/.agent/rules/fixture.md"
+printf 'cline rule\n' > "$SRC/.clinerules"
 printf '# Fixture conventions\n' > "$SRC/AGENTS.md"
 git -C "$SRC" add .
 commit_fixture "$SRC"
@@ -123,7 +125,9 @@ assert_eq 'snapshot has no git metadata anywhere' "$(find "$DEST" -name .git -pr
 assert 'snapshot relocated Claude settings' test -f "$DEST/_agent-config/claude/settings.json"
 assert 'snapshot relocated omp extension' test -f "$DEST/_agent-config/omp/extensions/x.ts"
 assert 'snapshot relocated MCP config' test -f "$DEST/_agent-config/mcp.json"
-for name in .claude .omp .mcp.json; do
+assert 'snapshot relocated agent rules' test -f "$DEST/_agent-config/agent/rules/fixture.md"
+assert_contains 'snapshot relocated clinerules content' 'cline rule' "$DEST/_agent-config/clinerules"
+for name in .claude .omp .mcp.json .agent .clinerules; do
   assert "snapshot removed root $name" test ! -e "$DEST/$name"
 done
 assert 'snapshot keeps root AGENTS.md' test -f "$DEST/AGENTS.md"
@@ -268,7 +272,10 @@ cat > "$WORK/bin/omp" <<'EOF'
 printf '%s\n' "$*" >> "$SMOKE_OMP_CALLS"
 case "$*" in
   '--profile glen-harness models cursor --json') printf '%s\n' '{"models":[{"id":"fixture"}]}' ;;
-  '--profile glen-harness config get modelRoles.default --json') printf '%s\n' '{"value":"cursor/fixture"}' ;;
+  '--profile glen-harness config get modelRoles --json')
+    [ "${SMOKE_REJECT_MODEL_ROLES:-0}" = 0 ] || exit 99
+    printf '%s\n' '{"value":{"default":"cursor/fixture","task":"cursor/other"}}'
+    ;;
   *) exit 99 ;;
 esac
 EOF
@@ -307,6 +314,11 @@ run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGI
 assert_exit 'probe safe private run root exit' 0
 assert_eq 'probe safe private run root status' "$(jq -r .status "$STDOUT")" ready
 assert_eq 'probe private run root permissions' "$(perl -e 'printf "%04o\n", (stat shift)[2] & 07777' "$WORK/tmp/glen-omp-engine")" 0700
+assert_contains 'probe queries registered modelRoles record key' 'config get modelRoles --json' "$SMOKE_OMP_CALLS"
+assert_eq 'probe never queries invalid modelRoles.default key' "$(grep -c 'config get modelRoles.default' "$SMOKE_OMP_CALLS" || true)" 0
+run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on SMOKE_REJECT_MODEL_ROLES=1 /bin/bash "$ENGINE" probe
+assert_exit 'probe rejected modelRoles query skips' 3
+assert_contains 'probe rejected modelRoles query reason' 'config check failed' "$STDOUT"
 
 # A leaked orchestrator hook must not execute inside the production snapshot,
 # while both review/debug still reach a send AND a wait with scrubbed env.
@@ -362,6 +374,305 @@ run env HOME="$WORK/home" PI_CONFIG_DIR=.omp TMPDIR="$WORK/symlink-tmp" GLEN_OMP
 assert_exit 'probe refuses unsafe symlink target run root' 3
 assert_contains 'probe unsafe symlink target reason names root' "$(cd "$WORK/symlink-target/glen-omp-engine" && pwd -P)" "$STDOUT"
 assert_eq 'unsafe run roots invoke no omp probes or jobs' "$(wc -l < "$SMOKE_OMP_CALLS")" "$omp_calls_before"
+
+# Full dispatch integration. Clock/sleep wrappers exercise the real retry/deadline
+# branches without sleeping a minute or adding a production-only test hook.
+DISPATCH_SRC="$WORK/dispatch-source" DISPATCH_BIN="$WORK/dispatch-bin"
+mkdir -p "$DISPATCH_SRC" "$DISPATCH_BIN" "$WORK/dispatch"
+git -C "$DISPATCH_SRC" init -q --initial-branch=main
+printf 'fixture\n' > "$DISPATCH_SRC/tracked"
+git -C "$DISPATCH_SRC" add .
+commit_fixture "$DISPATCH_SRC"
+FAKE_REAL_DATE="$(command -v date)" FAKE_REAL_DU="$(command -v du)"
+export FAKE_REAL_DATE FAKE_REAL_DU
+cat > "$DISPATCH_BIN/date" <<'EOF'
+#!/bin/bash
+set -eu
+if [ "$*" = '+%s' ]; then cat "$FAKE_GLEN_STATE/clock"; else exec "$FAKE_REAL_DATE" "$@"; fi
+EOF
+cat > "$DISPATCH_BIN/sleep" <<'EOF'
+#!/bin/bash
+set -eu
+[ "$*" = 60 ] || exit 99
+printf '60\n' >> "$FAKE_GLEN_STATE/sleeps"
+printf '%s\n' "$(( $(cat "$FAKE_GLEN_STATE/clock") + 60 ))" > "$FAKE_GLEN_STATE/clock"
+EOF
+cat > "$DISPATCH_BIN/du" <<'EOF'
+#!/bin/bash
+set -eu
+if [ -e "$FAKE_GLEN_STATE/oversize" ] && [ "$1" = -sk ]; then
+  printf '512001\t%s\n' "$2"
+else
+  exec "$FAKE_REAL_DU" "$@"
+fi
+EOF
+chmod +x "$DISPATCH_BIN/date" "$DISPATCH_BIN/sleep" "$DISPATCH_BIN/du"
+
+dispatch_fixture() {
+  STATE="$WORK/dispatch/$1" CASE_MODE="${2:-review}" CASE_DEADLINE=15m
+  CASE_PROVIDER="${3:-cursor}"
+  mkdir "$STATE"
+  CASE_OUT="$STATE/answer.md"
+  printf '100000\n' > "$STATE/clock"
+  : > "$STATE/plan.jsonl"
+  : > "$STATE/calls.jsonl"
+  : > "$STATE/sleeps"
+  for job in j0000001 j0000002; do
+    jq -cn --arg provider "$CASE_PROVIDER" '
+      {type:"message",message:{role:"assistant",model:"fixture-model",provider:$provider,
+        usage:{input:2,output:3,cacheRead:4,cacheWrite:5,totalTokens:14,cost:{total:1}}}},
+      {type:"message",message:{role:"assistant",model:"fixture-model",provider:$provider,
+        usage:{input:7,output:11,cacheRead:13,cacheWrite:17,totalTokens:48,cost:{total:2}}}}
+    ' > "$STATE/session-$job.jsonl"
+  done
+  if [ "$CASE_MODE" = review ]; then ANSWER=$'## omp review\nAPPROVE\nMnemosyne: unavailable'; else ANSWER=$'## Root Cause\nFixture'; fi
+  DONE="$(dispatch_envelope completed "$ANSWER" j0000001)"
+  DONE2="$(dispatch_envelope completed "$ANSWER" j0000002)"
+  RUNNING="$(dispatch_envelope running '' j0000001)"
+}
+dispatch_envelope() {
+  jq -cn --arg status "$1" --arg answer "$2" --arg job "$3" --arg state "$STATE" '
+    {v:1,ok:true,data:{status:$status,assistant_text:$answer,command_output:[],
+      delivered_as:"prompt",forked:null,session_settled:($status=="completed"),stop_reason:null,
+      job:{id:("00000000-0000-7000-8000-00000"+$job[1:]),handle:$job,
+        status:(if $status=="completed" then "completed" else "accepted" end),route:"new",
+        deliver_as:"auto",delivered_as:"prompt",session_id:null,session_handle:("a"+$job[1:]),
+        actual_session_id:null,created_at:"2026-10-30T00:00:00Z",updated_at:"2026-10-30T00:00:00Z",elapsed_ms:0},
+      session:{id:null,handle:("a"+$job[1:]),path:($state+"/session-"+$job+".jsonl")},
+      replies:(if $status=="completed" then [{v:1,text:"fixture reply",final:true,
+        id:"fixture-reply",job_id:$job,request_id:null,session_id:null,tool_call_id:"fixture-call",at:"2026-10-30T00:00:00Z"}] else [] end)}}'
+}
+dispatch_error() {
+  jq -cn --arg code "$1" --arg message "$2" --arg nested "$3" --arg incidental "${4:-}" \
+    --argjson job "$(printf '%s' "$DONE" | jq '.data.job')" '
+    {v:1,ok:false,error:{code:"job_failed",message:$message,details:{status:"failed",job:($job|.status="failed"),
+      forked:null,error:{code:$code,message:$nested},request_id:$incidental}}}'
+}
+dispatch_step() {
+  local extra='{}'
+  [ "$#" -lt 4 ] || extra="$4"
+  jq -cn --arg command "$1" --argjson code "$2" --argjson envelope "$3" --argjson extra "$extra" \
+    '{command:$command,exit:$code,envelope:$envelope} + $extra' >> "$STATE/plan.jsonl"
+}
+dispatch_command() {
+  local mode="$1" mode_args=(--uncommitted)
+  shift
+  [ "$mode" = review ] || mode_args=(--brief "$WORK/brief.md")
+  env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+    FAKE_GLEN_STATE="$STATE" PATH="$DISPATCH_BIN:$PATH" \
+    GLEN_BIN="$TEST_DIR/support/glen" /bin/bash "$ENGINE" "$mode" --repo "$DISPATCH_SRC" \
+    "${mode_args[@]}" --out "$CASE_OUT" --deadline "$CASE_DEADLINE" "$@"
+}
+dispatch_run() {
+  jq -s . "$STATE/plan.jsonl" > "$STATE/steps.json"
+  run dispatch_command "$CASE_MODE" "$@"
+  assert "dispatch $(basename "$STATE") emits one public result" jq -es 'length==1 and .[0].v==1 and .[0].engine=="omp"' "$STDOUT"
+}
+assert_tree() {
+  local label="$1" expected="$2" tree
+  tree="$(jq -r '.run_dir + "/tree"' "$STDOUT")"
+  if [ "$expected" = retained ]; then assert "$label" test -d "$tree"; else assert "$label" test ! -e "$tree"; fi
+}
+await_dispatch_wait() {
+  local attempt
+  for ((attempt=0; attempt<500; attempt++)); do
+    [ ! -e "$STATE/waiting" ] || return 0
+    kill -0 "$ENGINE_PID" 2>/dev/null || break
+    /bin/sleep 0.02
+  done
+  return 1
+}
+
+# Read FILE.json while wait is actually blocked, for both a completed and failed job.
+for terminal in ok failed; do
+  dispatch_fixture "wait-$terminal"
+  dispatch_step send 10 "$RUNNING"
+  dispatch_step wait 10 "$RUNNING" '{"job":"j0000001"}'
+  if [ "$terminal" = ok ]; then
+    dispatch_step wait 0 "$DONE" '{"job":"j0000001","barrier":true}'
+  else
+    dispatch_step wait 7 "$(dispatch_error omp_error 'job failed' 'provider failed')" '{"job":"j0000001","barrier":true}'
+  fi
+  jq -s . "$STATE/plan.jsonl" > "$STATE/steps.json"
+  dispatch_command "$CASE_MODE" > "$STDOUT" 2> "$STDERR" &
+  ENGINE_PID=$!
+  assert "dispatch $terminal reaches blocked wait" await_dispatch_wait
+  assert "dispatch $terminal is alive at running checkpoint" kill -0 "$ENGINE_PID"
+  assert "dispatch $terminal persists running recovery metadata mid-flight" jq -e '
+    .status=="running" and .job=="j0000001" and (.run_dir|type=="string") and
+    .glen_home==(.run_dir+"/glen-home")' "$CASE_OUT.json"
+  checkpoint_tree="$(jq -r '.run_dir + "/tree"' "$CASE_OUT.json")"
+  assert "dispatch $terminal tree exists during wait" test -d "$checkpoint_tree"
+  : > "$STATE/release"
+  if wait "$ENGINE_PID"; then CODE=0; else CODE="$?"; fi
+  assert "dispatch $terminal emits one public result" jq -es 'length==1 and .[0].v==1 and .[0].engine=="omp"' "$STDOUT"
+  if [ "$terminal" = ok ]; then expected=0; else expected=4; fi
+  assert_exit "dispatch $terminal terminal exit" "$expected"
+  assert_eq "dispatch $terminal terminal status" "$(jq -r .status "$STDOUT")" "$terminal"
+  assert_eq "dispatch $terminal send and repeated wait count" "$(cat "$STATE/count")" 3
+  assert_tree "dispatch $terminal cleans terminal tree" removed
+  if [ "$terminal" = ok ]; then
+    assert_eq 'dispatch captures exact final answer' "$(cat "$CASE_OUT")" "$ANSWER"
+    assert 'dispatch sums session usage and replies' jq -e '.replies==1 and .usage=={input:9,output:14,cacheRead:17,cacheWrite:22,totalTokens:62,cost_total:3}' "$STDOUT"
+  fi
+done
+
+dispatch_fixture running-no-job
+dispatch_step send 10 "$(printf '%s' "$RUNNING" | jq '.data.job=null')"
+dispatch_run
+assert_exit 'running without job fails rather than claiming timeout' 4
+assert_contains 'running without job reason' 'running glen result has no job handle' "$STDOUT"
+assert 'running without job cannot claim recoverability' jq -e '.status=="failed" and .job==null' "$CASE_OUT.json"
+assert_tree 'running without job cleans tree' removed
+
+for with_job in yes no; do
+  dispatch_fixture "job-timeout-$with_job"
+  error="$(dispatch_error timeout 'job failed' 'deadline exceeded')"
+  [ "$with_job" = yes ] || error="$(printf '%s' "$error" | jq '.error.details.job=null')"
+  dispatch_step send 7 "$error"
+  dispatch_run
+  if [ "$with_job" = yes ]; then
+    assert_exit 'glen timeout maps to engine timeout' 5
+    assert 'timeout has a recoverable job handle' jq -e '.status=="timeout" and .job=="j0000001"' "$CASE_OUT.json"
+    assert_tree 'timeout preserves tree' retained
+  else
+    assert_exit 'glen timeout without job fails' 4
+    assert 'timeout without job never claims timeout recovery' jq -e '.status=="failed" and .job==null' "$CASE_OUT.json"
+    assert_contains 'timeout without job reason' 'job timeout result has no job handle' "$STDOUT"
+    assert_tree 'timeout without job cleans tree' removed
+  fi
+done
+
+for location in top nested code incidental; do
+  dispatch_fixture "capacity-$location"
+  case "$location" in
+    top) error="$(dispatch_error omp_error 'rate limit exceeded' 'provider failed')" ;;
+    nested) error="$(dispatch_error omp_error 'job failed' 'rate limit exceeded')" ;;
+    code) error="$(dispatch_error overloaded 'job failed' 'provider failed')" ;;
+    incidental) error="$(dispatch_error omp_error 'job failed' 'provider failed' request-429-capacity-id)" ;;
+  esac
+  dispatch_step send 7 "$error"
+  [ "$location" = incidental ] || dispatch_step send 0 "$DONE2"
+  dispatch_run
+  if [ "$location" = incidental ]; then
+    assert_exit 'incidental capacity text does not retry' 4
+    assert_eq 'incidental capacity text sends once' "$(cat "$STATE/count")" 1
+    assert 'incidental capacity text never sleeps' test ! -s "$STATE/sleeps"
+  else
+    assert_exit "capacity $location retries successfully" 0
+    assert_eq "capacity $location sends twice" "$(cat "$STATE/count")" 2
+    assert_eq "capacity $location waits exactly once" "$(cat "$STATE/sleeps")" 60
+    assert "capacity $location resends new session with reduced budget" jq -es '
+      all(.[]; .argv[2:6]==["send","@new","-","--cwd"]) and
+      .[0].job_timeout=="900s" and .[1].job_timeout=="840s"' "$STATE/calls.jsonl"
+    assert_eq "capacity $location final job is new job" "$(jq -r .job "$STDOUT")" j0000002
+    assert_contains "capacity $location final session is new session" session-j0000002.jsonl "$STDOUT"
+  fi
+done
+for limit in budget once; do
+  dispatch_fixture "capacity-limit-$limit"
+  error="$(dispatch_error omp_error 'rate limit exceeded' 'provider failed')"
+  dispatch_step send 7 "$error"
+  if [ "$limit" = budget ]; then CASE_DEADLINE=299s; else dispatch_step send 7 "$error"; fi
+  dispatch_run
+  assert_exit "capacity $limit limit fails dispatch" 4
+  if [ "$limit" = budget ]; then expected=1; else expected=2; fi
+  assert_eq "capacity $limit limit caps send count" "$(cat "$STATE/count")" "$expected"
+  if [ "$limit" = budget ]; then assert 'short budget never sleeps' test ! -s "$STATE/sleeps"; else assert_eq 'repeated capacity failure sleeps once' "$(cat "$STATE/sleeps")" 60; fi
+done
+
+for spill in valid missing invalid; do
+  dispatch_fixture "spill-$spill"
+  if [ "$spill" = valid ]; then
+    dispatch_step send 10 "$RUNNING" '{"spill":"valid"}'
+    dispatch_step wait 0 "$DONE" '{"spill":"valid","job":"j0000001"}'
+  else
+    dispatch_step send 0 "$DONE" "{\"spill\":\"$spill\"}"
+  fi
+  dispatch_run
+  if [ "$spill" = valid ]; then
+    assert_exit 'spilled envelope loads successfully' 0
+    assert_eq 'spilled envelope answer retained' "$(cat "$CASE_OUT")" "$ANSWER"
+  else
+    assert_exit "$spill spilled envelope fails closed" 4
+    assert_contains "$spill spilled envelope reason" 'invalid glen envelope' "$STDOUT"
+    assert_tree "$spill spilled envelope cleans tree" removed
+  fi
+done
+
+for provider in cursor anthropic; do
+  for keep in no yes; do
+    dispatch_fixture "provider-$provider-$keep" review "$provider"
+    dispatch_step send 0 "$DONE"
+    if [ "$keep" = yes ]; then dispatch_run --keep; else dispatch_run; fi
+    if [ "$provider" = cursor ]; then
+      assert_exit "cursor provider $keep accepted" 0
+    else
+      assert_exit "foreign provider $keep rejected" 4
+      assert_eq "foreign provider $keep failure reason" "$(jq -r .reason "$STDOUT")" 'ran on anthropic, not cursor'
+    fi
+    if [ "$keep" = yes ]; then expected=retained; else expected=removed; fi
+    assert_tree "provider $provider keep=$keep cleanup" "$expected"
+  done
+done
+for shape in review-ok review-heading review-tail debug-ok debug-heading; do
+  case "$shape" in debug-*) mode=debug ;; *) mode=review ;; esac
+  dispatch_fixture "shape-$shape" "$mode"
+  case "$shape" in
+    review-heading) ANSWER=$'APPROVE\nMnemosyne: unavailable' ;;
+    review-tail) ANSWER=$'## omp review\nAPPROVE' ;;
+    debug-heading) ANSWER='Fixture without a root cause heading' ;;
+  esac
+  dispatch_step send 0 "$(dispatch_envelope completed "$ANSWER" j0000001)"
+  dispatch_run
+  assert_exit "$shape completed execution exits zero" 0
+  assert_eq "$shape always preserves answer text" "$(cat "$CASE_OUT")" "$ANSWER"
+  case "$shape" in
+    *-ok) assert_eq "$shape has a vote" "$(jq -r .status "$STDOUT")" ok ;;
+    *) assert 'malformed output gets no vote' jq -e '.status=="failed" and .reason=="malformed output"' "$CASE_OUT.json" ;;
+  esac
+  assert_tree "$shape terminal tree cleanup" removed
+done
+
+for phase in send wait; do
+  dispatch_fixture "interrupted-$phase"
+  [ "$phase" != wait ] || dispatch_step send 10 "$RUNNING"
+  dispatch_step "$phase" 0 '{}' '{"signal":"TERM"}'
+  dispatch_run
+  if [ "$phase" = send ]; then
+    assert_exit 'interruption before job is failure' 4
+    assert 'interruption before job is not recoverable timeout' jq -e '.status=="failed" and .job==null' "$CASE_OUT.json"
+    assert_contains 'interruption before job reason' 'before any job handle was obtained' "$STDOUT"
+    assert_tree 'interruption before job cleans tree' removed
+  else
+    assert_exit 'interruption after job is timeout' 5
+    assert 'interruption timeout names known job' jq -e '.status=="timeout" and .job=="j0000001"' "$CASE_OUT.json"
+    assert_tree 'interruption after job preserves tree' retained
+  fi
+done
+for advance in 75 76; do
+  dispatch_fixture "deadline-$advance"
+  CASE_DEADLINE=1s
+  dispatch_step send 10 "$RUNNING" "{\"advance\":$advance}"
+  [ "$advance" -ne 75 ] || dispatch_step wait 0 "$DONE" '{"job":"j0000001"}'
+  dispatch_run
+  if [ "$advance" -eq 75 ]; then
+    assert_exit 'deadline grace still permits final wait' 0
+  else
+    assert_exit 'engine deadline expires with known job' 5
+    assert_eq 'engine deadline names its own expiration reason' "$(jq -r .reason "$STDOUT")" 'engine deadline exceeded'
+    assert_eq 'expired engine deadline never starts wait' "$(cat "$STATE/count")" 1
+    assert 'engine deadline timeout has job' jq -e '.status=="timeout" and .job=="j0000001"' "$CASE_OUT.json"
+    assert_tree 'engine deadline preserves tree' retained
+  fi
+done
+dispatch_fixture snapshot-skipped
+: > "$STATE/oversize"
+dispatch_run
+assert_exit 'production snapshot skip propagates' 3
+assert_eq 'production snapshot skip status' "$(jq -r .status "$STDOUT")" skipped
+assert_tree 'production snapshot skip cleans tree' removed
+assert 'production snapshot skip never dispatches' test ! -s "$STATE/calls.jsonl"
 
 run_hook() {
   if jq -cn --arg command "$1" '{tool_name:"Bash",tool_input:{command:$command}}' |

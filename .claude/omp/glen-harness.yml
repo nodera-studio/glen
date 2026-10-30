@@ -1,5 +1,8 @@
 # Review gate: third review engine.
 # /deep-debug: optional third investigator.
+# Discovery id only (18.14.0 discovery/agents.ts); no model provider uses this id.
+# Native profile skills/MCP remain available. Never disable the cursor model provider.
+disabledProviders: [agents]
 tools:
   approvalMode: always-ask
   xdev: false
@@ -21,6 +24,8 @@ tools:
     mcp__mnemosyne_memory_get_recent: allow
     mcp__mnemosyne_memory_get_entity: allow
     mcp__mnemosyne_memory_decision_chain: allow
+    mcp__mnemosyne_memory_edit: deny
+    mcp__mnemosyne_memory_reflect: deny
   restrictedFolders: ["~"]
 bash:
   enabled: false

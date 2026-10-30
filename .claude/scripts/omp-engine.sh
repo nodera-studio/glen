@@ -2,6 +2,9 @@
 # Isolated third review/debug engine. Policy/envcheck are internal smoke helpers.
 set -euo pipefail
 umask 077
+# A signal trap can run while dispatch_env's stdout is redirected to response.raw.
+# Keep the public result stream available even inside that redirected function.
+exec 3>&1
 
 MODE="${1:-}"
 [ "$#" -eq 0 ] || shift
@@ -16,6 +19,11 @@ USAGE='{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,"cost_
 
 log() { printf 'omp-engine: %s\n' "$*" >&2; }
 stop() { STATUS="$1"; REASON="$2"; EXIT_CODE="$3"; exit "$EXIT_CODE"; }
+# shellcheck disable=SC2329 # Registered below for INT/TERM.
+interrupted() {
+  [ -z "$JOB" ] || stop timeout 'dispatch interrupted; job may still be running' 5
+  stop failed 'dispatch interrupted before any job handle was obtained' 4
+}
 usage() {
   log 'usage: omp-engine.sh probe | review [--repo DIR] (--base REF | --uncommitted) --out FILE [--scope TEXT] [--deadline 15m] [--keep]'
   log '       omp-engine.sh debug [--repo DIR] --brief FILE --out FILE [--base REF] [--deadline 20m] [--keep]'
@@ -149,7 +157,7 @@ finish() {
   local shell_status="$?"
   trap - EXIT
   set +e
-  if [ "$shell_status" -ne 0 ] && [ "$JOB_ACTIVE" -eq 1 ] && [ "$STATUS" != timeout ]; then
+  if [ "$shell_status" -ne 0 ] && [ "$JOB_ACTIVE" -eq 1 ] && [ -n "$JOB" ] && [ "$STATUS" != timeout ]; then
     STATUS=timeout REASON='dispatch interrupted; job may still be running' EXIT_CODE=5
   fi
   if [ "$OUTPUT_READY" -eq 1 ]; then
@@ -163,11 +171,11 @@ finish() {
     rm -rf "$TREE"
   fi
   [ -z "$PROBE_DIR" ] || rm -rf "$PROBE_DIR"
-  result_json
+  result_json >&3
   exit "$EXIT_CODE"
 }
 trap finish EXIT
-trap 'stop timeout "dispatch interrupted; job may still be running" 5' INT TERM
+trap interrupted INT TERM
 
 # The disabled probe must not pay for repository/tool discovery in a fresh TMPDIR.
 # Keep its JSON identical to other skips.
@@ -254,12 +262,12 @@ probe_checks() {
   if [ "$rc" -ne 0 ] || ! printf '%s' "$models" | jq -e '.models | type == "array" and length > 0' >/dev/null 2>&1; then
     stop skipped 'omp --profile glen-harness not logged into Cursor (run: omp --profile glen-harness login cursor)' 3
   fi
-  if value="$(bounded_omp 4 config get modelRoles.default --json)"; then rc=0; else rc="$?"; fi
+  if value="$(bounded_omp 4 config get modelRoles --json)"; then rc=0; else rc="$?"; fi
   case "$rc" in
     124 | 137 | 142) stop skipped 'modelRoles.default config check timed out' 3 ;;
   esac
   [ "$rc" -eq 0 ] || stop skipped 'modelRoles.default config check failed' 3
-  MODEL="$(printf '%s' "$value" | jq -er '.value | select(type == "string" and length > 0)')" || \
+  MODEL="$(printf '%s' "$value" | jq -er '.value.default | select(type == "string" and length > 0)')" || \
     stop skipped 'modelRoles.default config check failed' 3
   STATUS=ready REASON='' EXIT_CODE=0
 }
@@ -336,7 +344,7 @@ snapshot_command() {
     mv "$path" "$DEST/_agent-config/dotenv/$relative"
   done < <(find "$DEST" -path "$DEST/_agent-config/dotenv" -prune -o \
     \( -type f -o -type l \) \( -name .env -o -name '.env.*' \) -print0)
-  for name in .omp .pi .claude .codex .gemini .cursor .opencode .windsurf .vscode .agents .mcp.json mcp.json opencode.json opencode.jsonc; do
+  for name in .omp .pi .claude .codex .gemini .cursor .opencode .windsurf .vscode .agent .agents .clinerules .mcp.json mcp.json opencode.json opencode.jsonc; do
     if [ -e "$DEST/$name" ] || [ -L "$DEST/$name" ]; then
       [ ! -L "$DEST/_agent-config" ] || stop failed 'agent-config destination is a symlink' 4
       mkdir -p "$DEST/_agent-config"
@@ -511,6 +519,7 @@ while :; do
   load_envelope || stop failed 'invalid glen envelope' 4
   while [ "$RC" -eq 10 ] || [ "$RC" -eq 130 ]; do
     [ -n "$JOB" ] || stop failed 'running glen result has no job handle' 4
+    # This deadline can only time out an already identified, recoverable job.
     remaining=$((DEADLINE_SECONDS + 75 - ($(date +%s) - FIRST_SEND)))
     [ "$remaining" -gt 0 ] || stop timeout 'engine deadline exceeded' 5
     wait_seconds="$remaining"
@@ -521,11 +530,14 @@ while :; do
   done
   JOB_ACTIVE=0
   if [ "$RC" -eq 7 ] && jq -e '.error.details.error.code == "timeout"' "$ENVELOPE" >/dev/null; then
+    [ -n "$JOB" ] || stop failed 'job timeout result has no job handle' 4
     stop timeout 'glen job deadline exceeded' 5
   fi
   remaining=$((DEADLINE_SECONDS - ($(date +%s) - FIRST_SEND)))
   if [ "$RC" -eq 7 ] && [ "$RETRIED" -eq 0 ] && [ "$remaining" -ge 300 ] && \
-    jq -e '[.error.message, (.error.details | tostring)] | join(" ") | test("429|rate.?limit|capacity|quota|overloaded"; "i")' "$ENVELOPE" >/dev/null; then
+    jq -e '[.error.message, .error.details.error.code, .error.details.error.message] |
+      map(select(type == "string")) | join(" ") |
+      test("429|rate.?limit|capacity|quota|overloaded"; "i")' "$ENVELOPE" >/dev/null; then
     log 'capacity failure; retrying once after 60 seconds in a new session'
     sleep 60
     JOB_TIMEOUT_SECONDS=$((DEADLINE_SECONDS - ($(date +%s) - FIRST_SEND)))

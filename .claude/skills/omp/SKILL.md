@@ -74,6 +74,8 @@ Never block the whole gate on omp failure; report its absence and continue with 
 `GLEN_OMP_ENGINE=off` disables the engine.
 
 A killed run can be recovered from FILE.json as soon as it records `status: "running"`.
+A `timeout` result is recoverable only when FILE.json contains a non-null `job` handle;
+an interruption before any job handle was obtained is `failed`, not `timeout`.
 Use its `glen_home`, `job`, `run_dir`, and deadline with `glen wait`; never re-send.
 Apply the same environment scrubbing and policy path when recovering:
 
