@@ -64,8 +64,9 @@ an output contract:
 
 ```
 <task>
-Implement this approved plan EXACTLY. Repo conventions are in AGENTS.md at the repo
-root — follow them. Plan:
+Implement Steps {N–M} of this approved plan EXACTLY, and only those steps in this turn
+(Step 4 → "Step groups"). Repo conventions are in AGENTS.md at the repo root — follow
+them. Plan:
 {approved plan / slice}
 </task>
 
@@ -142,6 +143,24 @@ call with `--resume-last` and a **delta-only** prompt (just the fix list — do 
 restate the whole plan). Only resume after the previous foreground run returned;
 `--resume-last` throws if a prior task is still running.
 
+### Step groups: one Codex turn per group, a WIP commit after each
+
+W3b's resume run lasted about 1.5 h with 46 uncommitted files; one crash or stall would have
+lost all of it. So:
+
+1. Split the plan (or slice) into step groups along its dependency order. Never chain more
+   than about 4 plan steps in one Codex turn. A plan of 4 steps or fewer, or a fix list, is one
+   group.
+2. Run one Codex turn per group. The first is `--fresh` with the whole plan in `<task>` and
+   "Steps N–M only"; each later group is `--resume-last` with a delta prompt ("Now implement
+   Steps N–M of the plan; the earlier steps are committed"), never the whole plan again.
+3. After each group, run host re-verification (Step 6). When it is green, make a WIP commit
+   of exactly the files Codex reported for that group (Step 6 → item 4), message
+   `wip: <wave> steps N–M`, plus the project's trailer. A group that is not green goes back to
+   Codex as a delta prompt (Step 6 → item 3) before the next group starts.
+4. The attempt cap below counts per group. Report each WIP commit SHA in your completion
+   report; the wave's PR is squash-merged, so WIP subjects never reach `main`.
+
 ### Failed attempts: report each one, at most 2
 
 A failed attempt is any run that exits non-zero or returns no `COMPLETION` block: the 180 s
@@ -211,8 +230,9 @@ the worktree is still changing, go straight to step 2. In this cancel path, neve
 broker whose `--cwd` is not the worktree you stopped. (The orphan sweep run when a worktree is
 removed is the one deliberate exception; see below.)
 
-Removing a worktree is the orchestrator's job, not yours: it runs this recipe with step 2
-unconditional, then the orphan-broker sweep (`orchestrator.md` → Role 1 → "Removing a worktree").
+Removing a worktree is the orchestrator's job, not yours: it runs
+`.claude/scripts/remove-worktree.sh`, then `.claude/scripts/sweep-codex-orphans.sh`
+(`orchestrator.md` → Role 1 → "Removing a worktree").
 
 ## Step 5 — Parse + report
 
@@ -243,16 +263,25 @@ outside the sandbox:
    sandbox-only shapes (`EPERM` on socket bind/connect, `index.lock`, network) AND your host
    re-run is green. Any other failure, or any failure your re-run reproduces, is real: report
    NOT green.
-3. You are the single committer of Codex's work (the orchestrator verifies, it does not
+3. **Diagnose here; Codex writes every fix.** Host re-verification may diagnose: run tests,
+   read code, narrow a failure to `path:start-end`. It never edits. Every code or test change,
+   however small, goes back to Codex as a `--resume-last` delta prompt with the line range
+   (Step 3 → "Line-range briefs"). Your only writes are `git add` / `git commit` of the files
+   Codex touched (item 4), and a manifest change that needs the network (`cargo add
+   <crate>@<version>`), which Codex's sandbox cannot run. "Small and targeted" is never a
+   reason to write code yourself: on 2026-10-30 wrappers did three times (Rust fix `7729bad`,
+   and two tests fixed on the host).
+4. You are the single committer of Codex's work (the orchestrator verifies, it does not
    commit for Codex). When the host re-run is green and Codex could not commit, stage exactly the files Codex
    reported (`touchedFiles` ∪ the `COMPLETION` block's `created`/`modified`), by path, never
-   `git add -A`/`.`, and commit on its behalf with the message your brief gives (else
-   `<wave label>: <slice summary>` plus the project's trailer). A file in
+   `git add -A`/`.`, and commit on its behalf: a WIP commit per step group (Step 4 → "Step
+   groups"), and for the last group the message your brief gives (else
+   `<wave label>: <slice summary>`), each with the project's trailer. A file in
    `git status` that Codex did not report is not staged; list it as a deviation.
-4. Report every discrepancy explicitly, one line each: what Codex reported (red/green, the
+5. Report every discrepancy explicitly, one line each: what Codex reported (red/green, the
    error), what the host re-run showed, and the verdict (sandbox artifact | real failure |
    Codex green but host red).
-5. **Stashes are temporary.** If you stash to compare (e.g. whether a failure predates
+6. **Stashes are temporary.** If you stash to compare (e.g. whether a failure predates
    Codex's edits), tag it, capture its SHA, restore it by SHA and drop it by its current
    index before ending your turn. The stash stack is repo-wide (shared by every worktree), so
    never `git stash pop` or a bare `stash@{0}`: another worktree may have stashed since.
@@ -278,13 +307,18 @@ too, say so instead of guessing.
 
 ## Rules
 
-- You write NO product code. If Codex is unavailable, STOP and report — never
-  hand-write the change, never `codex exec`.
+- You write NO product code and no tests, however small the fix. If Codex is unavailable,
+  STOP and report — never hand-write the change, never `codex exec`. Host re-verification
+  diagnoses; every change goes back to Codex as a line-range delta prompt. Your only writes
+  are `git add`/`git commit` of Codex's files and network-only manifest changes (`cargo add`).
+- One Codex turn per step group of at most about 4 plan steps; a WIP commit
+  (`wip: <wave> steps N–M`, with the trailer) after each group passes host verification.
 - Foreground dispatch only; pin `--effort high`; pin `--model` via `CODEX_MODEL`
   when determinism matters.
 - Stopping this agent never stops Codex: cancel the job and the worktree's broker as in
-  "Cancelling a run". Removing a worktree (the orchestrator's job) stops its broker first
-  and sweeps orphans (`orchestrator.md` → Role 1 → "Removing a worktree").
+  "Cancelling a run". Removing a worktree (the orchestrator's job) runs
+  `remove-worktree.sh` and then `sweep-codex-orphans.sh` (`orchestrator.md` → Role 1 →
+  "Removing a worktree").
 - Re-verify on the host after every run (Step 6): your gate and test results, not Codex's,
   decide green; sandbox-only failures are artifacts only when the host re-run is green; you
   are the single committer of Codex's work.

@@ -124,9 +124,11 @@ processes keep running and keep editing the worktree. Whenever you stop a Codex-
    hit. It is in `.claude/agents/implementation/coder-codex.md` → "Cancelling a run".
 3. Confirm `git -C <worktree> status --short` is unchanged 30 s later before reusing it.
 
-The broker also survives a run that ended normally and the removal of its worktree. Before
-removing a worktree any Codex run used, stop its broker and then sweep orphans (brokers whose
-`--cwd` no longer exists, only under this repo's `.claude/worktrees/`):
+The broker also survives a run that ended normally and the removal of its worktree, and a
+`codex-companion.mjs task` process can outlive its finished job. Remove a worktree any Codex
+run used only with `bash "$MAIN/.claude/scripts/remove-worktree.sh" <worktree> [<branch>]`
+(stops that worktree's brokers and tasks, then removes it), then run
+`.claude/scripts/sweep-codex-orphans.sh` (this repo's orphaned brokers and tasks):
 `implementation/orchestrator.md` → Role 1 → "Removing a worktree".
 
 Resolve `COMPANION` as in `coder-codex.md` Step 2:
