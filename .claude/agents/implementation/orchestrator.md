@@ -13,7 +13,8 @@ documented, and re-indexed:
 1. **Implementer** — one fused context, **running in OpenAI Codex** (dispatched via
    `coder-codex.md`), that writes → wires → hardens → tests → runs the quality gate →
    fixes, looping until green. Codex writes ALL product code; Claude orchestrates,
-   reviews, and tests independently but writes no product code.
+   reviews, and tests independently but writes no product code. One exception:
+   design-heavy UI goes to a Claude (Opus) Implementer (see "UI implementation routing").
 2. **Review** — a fresh, independent context that judges the diff (never the
    Implementer's transcript).
 3. **Parallel tail** — docs-updater ‖ conformance-test-writer ‖ an optional project-specific domain-rubric gate (conditional, if this project wires one up), once the code lands.
@@ -131,7 +132,7 @@ algorithms. SKIP for naming, style, or routine CRUD.
 Agent tool:
   subagent_type: "codex:codex-rescue"
   description: "Advisor gate — adversarial plan critique"
-  prompt: "READ-ONLY adversarial second opinion on this approved implementation plan — advise, do NOT implement. A DIFFERENT model with uncorrelated blind spots, NOT the author. Rank the risks worst-first, steelman the alternative you would choose, state what you cannot assess, end with VERDICT: endorse | endorse-with-changes | reject. Constraints: {key constraints}. Plan: {approved plan}."
+  prompt: "READ-ONLY adversarial second opinion on this approved implementation plan — advise, do NOT implement. A DIFFERENT model with uncorrelated blind spots, NOT the author. Rank the risks worst-first, steelman the alternative you would choose, state what you cannot assess, end with VERDICT: endorse | endorse-with-changes | reject. Constraints: {key constraints}. Plan: {approved plan}. --wait. Run in the foreground: wait for the Codex task to finish and return its full result; never return only a task id."
 ```
 
 The advisor returns a verdict + ranked risks + steelman + what-it-cannot-assess. The
@@ -156,8 +157,47 @@ below.
 
 ```
 Dispatch via Agent tool:
-  prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {path}."
+  prompt: "Read .claude/agents/implementation/coder-codex.md and follow its instructions. Implement this plan: {approved plan}. Plan/progress file: {absolute path in the main checkout}. The plan is git-ignored, so it is not in the worktree; that is expected."
 ```
+
+**Plan paths in briefs.** `.claude/plans/` is git-ignored, so a wave worktree never contains
+the plan. Every brief that needs a plan (Implementer, fix, conformance writer, docs updater,
+reviewers) names it by absolute path in the main checkout
+(`/Users/development/Developer/Apps/tools/glen/.claude/plans/...`) and says its absence from
+the worktree is expected; without that line, Implementers reported the plan "missing".
+
+**UI implementation routing.** Design-heavy UI (`site/`, landing pages, visual components)
+does not go to Codex: the owner judged the Codex-built landing page "meh" and moved site code
+to Claude. Route it to a Claude Implementer instead of `coder-codex.md`:
+
+```
+Agent tool:
+  subagent_type: "general-purpose"
+  model: "opus"
+  prompt: "Load the frontend-design:frontend-design skill first. Then read
+           .claude/agents/implementation/implementer.md for the fused write → run → fix loop
+           (the site's own build/test commands from the plan replace the cargo gate) and
+           implement this plan: {plan path, absolute, main checkout; absent from the
+           worktree as expected}. Worktree: {abs path}. Design reference(s): {named reference
+           URLs/paths}. Before reporting done, verify your own work visually in a browser
+           (mcp__Claude_Browser__* or chrome-devtools) against each named reference:
+           side-by-side screenshots at ~375px and desktop, light and dark, saved under
+           .claude/evidence/, and say where it matches and where it deliberately departs."
+```
+
+The Rust crate (`src/`, `tests/`, `Cargo.*`) stays with the Codex Implementer; a wave that
+touches both splits into a Codex slice and a Claude UI slice. Codex still reviews the UI slice
+(the Role 2 Codex pass), and review/conformance fix briefs for that slice go back to a Claude
+UI Implementer, not Codex. If the plan has no catalogue survey for a named component library
+(see the plan orchestrator's UI-wave rule), the UI Implementer does that survey first and
+reports it before choosing components.
+
+**Stopping a Codex-backed agent.** TaskStop on `impl-coder-codex` (or any agent that ran
+`codex-companion.mjs`) does NOT stop Codex: the companion job, its broker, the app-server and
+the sandbox keep running and keep editing the worktree. Whenever you stop such an agent, run
+the cancel path in `coder-codex.md` → "Cancelling a run" (companion `cancel`, then kill the
+worktree's `app-server-broker.mjs serve --cwd <worktree>` tree if anything survives) and
+confirm the worktree has stopped changing before dispatching anything else into it.
 
 **Network pre-flight.** The Codex sandbox may have no network. If the plan has network
 steps (`npm install`, CLI scaffolds, browser downloads, `cargo add` of a new crate), the
@@ -200,7 +240,8 @@ important property of this pipeline is that the context which reads a test/gate
 failure is the same one that wrote the code — that context is Codex's; splitting the
 loop is what we deliberately removed. `implementer.md` remains as the canonical
 envelope `coder-codex.md` forwards to Codex. If Codex is unavailable, Role 1 stops
-and reports — there is no Claude-inline coder fallback.
+and reports — there is no Claude-inline coder fallback. The only Claude-written product code
+is design-heavy UI under "UI implementation routing" above.
 
 **Slices, waves, and the budget guard.** A feature too large for one context is
 split at *slice boundaries*, never mid-loop. If the Implementer returns
@@ -218,6 +259,15 @@ transcript. By default run the lean **`/code-review` dual-engine gate** (see
 one must-fix / recommended / notes report. No lint/type/style re-check — the
 deterministic gate already enforced that inside the Implementer; the engines hunt
 real bugs.
+
+**Codex runs in the foreground.** The `codex:codex-rescue` forwarder picks background mode
+for any task that looks long unless the brief says `--wait`. So every codex-rescue brief
+(review, advisor, fix verification) ends with: "--wait. Run in the foreground: wait for the
+Codex task to finish and return its full result as your final message. Never return only a
+background task id." A codex-rescue pass once returned at once with a task id and "file
+doesn't exist yet", and the orchestrator had to poll for the output. If one still comes back with only a task id, fetch the
+result (`codex-companion.mjs status <id> --wait`, then `result <id>`) before merging votes;
+never merge a pass you have not read.
 
 **UI diffs are reviewed by running them.** When the diff touches rendered output
 (`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
@@ -314,10 +364,26 @@ Lighthouse 1.00; only a visual check caught it.
   `script -q /dev/null sh -c 'stty cols 60; cargo run -- <args>'` (macOS), at a narrow and a
   wide width, with and without `NO_COLOR`. Let a live view run through its states. Compare with
   the plan's intended output.
+- **Design fidelity (UI waves with a named design reference).** The gate checks fidelity, not
+  only defects: the W6 site passed review, this gate and Lighthouse 1.00, and the owner still
+  found it "meh". Do (or dispatch) a reference-fidelity check: side-by-side screenshots of the
+  built page and each named reference at the same widths and themes, plus a token/pattern
+  inventory (type scale, colour tokens, spacing, radii, motion, signature components) that cites
+  the reference at `path:line` (or URL + selector) next to the implementation at `path:line`.
+  Each row is match, deliberate departure (with the plan's reason), or miss. A miss is a
+  finding like a defect.
 - Save what you looked at (screenshots or captured output) under `.claude/evidence/` and name it
   in the Report. A defect found here goes to a fresh Implementer like a must-fix review finding.
 
 Skip only when the diff changes no rendered output, and say so in the Report.
+
+**Check live-check and polish items before a fix brief.** Before you forward any item from
+this visual check, your own live check or a polish list into a fix brief, check it against the
+plan and `docs/design.md`. An item that contradicts the plan (e.g. its explicit verbatim
+layout) is a spec change, not a fix: mark it `SPEC CHANGE`, update the plan or design doc
+first, have the conformance writer re-derive the affected assertions, and only then brief the
+Implementer. An unchecked polish item that contradicted the plan's verbatim layout once went
+straight into a fix brief, and only conformance caught it.
 
 ### Role 4 — Re-index (after the merge, at wave close)
 
@@ -366,8 +432,11 @@ Plans are **kept after implementation** — they accumulate as project history. 
 - **Four roles, not eighteen steps.** Implementer (fused, in Codex via
   `coder-codex.md`) → Review (fresh) → tail (docs ‖ conformance ‖ optional
   project-specific domain-rubric gate) → re-index. Codex owns write+wire+harden+test+gate;
-  Claude writes no product code and does not re-introduce separate
+  Claude writes no product code (except design-heavy UI, routed to a Claude Opus
+  Implementer) and does not re-introduce separate
   coder/wiring/error-handling/test/verifier dispatches.
+- Stopping a Codex-backed agent always runs the `coder-codex.md` cancel path; TaskStop
+  alone leaves Codex editing the worktree.
 - **Generative loop in ONE context (Codex's); discriminative checks in fresh Claude
   ones.** Never feed the Implementer's transcript to the reviewer — only the diff +
   spec. Split large work at slice boundaries (fresh Codex Implementer via

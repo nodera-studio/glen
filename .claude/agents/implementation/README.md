@@ -43,7 +43,9 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
 
 ## The fused Implementer runs in Codex
 
-Claude writes no product code. The fused write→wire→harden→test→gate→fix loop runs in
+Claude writes no product code, except design-heavy UI (`site/`, landing pages, visual
+components), which goes to a Claude Opus Implementer (`orchestrator.md` → UI implementation
+routing). The fused write→wire→harden→test→gate→fix loop runs in
 **Codex** via `coder-codex.md` (`codex-companion.mjs task --json --write`), which
 forwards the `implementer.md` envelope + the repo-root `AGENTS.md` conventions. The
 former per-concern agents (`coder.md`, `wiring.md`, `error-handling.md`,

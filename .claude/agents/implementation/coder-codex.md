@@ -32,6 +32,11 @@ Read the plan + `progress.md` and the files the plan names. Use Read/Grep/Glob o
 contradictory or names files that don't exist, STOP and report to the orchestrator
 rather than dispatching a doomed Codex run.
 
+The plan file itself is not one of those files. `.claude/plans/` is git-ignored, so a wave
+worktree never contains it: read the plan from the absolute main-checkout path in your brief,
+and do not report it "missing" from the worktree. Inline the plan text into the Codex prompt
+(Step 3) rather than pointing Codex at a path.
+
 ## Step 2 — Resolve the Codex runtime
 
 ```bash
@@ -113,6 +118,31 @@ call with `--resume-last` and a **delta-only** prompt (just the fix list — do 
 restate the whole plan). Only resume after the previous foreground run returned;
 `--resume-last` throws if a prior task is still running.
 
+## Cancelling a run (stopping this agent does not stop Codex)
+
+TaskStop on this agent ends the Claude host only. The codex-companion job, its
+`app-server-broker.mjs` broker, the `codex app-server` and the sandbox processes it spawned
+keep running, and keep editing the worktree. Whoever stops this agent (the orchestrator, or
+you on an abort) must cancel the Codex side too, with `COMPANION` resolved as in Step 2 and
+`WT` = the absolute worktree path:
+
+```bash
+# 1. Interrupt the turn and kill the job's process tree (the companion's own cancel).
+for id in $(node "$COMPANION" status --cwd "$WT" --json | jq -r '.running[].id'); do
+  node "$COMPANION" cancel "$id" --cwd "$WT" --json
+done
+# 2. If anything still runs, kill the broker for THIS worktree and all its descendants.
+#    Fixed-string match on "--cwd $WT --pid-file" so other worktrees' brokers survive.
+kill_tree() { local c; for c in $(pgrep -P "$1"); do kill_tree "$c"; done; kill -TERM "$1" 2>/dev/null; }
+ps -axo pid=,command= | grep -F 'app-server-broker.mjs serve' | grep -F -- "--cwd $WT --pid-file" \
+  | awk '{print $1}' | while read -r pid; do kill_tree "$pid"; done
+# 3. Verify: no broker left for $WT, and `git -C "$WT" status --short` is unchanged 30 s later.
+```
+
+The `status` call lists only the current Claude session's jobs; if it shows nothing while
+the worktree is still changing, go straight to step 2. Never kill a broker whose `--cwd` is
+not the worktree you stopped.
+
 ## Step 5 — Parse + report
 
 The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSummary}`.
@@ -134,6 +164,8 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
   hand-write the change, never `codex exec`.
 - Foreground dispatch only; pin `--effort high`; pin `--model` via `CODEX_MODEL`
   when determinism matters.
+- Stopping this agent never stops Codex: cancel the job and the worktree's broker as in
+  "Cancelling a run".
 - Keep the read-first + STOP-and-report gate on the Claude side; everything else is
   Codex's fused loop.
 - Never `--no-verify`; never weaken a test or silence the gate (enforced in the

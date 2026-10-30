@@ -19,7 +19,9 @@ argument-hint: '<task or question to dispatch to Codex>'
 
 Codex is the **sole writer of product code** in this harness. Claude orchestrates,
 plans, reviews, and writes the independent conformance tests — it does **not** write
-product code. Codex fills three roles here, in priority order:
+product code. One exception: design-heavy UI (`site/`, landing pages, visual components)
+goes to a Claude Opus Implementer, and Codex reviews it (`implementation/orchestrator.md` →
+UI implementation routing). Codex fills three roles here, in priority order:
 
 1. **Implementer (primary)** — the fused write → wire → harden → test → gate → fix
    loop for `/implement` (Role 1) and `/implement-quick`, run in Codex's own context
@@ -76,6 +78,33 @@ flags the user may include and that you should preserve in the prompt text:
 - `--effort high` | `medium` | `low` (default: leave unset)
 - `--write` / read-only (default: write-capable unless user wants review only)
 - `--resume` / `--fresh` (default: fresh; `--resume` continues prior Codex work)
+
+### Foreground by default for agent briefs
+
+When an orchestrator or planner/reviewer pipeline dispatches `codex:codex-rescue`, the brief
+MUST include `--wait` and say: "Run in the foreground: wait for the Codex task to finish and
+return its full result as your final message; never return only a background task id." Without
+`--wait` the forwarder backgrounds any task that looks long and returns at once with a task id
+("file doesn't exist yet"), leaving the caller to poll. If a task id comes back anyway, fetch it
+(`node "$COMPANION" status <id> --wait`, then `node "$COMPANION" result <id>`) before using the
+pass. Use `--background` only when the user asks for it.
+
+### Cancelling a Codex job (TaskStop is not enough)
+
+Stopping the Claude agent that launched Codex (TaskStop on `impl-coder-codex`, or a
+`codex:codex-rescue` agent with `--write`) does not stop Codex. The companion job, its
+`app-server-broker.mjs serve --cwd <worktree>` broker, the `codex app-server` and its sandbox
+processes keep running and keep editing the worktree. Whenever you stop a Codex-backed agent:
+
+1. `node "$COMPANION" status --cwd <worktree> --json`, then for each id in `.running[]`:
+   `node "$COMPANION" cancel <id> --cwd <worktree> --json` (interrupts the turn and kills
+   the job's process tree).
+2. If the worktree still changes, kill that worktree's broker tree only. The exact recipe,
+   which matches `--cwd <worktree> --pid-file` as a fixed string so other worktrees' brokers
+   survive, is in `.claude/agents/implementation/coder-codex.md` → "Cancelling a run".
+3. Confirm `git -C <worktree> status --short` is unchanged 30 s later before reusing it.
+
+`COMPANION` is `$(ls -d ~/.claude/plugins/cache/openai-codex/codex/*/ | sort -V | tail -1)scripts/codex-companion.mjs`.
 
 ### Brief hygiene
 

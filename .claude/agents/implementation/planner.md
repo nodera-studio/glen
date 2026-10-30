@@ -179,6 +179,12 @@ controller → service → schema. Then confirm the glue is planned:
 - Shared package rebuild step included, if this project requires one.
 - Error handler / error-state check present; user-facing error messages defined per this
   project's error-catalog convention.
+- Every timing AC (deadline, timeout, abort latency) holds against the worst-case blocking
+  calls on its path (readiness waits, per-call timeouts, retries); fix the AC or make the
+  wait interruptible.
+- Every tool, crate or package the plan names resolves in the real tree (`cargo tree -i`,
+  `npm ls` in `site/`, `--version`), with the resolved version in the step; every new
+  dependency is listed with its exact command in a **Network pre-flight** block.
 
 Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user can see what was caught.
 

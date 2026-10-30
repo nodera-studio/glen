@@ -52,7 +52,8 @@ copies}." If a tripwire fires: "This needs the full pipeline — run `/implement
 
 ### 1 — Implement (fused, in Codex)
 
-Claude writes no product code — dispatch the **Codex Implementer** even on the quick path:
+Claude writes no product code — dispatch the **Codex Implementer** even on the quick path
+(a design-heavy UI change follows `orchestrator.md` → UI implementation routing instead):
 
 ```
 Agent tool:
