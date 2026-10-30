@@ -2686,6 +2686,7 @@ const st = {
   model: byPair(E.HOST_MODEL || "fake/fake-1"),
   thinking: E.HOST_THINKING || "medium",
   tokens: 1234,
+  entries: [],
   compacting: null,
 };
 const handlers = new Map();
@@ -2728,6 +2729,7 @@ const ctx = fallback("ctx_unknown", {
   agent: { kind: "main", id: "main", name: "main", depth: 0 },
   sessionManager: fallback("sm_unknown", {
     getSessionId: () => st.id, getSessionFile: () => st.file, getCwd: () => process.cwd(),
+    getEntries: () => st.entries,
   }),
   isIdle: () => st.idle,
   hasPendingMessages: () => st.queue.length > 0 || E.HOST_PENDING === "1",
@@ -2749,7 +2751,11 @@ const ctx = fallback("ctx_unknown", {
       const c = { reject };
       st.compacting = c;
       setTimeout(() => {
-        if (st.compacting === c) { st.compacting = null; st.tokens = 123; resolve(); }
+        if (st.compacting === c) {
+          st.compacting = null;
+          st.entries.push({ type: "compaction", id: `compact-${st.entries.length}` });
+          st.tokens = 123; resolve();
+        }
       }, Number(E.HOST_COMPACT_MS ?? "0"));
     });
   },

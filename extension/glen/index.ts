@@ -67,6 +67,22 @@ function write(conn: net.Socket | null, frame: object): boolean {
     if (!conn || conn.destroyed || conn.writableEnded) return false;
     try { conn.write(JSON.stringify(frame) + "\n"); return true; } catch { return false; }
 }
+export function finish(ctx: ExtensionContext, conn: net.Socket, frame?: object) {
+    if (conn.destroyed || conn.writableEnded) return;
+    const timer = ctx.setTimeout(() => quietly(() => conn.destroy()), 3000);
+    conn.once("close", () => quietly(() => ctx.clearTimer(timer)));
+    try {
+        // An empty write is a flush barrier for already queued stream events.
+        conn.write(frame === undefined ? "" : JSON.stringify(frame) + "\n", err => {
+            if (err) { quietly(() => conn.destroy()); return; }
+            quietly(() => conn.end(() => {
+                // Keep draining ignored input until peer EOF. Destroying with
+                // unread input can reset the socket and discard the response.
+                if (conn.readableEnded) quietly(() => conn.destroy());
+            }));
+        });
+    } catch { quietly(() => conn.destroy()); }
+}
 function event(r: Request, kind: string, body: object = {}): boolean {
     const frame = { v: PROTOCOL, id: r.id, event: kind, ...body };
     if (!r.acked) {
@@ -80,7 +96,7 @@ function terminal(e: Endpoint, r: Request, kind: string, body: object) {
     event(r, kind, body); r.settled = true;
     if (r.deliveryTimer !== undefined) e.ctx.clearTimer(r.deliveryTimer);
     e.active = e.active.filter(x => x !== r);
-    if (r.acked && r.conn) { const conn = r.conn; quietly(() => conn.end(() => quietly(() => conn.destroy()))); }
+    if (r.acked && r.conn) finish(e.ctx, r.conn);
     e.settledIds.add(r.id);
     if (e.settledIds.size > 4096) e.settledIds.delete(e.settledIds.values().next().value!);
     e.requests = e.requests.filter(x => x !== r);
@@ -150,8 +166,8 @@ export function modelRef(model: any) { return model ? { provider: model.provider
 export function modelRow(model: any) { return { provider: model.provider, id: model.id, name: model.name, reasoning: !!model.reasoning, thinking_levels: thinkingLevelsOf(model), context_window: model.contextWindow ?? null, max_tokens: model.maxTokens ?? null }; }
 async function control(e: Endpoint, conn: net.Socket, frame: any) {
     const { id, op } = frame, a = frame.args === undefined ? {} : frame.args;
-    const error = (code: string, message: string, details?: object) => { if (!conn.destroyed) conn.end(JSON.stringify({ v: PROTOCOL, id, ok: false, error: { code, message, ...(details ? { details } : {}) } }) + "\n"); };
-    const success = (data: object) => { identity(e); if (!conn.destroyed) conn.end(JSON.stringify({ v: PROTOCOL, id, ok: true, data: { ...data, session_id: e.sessionId } }) + "\n"); };
+    const error = (code: string, message: string, details?: object) => finish(e.ctx, conn, { v: PROTOCOL, id, ok: false, error: { code, message, ...(details ? { details } : {}) } });
+    const success = (data: object) => { identity(e); finish(e.ctx, conn, { v: PROTOCOL, id, ok: true, data: { ...data, session_id: e.sessionId } }); };
     try {
         // A socket belongs only to the cached main-agent context.
         if ((e.ctx.agent?.kind ?? "main") !== "main") { conn.destroy(); return; }
@@ -189,8 +205,14 @@ async function control(e: Endpoint, conn: net.Socket, frame: any) {
             e.compacting = true;
             try {
                 const tokens_before = e.ctx.getContextUsage()?.tokens ?? null;
+                const compactions = () => e.ctx.sessionManager.getEntries().filter((entry: any) => entry.type === "compaction");
+                const before = compactions(), lastId = before.at(-1)?.id;
                 notify(e.ctx, "glen: compacting the session");
-                await e.ctx.compact(a.instructions ?? undefined); identity(e);
+                const result = await e.ctx.compact(a.instructions ?? undefined); identity(e);
+                const after = compactions();
+                if (result === "cancelled" || result === "failed" || (after.length <= before.length && after.at(-1)?.id === lastId)) {
+                    error("omp_error", result === "cancelled" ? "compaction cancelled" : "compaction did not run"); return;
+                }
                 success({ tokens_before, tokens_after: e.ctx.getContextUsage()?.tokens ?? null });
             } finally { e.compacting = false; }
         }
@@ -200,7 +222,7 @@ function connection(e: Endpoint, conn: net.Socket) {
     e.connections.add(conn);
     const chunks: Buffer[] = [];
     let length = 0, handled = false;
-    const error = (id: any, code: string, message: string, details?: object) => conn.end(JSON.stringify({ v: PROTOCOL, id, ok: false, error: { code, message, ...(details ? { details } : {}) } }) + "\n");
+    const error = (id: any, code: string, message: string, details?: object) => finish(e.ctx, conn, { v: PROTOCOL, id, ok: false, error: { code, message, ...(details ? { details } : {}) } });
     conn.on("error", () => {});
     // A complete request must arrive within the budget, including trickled bytes.
     const deadline = e.ctx.setTimeout(() => quietly(() => { if (!handled) conn.destroy(); }), e.deps.idleMs);
@@ -229,7 +251,7 @@ function connection(e: Endpoint, conn: net.Socket) {
             if (id === null) { error(null, "bad_request", "id must be a string"); return; }
             if (frame.v !== PROTOCOL) { error(id, "unsupported_version", "unsupported protocol version", { supported: [PROTOCOL] }); return; }
             identity(e);
-            if (frame.op === "hello" || frame.op === "state") { conn.end(JSON.stringify({ v: PROTOCOL, id, ok: true, data: state(e, frame.op === "hello") }) + "\n"); return; }
+            if (frame.op === "hello" || frame.op === "state") { finish(e.ctx, conn, { v: PROTOCOL, id, ok: true, data: state(e, frame.op === "hello") }); return; }
             if (OPS.includes(frame.op) && frame.op !== "send") { void control(e, conn, frame); return; }
             if (frame.op !== "send") { error(id, "unsupported_op", "unsupported operation", { op: frame.op ?? null, ops: OPS, reserved: RESERVED_OPS.includes(frame.op) }); return; }
             if (e.requests.some(r => r.id === id) || e.settledIds.has(id)) { error(id, "bad_request", "duplicate request id"); return; }
@@ -247,7 +269,7 @@ function connection(e: Endpoint, conn: net.Socket) {
             if (!r.consumed && !r.settled) r.deliveryTimer = e.ctx.setTimeout(() => notDelivered(e, r), e.deps.deliveryMs ?? LIMITS.deliveryMs);
             for (const frame of r.outbox) write(conn, frame);
             r.outbox = [];
-            if (r.settled) conn.end(() => quietly(() => conn.destroy()));
+            if (r.settled) finish(e.ctx, conn);
             notify(e.ctx, `glen: message from job ${r.jobId ? "j" + r.jobId.replaceAll("-", "").slice(-7) : "a glen client"} delivered as ${deliveredAs}`);
         } catch (err) { error(null, "internal", String(err)); }
     });

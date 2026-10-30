@@ -7,10 +7,11 @@ let pid = 4000000;
 export function createFakeHost(options: any = {}) {
     const handlers = new Map<string, Function[]>(), tools: any[] = [], sends: any[] = [], notes: string[] = [];
     const fields = { mode: "tui", agentKind: "main", sessionId: "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de", sessionFile: null, idle: true, pending: false, model: models[0], thinking: "medium", tokens: 1234, hasUI: true, ...options };
-    const timers = new Set<any>();
+    const timers = new Set<any>(), entries: any[] = [];
     const builder = () => { const b: any = { optional() { b.isOptional = true; return b; }, strict() { b.isStrict = true; return b; }, describe(text: string) { b.description = text; return b; } }; return b; };
     const pi: any = { on(name: string, fn: Function) { handlers.set(name, [...(handlers.get(name) ?? []), fn]); }, registerTool(t: any) { tools.push(t); }, sendUserMessage(text: string, opts?: any) { sends.push({ text, opts }); if (fields.throwSend) throw new Error("send failed"); fields.onSend?.(); }, zod: { object: builder, string: builder, boolean: builder } };
     const ctx: any = { mode: fields.mode, cwd: "/work/fixture", hasUI: true, agent: { kind: fields.agentKind }, ui: { notify: (text: string) => notes.push(text) }, sessionManager: { getSessionId: () => fields.sessionId, getSessionFile: () => fields.sessionFile }, isIdle: () => fields.idle, hasPendingMessages: () => fields.pending, setTimeout(fn: Function, ms: number) { const timer = setTimeout(() => { timers.delete(timer); fn(); }, ms); timers.add(timer); return timer; }, clearTimer(timer: any) { clearTimeout(timer); timers.delete(timer); } };
+    ctx.sessionManager.getEntries = () => entries;
     const calls = { abort: 0, setModel: [] as any[], thinking: [] as string[], compact: [] as any[] };
     let compactReject: ((error: Error) => void) | undefined;
     ctx.hasUI = fields.hasUI;
@@ -25,9 +26,14 @@ export function createFakeHost(options: any = {}) {
     ctx.compact = async (instructions?: string) => {
         calls.compact.push(instructions);
         if (fields.compactError) throw new Error(fields.compactError);
-        await new Promise<void>((resolve, reject) => { compactReject = reject; ctx.setTimeout(resolve, fields.compactDelay ?? 0); });
-        compactReject = undefined;
+        try {
+            await new Promise<void>((resolve, reject) => { compactReject = reject; ctx.setTimeout(resolve, fields.compactDelay ?? 0); });
+        } catch (err) { if (fields.compactAbortReturns) return "cancelled"; throw err; }
+        finally { compactReject = undefined; }
+        if (fields.compactNoEntry) return fields.compactResult;
+        entries.push({ type: "compaction", id: `compact-${entries.length}` });
         fields.tokens = 123;
+        return fields.compactResult;
     };
     pi.setModel = async (model: any) => {
         calls.setModel.push(model);

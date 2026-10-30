@@ -63,6 +63,33 @@ test("AC366 model errors, compaction errors and busy guards", async () => {
         const failed = await run(f, e.socket, "compact"); assert.equal(failed.error.code, "omp_error"); assert.equal(failed.error.message, "Nothing to compact");
     } finally { await f.close(); }
 });
+test("AC366 compaction without a new entry is an omp error even when it returns normally", async () => {
+    for (const compactResult of [undefined, "ok", "failed"]) {
+        const f = await fixture(); try { const e = await f.start(); assert.ok(e, f.notes.join("\n"));
+            // An older compaction and unchanged tokens must not count as success.
+            assert.equal((await run(f, e.socket, "compact")).ok, true);
+            const before = [...f.ctx.sessionManager.getEntries()];
+            f.fields.compactNoEntry = true; f.fields.compactResult = compactResult;
+            const failed = await run(f, e.socket, "compact");
+            assert.equal(failed.ok, false); assert.equal(failed.error.code, "omp_error");
+            assert.equal(failed.error.message, "compaction did not run");
+            assert.deepEqual(f.ctx.sessionManager.getEntries(), before); assert.equal(f.fields.tokens, 123);
+            f.fields.compactNoEntry = false; f.fields.compactResult = undefined;
+            assert.equal((await run(f, e.socket, "compact")).ok, true);
+        } finally { await f.close(); }
+    }
+});
+test("AC366 cancelled compaction returning normally is an omp error", async () => {
+    const f = await fixture({ compactDelay: 1000, compactAbortReturns: true });
+    try { const e = await f.start(); assert.ok(e, f.notes.join("\n"));
+        const c = await client(e.socket, frame("compact")); await c.until(() => f.calls.compact.length === 1);
+        assert.equal((await run(f, e.socket, "abort")).ok, true);
+        await c.until(() => c.ended); assert.equal(c.frames.length, 1);
+        assert.equal(c.frames[0].ok, false); assert.equal(c.frames[0].error.code, "omp_error");
+        assert.equal(c.frames[0].error.message, "compaction cancelled");
+        assert.equal(f.fields.tokens, 1234); assert.deepEqual(f.ctx.sessionManager.getEntries(), []);
+    } finally { await f.close(); }
+});
 test("AC366 session switch while setModel awaits returns post-op id", async () => {
     const f = await fixture(); try { const e = await f.start(); assert.ok(e, f.notes.join("\n"));
         f.fields.onSetModel = async () => { f.fields.sessionId = "new-session"; };
