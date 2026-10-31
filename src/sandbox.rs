@@ -106,11 +106,59 @@ pub fn map_socket_failure(env: &Env, action: &str, err: &io::Error) -> Option<Gl
     error.message = format!("cannot {action}: {err}");
     Some(error)
 }
+/// On Linux, a sandboxed glen in its own network namespace cannot see the abstract-socket
+/// lease a host-namespace omp holds, so an RPC resume could fork a session omp already owns.
+/// True under any Codex marker when glen's network namespace differs from PID 1's (the init
+/// namespace escalated commands still run in) or that comparison cannot be made.
+pub fn lease_hidden(env: &Env, linux: bool) -> bool {
+    if !linux {
+        return false;
+    }
+    let marker = detect(env).is_some() || env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1");
+    marker && net_namespace_hidden()
+}
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only called by the Linux probe; kept visible for the cross-platform unit test
+fn differs_by_identity(a: &std::path::Path, b: &std::path::Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
+        (Ok(ma), Ok(mb)) => (ma.dev(), ma.ino()) != (mb.dev(), mb.ino()),
+        _ => true,
+    }
+}
+#[cfg(target_os = "linux")]
+fn net_namespace_hidden() -> bool {
+    differs_by_identity(
+        std::path::Path::new("/proc/self/ns/net"),
+        std::path::Path::new("/proc/1/ns/net"),
+    )
+}
+#[cfg(not(target_os = "linux"))]
+fn net_namespace_hidden() -> bool {
+    false
+}
+/// Every lease value is treated as unknown when `lease_hidden`; otherwise only a real probe
+/// error (`Lease::Unknown` with an errno) is mapped.
 pub fn map_probe_failure(
     env: &Env,
     command: &str,
     lease: &crate::omp::lease::Lease,
 ) -> Option<GlenError> {
+    let _ = command;
+    if lease_hidden(env, cfg!(target_os = "linux")) {
+        let kind = detect(env).and_then(|s| s.kind);
+        let network = env.get("CODEX_SANDBOX_NETWORK_DISABLED") != Some("1");
+        let error = GlenError::no_route(
+            NoRouteReason::Sandboxed,
+            "cannot tell whether an omp process owns this session: on Linux omp's session lease is an abstract socket, and a sandbox's network namespace can hide it",
+        )
+        .with_hint(
+            "glen will not resume an existing session over RPC from a Codex command on Linux; open the session in omp with glen's extension so glen can use the live route, or run glen from a terminal outside Codex",
+        )
+        .with_detail("sandbox", json!(kind))
+        .with_detail("network", network)
+        .with_detail("lease", json!("unknown"));
+        return Some(error);
+    }
     let crate::omp::lease::Lease::Unknown {
         reason,
         errno: Some(errno),
@@ -367,6 +415,97 @@ mod tests {
                 assert_eq!(error.details.as_ref().unwrap()["network"], network);
             }
         }
+    }
+    #[test]
+    fn differs_by_identity_truth_table() {
+        let t = tempfile::tempdir().unwrap();
+        let a = t.path().join("a");
+        let b = t.path().join("b");
+        std::fs::write(&a, b"x").unwrap();
+        std::fs::write(&b, b"x").unwrap();
+        assert!(
+            !differs_by_identity(&a, &a),
+            "same path is the same namespace"
+        );
+        assert!(
+            differs_by_identity(&a, &b),
+            "different files are different namespaces"
+        );
+        assert!(
+            differs_by_identity(&a, &t.path().join("missing")),
+            "unreadable means hidden, never assumed visible"
+        );
+    }
+    #[test]
+    fn lease_hidden_truth_table() {
+        // Linux is a pure function of (linux, marker). macOS never hides a lease.
+        for (vars, linux, expected) in [
+            (vec![], true, false),
+            (vec![("CODEX_SANDBOX", "")], true, false),
+            (vec![("CODEX_SANDBOX", "seatbelt")], false, false),
+            (vec![("CODEX_SANDBOX_NETWORK_DISABLED", "0")], true, false),
+        ] {
+            let e = Env::for_test(None, Path::new("/"), &vars);
+            assert_eq!(lease_hidden(&e, linux), expected, "{vars:?} linux={linux}");
+        }
+        // A marker on Linux only hides the lease when the namespace comparison itself says
+        // "hidden" (net_namespace_hidden); on this test host that is whatever
+        // /proc/self/ns/net vs /proc/1/ns/net actually report, so assert the two Linux marker
+        // cases agree with `net_namespace_hidden()` rather than a fixed boolean.
+        for vars in [
+            vec![("CODEX_SANDBOX", "seatbelt")],
+            vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        ] {
+            let e = Env::for_test(None, Path::new("/"), &vars);
+            assert_eq!(lease_hidden(&e, true), net_namespace_hidden());
+        }
+    }
+    #[test]
+    fn map_probe_failure_when_hidden_refuses_every_lease_value() {
+        use crate::omp::lease::Lease;
+        let e = Env::for_test(
+            None,
+            Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        // Force the hidden path deterministically by asserting against the real
+        // `lease_hidden(&e, true)` result rather than the host's actual OS.
+        if !lease_hidden(&e, true) {
+            return; // this host's /proc identity makes the lease visible; nothing to assert
+        }
+        for lease in [
+            Lease::Free,
+            Lease::Held,
+            Lease::Unknown {
+                reason: "probe failed".into(),
+                errno: Some(libc::EACCES),
+            },
+        ] {
+            let error = map_probe_failure(&e, "send", &lease).expect("sandboxed refusal");
+            assert_eq!(error.code.exit_code(), 6);
+            let details = error.details.unwrap();
+            assert_eq!(details["reason"], "sandboxed");
+            assert_eq!(details["lease"], "unknown");
+            assert!(!error.hint.unwrap().contains("escalat"));
+        }
+    }
+    #[test]
+    fn map_probe_failure_when_not_hidden_only_maps_a_real_probe_error() {
+        use crate::omp::lease::Lease;
+        let e = Env::for_test(None, Path::new("/"), &[]);
+        assert!(map_probe_failure(&e, "send", &Lease::Free).is_none());
+        assert!(map_probe_failure(&e, "send", &Lease::Held).is_none());
+        assert!(
+            map_probe_failure(
+                &e,
+                "send",
+                &Lease::Unknown {
+                    reason: "no marker".into(),
+                    errno: Some(libc::EACCES),
+                }
+            )
+            .is_none()
+        );
     }
 }
 

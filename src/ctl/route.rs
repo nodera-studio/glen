@@ -485,6 +485,7 @@ pub(crate) fn route(
             cwd,
             deadline,
             stop.clone(),
+            env,
         ) {
             Ok(client) => return Ok((Target::Rpc(client), vec![])),
             Err(OpenError::Busy) => {

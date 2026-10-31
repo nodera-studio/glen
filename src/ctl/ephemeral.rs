@@ -204,6 +204,7 @@ impl Ephemeral {
         cwd: &Path,
         deadline: Instant,
         stop: Arc<AtomicBool>,
+        env: &crate::env::Env,
     ) -> Result<Self, OpenError> {
         stopped(deadline, &stop).map_err(OpenError::Stopped)?;
         let id = &session.header.id;
@@ -246,6 +247,9 @@ impl Ephemeral {
             _ => (),
         }
         let probe = lease::probe(&paths.session_owners_dir, id);
+        if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &probe) {
+            return Err(OpenError::Failed(e));
+        }
         if !matches!(probe, Lease::Free) {
             return Err(OpenError::Failed(
                 GlenError::no_route(

@@ -1039,6 +1039,14 @@ fn endpoint_result(
 }
 
 fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
+    // Checked before every lease value, including Free: on Linux under a Codex marker in a
+    // different network namespace, even a "free" probe cannot be trusted.
+    if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &lease) {
+        let mut failure = Failure::no_route(NoRouteReason::Sandboxed, e.message);
+        failure.hint = e.hint;
+        failure.details = e.details.map(|d| *d);
+        return Err(failure);
+    }
     let (reason, message) = match lease {
         Lease::Free => return Ok(()),
         Lease::Held => (
@@ -1046,12 +1054,6 @@ fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
             format!("before spawning omp: session {handle} is open in another omp process"),
         ),
         unknown @ Lease::Unknown { .. } => {
-            if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &unknown) {
-                let mut failure = Failure::no_route(NoRouteReason::Sandboxed, e.message);
-                failure.hint = e.hint;
-                failure.details = e.details.map(|d| *d);
-                return Err(failure);
-            }
             let r = lease::state_detail(&unknown).unwrap_or_default();
             (
                 NoRouteReason::UnknownLease,
