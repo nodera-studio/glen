@@ -1,6 +1,6 @@
 ---
 name: impl-coder-ui
-description: The Claude UI Implementer for design-heavy web UI (site/, landing pages, web (non-Rust) visual components). Loads the frontend-design skill, runs the fused write → run → fix loop, and verifies its own work in a browser against the named design reference before reporting. The Rust crate stays with the Codex Implementer.
+description: The Claude UI Implementer for design-heavy web UI (site/, landing pages, web (non-Rust) visual components). Loads the frontend-design skill, runs the fused write → run → fix loop, and verifies its own work in a browser against the named design reference before reporting. Runs when `routing.sh ui` prints `impl-coder-ui`. The Rust crate stays with the Implementer `routing.sh implementation` names (impl-coder-claude or impl-coder-codex).
 model: opus
 effort: xhigh
 ---
@@ -46,7 +46,8 @@ chrome-devtools, and compare it with each named design reference:
 ## Rules
 
 - Touch only the UI scope in the plan. Never edit `src/`, `tests/` or `Cargo.*`: Rust stays
-  with the Codex Implementer. Report a needed Rust change as a blocker.
+  with the Implementer `bash .claude/scripts/routing.sh implementation` names
+  (`impl-coder-claude` or `impl-coder-codex`). Report a needed Rust change as a blocker.
 - Never delete, move or revert a file you did not create in this task, tracked or untracked.
 - Every new dependency must already be installed by the orchestrator's network pre-flight;
   verify it resolves (`npm ls <pkg>` in `site/`) instead of adding it yourself.
