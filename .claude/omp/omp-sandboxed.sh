@@ -41,20 +41,23 @@ sbpl_path() {
   value="${value//\\/\\\\}"
   printf '%s' "${value//\"/\\\"}"
 }
-# Escape a path for use inside an SBPL (regex #"...") literal: backslash-escape
-# regex metacharacters first, then SBPL-quote the result like sbpl_path.
+# Escape a path for use inside an SBPL (regex #"...") literal. #"..." is a raw
+# literal, not an ordinary SBPL string: a literal `\"` inside it ends the
+# literal early rather than escaping the quote (fix cycle 5, decision 5,
+# Codex P2/LOW-4), so a path containing `"` or `\` is refused outright
+# instead of attempting to escape it.
 sbpl_regex_literal() {
   local value="$1" out="" ch i len
-  case "$value" in *$'\n'* | *$'\r'*) die 'newline in sandbox path' ;; esac
+  case "$value" in
+    *$'\n'* | *$'\r'*) die 'newline in sandbox path' ;;
+    *'"'* | *$'\\'*) die 'sandbox path contains a literal " or \, which an SBPL regex literal cannot carry safely' ;;
+  esac
   len=${#value}
   for ((i = 0; i < len; i++)); do
     ch="${value:i:1}"
     case "$ch" in
-      $'\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|')
+      '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|')
         out="$out\\$ch"
-        ;;
-      '"')
-        out="$out\\\""
         ;;
       *)
         out="$out$ch"
@@ -70,8 +73,9 @@ agent_sb="$(sbpl_path "$PROFILE_AGENT_DIR")"
 profile_sb="$(sbpl_path "$PROFILE_ROOT")"
 agent_regex="$(sbpl_regex_literal "$PROFILE_AGENT_DIR")"
 # Preserve read-only treatment for other entries already present in the agent
-# directory. SQLite database families and sessions need directory operations;
-# new transient filenames are intentionally covered by the broad write grant.
+# directory. The write allowlist below is a named list of entries (the state-
+# database regex, sessions/, logs/, cache/, run/), never a broad grant: a new
+# filename anywhere else in the agent directory is read-only by default.
 readonly_agent_filters() {
   local entry entry_sb
   find "$PROFILE_AGENT_DIR" -mindepth 1 -maxdepth 1 -print0 |
@@ -84,6 +88,44 @@ readonly_agent_filters() {
     done
 }
 readonly_filters="$(readonly_agent_filters)" || die 'could not inspect read-only agent entries'
+# Fix cycle 5, decision 2 (Claude MED-1): derive host:port from the profile's
+# Mnemosyne MCP server's own URL field at launch, so the omp reviewer can
+# still reach its memory server. Parses only the URL; never prints, logs or
+# otherwise touches headers or tokens.
+mnemosyne_network_rule() {
+  local mcp_file="$PROFILE_AGENT_DIR/mcp.json" url host port scheme var_name var_default
+  [ -f "$mcp_file" ] && command -v jq >/dev/null 2>&1 || return 0
+  url="$(jq -r '.mcpServers.mnemosyne.url // empty' "$mcp_file" 2>/dev/null)" || return 0
+  [ -n "$url" ] || return 0
+  # mcp.json ships the literal "${VAR:-default}" template text; omp expands
+  # it at its own runtime, so expand it here the same way, reading only the
+  # named env var (never logged) or its literal default.
+  if [[ "$url" =~ ^\$\{([A-Za-z_][A-Za-z0-9_]*):-(.*)\}$ ]]; then
+    var_name="${BASH_REMATCH[1]}"
+    # shellcheck disable=SC2034 # read indirectly, by name, inside eval below.
+    var_default="${BASH_REMATCH[2]}"
+    eval "url=\"\${$var_name:-\$var_default}\""
+  fi
+  [[ "$url" =~ ^(https?)://([^/:]+)(:([0-9]+))?(/.*)?$ ]] || return 0
+  scheme="${BASH_REMATCH[1]}"
+  host="${BASH_REMATCH[2]}"
+  port="${BASH_REMATCH[4]}"
+  if [ -z "$port" ]; then
+    if [ "$scheme" = https ]; then port=443; else port=80; fi
+  fi
+  case "$host" in
+    localhost | 127.0.0.1 | ::1) ;;
+    *)
+      [ "$port" = 443 ] || die "Mnemosyne MCP host $host is neither loopback nor on 443; refusing rather than granting an unbounded outbound host"
+      return 0
+      ;;
+  esac
+  # SBPL's (remote tcp "host:port") host component accepts only "*" or the
+  # literal "localhost" (host-verified, fix cycle 5); every loopback form
+  # (127.0.0.1, ::1, localhost) normalizes to that one literal.
+  printf '(allow network-outbound (remote tcp "localhost:%s"))\n' "$port"
+}
+mnemosyne_rule="$(mnemosyne_network_rule)" || die 'could not derive the Mnemosyne MCP outbound rule'
 profile="$(mktemp "$RUN_ROOT_REAL/omp-sandbox.XXXXXX")"
 cat > "$profile" <<EOF
 (version 1)
@@ -108,11 +150,10 @@ cat > "$profile" <<EOF
   ;; Runtime device nodes and timezone database.
   (subpath "/dev")
   (subpath "/private/var/db/timezone")
-  ;; S5 fix-cycle-4 (host-verified, 2026-10-31): the only /Library path a real
-  ;; send actually touched was Bun's own JIT/module cache; a clean run with no
-  ;; /Library grant at all still completed (denials there are non-fatal), so
-  ;; the full subpath grant this replaced was unnecessarily broad.
-  (subpath "/Library/Caches/bun")
+  ;; S5 fix-cycle-4 (host-verified, 2026-10-31): a real send completes with
+  ;; no /Library grant at all (denials there are non-fatal); fix cycle 5
+  ;; confirmed /Library/Caches/bun does not exist on this host either, so
+  ;; dropped the dead grant for it this replaced.
   ;; DNS config files Bun's getaddrinfo (and dscacheutil) consult.
   (literal "/private/etc/hosts")
   (literal "/private/etc/resolv.conf")
@@ -128,6 +169,11 @@ cat > "$profile" <<EOF
   (subpath "$profile_sb/run")
   ;; Shared native cache: populated unsandboxed by setup, then read-only here.
   (subpath "$home_sb/.omp/natives")
+  ;; Fix cycle 5, decision 9 (LOW-7): the deny log showed a real dispatch
+  ;; reading ~/.omp/run/session-owners for lease state (non-fatal when
+  ;; denied, but a read grant keeps the lease check accurate instead of
+  ;; silently degrading). Shared owner lock/JSON data, no executable code.
+  (subpath "$home_sb/.omp/run")
 )
 ;; S4 fix-cycle-4 allowlist (host-verified via a real send, 2026-10-31): omp's
 ;; own state databases and their WAL/SHM/journal siblings, plus sessions/ and
@@ -160,8 +206,23 @@ cat > "$profile" <<EOF
   (literal "$agent_sb/mcp.json")
   (subpath "$agent_sb/extensions")
   (subpath "$agent_sb/skills")
+  ;; Fix cycle 5, decision 4 (Claude MED-2): deny renaming or unlinking these
+  ;; runtime directories themselves, not just their contents, so the child
+  ;; cannot swap one out from under a later unsandboxed omp run on this
+  ;; profile. Writes to files inside them stay allowed via the subpath grants
+  ;; above.
+  (literal "$agent_sb/sessions")
+  (literal "$profile_sb/logs")
+  (literal "$profile_sb/cache")
+  (literal "$profile_sb/run")
 $readonly_filters
 )
+;; Fix cycle 5, decision 4 (Claude MED-2): deny creating a symlink anywhere
+;; writable. A planted symlink in an allowed path (for example
+;; agent/sessions/x -> ~/.ssh) would fail to write inside this sandbox
+;; (Seatbelt checks the resolved target), but a later UNSANDBOXED omp run on
+;; this profile (setup, login) would follow it and write through it for real.
+(deny file-write-create (vnode-type SYMLINK))
 ;; Fix cycle 4, item 6 (accepted exfiltration residual, documented in
 ;; SKILL.md under Risks): outbound is restricted to TCP 443 (any host, not
 ;; just Cursor's) plus the mDNSResponder DNS socket below. omp still needs
@@ -169,6 +230,11 @@ $readonly_filters
 ;; narrowest grant that keeps a real dispatch working; it does not confine
 ;; traffic to Cursor specifically.
 (allow network-outbound (remote tcp "*:443"))
+;; Fix cycle 5, decision 2: the Mnemosyne MCP's own loopback port, derived
+;; above from the profile's mcp.json at launch. Empty when mcp.json has no
+;; Mnemosyne entry, jq is unavailable, or the port is already 443 (covered
+;; by the grant above already).
+$mnemosyne_rule
 ;; Apple com.apple.security.XPCTimeStampingService.sb:79: DNS Unix socket.
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
 ;; S5 fix-cycle-4 (host-verified via a real send and models cursor --json,

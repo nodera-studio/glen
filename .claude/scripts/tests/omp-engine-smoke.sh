@@ -188,6 +188,29 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   assert 'sandbox explicit profile does not admit old profile root' test "$(grep -Fc '.omp/profiles/glen-harness' "$custom_profile" || true)" -eq 0
   unset sandbox_agent
 
+  # Fix cycle 5, decision 2: the Mnemosyne MCP's own URL derives a loopback
+  # outbound rule. A loopback host on a non-443 port is allowed; a
+  # non-loopback, non-443 host refuses instead of granting it outbound.
+  mkdir -p "$sandbox_base/home/mnemosyne-ok/profiles/glen-harness/agent"
+  printf '%s
+' '{"mcpServers":{"mnemosyne":{"type":"http","url":"http://127.0.0.1:9191/mcp","headers":{"Authorization":"Bearer secret-token-never-logged"}}}}'     > "$sandbox_base/home/mnemosyne-ok/profiles/glen-harness/agent/mcp.json"
+  sandbox_agent="$sandbox_alias/home/mnemosyne-ok/profiles/glen-harness/agent"
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  mnemosyne_profile="$(grep -Fl -- "$sandbox_base/home/mnemosyne-ok/profiles/glen-harness/agent" "$sandbox_base/run"/omp-sandbox.*)"
+  assert_exit 'sandbox still runs with a loopback Mnemosyne MCP entry' 0
+  assert_contains 'sandbox derives the Mnemosyne loopback outbound rule'     '(allow network-outbound (remote tcp "localhost:9191"))' "$mnemosyne_profile"
+  assert 'sandbox never carries the Mnemosyne token into the profile' test     "$(grep -Fc 'secret-token-never-logged' "$mnemosyne_profile" || true)" -eq 0
+  unset sandbox_agent
+
+  mkdir -p "$sandbox_base/home/mnemosyne-remote/profiles/glen-harness/agent"
+  printf '%s
+' '{"mcpServers":{"mnemosyne":{"type":"http","url":"http://mnemosyne.example.com:9191/mcp"}}}'     > "$sandbox_base/home/mnemosyne-remote/profiles/glen-harness/agent/mcp.json"
+  sandbox_agent="$sandbox_alias/home/mnemosyne-remote/profiles/glen-harness/agent"
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  assert_exit 'sandbox refuses a non-loopback, non-443 Mnemosyne MCP host' 1
+  assert_contains 'non-loopback refusal names the reason' 'neither loopback nor on 443' "$STDERR"
+  unset sandbox_agent
+
   # Verify the SQLite CLI/query itself even when nested Seatbelt is unavailable.
   # The sandboxed cases below must perform these same real transactions.
   for journal in delete wal; do
@@ -283,6 +306,21 @@ PY
       run_sandbox sandbox_call /bin/cat "$writable"
       assert_exit 'sandbox allows read-back in permitted directory' 0
       assert_eq 'sandbox write read-back content' "$(cat "$STDOUT")" 'sandbox write'
+    done
+
+    # Fix cycle 5, decision 4 (Claude MED-2): no symlink creation anywhere,
+    # and the sessions/logs/cache/run directories cannot be renamed away.
+    for planted in       "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions/evil-link"       "$sandbox_base/home/.omp/profiles/glen-harness/logs/evil-link"; do
+      run_sandbox sandbox_call /bin/ln -s "$sandbox_base/home/glen-canary.txt" "$planted"
+      assert_exit 'sandbox refuses planting a symlink in a writable directory' 1
+      assert 'sandbox refused symlink never actually appears' test ! -L "$planted"
+    done
+    for renamed_pair in       "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions sessions.bak"       "$sandbox_base/home/.omp/profiles/glen-harness/logs logs.bak"; do
+      # shellcheck disable=SC2086 # intentional word splitting of the pair.
+      set -- $renamed_pair
+      run_sandbox sandbox_call /bin/mv "$1" "$2"
+      assert_exit 'sandbox refuses renaming a runtime directory away' 1
+      assert 'sandbox refused rename leaves the directory in place' test -d "$1"
     done
 
     if [ -n "$socket_python" ]; then
@@ -466,32 +504,37 @@ chmod +x "$WORK/bin/glen" "$WORK/bin/omp"
 export PATH="$WORK/bin:$PATH"
 export GLEN_BIN="$WORK/bin/glen" SMOKE_UNEXPECTED_CALL="$WORK/unexpected-call"
 
-# Linux coverage is limited to local probe gates; no live omp or real bwrap run.
-if [ "$(uname -s)" != Darwin ]; then
-  linux_probe_bin="$WORK/linux-probe-bin"
-  mkdir -p "$linux_probe_bin" "$WORK/linux-probe-home"
-  # An allowlisted PATH guarantees bwrap is absent even when CI installed it.
-  for tool in date uname git dirname jq omp; do
-    ln -s "$(command -v "$tool")" "$linux_probe_bin/$tool"
-  done
-  run env HOME="$WORK/linux-probe-home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
-    PATH="$linux_probe_bin" /bin/bash "$ENGINE" probe
-  assert_exit 'Linux probe missing bwrap skips' 3
-  assert 'Linux probe missing bwrap status' jq -e '.status == "skipped"' "$STDOUT"
-  assert_contains 'Linux probe missing bwrap reason' 'bwrap not on PATH; the omp sandbox requires it on Linux' "$STDOUT"
+# Fix cycle 5, decision 3/8: the engine refuses Linux unconditionally, before
+# ever checking for bwrap, so the refusal must appear with AND without bwrap
+# on PATH. This block runs on every host (not gated to non-Darwin) because
+# the refusal is itself platform-independent code, testable by temporarily
+# reporting a fake uname.
+linux_probe_bin="$WORK/linux-probe-bin"
+mkdir -p "$linux_probe_bin" "$WORK/linux-probe-home"
+cat > "$linux_probe_bin/uname" <<'EOF'
+#!/bin/sh
+printf 'Linux
+'
+EOF
+chmod +x "$linux_probe_bin/uname"
+for tool in date git dirname jq omp; do
+  ln -s "$(command -v "$tool")" "$linux_probe_bin/$tool"
+done
+run env HOME="$WORK/linux-probe-home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+  PATH="$linux_probe_bin" /bin/bash "$ENGINE" probe
+assert_exit 'Linux probe without bwrap refuses before any tool check' 3
+assert 'Linux probe without bwrap has skipped status' jq -e '.status == "skipped"' "$STDOUT"
+assert_contains 'Linux probe without bwrap names the unavailable reason' \
+  'unavailable: linux abstract-socket isolation not supported' "$STDOUT"
 
-  # Keep the fake tool for the rest of the offline engine fixtures as well.
-  # Any attempt to execute it is unexpected: only command -v should inspect it.
-  cp "$WORK/bin/glen" "$WORK/bin/bwrap"
-  chmod +x "$WORK/bin/bwrap"
-  run env HOME="$WORK/linux-probe-home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
-    PATH="$WORK/bin:$linux_probe_bin" /bin/bash "$ENGINE" probe
-  assert_exit 'Linux probe fake bwrap proceeds to next skip' 3
-  assert_contains 'Linux probe fake bwrap reaches profile check' 'profile is not set up' "$STDOUT"
-  assert 'Linux probe tool checks invoke neither omp nor bwrap' test ! -e "$SMOKE_UNEXPECTED_CALL"
-else
-  printf 'NOTE Linux bwrap probe checks skipped: non-Darwin required\n'
-fi
+cp "$WORK/bin/glen" "$linux_probe_bin/bwrap"
+chmod +x "$linux_probe_bin/bwrap"
+run env HOME="$WORK/linux-probe-home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+  PATH="$linux_probe_bin" /bin/bash "$ENGINE" probe
+assert_exit 'Linux probe with bwrap present still refuses' 3
+assert_contains 'Linux probe with bwrap present names the same reason' \
+  'unavailable: linux abstract-socket isolation not supported' "$STDOUT"
+assert 'Linux probe invokes neither omp nor the fake bwrap' test ! -e "$SMOKE_UNEXPECTED_CALL"
 
 # Hide the sandbox tool with an allowlisted PATH: prepending an empty directory
 # cannot hide a later executable. Both the probe and bypassed-probe dispatch fail.
@@ -499,16 +542,23 @@ mkdir "$WORK/no-sandbox-bin"
 for tool in date uname git dirname jq omp mktemp rm; do
   ln -s "$(command -v "$tool")" "$WORK/no-sandbox-bin/$tool"
 done
-if [ "$(uname -s)" = Darwin ]; then missing_tool=sandbox-exec; else missing_tool=bwrap; fi
+# Fix cycle 5, decision 8: on a real (not faked) Linux host, probe_checks and
+# resolve_launcher both refuse before ever reaching a bwrap-on-PATH check, so
+# the expected reason differs by host platform, not by this fixture.
+if [ "$(uname -s)" = Darwin ]; then
+  no_sandbox_reason='sandbox-exec not on PATH'
+else
+  no_sandbox_reason='unavailable: linux abstract-socket isolation not supported'
+fi
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
   PATH="$WORK/no-sandbox-bin" /bin/bash "$ENGINE" probe
 assert_exit 'probe without sandbox skips' 3
 assert 'probe without sandbox has skipped status' jq -e '.status == "skipped"' "$STDOUT"
-assert_contains 'probe without sandbox names missing tool' "$missing_tool not on PATH" "$STDOUT"
+assert_contains 'probe without sandbox names the reason' "$no_sandbox_reason" "$STDOUT"
 assert 'probe without sandbox creates no run root or jobs' test ! -e "$WORK/tmp/glen-omp-engine"
 run env HOME="$WORK/home" PATH="$WORK/no-sandbox-bin" /bin/bash "$ENGINE" envcheck -- "$GLEN_BIN"
 assert_exit 'dispatch without sandbox fails closed' 4
-assert_contains 'dispatch without sandbox names missing tool' "$missing_tool not on PATH" "$STDERR"
+assert_contains 'dispatch without sandbox names the reason' "$no_sandbox_reason" "$STDERR"
 assert 'missing sandbox never executes omp or glen' test ! -e "$SMOKE_UNEXPECTED_CALL"
 
 # Offline routing checks exercise the REAL launcher with a fake OS sandbox tool,
@@ -643,14 +693,10 @@ for name in AGENTS.md cLaUdE.mD; do
   run /bin/bash "$ENGINE" snapshot "$SRC" "$ancestor/glen-omp-engine/run/tree"
   assert_exit "snapshot refuses ancestor context $name" 3
   assert "ancestor context $name is a skip" jq -e '.status == "skipped"' "$STDOUT"
-  # MED-002's nocaseglob match returns the on-disk entry name for its own
-  # case variant; on a case-insensitive filesystem the directory lookup can
-  # also report the pattern's own casing for an exact-string match, so check
-  # the ancestor directory and basename case-insensitively, not full exact text.
-  assert_contains "ancestor context $name reason names directory" "$ancestor" "$STDOUT"
-  # shellcheck disable=SC2016 # $1/$2 expand inside the inner bash -c, not here.
-  assert "ancestor context $name reason names the file case-insensitively" bash -c \
-    'printf "%s" "$1" | grep -qi "$2"' _ "$(jq -r .reason "$STDOUT")" "$name"
+  # Fix cycle 5, decision 6: the bracket-class glob is a real metacharacter
+  # pattern, so it now returns the exact on-disk name (its own case variant),
+  # not the pattern's own casing; check the full exact path.
+  assert_contains "ancestor context $name reason names file" "$ancestor/$name" "$STDOUT"
   assert_contains "ancestor context $name reason names problem" 'context file' "$STDOUT"
 done
 ancestor="$WORK/ancestor-permissions"
@@ -797,6 +843,22 @@ run /bin/bash "$ENGINE" launcher "$WORK/no-launcher-source" "$WORK/launcher-miss
 assert_exit 'launcher missing from both sources fails closed' 4
 assert 'missing launcher never returns an executable path' test ! -s "$STDOUT"
 
+# Fix cycle 5, decision 1: physical containment. A destination that IS a
+# per-dispatch run directory is refused lexically; one reached only through a
+# symlink into such a directory is refused once pwd -P resolves it.
+mkdir -p "$WORK/launcher-run-dirs/glen-omp-engine/run-fake-20260101T000000Z-1"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-run-dirs/glen-omp-engine/run-fake-20260101T000000Z-1"
+assert_exit 'launcher placed in a run directory is refused' 4
+assert_contains 'run directory refusal names the reason' 'per-dispatch run directory' "$STDERR"
+assert 'run directory refusal returns no launcher path' test ! -s "$STDOUT"
+
+mkdir -p "$WORK/launcher-run-target/glen-omp-engine/run-fake-20260101T000000Z-2"
+ln -s "$WORK/launcher-run-target/glen-omp-engine/run-fake-20260101T000000Z-2" "$WORK/launcher-run-symlink"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-run-symlink"
+assert_exit 'launcher dir symlinked into a run directory is refused' 4
+assert_contains 'symlinked run directory refusal names the reason' 'per-dispatch run directory' "$STDERR"
+assert 'symlinked run directory refusal returns no launcher path' test ! -s "$STDOUT"
+
 # Use a synthetic token. Never print envcheck output or any variable values.
 (
   export CLAUDE_CONFIG_DIR=smoke PI_PY=smoke PI_JS=smoke PI_CODING_AGENT_DIR=smoke
@@ -832,7 +894,7 @@ case "$*" in
   '--profile glen-harness models cursor --json') printf '%s\n' '{"models":[{"id":"fixture"}]}' ;;
   '--profile glen-harness config get modelRoles --json')
     [ "${SMOKE_REJECT_MODEL_ROLES:-0}" = 0 ] || exit 99
-    printf '%s\n' '{"value":{"default":"cursor/fixture","task":"cursor/other"}}'
+    printf '%s\n' "{\"value\":{\"default\":\"${SMOKE_MODEL_ROLES_DEFAULT:-cursor/fixture}\",\"task\":\"cursor/other\"}}"
     ;;
   *) exit 99 ;;
 esac
@@ -899,7 +961,7 @@ assert 'probe reports launcher source' jq -e '.launcher_source == "main" or .lau
 # Exercise both bounded_omp branches, independent of which timeout tools the
 # host installed. The private PATH still points at the same fd-aware fake omp.
 mkdir "$WORK/no-timeout-bin" "$WORK/with-timeout-bin"
-for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp cp chmod cat readlink sandbox-exec; do
+for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp cp chmod cat readlink sandbox-exec shasum sha256sum awk; do
   if command -v "$tool" >/dev/null 2>&1; then ln -s "$(command -v "$tool")" "$WORK/no-timeout-bin/$tool"; fi
 done
 if [ "$(uname -s)" != Darwin ]; then ln -s "$WORK/bin/bwrap" "$WORK/no-timeout-bin/bwrap"; fi
@@ -988,6 +1050,11 @@ assert_exit 'probe refuses unsafe symlink target run root' 3
 assert_contains 'probe unsafe symlink target reason names root' "$(cd "$WORK/symlink-target/glen-omp-engine" && pwd -P)" "$STDOUT"
 assert_eq 'unsafe run roots invoke no omp probes or jobs' "$(wc -l < "$SMOKE_OMP_CALLS")" "$omp_calls_before"
 
+# Fix cycle 5, decision 8: this whole section exercises macOS's
+# sandbox-exec-specific dispatch path (resolve_launcher/probe_checks both
+# refuse Linux unconditionally, before reaching any of this), so it is
+# gated to Darwin like the other sandbox-exec-only blocks in this file.
+if [ "$(uname -s)" = Darwin ]; then
 # Full dispatch integration. Clock/sleep wrappers exercise the real retry/deadline
 # branches without sleeping a minute or adding a production-only test hook.
 DISPATCH_SRC="$WORK/dispatch-source" DISPATCH_BIN="$WORK/dispatch-bin"
@@ -1127,12 +1194,31 @@ for terminal in ok failed; do
   if [ "$terminal" = ok ]; then
     assert_eq 'dispatch captures exact final answer' "$(cat "$CASE_OUT")" "$ANSWER"
     assert 'dispatch sums session usage and replies' jq -e '.replies==1 and .usage=={input:9,output:14,cacheRead:17,cacheWrite:22,totalTokens:62,cost_total:3}' "$STDOUT"
-    # Item 11 (fix cycle 4): the ladder entry's thinking level reaches the send
-    # argv. The fixture model (cursor/fixture) is off-ladder, so
-    # thinking_level_for falls back to the first entry's level (medium), via
-    # the shared ladder file both scripts source.
-    assert_contains 'probe fixture model resolves the ladder fallback thinking level' '--thinking medium' "$SMOKE_SEND_ARGV"
+    # Items 11 and 7 (fix cycle 4/5): the fixture model (cursor/fixture) is
+    # off-ladder (an explicit --model stand-in), so no --thinking at all
+    # reaches the real send argv ($STATE/calls.jsonl, written by
+    # tests/support/glen's own argv capture, not $WORK/bin/glen's).
+    assert 'off-ladder model sends no --thinking at all' jq -es \
+      'all(.[]; (.argv | index("--thinking")) == null)' "$STATE/calls.jsonl"
   fi
+done
+
+# Items 11 and 7: an on-ladder model gets its own paired level, including the
+# grok rung's "high" (not medium, the ladder's first entry).
+for ladder_case in argon grok; do
+  case "$ladder_case" in
+    argon) ladder_model=cursor/gemini-4-argon expected_level=medium ;;
+    grok) ladder_model=cursor/grok-4.7 expected_level=high ;;
+  esac
+  dispatch_fixture "ladder-$ladder_case"
+  dispatch_step send 0 "$DONE"
+  SMOKE_MODEL_ROLES_DEFAULT="$ladder_model" dispatch_run
+  assert_exit "ladder model $ladder_model dispatch succeeds" 0
+  # shellcheck disable=SC2016 # jq binds $level through --arg.
+  assert "ladder model $ladder_model sends its own thinking level" jq -es \
+    --arg level "$expected_level" \
+    'any(.[]; (.argv | index("--thinking")) as $i | $i != null and .argv[$i+1] == $level)' \
+    "$STATE/calls.jsonl"
 done
 
 dispatch_fixture running-no-job
@@ -1292,5 +1378,8 @@ assert_eq 'production snapshot skip status' "$(jq -r .status "$STDOUT")" skipped
 assert_tree 'production snapshot skip cleans tree' removed
 assert 'production snapshot skip never dispatches' test ! -s "$STATE/calls.jsonl"
 
+else
+  printf 'NOTE dispatch integration suite skipped: Darwin with sandbox-exec required\n'
+fi
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]

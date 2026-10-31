@@ -92,11 +92,16 @@ bwrap policy today. `probe` returns `unavailable: linux abstract-socket isolatio
 supported` and dispatch never runs or calls `omp-sandboxed-linux.sh`. That launcher stays in
 the repo for a later Landlock-based version.
 
-**Outbound network is restricted to TCP port 443 plus the mDNSResponder Unix socket**
-(fix cycle 4), not to the Cursor API host specifically. Two residuals remain, accepted by the
-owner: any HTTPS host on the public internet is reachable from inside the sandbox (not just
-Cursor's), and `agent.db` (the Cursor credential store) stays readable by the sandboxed omp
-process, since omp needs it to authenticate. Neither is mitigated further in v0.1.0.
+**Outbound network is restricted to TCP port 443, the Mnemosyne MCP's own loopback port, and
+the mDNSResponder Unix socket** (fix cycles 4-5), not to the Cursor API host specifically. The
+Mnemosyne port is derived at launch from the profile's own `mcp.json` URL field (fix cycle 5,
+decision 2): a loopback host (`localhost`/`127.0.0.1`/`::1`) on any port is allowed; a
+non-loopback host must already be on 443, or the launcher refuses to start rather than grant it
+an unbounded outbound host. Only the URL is parsed; headers and tokens are never read, logged or
+carried into the generated profile. Two residuals remain, accepted by the owner: any HTTPS host
+on the public internet is reachable from inside the sandbox (not just Cursor's), and `agent.db`
+(the Cursor credential store) stays readable by the sandboxed omp process, since omp needs it to
+authenticate. Neither is mitigated further in v0.1.0.
 
 ## Results
 
