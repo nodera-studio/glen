@@ -51,6 +51,8 @@ pub fn run(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             ),
         )
     };
+    outcome.warnings.extend(o.catalog.unreadable_warnings());
+    outcome.warnings.extend(o.session.branch_warning());
     if o.not_yet_persisted {
         outcome.warnings.push(crate::error::Warning {
             code: "not_yet_persisted".into(),
@@ -117,6 +119,8 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     let init = (|| -> std::io::Result<()> {
         stream.event("session",fields(json!({"session":open::session_json(&o),"continued_from":o.continued_from,"skipped_lines":o.session.skipped_lines})))?;
         stream.warnings(&ctx.warnings)?;
+        stream.warnings(&o.catalog.unreadable_warnings())?;
+        stream.warnings(&Vec::from_iter(o.session.branch_warning()))?;
         if o.not_yet_persisted {
             stream.warnings(&[crate::error::Warning {
                 code: "not_yet_persisted".into(),

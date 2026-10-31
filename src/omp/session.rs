@@ -144,6 +144,12 @@ impl Session {
         }
         let parsed = serde_json::from_slice::<Value>(line)
             .ok()
+            .or_else(|| {
+                // omp's JSON.stringify writes lone surrogates as `\uD83D`, which
+                // serde_json rejects; omp reads them back, so glen must too.
+                let repaired = repair_lone_surrogates(line)?;
+                serde_json::from_slice::<Value>(&repaired).ok()
+            })
             .and_then(|mut raw| {
                 // v1 predates the tree format. Rebuild its linear chain in
                 // memory, including records carrying stale ids or parents.
@@ -196,6 +202,12 @@ impl Session {
         }
     }
     pub fn active_branch(&self) -> Vec<&Entry> {
+        self.active_branch_checked().0
+    }
+    /// The active branch, plus whether the walk stopped at a parent that is
+    /// missing while lines were skipped: a malformed line may hide ancestors.
+    /// The walk never guesses ancestors across the gap.
+    pub fn active_branch_checked(&self) -> (Vec<&Entry>, bool) {
         let map: HashMap<_, _> = self
             .entries
             .iter()
@@ -205,17 +217,39 @@ impl Session {
         let mut next = self.leaf_id();
         let mut seen = HashSet::new();
         let mut branch = vec![];
+        let mut truncated = false;
         while let Some(id) = next {
             if !seen.insert(id) {
                 break;
             }
-            let Some(i) = map.get(id) else { break };
+            let Some(i) = map.get(id) else {
+                truncated = self.skipped_lines > 0;
+                break;
+            };
             let e = &self.entries[*i];
             branch.push(e);
             next = e.parent_id.as_deref();
         }
         branch.reverse();
-        branch
+        (branch, truncated)
+    }
+    /// The `branch_truncated` warning when the active branch was cut at a
+    /// missing parent while lines were skipped.
+    pub fn branch_warning(&self) -> Option<crate::error::Warning> {
+        let (branch, truncated) = self.active_branch_checked();
+        truncated.then(|| {
+            // Entries before the branch root in file order are the ones that may be hidden.
+            let earlier = branch.first().map_or(0, |root| {
+                self.entries
+                    .iter()
+                    .position(|e| std::ptr::eq(e, *root))
+                    .unwrap_or(0)
+            });
+            crate::error::Warning {
+                code: "branch_truncated".into(),
+                message: format!("{earlier} earlier entries may be hidden by a malformed line"),
+            }
+        })
     }
     pub fn title(&self) -> Option<String> {
         self.slot_title
@@ -262,6 +296,45 @@ impl Session {
         }
         selection
     }
+}
+/// Rewrite every `\uD800`-`\uDFFF` escape that is not part of a valid
+/// high+low pair to `\uFFFD`. Returns None when the line has none.
+fn repair_lone_surrogates(line: &[u8]) -> Option<Vec<u8>> {
+    let escape = |at: usize| -> Option<u16> {
+        let hex = line.get(at..at + 6)?;
+        if hex[0] != b'\\' || hex[1] != b'u' {
+            return None;
+        }
+        u16::from_str_radix(std::str::from_utf8(&hex[2..]).ok()?, 16).ok()
+    };
+    let mut out = Vec::with_capacity(line.len());
+    let mut changed = false;
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] != b'\\' {
+            out.push(line[i]);
+            i += 1;
+            continue;
+        }
+        match escape(i) {
+            Some(0xD800..=0xDBFF) if matches!(escape(i + 6), Some(0xDC00..=0xDFFF)) => {
+                out.extend_from_slice(&line[i..i + 12]);
+                i += 12;
+            }
+            Some(0xD800..=0xDFFF) => {
+                out.extend_from_slice(b"\\ufffd");
+                changed = true;
+                i += 6;
+            }
+            // Any other escape, including `\\`, is copied whole so the byte
+            // after it is never read as the start of an escape.
+            _ => {
+                out.extend_from_slice(&line[i..(i + 2).min(line.len())]);
+                i += 2;
+            }
+        }
+    }
+    changed.then_some(out)
 }
 fn entry_leaf(e: &Entry) -> Option<&str> {
     e.active_leaf_id
@@ -470,6 +543,23 @@ mod tests {
             assert_eq!(s.leaf_id(), want);
             assert!(s.active_branch().len() <= 2);
         }
+    }
+    #[test]
+    fn lone_surrogates_are_repaired_and_valid_escapes_kept() {
+        for (line, want) in [
+            (r#""a\ud83d""#, Some(r#""a\ufffd""#)),
+            (r#""\uDE00x\uD83D\uDE00""#, Some(r#""\ufffdx\uD83D\uDE00""#)),
+            (r#""\uD83D\uD83D\uDE00""#, Some(r#""\ufffd\uD83D\uDE00""#)),
+            (r#""\\ud83d""#, None),
+            (r#""\uD83D\uDE00 \n""#, None),
+            (r#""tail\ud83d"#, Some(r#""tail\ufffd"#)),
+        ] {
+            let got = repair_lone_surrogates(line.as_bytes());
+            assert_eq!(got.as_deref(), want.map(str::as_bytes), "{line}");
+        }
+        let s = parse(b"{\"type\":\"session\",\"version\":3,\"id\":\"x\"}\n{\"type\":\"future\",\"id\":\"a\",\"t\":\"\\udc00\"}\n");
+        assert_eq!(s.skipped_lines, 0);
+        assert_eq!(s.entries[0].raw["t"], "\u{fffd}");
     }
     #[test]
     fn busy_is_separate_from_turn() {

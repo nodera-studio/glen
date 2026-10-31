@@ -215,10 +215,12 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
     );
     spinner.finish();
     if ctx.mode == Mode::Json {
-        return Ok(Outcome::new(
+        let mut outcome = Outcome::new(
             json!({"scope":{"all":args.all,"cwd":(!args.all).then_some(&cwd),"bucket":bucket},"sessions_dir":catalog.sessions_dir,"total":total,"total_all":total_all,"sessions":rows.iter().map(|r|row_json(r,now)).collect::<Vec<_>>()}),
             "",
-        ));
+        );
+        outcome.warnings = catalog.unreadable_warnings();
+        return Ok(outcome);
     }
     let p = &ctx.painter;
     let human = if rows.is_empty() {
@@ -362,7 +364,9 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
                 .join("\n")
         )
     };
-    Ok(Outcome::new(Value::Null, human))
+    let mut outcome = Outcome::new(Value::Null, human);
+    outcome.warnings = catalog.unreadable_warnings();
+    Ok(outcome)
 }
 fn column_budget(widths: &[usize], all: bool, width: Option<usize>) -> (Vec<usize>, Vec<usize>) {
     let mut cols = vec![0, 1, 3, 4, 5, 6];

@@ -66,7 +66,14 @@ pub fn wrap(line: &str, max: Option<usize>) -> Vec<String> {
         .chars()
         .take_while(|c| c.is_whitespace())
         .collect::<String>();
-    let indent = truncate(&indent, max.saturating_sub(1));
+    // Carry at most half the width as indent, and none when that would leave
+    // fewer than 10 columns, so deep indents cannot wrap one grapheme per line.
+    let carried = width(&indent).min(max / 2);
+    let indent = if max - carried < 10 {
+        String::new()
+    } else {
+        truncate(&indent, carried)
+    };
     let mut out = vec![];
     let mut current = indent.clone();
     for word in line.split_whitespace() {
@@ -133,11 +140,26 @@ mod tests {
         assert_eq!(truncate("héllo wörld", 6), "héllo…");
         assert_eq!(truncate("界界界", 5), "界界…");
         assert_eq!(clean_lines("a\tb\n\x1b"), ["a    b", "\\x1b"]);
+        // W8-SEC-8: at width 8 the indent would leave fewer than 10 columns, so it is
+        // dropped; at width 14 it leaves 12 and every line keeps it.
         for line in wrap("  abc abcdefghijkl 界界界", Some(8)) {
             assert!(width(&line) <= 8);
+            assert!(!line.starts_with(' '));
+        }
+        for line in wrap("  abc abcdefghijklmnopq 界界界界界界界", Some(14)) {
+            assert!(width(&line) <= 14);
             assert!(line.starts_with("  "));
         }
         assert_eq!(age(SystemTime::UNIX_EPOCH, SystemTime::now()), "just now");
+    }
+    #[test]
+    fn deep_indents_are_capped_so_wrapping_stays_bounded() {
+        let line = format!("{}{}", " ".repeat(300), "a".repeat(100));
+        let lines = wrap(&line, Some(40));
+        assert!(lines.len() <= 6, "{} lines", lines.len());
+        assert!(lines.iter().all(|l| width(l) <= 40));
+        let tabs = format!("{}{}", "\t".repeat(75), "b".repeat(100));
+        assert!(wrap(&tabs, Some(40)).len() <= 6);
     }
     #[test]
     fn grapheme_truncation_and_wrapping_keep_clusters_whole() {

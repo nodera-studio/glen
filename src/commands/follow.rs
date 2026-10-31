@@ -96,7 +96,10 @@ pub(crate) struct Follower {
     summary: Summary,
     offset: u64,
     identity: (u64, u64),
+    /// Size and mtime when the consumed prefix was last known to match.
     observed: Option<(u64, SystemTime)>,
+    /// When the consumed prefix was last hashed in full; None means a hash is due.
+    prefix_hashed: Option<Instant>,
     emitted: HashSet<Emitted>,
     occurrences: HashMap<String, usize>,
     known_ids: HashSet<String>,
@@ -121,6 +124,7 @@ impl Follower {
                 .metadata
                 .as_ref()
                 .and_then(|m| m.modified().ok().map(|time| (m.len(), time))),
+            prefix_hashed: None,
             emitted,
             occurrences,
             known_ids: o
@@ -166,7 +170,7 @@ impl Follower {
         let available = match File::open(&path) {
             Ok(mut file) => {
                 let metadata = file.metadata().map_err(|e| GlenError::read(&path, e))?;
-                let (available, next) = self.tick(&mut file, &metadata)?;
+                let (available, next) = self.tick_at(&mut file, &metadata, now)?;
                 events.extend(next);
                 available
             }
@@ -278,12 +282,26 @@ impl Follower {
         }
         Ok(hash.digest() == self.session.consumed_hash())
     }
+    #[cfg(test)]
     pub(crate) fn tick(
         &mut self,
         file: &mut File,
         m: &Metadata,
     ) -> Result<(bool, Vec<FollowEvent>), GlenError> {
+        self.tick_at(file, m, Instant::now())
+    }
+    /// The size-shrink, identity and 4 KB tail checks run on every poll. The
+    /// full prefix hash runs only when metadata moved since the prefix was last
+    /// verified and at least `PREFIX_HASH_EVERY` has passed since the last hash,
+    /// so following a busy, large session is not O(file size) per poll.
+    fn tick_at(
+        &mut self,
+        file: &mut File,
+        m: &Metadata,
+        now: Instant,
+    ) -> Result<(bool, Vec<FollowEvent>), GlenError> {
         let mut events = vec![];
+        let mut hashed = false;
         let observed = (
             m.len(),
             m.modified()
@@ -293,7 +311,11 @@ impl Follower {
             || m.len() < self.offset
             || identity(m) != self.identity
             || !self.consumed_tail_matches(file)?
-            || (self.observed != Some(observed) && !self.consumed_prefix_matches(file)?)
+            || (self.observed != Some(observed) && self.prefix_hash_due(now) && {
+                hashed = true;
+                self.prefix_hashed = Some(now);
+                !self.consumed_prefix_matches(file)?
+            })
         {
             let session = match open::snapshot(&self.session.path, file, m, true) {
                 Ok(session) if session.header.id == self.session.header.id => session,
@@ -316,6 +338,7 @@ impl Follower {
                 path: self.session.path.clone(),
             });
             events.push(FollowEvent::Items(self.unseen(true)));
+            self.observed = Some(observed);
         } else if m.len() > self.offset {
             file.seek(SeekFrom::Start(self.offset))
                 .map_err(|e| GlenError::read(&self.session.path, e))?;
@@ -369,10 +392,17 @@ impl Follower {
                 }
             }
         }
-        self.observed = Some(observed);
+        if hashed {
+            self.observed = Some(observed);
+        }
         Ok((true, events))
     }
+    fn prefix_hash_due(&self, now: Instant) -> bool {
+        self.prefix_hashed
+            .is_none_or(|at| now.saturating_duration_since(at) >= PREFIX_HASH_EVERY)
+    }
 }
+const PREFIX_HASH_EVERY: Duration = Duration::from_secs(5);
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +639,68 @@ mod poll_tests {
         // A true append also changes metadata, but must not be mistaken for another rewrite.
         append(&path, &message("after-prefix", "padding"));
         one(&f.poll().unwrap(), "after-prefix");
+    }
+    #[test]
+    fn appends_within_the_cadence_hash_the_prefix_at_most_once() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let mut f = follower(&tree, &path);
+        PREFIX_CHECKS.with(|count| count.set(0));
+        let start = Instant::now();
+        let mut parent = "10000009".to_owned();
+        for i in 0..20 {
+            let id = format!("append-{i}");
+            append(&path, &message(&id, &parent));
+            one(
+                &f.poll_at(start + Duration::from_millis(200 * i)).unwrap(),
+                &id,
+            );
+            parent = id;
+        }
+        assert!(PREFIX_CHECKS.with(|count| count.get()) <= 1);
+    }
+    #[test]
+    fn equal_size_prefix_rewrite_inside_the_cadence_is_found_when_the_hash_is_due() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let original = String::from_utf8(fixtures::bytes('A').to_vec()).unwrap()
+            + &format!(
+                "{}\n",
+                json!({"type":"future", "id":"padding", "parentId":"10000009", "data":"x".repeat(9000)})
+            );
+        fs::write(&path, &original).unwrap();
+        let mut f = follower(&tree, &path);
+        let start = Instant::now();
+        // The first append hashes the prefix and starts the cadence.
+        append(&path, &message("first", "padding"));
+        one(&f.poll_at(start).unwrap(), "first");
+        PREFIX_CHECKS.with(|count| count.set(0));
+        let current = fs::read_to_string(&path).unwrap();
+        let rewritten = current
+            .replace("10000003", "90000003")
+            .replace("Why does parser_test flake?", "prefix rewrite detected    ");
+        assert_eq!(current.len(), rewritten.len());
+        let old = fs::metadata(&path).unwrap();
+        fs::write(&path, &rewritten).unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(old.modified().unwrap() + Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            f.poll_at(start + Duration::from_secs(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 0);
+        let events = f.poll_at(start + Duration::from_secs(5)).unwrap();
+        assert!(matches!(&events[0], FollowEvent::Rewritten { .. }));
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 1);
+        assert!(
+            f.poll_at(start + Duration::from_secs(11))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 1);
     }
     fn legacy_message(text: &str) -> String {
         format!(
