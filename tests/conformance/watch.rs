@@ -2661,8 +2661,13 @@ fn ac506_scrolled_up_new_items_keep_the_viewport_and_count_as_n_new() {
     for _ in 0..5 {
         t.key(b"k");
     }
-    t.wait_for("the G follows row", UI, |v| {
+    // Wait for all five lines of scroll, not the first: the indicator shows after one `k`, and
+    // a snapshot taken before glen has drawn the other four moves under the assertion below.
+    // Rows repeat every three lines, so the item number pins the count.
+    t.wait_for("the G follows row five lines up", UI, |v| {
         indicator(v).is_some_and(|(_, s)| s == "G follows")
+            && pane_lines(v).iter().rev().nth(1).map(String::as_str)
+                == Some("  item 0058 short line")
     });
     let v = t.screen().clone();
     let (y, _) = indicator(&v).unwrap();
