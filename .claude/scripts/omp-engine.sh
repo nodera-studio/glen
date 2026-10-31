@@ -46,11 +46,11 @@ dispatch_env() {
     set -- GLEN_OMP_BIN="$engine_root/.claude/omp/$launcher" \
       OMP_SANDBOX_RUN_ROOT="$RUN_DIR" "$@"
   fi
-  env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CODING_AGENT_DIR \
+  env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CODING_AGENT_DIR \
     -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
     -u GLEN_OMP_BIN -u OMP_SANDBOX_RUN_ROOT \
     GLEN_HOME="$RUN_GLEN_HOME" PI_CONFIG_FILES="$POLICY_PATH" \
-    GLEN_JOB_TIMEOUT="${JOB_TIMEOUT_SECONDS}s" "$@"
+    GLEN_JOB_TIMEOUT="${JOB_TIMEOUT_SECONDS}s" "$@" 3>&-
 }
 
 # SRC is an engine checkout, not the tree being reviewed.
@@ -227,6 +227,33 @@ prepare_root() {
     return 1
   fi
 }
+
+# omp 18.14.0 discovery/agents-md.ts:20-21 and claude-md.ts:20-21 delegate
+# to discovery/helpers.ts:723-783, which walks parents (without a Git boundary
+# for these git-free snapshots). Inspect the physical chain all the way to /,
+# including ROOT's parent; shared sticky directories get no permission exception.
+validate_snapshot_ancestors() {
+  local ancestor context permissions
+  ancestor="$(cd "$(dirname "$1")" && pwd -P)" || stop skipped 'unsafe snapshot ancestor: could not resolve parent' 3
+  while :; do
+    if ! context="$(find "$ancestor" -mindepth 1 -maxdepth 1 \
+      \( -iname AGENTS.md -o -iname CLAUDE.md \) \( -type f -o -type l \) -print -quit)"; then
+      stop skipped "unsafe snapshot ancestor: could not inspect $ancestor" 3
+    fi
+    [ -z "$context" ] || stop skipped "unsafe snapshot ancestor: context file $context" 3
+    if [ "$(uname -s)" = Darwin ]; then
+      permissions="$(stat -f '%Lp' "$ancestor")" || stop skipped "unsafe snapshot ancestor: could not stat $ancestor" 3
+    else
+      permissions="$(stat -c '%a' "$ancestor")" || stop skipped "unsafe snapshot ancestor: could not stat $ancestor" 3
+    fi
+    if (( (8#$permissions & 0022) != 0 )); then
+      stop skipped "unsafe snapshot ancestor: $ancestor is group- or world-writable" 3
+    fi
+    [ "$ancestor" != / ] || break
+    ancestor="$(dirname "$ancestor")"
+  done
+}
+
 resolve_glen() {
   local common main
   if [ -n "${GLEN_BIN:-}" ]; then
@@ -248,13 +275,13 @@ bounded_omp() {
   (
     cd "$cwd" || exit 1
     if command -v timeout >/dev/null 2>&1; then
-      env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
+      env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
-        timeout "$seconds" omp --profile "$PROFILE" "$@"
+        timeout "$seconds" omp --profile "$PROFILE" "$@" 3>&-
     else
-      env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
+      env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
-        perl -e 'alarm shift @ARGV; exec @ARGV' "$seconds" omp --profile "$PROFILE" "$@"
+        perl -e 'alarm shift @ARGV; exec @ARGV' "$seconds" omp --profile "$PROFILE" "$@" 3>&-
     fi
   )
 }
@@ -269,6 +296,8 @@ probe_checks() {
   [ -f "$HOME/${PI_CONFIG_DIR:-.omp}/profiles/$PROFILE/agent/config.yml" ] || \
     stop skipped 'glen-harness profile is not set up; run .claude/scripts/omp-profile-setup.sh' 3
   prepare_root || stop skipped "$REASON" 3
+  # Probe cwd is also below ROOT; reject unsafe discovery ancestry before omp.
+  validate_snapshot_ancestors "$ROOT/.probe"
   PROBE_DIR="$(mktemp -d "$ROOT/probe.XXXXXX")"
   # Provisional login signal; Step 3 must confirm this after the owner's login.
   if models="$(bounded_omp 9 models cursor --json)"; then rc=0; else rc="$?"; fi
@@ -317,6 +346,7 @@ snapshot_command() {
   DEST="$(cd "$DEST" && pwd -P)"
   if under "$DEST" "$SRC" || under "$SRC" "$DEST"; then stop failed 'snapshot paths overlap' 4; fi
   [ -z "$(find "$DEST" -mindepth 1 -maxdepth 1 -print -quit)" ] || stop failed 'snapshot destination is not empty' 4
+  validate_snapshot_ancestors "$DEST"
   for attempt in 1 2; do
     before="$(fingerprint_source "$SRC")"
     (
@@ -359,7 +389,7 @@ snapshot_command() {
     mkdir -p "$DEST/_agent-config/dotenv/$(dirname "$relative")"
     mv "$path" "$DEST/_agent-config/dotenv/$relative"
   done < <(find "$DEST" -path "$DEST/_agent-config/dotenv" -prune -o \
-    \( -type f -o -type l \) \( -name .env -o -name '.env.*' \) -print0)
+    \( -type f -o -type l \) \( -iname .env -o -iname '.env.*' \) -print0)
   for name in .omp .pi .claude .codex .gemini .cursor .opencode .windsurf .vscode .agent .agents .clinerules .mcp.json mcp.json opencode.json opencode.jsonc; do
     if [ -e "$DEST/$name" ] || [ -L "$DEST/$name" ]; then
       [ ! -L "$DEST/_agent-config" ] || stop failed 'agent-config destination is a symlink' 4
@@ -378,6 +408,10 @@ snapshot_command() {
   # line start nor space/tab. Keep the text (also in code examples) readable.
   # Include symlinked context files and every copilot basename, since a .github
   # directory alias may expose a differently named directory's context file.
+  # No WATCHDOG provider exists in discovery/*.ts. Separate advisor loaders read
+  # WATCHDOG.md (advisor/watchdog.ts:137-141) and WATCHDOG.yml (advisor/config.ts:193-201).
+  # Neutralizing their @ text is speculative defense-in-depth, not a confirmed
+  # context-provider @-expansion surface. BSD/macOS find supports -iname too.
   while IFS= read -r -d '' path; do
     [ -f "$path" ] || continue
     perl -e '
@@ -389,7 +423,8 @@ snapshot_command() {
       print {$out} $text; close $out or die "$file: $!";
     ' "$path"
   done < <(find "$DEST" \( -type f -o -type l \) \
-    \( -name AGENTS.md -o -name CLAUDE.md -o -name copilot-instructions.md \) -print0)
+    \( -iname AGENTS.md -o -iname CLAUDE.md -o -iname copilot-instructions.md \
+      -o -iname WATCHDOG.md -o -iname WATCHDOG.yml \) -print0)
   HEAD="$(git -C "$SRC" rev-parse HEAD)"
   SNAPSHOT_SHA256="$(
     cd "$DEST" || exit 1
@@ -529,6 +564,8 @@ FIRST_SEND="$(date +%s)"
 JOB_TIMEOUT_SECONDS="$DEADLINE_SECONDS"
 RETRIED=0
 while :; do
+  # Re-check immediately before every new omp cwd use, including capacity retry.
+  validate_snapshot_ancestors "$TREE"
   JOB_ACTIVE=1
   if dispatch_env "$GLEN_BIN" --profile "$PROFILE" send @new - --cwd "$TREE" --wait 30s --json \
     < "$RUN_DIR/prompt.md" > "$RUN_DIR/response.raw"; then RC=0; else RC="$?"; fi

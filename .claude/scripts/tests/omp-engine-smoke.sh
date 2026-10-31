@@ -9,7 +9,12 @@ ENGINE="$REPO_ROOT/.claude/scripts/omp-engine.sh"
 SANDBOX="$REPO_ROOT/.claude/omp/omp-sandboxed.sh"
 LINUX_SANDBOX="$REPO_ROOT/.claude/omp/omp-sandboxed-linux.sh"
 GUARD="$REPO_ROOT/.claude/hooks/guard-omp-profile.sh"
-WORK="$(mktemp -d "${TMPDIR:-/tmp}/glen-omp-smoke.XXXXXX")"
+# Strict ancestor checks reject /tmp (01777), even above a private child. Linux
+# fixtures use the real user's home as scratch, separate from every fake HOME.
+# Darwin's normal TMPDIR already has a non-writable physical ancestor chain.
+if [ "$(uname -s)" = Darwin ]; then smoke_parent="${TMPDIR:-/tmp}"; else smoke_parent="$HOME"; fi
+WORK="$(mktemp -d "$smoke_parent/glen-omp-smoke.XXXXXX")"
+WORK="$(cd "$WORK" && pwd -P)"
 trap 'rm -rf "$WORK"' EXIT
 mkdir -p "$WORK/tmp" "$WORK/home" "$WORK/bin"
 export TMPDIR="$WORK/tmp"
@@ -233,8 +238,8 @@ printf 'untracked\n' > "$SRC/untracked.txt"
 printf 'ignored\n' > "$SRC/ignored.txt"
 rm "$SRC/deleted.txt"
 # Hostile dotenv variants at root, below root, and in a relocated config tree.
-mkdir -p "$SRC/nested/.github" "$SRC/.github" "$SRC/.wrangler/state" "$SRC/nested/.wrangler/state"
-for path in .env .env.local .env.production .env.production.local nested/.env.development.local .claude/.env; do
+mkdir -p "$SRC/nested/.github" "$SRC/.github" "$SRC/.wrangler/state" "$SRC/nested/.wrangler/state" "$SRC/mixed-case/.github"
+for path in .env .env.local .env.production .env.production.local nested/.env.development.local .claude/.env mixed-case/.ENV mixed-case/.Env.Local; do
   printf 'CLAUDE_CONFIG_DIR=_agent-config/claude\n' > "$SRC/$path"
 done
 printf 'local database\n' > "$SRC/.wrangler/state/db"
@@ -244,6 +249,10 @@ printf 'See @/outside and @relative\n' > "$SRC/nested/AGENTS.md"
 printf 'See @~/private\n' > "$SRC/nested/CLAUDE.md"
 printf 'See @../private\n' > "$SRC/.github/copilot-instructions.md"
 printf 'See @~/private\n' > "$SRC/nested/.github/copilot-instructions.md"
+for path in agents.md Claude.MD .github/COPILOT-INSTRUCTIONS.MD WATCHDOG.md WATCHDOG.yml; do
+  printf 'See @~/private\n' > "$SRC/mixed-case/$path"
+  assert "mixed-case/watchdog fixture $path has an import" has_at_imports "$SRC/mixed-case/$path"
+done
 ln -s AGENTS.md "$SRC/CLAUDE.md"
 ln -s nested "$SRC/context-dir"
 assert 'context fixture exercises import regex' has_at_imports "$SRC/AGENTS.md"
@@ -266,15 +275,17 @@ done
 assert 'snapshot keeps root AGENTS.md' test -f "$DEST/AGENTS.md"
 assert_eq 'snapshot head' "$(jq -r .head "$STDOUT")" "$(git -C "$SRC" rev-parse HEAD)"
 assert 'snapshot hash recorded' jq -e '.snapshot_sha256 | test("^[0-9a-f]{64}$")' "$STDOUT"
-for path in .env .env.local .env.production .env.production.local nested/.env.development.local .claude/.env; do
+for path in .env .env.local .env.production .env.production.local nested/.env.development.local .claude/.env mixed-case/.ENV mixed-case/.Env.Local; do
   assert "snapshot removes dotenv $path" test ! -e "$DEST/$path"
   assert_contains "snapshot preserves dotenv $path" 'CLAUDE_CONFIG_DIR=_agent-config/claude' "$DEST/_agent-config/dotenv/$path"
 done
-assert_eq 'snapshot has no active dotenv files' "$(find "$DEST" -path "$DEST/_agent-config/dotenv" -prune -o \( -name .env -o -name '.env.*' \) -print)" ''
+assert_eq 'snapshot has no active dotenv files' "$(find "$DEST" -path "$DEST/_agent-config/dotenv" -prune -o \( -iname .env -o -iname '.env.*' \) -print)" ''
 assert 'snapshot excludes unignored root wrangler state' test ! -e "$DEST/.wrangler"
 assert 'snapshot excludes unignored nested wrangler state' test ! -e "$DEST/nested/.wrangler"
 assert 'snapshot keeps ordinary untracked content beside state' test -f "$DEST/untracked.txt"
-for path in AGENTS.md CLAUDE.md nested/AGENTS.md nested/CLAUDE.md .github/copilot-instructions.md nested/.github/copilot-instructions.md context-dir/AGENTS.md; do
+for path in AGENTS.md CLAUDE.md nested/AGENTS.md nested/CLAUDE.md .github/copilot-instructions.md nested/.github/copilot-instructions.md context-dir/AGENTS.md \
+  mixed-case/agents.md mixed-case/Claude.MD mixed-case/.github/COPILOT-INSTRUCTIONS.MD mixed-case/WATCHDOG.md mixed-case/WATCHDOG.yml; do
+  assert "snapshot preserves context file $path" test -f "$DEST/$path"
   assert "snapshot neutralizes imports in $path" no_at_imports "$DEST/$path"
 done
 assert_contains 'snapshot keeps import path readable' '@~/.ssh/x' "$DEST/AGENTS.md"
@@ -282,6 +293,31 @@ assert_contains 'snapshot keeps email unchanged' 'user@example.com' "$DEST/AGENT
 assert_eq 'snapshot leaves harmless context unchanged' "$(head -n 1 "$DEST/AGENTS.md")" '# Fixture conventions'
 assert 'snapshot accepts internal file symlink' test -L "$DEST/CLAUDE.md"
 assert 'snapshot accepts internal directory symlink' test -L "$DEST/context-dir"
+
+# Ancestors above the engine run root are never copied/sanitized into the tree.
+for name in AGENTS.md cLaUdE.mD; do
+  ancestor="$WORK/ancestor-context-$name"
+  mkdir -p "$ancestor/glen-omp-engine/run"
+  printf 'Hostile ancestor context\n' > "$ancestor/$name"
+  run /bin/bash "$ENGINE" snapshot "$SRC" "$ancestor/glen-omp-engine/run/tree"
+  assert_exit "snapshot refuses ancestor context $name" 3
+  assert "ancestor context $name is a skip" jq -e '.status == "skipped"' "$STDOUT"
+  assert_contains "ancestor context $name reason names file" "$ancestor/$name" "$STDOUT"
+  assert_contains "ancestor context $name reason names problem" 'context file' "$STDOUT"
+done
+ancestor="$WORK/ancestor-permissions"
+mkdir -p "$ancestor/glen-omp-engine/run"
+chmod 0770 "$ancestor"
+run /bin/bash "$ENGINE" snapshot "$SRC" "$ancestor/glen-omp-engine/run/tree"
+assert_exit 'snapshot refuses group-writable ancestor above run root' 3
+assert 'writable ancestor is a skip' jq -e '.status == "skipped"' "$STDOUT"
+assert_contains 'writable ancestor reason names directory' "$ancestor" "$STDOUT"
+assert_contains 'writable ancestor reason names mode problem' 'group- or world-writable' "$STDOUT"
+chmod 0700 "$ancestor"
+run /bin/bash "$ENGINE" snapshot "$SRC" "$ancestor/glen-omp-engine/run/clean-tree"
+assert_exit 'snapshot clean ancestor chain succeeds' 0
+assert 'snapshot clean ancestor chain status' jq -e '.status == "ok"' "$STDOUT"
+assert 'snapshot clean ancestor chain copied content' test -f "$ancestor/glen-omp-engine/run/clean-tree/tracked file.txt"
 
 # Quarantine is reserved: never merge a copied destination with moved evidence.
 mkdir -p "$SRC/_agent-config/dotenv"
@@ -386,12 +422,13 @@ assert_eq 'policy content comes from main' "$(sed '1d' "$STDOUT")" \
 # Use a synthetic token. Never print envcheck output or any variable values.
 (
   export CLAUDE_CONFIG_DIR=smoke PI_PY=smoke PI_JS=smoke PI_CODING_AGENT_DIR=smoke
+  export COPILOT_CUSTOM_INSTRUCTIONS_DIRS=smoke
   export OMP_CODING_AGENT_DIR=smoke OMP_PROFILE=smoke PI_PROFILE=smoke
   export GLEN_OMP_BIN=hostile-inherited OMP_SANDBOX_RUN_ROOT=hostile-inherited
   export MNEMOSYNE_TOKEN=smoke-placeholder
   /bin/bash "$ENGINE" envcheck -- env
 ) > "$WORK/env.out" 2> "$STDERR"
-for name in CLAUDE_CONFIG_DIR PI_PY PI_JS PI_CODING_AGENT_DIR OMP_CODING_AGENT_DIR OMP_PROFILE PI_PROFILE; do
+for name in CLAUDE_CONFIG_DIR COPILOT_CUSTOM_INSTRUCTIONS_DIRS PI_PY PI_JS PI_CODING_AGENT_DIR OMP_CODING_AGENT_DIR OMP_PROFILE PI_PROFILE; do
   if grep -q "^${name}=" "$WORK/env.out"; then present=yes; else present=no; fi
   assert_eq "dispatch scrubs $name" "$present" no
 done
@@ -408,10 +445,13 @@ fi
 
 # Successful production paths use offline stubs, never the owner's omp/profile.
 export SMOKE_OMP_CALLS="$WORK/omp-calls" SMOKE_DISPATCH_CALLS="$WORK/dispatch-calls"
+export SMOKE_OMP_FDS="$WORK/omp-fds" SMOKE_DISPATCH_FDS="$WORK/dispatch-fds"
 export SMOKE_SESSION="$WORK/session.jsonl"
 printf '%s\n' '{"type":"message","message":{"role":"assistant","model":"fixture","provider":"cursor","usage":{"input":1,"output":1}}}' > "$SMOKE_SESSION"
 cat > "$WORK/bin/omp" <<'EOF'
 #!/bin/sh
+if [ -e /dev/fd/3 ]; then printf 'open\n' >> "$SMOKE_OMP_FDS"; exit 99; fi
+printf 'closed\n' >> "$SMOKE_OMP_FDS"
 printf '%s\n' "$*" >> "$SMOKE_OMP_CALLS"
 case "$*" in
   '--profile glen-harness models cursor --json') printf '%s\n' '{"models":[{"id":"fixture"}]}' ;;
@@ -430,6 +470,11 @@ command="$1"
 shift
 # The send AND wait environment must retain the dotenv backstop.
 [ "${CLAUDE_CONFIG_DIR+x}" != x ] || exit 99
+[ "${COPILOT_CUSTOM_INSTRUCTIONS_DIRS+x}" != x ] || exit 99
+fd3=closed
+[ ! -e /dev/fd/3 ] || fd3=open
+printf '%s %s\n' "$command" "$fd3" >> "$SMOKE_DISPATCH_FDS"
+[ "$fd3" = closed ] || exit 99
 if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   [ "${GLEN_OMP_BIN:-}" = "$SMOKE_SANDBOX" ] || exit 99
   [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
@@ -466,8 +511,42 @@ run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGI
 assert_exit 'probe safe private run root exit' 0
 assert_eq 'probe safe private run root status' "$(jq -r .status "$STDOUT")" ready
 assert_eq 'probe private run root permissions' "$(perl -e 'printf "%04o\n", (stat shift)[2] & 07777' "$WORK/tmp/glen-omp-engine")" 0700
+assert 'fd3 fixture detects an intentionally open descriptor' /bin/bash -c 'test -e /dev/fd/3' 3> "$WORK/fd3-control"
+assert_eq 'probe omp children start with fd3 closed' "$(cat "$SMOKE_OMP_FDS")" $'closed\nclosed'
 assert_contains 'probe queries registered modelRoles record key' 'config get modelRoles --json' "$SMOKE_OMP_CALLS"
 assert_eq 'probe never queries invalid modelRoles.default key' "$(grep -c 'config get modelRoles.default' "$SMOKE_OMP_CALLS" || true)" 0
+
+# Exercise both bounded_omp branches, independent of which timeout tools the
+# host installed. The private PATH still points at the same fd-aware fake omp.
+mkdir "$WORK/no-timeout-bin" "$WORK/with-timeout-bin"
+for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp; do
+  ln -s "$(command -v "$tool")" "$WORK/no-timeout-bin/$tool"
+done
+if [ "$(uname -s)" != Darwin ]; then ln -s "$WORK/bin/bwrap" "$WORK/no-timeout-bin/bwrap"; fi
+cat > "$WORK/with-timeout-bin/timeout" <<'EOF'
+#!/bin/sh
+: > "$SMOKE_TIMEOUT_USED"
+shift
+exec "$@"
+EOF
+chmod +x "$WORK/with-timeout-bin/timeout"
+export SMOKE_TIMEOUT_USED="$WORK/timeout-used"
+for branch in timeout perl; do
+  probe_path="$WORK/no-timeout-bin"
+  [ "$branch" != timeout ] || probe_path="$WORK/with-timeout-bin:$probe_path"
+  : > "$SMOKE_OMP_FDS"
+  run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+    PATH="$probe_path" /bin/bash "$ENGINE" probe
+  assert_exit "probe $branch fd3 check succeeds" 0
+  assert_eq "probe $branch closes fd3 for both omp calls" "$(cat "$SMOKE_OMP_FDS")" $'closed\nclosed'
+  if [ "$branch" = timeout ]; then
+    assert 'probe timeout fixture actually ran' test -e "$SMOKE_TIMEOUT_USED"
+    rm "$SMOKE_TIMEOUT_USED"
+  else
+    assert 'probe perl branch does not run timeout' test ! -e "$SMOKE_TIMEOUT_USED"
+  fi
+done
+
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on SMOKE_REJECT_MODEL_ROLES=1 /bin/bash "$ENGINE" probe
 assert_exit 'probe rejected modelRoles query skips' 3
 assert_contains 'probe rejected modelRoles query reason' 'config check failed' "$STDOUT"
@@ -497,6 +576,8 @@ for mode in review debug; do
 done
 assert_eq 'production send environment scrubbed on every call' "$(grep -c '^send scrubbed$' "$SMOKE_DISPATCH_CALLS")" 4
 assert_eq 'production wait environment scrubbed on every call' "$(grep -c '^wait scrubbed$' "$SMOKE_DISPATCH_CALLS")" 4
+assert_eq 'send children have fd3 closed on every call' "$(grep -c '^send closed$' "$SMOKE_DISPATCH_FDS")" 4
+assert_eq 'wait children have fd3 closed on every call' "$(grep -c '^wait closed$' "$SMOKE_DISPATCH_FDS")" 4
 if grep -q 'leaked hook' "$SRC/modified.txt"; then leaked=yes; else leaked=no; fi
 assert_eq 'production mutation leaves source unchanged' "$leaked" no
 
