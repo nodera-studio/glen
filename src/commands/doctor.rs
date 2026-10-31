@@ -153,13 +153,18 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         },
     );
     let extension_path = paths.extensions_dir.join("glen/index.ts");
-    let inspection =
-        crate::extension::inspect(&extension_path, env!("CARGO_PKG_VERSION"), &glen_home.root);
-    let (extension_state, extension_version, extension_error) = match inspection {
-        Ok((state, version)) => (state, version, None),
+    let inspection = crate::extension::inspect(
+        &extension_path,
+        &paths.extensions_dir,
+        env!("CARGO_PKG_VERSION"),
+        &glen_home.root,
+    );
+    let (extension_state, extension_version, unsafe_path, extension_error) = match inspection {
+        Ok(i) => (i.state, i.version, i.unsafe_path, None),
         Err(e) => (
             crate::extension::State::Foreign,
             None,
+            false,
             Some(format!(
                 "cannot inspect extension {}: {e}",
                 extension_path.display()
@@ -189,6 +194,11 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             extension_state.name().into()
         },
         extension_error.unwrap_or_else(|| {
+            // W8 DEBT-2: install-extension refuses a symlinked path even with --force, so
+            // doctor says so rather than recommending a command that cannot succeed.
+            if unsafe_path {
+                return crate::extension::unsafe_path_message(&extension_path);
+            }
             format!(
                 "{}{}{}",
                 extension_path.display(),

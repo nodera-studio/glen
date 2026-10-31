@@ -63,5 +63,6 @@ pub mod ops;
 
 pub(crate) mod atomic_swap;
 pub mod extension;
+pub(crate) mod install_guard;
 
 pub mod inbox;
