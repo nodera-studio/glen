@@ -4,8 +4,10 @@
 #
 # Usage: /bin/bash .claude/scripts/tests/quick-classify-smoke.sh
 # Cases: clean tree passes; a small non-Linux edit passes; a tracked cfg(target_os = "linux")
-# line, a tracked `target_os="linux"` line, an untracked file with bwrap, and a removed
-# renameat2 line each escalate with exit 3. Prints ok/FAIL per case and exits 1 on any FAIL.
+# line, a tracked `target_os="linux"` line, an untracked file with bwrap, a removed renameat2
+# line, a tracked Linux line next to a benign untracked file, and an untracked
+# omp-sandboxed-linux.sh with no Linux words each escalate with exit 3. Prints ok/FAIL per case
+# and exits 1 on any FAIL.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -70,6 +72,17 @@ check "untracked file with bwrap escalates" "$d" 3 "$LINUX_MSG"
 d="$(setup removed-renameat2)"
 printf 'pub fn a() {}\n#[cfg(target_os = "macos")]\npub fn b() {}\n\n\n' >"$d/src/lib.rs"
 check "removed renameat2 line escalates" "$d" 3 "$LINUX_MSG"
+
+# A benign untracked file must not mask a tracked Linux line (pipefail fail-open, batch 10).
+d="$(setup linux-plus-untracked)"
+printf '#[cfg(target_os = "linux")]\npub fn c() {}\n' >>"$d/src/lib.rs"
+printf 'hello\n' >"$d/src/notes.txt"
+check "tracked Linux line plus benign untracked file escalates" "$d" 3 "$LINUX_MSG"
+
+d="$(setup linux-path)"
+mkdir -p "$d/.claude/omp"
+printf 'echo hi\n' >"$d/.claude/omp/omp-sandboxed-linux.sh"
+check "Linux-only path without Linux words escalates" "$d" 3 "$LINUX_MSG"
 
 if [ "$FAILS" -gt 0 ]; then
   echo "quick-classify-smoke: $FAILS FAIL"

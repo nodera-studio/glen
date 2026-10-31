@@ -14,13 +14,15 @@ exhaustive multi-pass audit use `/review-implementation` instead.
 - **Run it as a workflow** (`.claude/docs/Workflow-Fanout.md`): the two engines in parallel,
   then one fresh read-only verifier per must-fix finding, which REPRODUCEs it (re-traces the
   cited `file:line`, or runs the failing case) before the vote. A must-fix that does not
-  reproduce drops to a note. The 2-vote merge in step 3 is unchanged.
+  reproduce drops to a note. The 2-vote merge in step 3 is unchanged. "Linux-only code
+  unverified: CI run required" is exempt from reproduction: its verifier only confirms that
+  the brief gave no passing Linux CI run id for the reviewed head, and the finding stands.
 - **Linux-only code waits for CI.** When the diff adds or changes `cfg(target_os = "linux")`,
   `bwrap`, `unshare`, `netns`, `renameat2`, `omp-sandboxed-linux.sh` or a Linux job in
   `.github/workflows/`, wait for the draft PR's Linux CI first (`check (ubuntu-latest)` and
   `linux-sandbox`; `gh pr checks <pr>`), and give both engines the run id and any failing
-  logs. With no run, the Claude pass reports "Linux-only code unverified: CI run required",
-  which blocks the gate.
+  logs. With no passing run, either pass reports "Linux-only code unverified: CI run
+  required", which blocks the gate on one vote (step 3).
 
 Optional scope hint: $ARGUMENTS
 
@@ -52,7 +54,12 @@ Steps:
      run only read verbs (list, show, tail); for anything else point
      PI_CODING_AGENT_DIR at tests/fixtures or a scratch dir under $TMPDIR, or use
      the fake omp via GLEN_OMP_BIN. Never send, steer, follow-up, abort or switch
-     the model of a live omp session. Report severity + category + file:line + issue + impact
+     the model of a live omp session. If the diff adds or changes Linux-only code
+     (`cfg(target_os = "linux")`, `bwrap`, `unshare`, `netns`, `renameat2`,
+     `omp-sandboxed-linux.sh`, a Linux job in `.github/workflows/`) and this brief gives no
+     passing `check (ubuntu-latest)` / `linux-sandbox` run id for the reviewed head, report
+     HIGH 'Linux-only code unverified: CI run required' at the Linux-only file:line; a macOS
+     trace or the host's Linux clippy does not verify it. Report severity + category + file:line + issue + impact
      - fix + confidence. Read-only — report only, do not fix. Do NOT write any
      file: return the full review as your final message text; the orchestrator
      saves it. Run in the foreground: wait for the Codex task to finish and return
@@ -84,6 +91,9 @@ Steps:
 3. Merge by 2-vote consensus and present ONE report:
    - Both engines raise it → **HIGH — must fix**.
    - CRITICAL from either engine → **must fix** (survives a single vote).
+   - "Linux-only code unverified: CI run required" from either engine → **must fix** on one
+     vote; it never needs a second engine. It is settled by a passing Linux CI run on the
+     reviewed head, not by a code fix, so it is not a fix-cycle item.
    - HIGH from one engine only → judgement call; list as a recommended fix.
    - MEDIUM/LOW single-engine → note only (do not block).
      Group by must-fix / recommended / notes, each with file:line and the

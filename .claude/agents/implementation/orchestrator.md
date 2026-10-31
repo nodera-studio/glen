@@ -133,6 +133,10 @@ proceeding.
 
 Under `/auto-mode`: use the plan and proceed; announce the same summary.
 
+If the plan adds or changes Linux-only code (see "Fix cycles" → "Linux-only code needs CI
+before Role 2"), say in the summary that the pipeline will push the branch and open a draft
+PR before review, so CI can run.
+
 ### Step 4.5 — Advisor Gate (high-value plans only)
 
 Before the Implementer touches the architecture, get a DIFFERENT-model second
@@ -393,7 +397,9 @@ engine is unavailable, Role 1 stops and reports; switching engines is an owner r
 (`routing.json`), never a silent fallback. Product code outside the routed Implementer has two
 exceptions only: design-heavy UI under "UI implementation routing" above, and integrating two
 already-reviewed parallel waves (merging one wave's branch into the other), which goes to the
-agent `routing.sh integration` names, recorded as a routing deviation and followed by the gate,
+agent `routing.sh integration` names (it prints an engine, not an agent type: for `claude`
+dispatch a fresh `subagent_type: "general-purpose"` with `model: "opus"`), recorded as a
+routing deviation and followed by the gate,
 tests and a scoped Claude ‖ Codex review of the resolved files (`loop-procedures.md` → "Shared
 seams").
 
@@ -464,8 +470,9 @@ otherwise (not high-risk, probe skipped) the lean two-engine gate runs.
 Use the default-branch merge-base as `BASE` (no prompt — this is the in-pipeline
 path). If the report has must-fix items, dispatch a **fresh**
 Implementer ("Fix ONLY these review findings: {fix plan}. Do not re-implement the
-plan."), then re-run the review scoped to the fixed files. Maximum 2 cycles; if
-must-fix items remain, stop and report to the user.
+plan."), then re-run the review scoped to the fixed files. Maximum 2 cycles (a Linux
+CI-required finding is not a cycle: see "Fix cycles"); if must-fix items remain, stop and
+report to the user.
 
 **Line-range fix briefs.** For a small or targeted fix (review, conformance or visual
 findings), give each finding its exact `path:start-end` range, and say: "Read only these
@@ -483,17 +490,22 @@ Every fix cycle (review, conformance, visual or CI findings) follows these rules
   `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit origin/main`. Never rebase. Merge
   only when `git -C "$WT" status --short` is empty (else have the owning agent commit first),
   and not when a CI-owner agent works in `$WT` (it merges as its first fix step). A conflict
-  goes to the agent `bash .claude/scripts/routing.sh integration` names. After a non-trivial
+  goes to the agent `bash .claude/scripts/routing.sh integration` names (dispatched as in
+  Role 1's integration exception). After a non-trivial
   merge, re-run `bash .claude/scripts/quality-gate.sh` and `cargo test --locked` before the
   fix, and name the merged SHA (`git -C "$WT" rev-parse origin/main`) in the fix brief.
-- **Linux-only code needs CI before the gate closes** (s183). When `git diff "$BASE"...HEAD`
+- **Linux-only code needs CI before Role 2** (s183). When `git -C "$WT" diff "$BASE"...HEAD`
   adds or changes `cfg(target_os = "linux")`, `bwrap`, `unshare`, `netns`, `renameat2`,
-  `omp-sandboxed-linux.sh`, or a Linux job in `.github/workflows/`, the Role 2 gate stays open
-  until CI has run on that head:
-  - push and open a **draft** PR (`gh pr create --draft --base main`) before the gate would
-    close;
+  `omp-sandboxed-linux.sh`, or a Linux job in `.github/workflows/`, run CI on that head before
+  dispatching the Role 2 reviewers (and again before each scoped re-review):
+  - push the branch and open a **draft** PR (`gh pr create --draft --base main`; announced at
+    Step 4);
   - wait for `check (ubuntu-latest)` and any Linux sandbox job on that head;
-  - give the reviewers the run id and the failing logs (`gh run view <id> --log-failed`);
+  - put the run id and the failing logs (`gh run view <id> --log-failed`) in both review
+    briefs, so the reviewers do not report "CI run required" for a head that has a run;
+  - a "Linux-only code unverified: CI run required" finding is settled by a passing run on the
+    reviewed head, never by an Implementer: it is not a fix-cycle item and does not count
+    toward the 2-cycle cap;
   - the macOS host's Linux clippy (`quality-gate.sh`) is necessary but not sufficient: it
     compiles the code, it does not run it.
 - **CI-owner marker.** When a background agent owns the PR's CI loop, write
@@ -506,18 +518,21 @@ Every fix cycle (review, conformance, visual or CI findings) follows these rules
 Once Role 2 is green, check every acceptance criterion against the source before the tail
 (W10 plan Step 21):
 
-1. Dispatch fresh read-only Claude verifier(s) with the plan's AC list: one agent, or one per
-   about 5 ACs as a workflow (`.claude/docs/Workflow-Fanout.md`). For each AC a verifier cites
-   the constraining code or doc as `path:line`. For an omp-fact AC it first confirms that
-   `git -C ../metis/references/oh-my-pi describe --tags` prints `v18.14.0`, then cites that
-   file and line.
+1. Dispatch fresh read-only Claude verifier(s) with the plan's AC list, `WT` (the wave's
+   checkout) and `MAIN="$(dirname "$(git -C "$WT" rev-parse --path-format=absolute
+   --git-common-dir)")"`: one agent, or one per about 5 ACs as a workflow
+   (`.claude/docs/Workflow-Fanout.md`). For each AC a verifier cites the constraining code or
+   doc in `$WT` as `path:line`. For an omp-fact AC it first confirms that
+   `git -C "$MAIN/../metis/references/oh-my-pi" describe --tags` prints `v18.14.0`, then
+   cites that file and line.
 2. Each AC is classified as `consistent`, `omp-verified`, `stale`, `contradictory`, `missing`
-   (no code implements it yet) or `unverifiable` (with the reason). Save the rows to
-   `.claude/plans/<slug>.ac-check.md` in the main checkout, headed with the
-   `git rev-parse HEAD` that was checked.
+   (no code implements it yet) or `unverifiable` (with the reason). Save the rows, one per AC
+   as `AC-id | class | path:line | reason | settled-by`, to `.claude/plans/<slug>.ac-check.md`
+   in `$MAIN`, headed with the `git -C "$WT" rev-parse HEAD` that was checked.
 3. Settle every row that is not `consistent` or `omp-verified` before Role 3: either a
    SPEC CHANGE (design doc and AC first, per "Spec ambiguity" below) or a fix brief. `missing`
-   always gets a fix brief. Unverifiable omp facts join the live-smoke list.
+   always gets a fix brief. A fix from this check re-enters Role 2 scoped to the fixed files,
+   then this check re-runs for those ACs. Unverifiable omp facts join the live-smoke list.
 4. If a later commit before the end of Role 3 changes a file a row cites, re-run the check for
    those ACs.
 
@@ -525,11 +540,10 @@ List the rows and how each was settled in the Report.
 
 ### Role 3 — Parallel tail (docs ‖ conformance ‖ optional domain-rubric gate)
 
-Once review is green the code is final, so these run **concurrently** — dispatch
-them in ONE message. The docs-updater and conformance writer touch only docs and
-tests, so they may be dispatched as soon as the Role 2 fix commit exists,
-concurrently with the scoped re-review; if that re-review forces another product
-fix, re-run the conformance suite against it. Arms 1+2 ALWAYS fire; a third, conditional arm is a SLOT for a
+Once review is green and the AC source check has settled every row, the code is final, so
+these run **concurrently** — dispatch them in ONE message. Never start the conformance writer
+before both: its brief carries the settled AC text, which does not exist until the check has
+run. If a later product fix lands, re-run the conformance suite against it. Arms 1+2 ALWAYS fire; a third, conditional arm is a SLOT for a
 project-specific isolated-context grader, only if this project has wired one up (see
 below) — fire it ONLY when its trigger predicate returns non-empty:
 

@@ -131,7 +131,8 @@ Two claims never count as verification:
   verified only by a CI run on the reviewed head that passed `check (ubuntu-latest)` and any
   Linux sandbox job (`linux-sandbox`). If the brief gives no such run id, report a HIGH
   finding "Linux-only code unverified: CI run required" (Category: Tests, the Linux-only
-  `file:line`), with **Recommendation: BLOCK**: it holds the gate until the run passes.
+  `file:line`), with **Recommendation: BLOCK**: the merge counts it as must-fix on this one
+  vote, and it holds the gate until the run passes.
 </reasoning>
 
 ## Categories (cover ALL in this single pass)
