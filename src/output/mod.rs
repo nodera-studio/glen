@@ -16,6 +16,9 @@ use std::{
 };
 // Rust's standard stdio writers silently ignore EBADF. Write directly to the
 // locked descriptor so read-only stdout/stderr still report a failed write.
+// Unbuffered on purpose (W10 decision 12, skipped): envelopes and stream events are
+// rendered into one buffer, written, then flushed, so a `BufWriter` saves no syscalls and
+// adds a drop-time flush that would swallow EPIPE before an `after_output` commit.
 struct StdioWriter<T>(T);
 impl<T: AsFd> Write for StdioWriter<T> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {

@@ -206,15 +206,86 @@ fn ac325_rpc_reply_nulls() {
     assert!(r.get("request_id").unwrap().is_null());
 }
 
+/// W8-ERR-1 re-derived this test: an unwritable cursor is now caught before any output, so
+/// the failure is the one JSON error envelope on stdout (stderr stays empty), not `ok:true`
+/// followed by a stderr line.
 #[test]
-fn mark_read_failure_is_reported_on_stderr_and_leaves_messages_unread() {
+fn mark_read_failure_is_an_error_envelope_and_leaves_messages_unread() {
     let b = OmpBox::new();
     append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
     fs::write(b.glen_home.join("inbox/.read"), "blocked").unwrap();
     let o = inbox(&b, &[]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("cannot mark inbox {A} read")));
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let v = common::json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "io");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("cannot mark inbox {A} read")),
+        "{v}"
+    );
     assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 1);
+}
+
+/// W8-ERR-1: inside Codex's sandbox an unwritable GLEN_HOME is exit 6 `sandboxed`, and the
+/// messages stay unread. `.read` does not exist yet, so the probe must catch a read-only
+/// `inbox/` where `mark` would create it.
+#[test]
+fn sandboxed_mark_read_failure_is_exit_six_and_leaves_messages_unread() {
+    if rustix::process::geteuid().is_root() {
+        return; // root ignores the read-only mode this test relies on
+    }
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+    let dir = b.glen_home.join("inbox");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let o = b
+        .command(&["inbox", "--json"], &b.alpha())
+        .env("CODEX_SANDBOX", "seatbelt")
+        .output()
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(6), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let v = common::json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
+    assert!(!dir.join(".read").exists());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no probe file left");
+    let d = data(&inbox(&b, &["--peek"]));
+    assert_eq!(d["total"], 1);
+    assert_eq!(d["messages"][0]["text"], "keep");
+}
+
+/// W8-DOC-7: `marked_read` is true only when a cursor moves; `--all` after everything was
+/// read returns the old messages without moving anything.
+#[test]
+fn marked_read_is_false_when_no_cursor_moves() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "one", "2026-10-30T00:00:00Z"));
+    append(&b, B, &record(B, "two", "2026-10-30T00:00:01Z"));
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(d["marked_read"], true);
+    let cursor = b.glen_home.join("inbox/.read").join(A);
+    let before = fs::read(&cursor).unwrap();
+    let d = data(&inbox(&b, &["--all"]));
+    assert_eq!(d["total"], 2);
+    assert_eq!(d["marked_read"], false);
+    assert_eq!(fs::read(&cursor).unwrap(), before);
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (d["total"].clone(), d["marked_read"].clone()),
+        (j!(0), j!(false))
+    );
+    append(&b, B, &record(B, "three", "2026-10-30T00:00:02Z"));
+    let d = data(&inbox(&b, &["--all"]));
+    assert_eq!(d["total"], 3);
+    assert_eq!(d["marked_read"], true);
+    assert_eq!(data(&inbox(&b, &[]))["total"], 0);
 }
 
 #[test]
@@ -316,8 +387,13 @@ fn fixture_session_id(b: &OmpBox, key: char) -> String {
         .id
 }
 
+/// Decision 10 re-derived the orphan half of this test: a reply no catalog or registry entry
+/// places in a project (`B`, and `registry-unknown`, whose registry has no cwd) is still left
+/// out under `--cwd`, but a non-peek scoped call now marks it read, as the unscoped inbox
+/// does. A foreign project's reply (`beta`) stays unread, and so does an orphan when the
+/// `outside_cwd` warning tells the caller to drop `--cwd` to see it.
 #[test]
-fn cwd_inbox_intersects_session_filters_and_leaves_foreign_and_orphan_replies_unread() {
+fn cwd_inbox_intersects_session_filters_leaves_foreign_replies_unread_and_marks_orphans_read() {
     let b = OmpBox::new();
     let beta = fixture_session_id(&b, 'E');
     let registry_alpha = "registry-alpha";
@@ -373,12 +449,39 @@ fn cwd_inbox_intersects_session_filters_and_leaves_foreign_and_orphan_replies_un
             .iter()
             .all(|message| message["session_id"] == A || message["session_id"] == registry_alpha)
     );
-    assert_eq!(data(&inbox(&b, &flags))["total"], 2);
-    for id in [&beta, B, registry_unknown] {
-        assert!(!b.glen_home.join("inbox/.read").join(id).exists());
+    let read_dir = b.glen_home.join("inbox/.read");
+    assert!(!read_dir.exists(), "--peek under --cwd marks nothing");
+    let orphan_only = inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--session", "ffff"]);
+    assert_eq!(data(&orphan_only)["total"], 0);
+    assert_eq!(
+        common::json(&orphan_only)["warnings"][0]["code"],
+        "outside_cwd"
+    );
+    assert!(
+        !read_dir.join(B).exists(),
+        "the outside_cwd hint must still find the orphan unread"
+    );
+    let scoped = data(&inbox(&b, &flags));
+    assert_eq!(scoped["total"], 2);
+    assert_eq!(scoped["marked_read"], true);
+    for id in [A, registry_alpha, B, registry_unknown] {
+        assert!(read_dir.join(id).exists(), "{id} is marked read");
     }
+    assert!(!read_dir.join(&beta).exists());
     let remaining = data(&inbox(&b, &["--peek"]));
-    assert_eq!(remaining["total"], 3);
+    assert_eq!(remaining["total"], 1);
+    assert_eq!(remaining["messages"][0]["session_id"], beta.as_str());
+    // Only an orphan moves: nothing is returned, so `marked_read` stays false, yet the orphan
+    // is committed.
+    let before = fs::read(read_dir.join(B)).unwrap();
+    append(&b, B, &record(B, "orphan two", "2026-10-30T00:00:01Z"));
+    let scoped = data(&inbox(&b, &flags));
+    assert_eq!(
+        (scoped["total"].clone(), scoped["marked_read"].clone()),
+        (j!(0), j!(false))
+    );
+    assert_ne!(fs::read(read_dir.join(B)).unwrap(), before);
+    assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 1);
     let outside = inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--session", &beta]);
     assert_eq!(data(&outside)["total"], 0);
     assert_eq!(common::json(&outside)["warnings"][0]["code"], "outside_cwd");
