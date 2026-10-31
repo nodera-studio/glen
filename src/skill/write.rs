@@ -205,6 +205,8 @@ impl Guard {
                 if !self.unchanged() {
                     return Ok(Applied::Lost);
                 }
+                // Test seam: the window between the last check and the publish itself.
+                step("publish", path)?;
                 let applied = match existing {
                     None => {
                         match at::renameat_with(&dir, &temp, &dir, name, at::RenameFlags::NOREPLACE)
@@ -225,7 +227,7 @@ impl Guard {
                     )
                     .map_err(|e| {
                         temp_unsafe_to_clean = !e.temp_is_safe_to_clean();
-                        e.into_io()
+                        e.into_io(parent)
                     })?,
                 };
                 if matches!(applied, Applied::Lost) {
@@ -561,5 +563,126 @@ mod tests {
             1,
             "no temp left behind"
         );
+    }
+    /// Fixes2 decision 6: a competitor that replaces the skill after the last `unchanged()`
+    /// reaches the exchange itself, which swaps back: Lost, the competitor's file intact, and
+    /// no temp left.
+    #[test]
+    fn competing_replacement_during_the_swap_window_is_lost_not_clobbered() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("skills/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("SKILL.md");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        let competitor = t.path().join("competitor");
+        fs::write(&competitor, b"competitor").unwrap();
+        let exchanged = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = exchanged.clone();
+        let _hook = atomic_swap::set_test_hook(move |stage| {
+            if stage == "exchanged" {
+                seen.set(seen.get() + 1);
+            }
+            Ok(())
+        });
+        let applied = guard
+            .apply_with(&path, Some(b"after"), false, |stage, p| {
+                if stage == "publish" {
+                    fs::rename(&competitor, p)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(applied, Applied::Lost);
+        assert_eq!(exchanged.get(), 1, "the exchange itself ran");
+        assert_eq!(fs::read(&path).unwrap(), b"competitor");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1, "no temp left");
+    }
+    /// An injected EACCES from the exchange publishes nothing and leaves no temp.
+    #[test]
+    fn an_exchange_failure_publishes_nothing_and_cleans_the_temp() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("skills/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("SKILL.md");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        let _hook = atomic_swap::set_test_hook(|stage| {
+            if stage == "exchange" {
+                Err(io::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                Ok(())
+            }
+        });
+        let error = guard.apply(&path, Some(b"after")).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EACCES));
+        assert_eq!(fs::read(&path).unwrap(), b"before");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1, "no temp left");
+    }
+    /// After the exchange, errors keep the displaced file, name it, and surface as errors:
+    /// never downgraded to Lost (HIGH-002), even though the directory no longer matches the
+    /// inspection.
+    #[test]
+    fn errors_after_the_exchange_keep_and_name_the_displaced_file() {
+        for case in ["verify_fails", "changed_twice"] {
+            let t = tempfile::tempdir().unwrap();
+            let parent = t.path().join("skills/glen");
+            fs::create_dir_all(&parent).unwrap();
+            let path = parent.join("SKILL.md");
+            fs::write(&path, b"before").unwrap();
+            let mut guard = Guard::inspect(&path).unwrap();
+            let competitor = t.path().join("competitor");
+            fs::write(&competitor, b"competitor").unwrap();
+            let third = t.path().join("third");
+            fs::write(&third, b"third").unwrap();
+            let kept = std::rc::Rc::new(std::cell::RefCell::new(None::<PathBuf>));
+            let (seen, dir) = (kept.clone(), parent.clone());
+            let _hook = atomic_swap::set_test_hook(move |stage| {
+                let temp = || {
+                    fs::read_dir(&dir)
+                        .unwrap()
+                        .map(|e| e.unwrap().path())
+                        .find(|p| p.file_name().unwrap().to_string_lossy().ends_with(".tmp"))
+                        .unwrap()
+                };
+                match (case, stage) {
+                    ("verify_fails", "exchanged") => {
+                        *seen.borrow_mut() = Some(temp());
+                        Err(io::Error::from_raw_os_error(libc::EIO))
+                    }
+                    ("changed_twice", "swapped_back") => {
+                        let temp = temp();
+                        fs::rename(&third, &temp)?;
+                        *seen.borrow_mut() = Some(temp);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            });
+            let result = guard.apply_with(&path, Some(b"after"), false, |stage, p| {
+                if case == "changed_twice" && stage == "publish" {
+                    fs::rename(&competitor, p)?;
+                }
+                Ok(())
+            });
+            assert!(!guard.unchanged(), "{case}: the directory moved on");
+            let error = result.expect_err(case);
+            let kept = kept.borrow().clone().expect(case);
+            let message = error.to_string();
+            assert!(
+                message.contains(&format!("displaced copy kept at {}", kept.display())),
+                "{case}: {message}"
+            );
+            let (published, displaced): (&[u8], &[u8]) = match case {
+                "verify_fails" => (b"after", b"before"),
+                _ => (b"competitor", b"third"),
+            };
+            assert_eq!(fs::read(&path).unwrap(), published, "{case}");
+            assert_eq!(
+                fs::read(&kept).unwrap(),
+                displaced,
+                "{case}: kept, not cleaned"
+            );
+        }
     }
 }

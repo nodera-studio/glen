@@ -155,12 +155,15 @@ fn open_mode(
         } else {
             None
         };
-        let state = if extension.as_ref().is_some_and(|s| s.busy) {
-            State::Busy
-        } else if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) {
-            State::Unknown
-        } else {
-            State::Live
+        // An answering endpoint is authoritative, exactly as in `ls::infer_row`; the hidden
+        // lease only matters when no endpoint answered (fixes2 decision 4).
+        let state = match &extension {
+            Some(s) if s.busy => State::Busy,
+            Some(_) => State::Live,
+            None if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) => {
+                State::Unknown
+            }
+            None => State::Live,
         };
         return Ok(Opened {
             session,
@@ -390,5 +393,59 @@ mod assignment_tests {
         let opened = open(&cli, &env, "e27c0de").unwrap();
         crate::sandbox::force_lease_hidden_for_test(None);
         assert_eq!(opened.state, State::Unknown);
+    }
+    /// Fixes2 decision 4: for a session that has only a live endpoint (no transcript yet), an
+    /// answering endpoint wins over a hidden lease, mapped exactly as `ls` maps it.
+    #[cfg(unix)]
+    #[test]
+    fn an_answering_endpoint_outranks_a_hidden_lease_for_a_not_yet_persisted_session() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let id = "00000000-0000-7000-8000-000001234567";
+        for (busy, expected) in [(false, State::Live), (true, State::Busy)] {
+            let tree = tempfile::tempdir().unwrap();
+            let agent = tree.path().join("agent");
+            fs::create_dir_all(agent.join("sessions")).unwrap();
+            let env = Env::for_test(
+                Some(tree.path()),
+                tree.path(),
+                &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())],
+            );
+            let sock_dir = tempfile::Builder::new()
+                .prefix("gshow-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket = sock_dir.path().join("s");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let home = crate::glen_home::resolve(&env).unwrap();
+            home.ensure_dir("run/live").unwrap();
+            let registry =
+                serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"socket":socket});
+            fs::write(crate::live::registry::path(&home, id), registry.to_string()).unwrap();
+            let peer = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                writeln!(
+                    &stream,
+                    "{}",
+                    serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":id,"busy":busy,"state":"ready"}})
+                )
+                .unwrap();
+            });
+            let cli = Cli::try_parse_from(["glen", "show", "1234567"]).unwrap();
+            crate::sandbox::force_lease_hidden_for_test(Some(true));
+            let opened = open(&cli, &env, "1234567");
+            crate::sandbox::force_lease_hidden_for_test(None);
+            peer.join().unwrap();
+            let opened = opened.unwrap();
+            assert!(opened.not_yet_persisted);
+            assert!(opened.extension.is_some(), "the endpoint answered");
+            assert_eq!(opened.state, expected, "busy={busy}");
+        }
     }
 }
