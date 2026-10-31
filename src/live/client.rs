@@ -164,6 +164,74 @@ fn unary_io(error: io::Error) -> ClientError {
         ClientError::Protocol(error.to_string())
     }
 }
+const DRAIN_CHUNK: usize = 4096;
+fn drain_closed() -> ClientError {
+    ClientError::Protocol("endpoint closed the connection before reading the request".into())
+}
+/// Read the peer's one answer line after a failed write. AC-1014, W8-ERR-9: the drain is
+/// bounded at an absolute instant, min(now + 1s, the write deadline), never the caller's own
+/// (possibly longer) read timeout; it reads at most `DRAIN_CHUNK` bytes at a time and checks
+/// `cancelled` and that instant before every read. It peeks first and then consumes only up
+/// to the newline: open_send's reader still needs the frames after it.
+fn drain_line(
+    stream: &mut UnixStream,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    use std::os::fd::AsRawFd;
+    let end = deadline.min(Instant::now() + Duration::from_secs(1));
+    let mut line = Vec::new();
+    let mut chunk = [0u8; DRAIN_CHUNK];
+    loop {
+        if cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(drain_closed());
+        }
+        // macOS can reject a timeout change once the peer has already closed.
+        if let Err(e) = stream.set_read_timeout(Some(left))
+            && e.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(ClientError::Protocol(e.to_string()));
+        }
+        let want = DRAIN_CHUNK.min(super::MAX_FRAME + 1 - line.len());
+        // SAFETY: `chunk` is a live, writable buffer of at least `want` bytes and the fd
+        // belongs to `stream`, which outlives the call.
+        let peeked = unsafe {
+            libc::recv(
+                stream.as_raw_fd(),
+                chunk.as_mut_ptr().cast(),
+                want,
+                libc::MSG_PEEK,
+            )
+        };
+        let n = match usize::try_from(peeked) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(_) => match io::Error::last_os_error().kind() {
+                io::ErrorKind::Interrupted
+                | io::ErrorKind::WouldBlock
+                | io::ErrorKind::TimedOut => continue,
+                _ => break,
+            },
+        };
+        let newline = chunk[..n].iter().position(|&b| b == b'\n');
+        let take = newline.map_or(n, |i| i + 1);
+        stream
+            .read_exact(&mut chunk[..take])
+            .map_err(|_| drain_closed())?;
+        line.extend_from_slice(&chunk[..take]);
+        if newline.is_some() {
+            return Ok(Some(line));
+        }
+        if line.len() > super::MAX_FRAME {
+            break;
+        }
+    }
+    Err(drain_closed())
+}
 fn write_request(
     stream: &mut UnixStream,
     bytes: &[u8],
@@ -192,29 +260,7 @@ fn write_request(
                 if cancelled() {
                     return Err(ClientError::Cancelled);
                 }
-                // AC-1014: bound the drain itself at min(1s, what's left of the write
-                // deadline), an absolute instant, never the caller's own (possibly longer)
-                // read timeout. unary_inner/unary_for set theirs to the full remaining
-                // deadline for the real response wait; open_send already caps its own read
-                // timeout the same way before calling this, so this is a no-op there.
-                let drain = end
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(1))
-                    .max(Duration::from_millis(1));
-                // macOS can reject a timeout change once the peer has already closed.
-                if let Err(e) = stream.set_read_timeout(Some(drain))
-                    && e.raw_os_error() != Some(libc::EINVAL)
-                {
-                    return Err(ClientError::Protocol(e.to_string()));
-                }
-                // Do not read ahead: open_send's reader still needs subsequent frames.
-                return read_line(&mut BufReader::with_capacity(1, stream))
-                    .map(Some)
-                    .map_err(|_| {
-                        ClientError::Protocol(
-                            "endpoint closed the connection before reading the request".into(),
-                        )
-                    });
+                return drain_line(stream, end, cancelled);
             }
             Err(e)
                 if matches!(
@@ -726,6 +772,124 @@ mod unary_tests {
             Err(ClientError::Cancelled)
         ));
         assert_eq!(checks.get(), 2);
+    }
+
+    /// W8-ERR-9: a peer that trickles one byte every 300 ms, never a newline, must not hold
+    /// the drain past ~1s, however long the write deadline, and a cancel must end it.
+    #[test]
+    fn drain_against_a_trickling_peer_is_bounded_and_cancellable() {
+        for cancel_after in [None, Some(Duration::from_millis(400))] {
+            let (mut client, mut peer) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let trickle = std::thread::spawn(move || {
+                for _ in 0..20 {
+                    if peer.write_all(b"x").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+            });
+            let start = Instant::now();
+            let result = drain_line(&mut client, start + Duration::from_secs(10), &|| {
+                cancel_after.is_some_and(|after| start.elapsed() >= after)
+            });
+            let elapsed = start.elapsed();
+            drop(client);
+            trickle.join().unwrap();
+            if cancel_after.is_some() {
+                assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
+                assert!(
+                    elapsed < Duration::from_millis(900),
+                    "cancel took {elapsed:?}"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ClientError::Protocol(ref m)) if m == "endpoint closed the connection before reading the request"),
+                    "{result:?}"
+                );
+                assert!(
+                    elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(1600),
+                    "drain took {elapsed:?}, not the ~1s bound"
+                );
+            }
+        }
+    }
+
+    /// W8-ERR-9 end to end: the peer half-closes its read side, so the large write fails with
+    /// EPIPE, then trickles one byte every 300 ms with no newline. Linux only: macOS silently
+    /// discards writes to a peer that shut its read side, so the write never fails there.
+    #[cfg(target_os = "linux")]
+    fn trickling_peer(prefix: &str) -> (tempfile::TempDir, PathBuf, std::thread::JoinHandle<()>) {
+        let tmp = tempfile::Builder::new()
+            .prefix(prefix)
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream.shutdown(Shutdown::Read).unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            for _ in 0..20 {
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(300));
+            }
+        });
+        (tmp, path, peer)
+    }
+    #[cfg(target_os = "linux")]
+    fn large_send() -> SendArgs {
+        SendArgs {
+            text: "x".repeat(1024 * 1024),
+            deliver_as: crate::jobs::Deliver::Auto,
+            job_id: None,
+            expect_session_id: None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn open_send_drain_against_a_trickling_peer_is_bounded_and_cancellable() {
+        let (_tmp, path, peer) = trickling_peer("gdrain-");
+        let start = Instant::now();
+        let result = open_send(&path, "trickle", large_send(), &|| false);
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ClientError::Protocol(ref m)) if m == "endpoint closed the connection before reading the request"),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            elapsed < Duration::from_millis(1600),
+            "drain took {elapsed:?}, past the ~1.2s bound"
+        );
+        drop(result);
+        peer.join().unwrap();
+
+        let (_tmp, path, peer) = trickling_peer("gdrainc-");
+        let start = Instant::now();
+        let cancel_at = start + Duration::from_millis(400);
+        let result = open_send(&path, "trickle", large_send(), &|| {
+            Instant::now() >= cancel_at
+        });
+        let elapsed = start.elapsed();
+        assert!(
+            matches!(result, Err(ClientError::Cancelled)),
+            "{:?}",
+            result.err()
+        );
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "cancel took {elapsed:?} to end the drain"
+        );
+        drop(result);
+        peer.join().unwrap();
     }
 
     // Match by path so concurrently running client tests never consume this hook.
