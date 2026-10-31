@@ -69,6 +69,7 @@ fn usage_envelopes() {
         vec!["bogus"],
         vec!["doctor", "--bad"],
         vec!["send", "a", "b", "--wait", "25h"],
+        vec!["send", "a", "b", "--thinking", "bogus"],
     ] {
         let o = glen(&args, &[]);
         assert_eq!(o.status.code(), Some(2));

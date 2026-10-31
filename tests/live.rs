@@ -492,6 +492,22 @@ fn ac323_version_mismatch_warns() {
     b.rpc.wait_worker_gone(job_id(&v["data"]));
 }
 #[test]
+fn w9_thinking_flag_on_live_route_warns_ignored() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = send(&b, &["--thinking", "high"]);
+    assert!(o.status.success());
+    let v = json(&o);
+    assert_eq!(v["warnings"][0]["code"], "ignored_flag");
+    assert!(
+        v["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("--thinking")
+    );
+    b.rpc.wait_worker_gone(job_id(&v["data"]));
+}
+#[test]
 fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
     let mut b = LiveBox::new();
     let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";

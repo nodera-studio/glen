@@ -205,9 +205,25 @@ pub struct SendArgs {
     #[arg(
         long,
         value_name = "LEVEL",
-        help = "omp's startup reasoning effort for the spawned process (e.g. off, low, medium, high); passed through unchanged, omp validates it"
+        help = "omp's startup reasoning effort for the spawned process: off, minimal, low, medium, high, xhigh, max or auto",
+        value_parser = parse_thinking_level
     )]
     pub thinking: Option<String>,
+}
+/// omp 18.14.0's full thinking-level list (coding-agent/src/cli/flag-tables.ts).
+/// A bad value is a usage error (exit 2), not a dispatch-time omp failure.
+pub fn parse_thinking_level(s: &str) -> Result<String, String> {
+    const LEVELS: &[&str] = &[
+        "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
+    ];
+    if LEVELS.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "thinking level must be one of {} (got {s:?})",
+            LEVELS.join(", ")
+        ))
+    }
 }
 impl SendArgs {
     pub fn deliver(&self) -> DeliverAs {

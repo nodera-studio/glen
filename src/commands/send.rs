@@ -252,6 +252,12 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     let store = JobStore::new(home.clone());
     store.create_for_send(&job, env)?;
     store.prune(now);
+    if live.is_some() && args.thinking.is_some() {
+        route_warnings.push(Warning {
+            code: "ignored_flag".into(),
+            message: "--thinking has no effect on the live route (the session is already running); send \"/effort <level>\" as a message to change it in-session instead".into(),
+        });
+    }
     route_warnings.extend(warning);
     if !route_warnings.is_empty() {
         let mut s = store.read_status(&id)?;
