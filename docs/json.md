@@ -403,6 +403,16 @@ The tail item example is a shape catalogue: one example per item kind (and per a
 ## `glen send`
 
 Send once. Exits 10 and 130 leave the job running; never resend to poll. Use `wait`.
+`--thinking <LEVEL>` passes omp's startup reasoning effort (off, minimal, low, medium, high,
+xhigh, max, auto) through to the spawned omp process; glen rejects any other value as a usage
+error (exit 2) before it ever reaches omp. It is ignored with an `ignored_flag` warning on the
+live route (the session is already running); the warning names the real handle and level for
+`glen thinking <handle> <level>`, and for `auto`, which `glen thinking` does not take, asks for an
+explicit level instead. omp 18.14.0 persists a default thinking level as
+a `<model-id>:<level>` suffix on `modelRoles.default` (honoured by omp itself); the harness's
+`omp-profile-setup.sh` writes that suffix for its model ladder, and `omp-engine.sh` repeats
+exactly that suffix as `--thinking` on every dispatch, as belt and braces on top of it, and
+passes no `--thinking` when the persisted value has none.
 
 | Field | Meaning |
 |---|---|

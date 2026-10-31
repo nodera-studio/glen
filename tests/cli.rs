@@ -52,6 +52,14 @@ fn public_help() {
     );
 }
 #[test]
+fn send_help_documents_thinking_flag() {
+    let o = glen(&["send", "--help"], &[]);
+    assert!(o.status.success());
+    let s = String::from_utf8(o.stdout).unwrap();
+    assert!(s.contains("--thinking <LEVEL>"));
+    assert!(s.contains("omp's startup reasoning effort"));
+}
+#[test]
 fn watch_requires_an_interactive_terminal() {
     let o = glen(&["watch"], &[]);
     assert_eq!(o.status.code(), Some(2));
@@ -77,6 +85,7 @@ fn usage_envelopes() {
         vec!["bogus"],
         vec!["doctor", "--bad"],
         vec!["send", "a", "b", "--wait", "25h"],
+        vec!["send", "a", "b", "--thinking", "bogus"],
     ] {
         let o = glen(&args, &[]);
         assert_eq!(o.status.code(), Some(2));

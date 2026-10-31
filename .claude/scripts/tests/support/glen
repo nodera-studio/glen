@@ -1,0 +1,70 @@
+#!/bin/bash
+# Offline engine peer: steps.json is an ordered list of command/envelope/exit
+# records. Optional barrier, signal, advance and spill fields drive edge cases.
+set -euo pipefail
+state="${FAKE_GLEN_STATE:?scratch fixture directory required}"
+argv=("$@")
+if [ "${1:-}" = --profile ]; then
+  [ "${2:-}" = glen-harness ] || exit 99
+  shift 2
+fi
+command="${1:-}"
+[ "$command" = send ] || [ "$command" = wait ] || exit 99
+mkdir -p "$GLEN_HOME"
+index=0
+[ ! -f "$state/count" ] || index="$(cat "$state/count")"
+printf '%s\n' "$((index + 1))" > "$state/count"
+jq -ce --argjson index "$index" '.[$index] // error("unexpected extra glen invocation")' \
+  "$state/steps.json" > "$state/step.json"
+step="$state/step.json"
+[ "$(jq -r .command "$step")" = "$command" ] || exit 99
+if [ "$command" = send ]; then
+  [ "$1 $2 $3 $4" = 'send @new - --cwd' ] || exit 99
+  [ -d "$5" ] && [ ! -e "$5/.git" ] || exit 99
+  cat > "$state/prompt-$index.md"
+else
+  expected="$(jq -r '.job // empty' "$step")"
+  [ -z "$expected" ] || [ "$2" = "$expected" ] || exit 99
+fi
+jq -cn --arg home "$GLEN_HOME" --arg policy "$PI_CONFIG_FILES" \
+  --arg timeout "$GLEN_JOB_TIMEOUT" --args \
+  '{argv:$ARGS.positional,glen_home:$home,policy:$policy,job_timeout:$timeout}' -- "${argv[@]}" >> "$state/calls.jsonl"
+
+advance="$(jq -r '.advance // 0' "$step")"
+if [ "$advance" -gt 0 ]; then
+  printf '%s\n' "$(( $(cat "$state/clock") + advance ))" > "$state/clock"
+fi
+if jq -e '.barrier == true' "$step" >/dev/null; then
+  : > "$state/waiting"
+  # Bounded rendezvous: the smoke reads the running result, then releases us.
+  for ((attempt=0; attempt<500; attempt++)); do
+    [ ! -e "$state/release" ] || break
+    /bin/sleep 0.02
+  done
+  [ -e "$state/release" ] || exit 99
+fi
+if jq -e '.signal == "TERM"' "$step" >/dev/null; then
+  kill -TERM "$PPID"
+  exit 0
+fi
+if jq -e 'has("raw")' "$step" >/dev/null; then
+  jq -jr .raw "$step"
+else
+  spill="$(jq -r '.spill // ""' "$step")"
+  if [ -z "$spill" ]; then
+    jq -c .envelope "$step"
+  else
+    path="$state/spill-$index.json"
+    case "$spill" in
+      valid) jq -c .envelope "$step" > "$path" ;;
+      invalid) printf 'invalid json\n' > "$path" ;;
+      missing) ;;
+      *) exit 99 ;;
+    esac
+    bytes=0
+    [ ! -f "$path" ] || bytes="$(wc -c < "$path")"
+    jq -cn --arg path "$path" --argjson bytes "$bytes" \
+      '{v:1,ok:true,spilled:{path:$path,bytes:$bytes,format:"json"}}'
+  fi
+fi
+exit "$(jq -r '.exit // 0' "$step")"

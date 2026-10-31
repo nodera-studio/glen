@@ -663,6 +663,36 @@ fn ac323_version_mismatch_warns() {
     b.rpc.wait_worker_gone(job_id(&v["data"]));
 }
 #[test]
+fn w9_thinking_flag_on_live_route_warns_ignored() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = send(&b, &["--thinking", "high"]);
+    assert!(o.status.success());
+    let v = json(&o);
+    assert_eq!(v["warnings"][0]["code"], "ignored_flag");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("--thinking"));
+    assert!(message.contains("glen thinking "));
+    assert!(message.contains(" high` instead"));
+    assert!(!message.contains("<handle>"));
+    assert!(!message.contains("/effort"));
+    b.rpc.wait_worker_gone(job_id(&v["data"]));
+}
+#[test]
+fn w9_thinking_auto_on_live_route_never_suggests_auto() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = send(&b, &["--thinking", "auto"]);
+    assert!(o.status.success());
+    let v = json(&o);
+    assert_eq!(v["warnings"][0]["code"], "ignored_flag");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("`auto` cannot be set on a running session"));
+    assert!(message.contains("<level>` with an explicit level"));
+    assert!(!message.contains(" auto` instead"));
+    b.rpc.wait_worker_gone(job_id(&v["data"]));
+}
+#[test]
 fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
     let mut b = LiveBox::new();
     let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";

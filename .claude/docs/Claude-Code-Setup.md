@@ -171,6 +171,22 @@ Run `.claude/scripts/bootstrap-tools.sh` on each machine (`--dry-run` first to
 preview). The `settings.json` `env` block + any `PostToolUse` hook wiring travel
 with the repo — no manual settings.json edit needed beyond what's already committed.
 
+### 3. omp third engine (per machine)
+
+The owner logs into Cursor for the dedicated `glen-harness` profile, then configures and checks it:
+
+```bash
+omp --profile glen-harness login cursor
+bash .claude/scripts/omp-profile-setup.sh
+bash .claude/scripts/omp-profile-setup.sh --check
+```
+
+Export `MNEMOSYNE_TOKEN` in the invoking shell for read-only memory access; never put its
+value in the repo. `TMPDIR` (or `/tmp` when unset) must resolve outside `$HOME` for the
+engine to run. Set `GLEN_OMP_ENGINE=off` to skip omp while the other engines continue.
+The harness capability is shipped; owner Cursor login and live acceptance are still pending,
+so no particular Cursor model id or runtime token/cost figures are confirmed yet.
+
 ## Mac bring-up sequence
 
 1. `git pull` (gets repo `.claude/` incl. hooks, scripts, settings, this doc).

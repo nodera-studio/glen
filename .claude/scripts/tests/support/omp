@@ -1,0 +1,73 @@
+#!/bin/bash
+# Offline setup fixture. All paths/state are supplied by omp-profile-setup-smoke.
+set -euo pipefail
+[ "$HOME" = "$FAKE_OMP_TEST_HOME" ] || exit 99
+jq -cn --arg home "$HOME" --args '{home:$home,argv:$ARGS.positional}' -- "$@" >> "$FAKE_OMP_LOG"
+if [ "${1:-}" != --profile ] || [ "${2:-}" != glen-harness ]; then
+  printf 'unscoped omp invocation refused\n' >&2
+  exit 42
+fi
+shift 2
+
+case "${1:-}" in
+  --version) printf '%s\n' "${FAKE_OMP_VERSION:-omp/18.14.0}" ;;
+  config)
+    action="${2:-}" key="${3:-}"
+    # Real config path calls Settings.init(), which may write before printing.
+    if [ "$action" = path ]; then
+      mkdir -p "$FAKE_OMP_AGENT_DIR"
+      printf 'settings init\n' >> "$FAKE_OMP_WRITES"
+      : > "$FAKE_OMP_AGENT_DIR/initialized"
+      printf '%s\n' "${FAKE_OMP_REPORTED_DIR:-$FAKE_OMP_AGENT_DIR}"
+      exit 0
+    fi
+    if [ "$key" = modelRoles.default ] || [ "$key" = "${FAKE_OMP_REJECT_KEY:-}" ]; then
+      printf 'Unknown setting: %s\n' "$key" >&2
+      exit 43
+    fi
+    case "$action" in
+      get)
+        [ "${4:-}" = --json ] || exit 44
+        if [ "$key" = "${FAKE_OMP_ERROR_KEY:-}" ]; then
+          printf '%s\n' '{"error":"fixture read failed"}'
+          exit 0
+        fi
+        source="$FAKE_OMP_STATE/settings.json"
+        [ -z "${PI_CONFIG_FILES:-}" ] || source="$FAKE_OMP_STATE/overlay.json"
+        jq -ce --arg key "$key" '
+          if has($key) then {key:$key,value:.[$key]} else error("Unknown setting: " + $key) end
+        ' "$source"
+        ;;
+      set)
+        [ "$#" -eq 4 ] || exit 44
+        if [ "$key" = modelRoles ]; then
+          jq -en --argjson value "$4" '$value | type == "object" and all(.[]; type == "string")' >/dev/null
+        fi
+        jq -ce --arg key "$key" --argjson value "$4" '
+          if has($key) then .[$key] = $value else error("Unknown setting: " + $key) end
+        ' "$FAKE_OMP_STATE/settings.json" > "$FAKE_OMP_STATE/next.json"
+        mv "$FAKE_OMP_STATE/next.json" "$FAKE_OMP_STATE/settings.json"
+        printf 'config set %s\n' "$key" >> "$FAKE_OMP_WRITES"
+        ;;
+      *) exit 44 ;;
+    esac
+    ;;
+  models)
+    [ "$*" = 'models cursor --json' ] || exit 44
+    # Deliberate default-profile mutation for the component diagnostics tests.
+    root="$HOME/${PI_CONFIG_DIR:-.omp}"
+    case "${FAKE_OMP_MUTATE:-}" in
+      config.yml | mcp.json) printf 'changed\n' >> "$root/agent/$FAKE_OMP_MUTATE" ;;
+      extensions | sessions)
+        mkdir -p "$root/agent/$FAKE_OMP_MUTATE"
+        : > "$root/agent/$FAKE_OMP_MUTATE/added"
+        ;;
+      natives) mkdir -p "$root/natives"; : > "$root/natives/added" ;;
+      run) mkdir -p "$root/run/daemons/global"; : > "$root/run/daemons/global/added" ;;
+      '') ;;
+      *) exit 44 ;;
+    esac
+    cat "$FAKE_OMP_STATE/models.json"
+    ;;
+  *) exit 44 ;;
+esac
