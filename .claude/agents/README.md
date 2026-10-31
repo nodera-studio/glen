@@ -35,12 +35,13 @@ workflow below) once to adapt the templated files to that project's actual stack
 ├── respond-to-review.md             # PR review response — verify claims, draft responses
 │
 ├── implementation/                  # Workflow: Build a feature/fix (4 roles)
-│   ├── orchestrator.md              # Pipeline manager: Codex Implementer → Review → tail → re-index
+│   ├── orchestrator.md              # Pipeline manager: routed Implementer → Review → tail → re-index
 │   ├── orchestrator-quick.md        # Fast path for small/low-risk changes — fewer gates, same quality bar
 │   ├── planner.md                   # Codebase analysis, step ordering, backward verification
-│   ├── coder-codex.md               # Role 1 — the fused Implementer, run in Codex (task --json --write); Claude writes no product code (except design-heavy UI, see coder-ui.md)
+│   ├── coder-claude.md              # Role 1 — the fused Implementer, run in Claude Opus (the default: `routing.sh implementation` prints `claude`)
+│   ├── coder-codex.md               # Role 1 — the fused Implementer, run in Codex (task --json --write), only when `routing.sh implementation` prints `codex`; routing picks one of the two
 │   ├── coder-ui.md                  # Role 1 for design-heavy web UI — Claude Opus Implementer, frontend-design skill, browser check vs the design reference
-│   ├── implementer.md               # Canonical fused-loop envelope coder-codex.md forwards to Codex
+│   ├── implementer.md               # Canonical fused-loop envelope both coders follow (coder-codex.md forwards it to Codex)
 │   ├── code-review.md               # Role 2 — Claude reviewer (‖ Codex via codex:codex-rescue), 2-vote
 │   ├── docs-updater.md              # Role 3 (tail) — updates docs after implementation
 │   └── conformance-test-writer.md   # Role 3 (tail) — author-blind, plan-derived conformance gate
@@ -148,7 +149,7 @@ approve it. See `agents/plan/README.md` for the full 8-step diagram.
 
 ## Implementation workflow (`/implement`)
 
-Builds the approved plan. The Implementer (run in Codex) writes the code, wires it in,
+Builds the approved plan. The Implementer (`routing.sh implementation` picks Claude, the default, or Codex) writes the code, wires it in,
 and writes its own tests; the review gate catches must-fix issues before the tail.
 When omp is ready or risk is high, it uses Claude ‖ Codex ‖ omp + synthesizer (recording
 omp's reason if skipped); otherwise it uses the lean Claude ‖ Codex gate with 2-vote

@@ -9,7 +9,7 @@ drives.
 | Command | Dispatches | What it does |
 | --- | --- | --- |
 | `/plan-implementation` | `agents/plan/orchestrator.md` | Explore, research, dual-engine architect + judge, dual-engine plan + judge — see `agents/plan/README.md` |
-| `/implement` | `agents/implementation/orchestrator.md` | Plan → Codex Implementer → triple-engine review → docs + conformance tail → re-index — see `agents/implementation/README.md` |
+| `/implement` | `agents/implementation/orchestrator.md` | Plan → routed Implementer (`routing.sh implementation`, Claude by default) → triple-engine review → docs + conformance tail → re-index — see `agents/implementation/README.md` |
 | `/implement-quick` | `agents/implementation/orchestrator-quick.md` | Same shape, fewer gates, for small/low-risk changes |
 | `/review-implementation` | `agents/review-implementation/orchestrator.md` | Standalone Claude ‖ Codex ‖ omp review + synthesizer on the current branch |
 | `/code-review` | `agents/implementation/code-review.md` | Lean 2-engine version of the review gate, runnable standalone |
