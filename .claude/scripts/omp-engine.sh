@@ -34,8 +34,16 @@ usage() {
 # The single environment boundary for send, wait, and the envcheck smoke helper.
 # Mnemosyne credentials pass through untouched; never log environment values.
 dispatch_env() {
+  local engine_root
+  if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
+    # envcheck runs before normal repository discovery; resolve only when needed.
+    engine_root="${ENGINE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
+    set -- GLEN_OMP_BIN="$engine_root/.claude/omp/omp-sandboxed.sh" \
+      OMP_SANDBOX_RUN_ROOT="$RUN_DIR" "$@"
+  fi
   env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CODING_AGENT_DIR \
     -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+    -u GLEN_OMP_BIN -u OMP_SANDBOX_RUN_ROOT \
     GLEN_HOME="$RUN_GLEN_HOME" PI_CONFIG_FILES="$POLICY_PATH" \
     GLEN_JOB_TIMEOUT="${JOB_TIMEOUT_SECONDS}s" "$@"
 }

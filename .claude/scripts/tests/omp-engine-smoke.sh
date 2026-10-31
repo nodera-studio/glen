@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
-# Offline W9 smoke: invoke the real engine with scratch repos, homes, and CLI stubs.
+# W9 smoke: scratch repos/homes and CLI stubs, plus gated macOS sandbox checks.
 set -euo pipefail
 umask 077
 
 TEST_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd -P)"
 ENGINE="$REPO_ROOT/.claude/scripts/omp-engine.sh"
+SANDBOX="$REPO_ROOT/.claude/omp/omp-sandboxed.sh"
 GUARD="$REPO_ROOT/.claude/hooks/guard-omp-profile.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/glen-omp-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -31,6 +32,15 @@ assert_contains() { assert "$1" grep -Fq -- "$2" "$3"; }
 run() {
   if "$@" > "$STDOUT" 2> "$STDERR"; then CODE=0; else CODE="$?"; fi
 }
+# Glen pipes stdout (src/omp/bin.rs:89-91); RPC pipes stdin/stdout (omp-rpc sdk/rust/omp-rpc/src/client.rs:756-758).
+run_sandbox() {
+  # Keep the launcher's status, including expected denials, under errexit/pipefail.
+  if "$@" 2> "$STDERR" | cat > "$STDOUT"; then
+    CODE="${PIPESTATUS[0]}"
+  else
+    CODE="${PIPESTATUS[0]}"
+  fi
+}
 now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f\n", time * 1000'; }
 commit_fixture() {
   git -C "$1" -c user.name='Glen smoke' -c user.email='smoke@example.invalid' \
@@ -48,7 +58,102 @@ has_at_imports() {
 }
 no_at_imports() { ! has_at_imports "$1"; }
 
-# Any accidental CLI call is a test failure; the real omp is never executed.
+# Exercise the launcher's own generated policy, never a handwritten test policy.
+# Real omp startup runs only when installed, before PATH gains CLI stubs.
+if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
+  run_sandbox sandbox-exec -p '(version 1)(allow default)' /usr/bin/true
+  sandbox_runtime=0
+  if [ "$CODE" -eq 0 ]; then
+    sandbox_runtime=1
+  else
+    printf 'NOTE sandbox runtime checks skipped: allow-all sandbox-exec self-test failed (exit %s): %s\n' "$CODE" "$(cat "$STDERR")"
+  fi
+  real_omp="$(command -v omp || true)"
+  sandbox_base="$WORK/sandbox"
+  mkdir -p "$sandbox_base/home/.ssh" "$sandbox_base/home/.omp/agent" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/agent" "$sandbox_base/run" "$sandbox_base/bin"
+  sandbox_base="$(cd "$sandbox_base" && pwd -P)"
+  # Exercise aliases only in launcher-owned inputs, including /var under TMPDIR.
+  # The executable has a relative symlink chain as well as aliased ancestors.
+  ln -s "$sandbox_base" "$WORK/sandbox-alias"
+  sandbox_alias="$WORK/sandbox-alias"
+  case "$sandbox_base" in /private/var/*) sandbox_alias="${sandbox_base#/private}" ;; esac
+  sandbox_home="$sandbox_alias/home" sandbox_run="$sandbox_alias/run"
+  ln -s /bin/cat "$sandbox_base/bin/helper"
+  ln -s helper "$sandbox_base/bin/omp"
+  printf 'allowed fixture\n' > "$sandbox_base/run/readable"
+  printf 'ssh fixture\n' > "$sandbox_base/home/.ssh/known_hosts"
+  printf 'canary fixture\n' > "$sandbox_base/home/glen-canary.txt"
+  printf 'default config fixture\n' > "$sandbox_base/home/.omp/agent/config.yml"
+  printf 'parent context fixture\n' > "$sandbox_base/AGENTS.md"
+
+  sandbox_call() (
+    local binary="$1"
+    shift
+    # Like omp-engine.sh, give the child physical cwd and file arguments.
+    cd "$sandbox_base/run" || exit 1
+    env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
+      -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+      -u XDG_STATE_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_DATA_HOME \
+      LC_ALL=C HOME="$sandbox_home" PI_CONFIG_DIR=.omp OMP_REAL_BIN="$binary" \
+      OMP_SANDBOX_RUN_ROOT="$sandbox_run" /bin/bash "$SANDBOX" "$@"
+  )
+  run_sandbox sandbox_call "$sandbox_alias/bin/omp" "$sandbox_base/run/readable"
+  if [ "$sandbox_runtime" -eq 1 ]; then
+    assert_exit 'sandbox helper reads allowed run root' 0
+    assert_eq 'sandbox helper read content' "$(cat "$STDOUT")" 'allowed fixture'
+  fi
+  profiles=("$sandbox_base/run"/omp-sandbox.*)
+  generated_profile="${profiles[0]}"
+  assert_contains 'sandbox imports dyld bootstrap support' '(import "dyld-support.sb")' "$generated_profile"
+  assert_contains 'sandbox canonicalizes run root' "(subpath \"$sandbox_base/run\")" "$generated_profile"
+  assert_contains 'sandbox canonicalizes HOME' "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness\")" "$generated_profile"
+  assert_contains 'sandbox resolves executable symlink chain' "(literal \"$(cd /bin && pwd -P)/cat\")" "$generated_profile"
+  assert 'sandbox profile contains no unresolved fixture alias' test "$(grep -Fc sandbox-alias "$generated_profile" || true)" -eq 0
+  # An opening quote followed by /var/ must never survive physical resolution.
+  assert 'sandbox profile contains no logical /var literal' test "$(grep -Fc '\"/var/' "$generated_profile" || true)" -eq 0
+
+  if [ "$sandbox_runtime" -eq 1 ]; then
+    # shellcheck disable=SC2016 # The sandboxed child must expand its own HOME.
+    run_sandbox sandbox_call /bin/sh -c 'printf "%s\n" "$HOME"'
+    assert_eq 'sandbox child inherits canonical HOME' "$(cat "$STDOUT")" "$sandbox_base/home"
+    for denied in home/.ssh/known_hosts home/glen-canary.txt home/.omp/agent/config.yml AGENTS.md; do
+      run_sandbox sandbox_call /bin/cat "$sandbox_base/$denied"
+      assert "sandbox denies outside read $denied" test "$CODE" -ne 0
+      # Match cat's file-specific denial, not sandbox_apply failing before exec.
+      assert_contains "sandbox outside read is EPERM $denied" "cat: $sandbox_base/$denied: Operation not permitted" "$STDERR"
+    done
+    for writable in "$sandbox_base/run/writable" "$sandbox_base/home/.omp/profiles/glen-harness/agent/writable"; do
+      run_sandbox sandbox_call /usr/bin/tee "$writable" <<< 'sandbox write'
+      assert_exit 'sandbox allows write in permitted directory' 0
+      run_sandbox sandbox_call /bin/cat "$writable"
+      assert_exit 'sandbox allows read-back in permitted directory' 0
+      assert_eq 'sandbox write read-back content' "$(cat "$STDOUT")" 'sandbox write'
+    done
+  fi
+
+  mkdir "$sandbox_base/no-sandbox-bin"
+  ln -s "$(command -v uname)" "$sandbox_base/no-sandbox-bin/uname"
+  run_sandbox env PATH="$sandbox_base/no-sandbox-bin" HOME="$sandbox_home" \
+    OMP_REAL_BIN=/bin/cat OMP_SANDBOX_RUN_ROOT="$sandbox_run" /bin/bash "$SANDBOX" "$sandbox_base/run/readable"
+  assert 'sandbox missing executable fails nonzero' test "$CODE" -ne 0
+  assert_contains 'sandbox missing executable explains refusal' 'sandbox-exec not on PATH; refusing to run omp unsandboxed' "$STDERR"
+  assert 'sandbox missing executable never runs helper' test ! -s "$STDOUT"
+
+  if [ "$sandbox_runtime" -eq 1 ] && [ -n "$real_omp" ]; then
+    # Always select glen-harness, including --version. Only scratch HOME is used.
+    run_sandbox sandbox_call "$real_omp" --profile glen-harness --version
+    assert_exit 'sandbox real omp version completes' 0
+    run_sandbox sandbox_call "$real_omp" --profile glen-harness models --json
+    assert_exit 'sandbox real omp models completes without login' 0
+  elif [ -z "$real_omp" ]; then
+    printf 'NOTE sandbox real omp startup skipped: omp not on PATH\n'
+  fi
+else
+  printf 'NOTE macOS sandbox checks skipped: Darwin with sandbox-exec required\n'
+fi
+
+# Outside the gated startup checks, any accidental CLI call is a test failure.
 cat > "$WORK/bin/glen" <<'EOF'
 #!/bin/sh
 touch "$SMOKE_UNEXPECTED_CALL"
@@ -254,6 +359,7 @@ assert_eq 'policy content comes from main' "$(sed '1d' "$STDOUT")" \
 (
   export CLAUDE_CONFIG_DIR=smoke PI_PY=smoke PI_JS=smoke PI_CODING_AGENT_DIR=smoke
   export OMP_CODING_AGENT_DIR=smoke OMP_PROFILE=smoke PI_PROFILE=smoke
+  export GLEN_OMP_BIN=hostile-inherited OMP_SANDBOX_RUN_ROOT=hostile-inherited
   export MNEMOSYNE_TOKEN=smoke-placeholder
   /bin/bash "$ENGINE" envcheck -- env
 ) > "$WORK/env.out" 2> "$STDERR"
@@ -262,6 +368,12 @@ for name in CLAUDE_CONFIG_DIR PI_PY PI_JS PI_CODING_AGENT_DIR OMP_CODING_AGENT_D
   assert_eq "dispatch scrubs $name" "$present" no
 done
 assert 'dispatch retains token variable name' grep -q '^MNEMOSYNE_TOKEN=' "$WORK/env.out"
+if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
+  assert_contains 'dispatch selects executable sandbox launcher' "GLEN_OMP_BIN=$SANDBOX" "$WORK/env.out"
+  assert 'sandbox launcher is a regular executable file' test -f "$SANDBOX" -a -x "$SANDBOX"
+else
+  assert 'non-macOS dispatch leaves GLEN_OMP_BIN unset' test "$(grep -c '^GLEN_OMP_BIN=' "$WORK/env.out" || true)" -eq 0
+fi
 
 # Successful production paths use offline stubs, never the owner's omp/profile.
 export SMOKE_OMP_CALLS="$WORK/omp-calls" SMOKE_DISPATCH_CALLS="$WORK/dispatch-calls"
@@ -287,6 +399,10 @@ command="$1"
 shift
 # The send AND wait environment must retain the dotenv backstop.
 [ "${CLAUDE_CONFIG_DIR+x}" != x ] || exit 99
+if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
+  [ "${GLEN_OMP_BIN:-}" = "$SMOKE_SANDBOX" ] || exit 99
+  [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
+fi
 printf '%s scrubbed\n' "$command" >> "$SMOKE_DISPATCH_CALLS"
 case "$command" in
   send)
@@ -309,6 +425,7 @@ jq -cn --arg answer "$answer" --arg session "$SMOKE_SESSION" \
   '{data:{assistant_text:$answer,job:{handle:"j-fixture"},session:{handle:"s-fixture",path:$session},replies:[]}}'
 exit "$code"
 EOF
+export SMOKE_SANDBOX="$SANDBOX"
 printf 'Debug fixture\n' > "$WORK/brief.md"
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
 assert_exit 'probe safe private run root exit' 0
