@@ -8,8 +8,8 @@ workflow below) once to adapt the templated files to that project's actual stack
 
 **Engine strategy:**
 
-- **Claude + Codex** (dual-engine) for review comprehensive passes, debug agents, and codebase audits — multi-pass voting with cross-model consensus catches issues a single model misses
-- **Claude only** for planning, orchestrators, testing, error handling, docs, and all implementation stages EXCEPT the lean code-review gate inside `/implement` (1 Claude + 1 Codex pass, 2-vote)
+- **Claude + Codex (+ omp as the third reviewer and optional third investigator)** for review comprehensive passes and debug agents — cross-model consensus catches issues a single model misses
+- **Claude only** for planning, orchestrators, testing, error handling and docs. The `/implement` review uses Claude ‖ Codex ‖ omp + synthesizer when omp is ready or risk is high; the lean Claude ‖ Codex gate applies only to low-risk diffs with a skipped omp probe.
 - Codebase audits use dual-engine (Claude + Codex) per group. Security audit additionally uses checklist perturbation.
 - **Model rides the session, not a hardcoded tier.** Every frontier role — orchestrators, planner/architect, the Implementer, reviewers, security/error finders, the debug investigator + adversary, and research — is `model: inherit`, so it runs on whatever the session runs. Never pin a frontier agent to a model that won't follow the session. Mechanical / summarization roles (test-runner, verifier, docs-updater, light audits, plan explorer/researcher) stay pinned `sonnet` — they don't need frontier compute. Effort: `high` is the default; `xhigh` is reserved for the Implementer, planner, and orchestrators on hard waves.
 
@@ -54,14 +54,14 @@ workflow below) once to adapt the templated files to that project's actual stack
 │   └── planner.md                   # Detailed plan with backward verification + wave splitting
 │
 ├── review-implementation/           # Workflow: Self-review (triple-engine + synthesizer)
-│   ├── orchestrator.md              # Branch-aware; 3 engines (Claude ‖ codex review ‖ CodeRabbit or equivalent) → synthesizer
+│   ├── orchestrator.md              # Branch-aware; 3 engines (Claude ‖ codex review ‖ omp) → synthesizer
 │   ├── comprehensive-review.md      # Claude engine — all 6 domains in one pass
 │   └── synthesizer.md               # Folds 3 engines: dedup + NEW/MODIFIED/PRE-EXISTING + fix plan + memory decision
 │
 ├── debug/                           # Workflow: Heavy investigation
-│   ├── investigator.md              # Claude + Codex — root cause analysis, log tracing
+│   ├── investigator.md              # Claude + Codex (+ optional omp) — root cause analysis, log tracing
 │   ├── adversary.md                 # Claude — adversarial hypothesis tester (disprove/confirm)
-│   └── queue.md                     # Claude + Codex — background job / async pipeline tracing
+│   └── queue.md                     # Claude + Codex (+ optional omp) — background job / async pipeline tracing
 │
 ├── codebase/                        # Workflow: Full-codebase analysis (occasional)
 │   ├── orchestrator.md              # Two-tier dispatcher (quick health check / deep audits)
@@ -119,7 +119,7 @@ flowchart TD
     REQ -->|"/plan-implementation"| PLAN["Approved plan<br/>saved to .claude/plans/"]
     PLAN -->|"/implement"| CODE["Code, wired + tested +<br/>reviewed (Claude ‖ Codex) +<br/>conformance-gated + docs updated"]
     CODE -->|"gh pr create"| PR["Pull request"]
-    PR -.->|"optional standalone pass"| DEEPREV["/review-implementation<br/>(Claude ‖ Codex ‖ 3rd engine → synthesizer)"]
+    PR -.->|"optional standalone pass"| DEEPREV["/review-implementation<br/>(Claude ‖ Codex ‖ omp → synthesizer)"]
     PR -->|"CI green, no unresolved comments"| SHIP["Squash-merged on main"]
 
     IDEA -.->|"or: declare the whole thing as one goal"| GOAL["/goal + /auto-mode"]
@@ -149,8 +149,10 @@ approve it. See `agents/plan/README.md` for the full 8-step diagram.
 ## Implementation workflow (`/implement`)
 
 Builds the approved plan. The Implementer (run in Codex) writes the code, wires it in,
-and writes its own tests; a lean internal review gate (1 Claude pass ‖ 1 Codex pass, 2-vote
-consensus) catches must-fix issues before the tail — an author-blind conformance-test
+and writes its own tests; the review gate catches must-fix issues before the tail.
+When omp is ready or risk is high, it uses Claude ‖ Codex ‖ omp + synthesizer (recording
+omp's reason if skipped); otherwise it uses the lean Claude ‖ Codex gate with 2-vote
+consensus. The tail is an author-blind conformance-test
 writer (who only ever saw the plan, never the diff or the Implementer's own tests) and a
 docs updater. `/implement-quick` is the same pipeline with fewer gates for small, low-risk
 changes, behind a fail-safe classifier that falls back to the full path on anything
@@ -159,8 +161,8 @@ ambiguous. See `agents/implementation/README.md` for the full pipeline diagram.
 ## Review workflow (`/review-implementation`)
 
 The heavy, standalone review pass — not the same machine as `/implement`'s internal gate.
-Three independent engines (Claude, a second-engine diff reviewer, and a third-party review
-bot if the project has one) each review the diff blind to the others' findings, then a
+Three independent engines (Claude, Codex via `codex review`, and omp (via glen)) each
+review the diff blind to the others' findings, then a
 fourth agent synthesizes: cross-engine agreement is HIGH confidence, a single critical
 finding still survives on its own. Every finding is provenance-labelled NEW / MODIFIED /
 PRE-EXISTING against the merge-base, and the output is an ordered fix plan plus a
@@ -170,7 +172,7 @@ deliberate memory-write decision — not just a wall of comments. See
 ## Debug workflow (`/deep-debug`)
 
 Root-cause investigation with a built-in check on its own conclusions: a dual-engine
-investigator (Claude + Codex) proposes a hypothesis, then a dedicated adversary agent
+investigator pair, Claude + Codex (+ optional omp), proposes a hypothesis, then a dedicated adversary agent
 tries to disprove it — up to 3 cycles — before you act on anything. A quick triage step
 runs first so trivial bugs don't pull in the heavy machinery, and `debug/queue.md` is a
 generic background-job/async-pipeline specialist you adapt to whatever queue or broker
@@ -218,10 +220,10 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 | `/research`              | Standalone research                                                               | `research/agent.md` — Context7 + web search + Playwright, saves report to `.claude/research/` |
 | `/brainstorm`            | Creative exploration                                                              | `brainstorm.md`                                                                               |
 | `/plan-implementation`   | Plan before coding                                                                | `plan/orchestrator.md`                                                                        |
-| `/implement`             | Build features/fixes                                                              | `implementation/orchestrator.md` (includes a lean internal Claude‖Codex code-review gate)     |
+| `/implement`             | Build features/fixes                                                              | `implementation/orchestrator.md` (Claude‖Codex‖omp + synthesizer when omp is ready or risk is high; lean gate otherwise) |
 | `/implement-quick`       | Fast path for small, low-risk changes                                            | `implementation/orchestrator-quick.md`                                                         |
 | `/review-implementation` | Self-review (heavy, standalone)                                                   | `review-implementation/orchestrator.md`                                                       |
-| `/code-review`           | Lean dual-engine review on current diff (standalone form of `/implement` Step 13) | `implementation/code-review.md` (Claude) ‖ `codex:codex-rescue`                               |
+| `/code-review`           | Lean dual-engine review on current diff (also the low-risk `/implement` fallback when omp is skipped) | `implementation/code-review.md` (Claude) ‖ `codex:codex-rescue` |
 | `/codex`                 | Dispatch a task to OpenAI Codex                                                   | `.claude/skills/codex/SKILL.md` → `codex:codex-rescue` agent                                  |
 | `/deep-debug`            | Heavy investigation                                                               | `debug/investigator.md` + `debug/adversary.md` (+ `debug/queue.md` for async-pipeline bugs)   |
 | `/run-ci`                | CI verification                                                                   | `local-ci.md`                                                                                 |
@@ -255,7 +257,7 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 - Analysis paralysis guard on writing agents (7-read threshold)
 - Deviation rules for coder (auto-fix trivial, STOP on architectural surprises)
 - Self-check step verifies every plan step was actually implemented
-- Lean dual-engine code-review gate (Step 13): 1 Claude + 1 Codex pass in parallel, 2-vote consensus + ≤2 rework cycles — separate from and much leaner than the standalone `/review-implementation`
+- Review gate (Step 13): Claude ‖ Codex ‖ omp + synthesizer when omp is ready or risk is high; low-risk diffs with a skipped omp probe use the lean Claude ‖ Codex gate and 2-vote consensus. Both paths allow ≤2 rework cycles and record unavailable engines.
 - Plan splitting into waves for 12+ step plans (fresh context per wave)
 - Fast path (`/implement-quick`) for small, low-risk changes — a fail-safe classifier gate, same quality bar, fewer gates
 - Optional project-specific domain-rubric gate slot (Role 3, conditional) — wire up your own isolated-context grader for any non-numeric, structural/textual artifact class this project cares about (see `implementation/orchestrator.md`'s Role 3 note)
@@ -271,13 +273,13 @@ explicitly approved. See `agents/orchestrator/README.md` for the full loop diagr
 **Debug pipeline:**
 
 - Adversarial verification loop: investigator proposes hypothesis, adversary tries to disprove it (max 3 cycles)
-- Dual-engine investigation (Claude agent + Codex) with cross-reference merge
+- Dual-engine investigation: Claude + Codex (+ optional omp), with cross-reference merge
 - Quick triage step before heavy agent dispatch
 - Generic background-job/async-pipeline specialist (`debug/queue.md`) — adapt to whatever queue/broker system this project actually uses
 
 **Review pipelines:**
 
-- Triple-engine review: Claude comprehensive reviewer ‖ a second-engine diff reviewer (e.g. `codex review`) ‖ a third-party PR bot if this project has one, each blind to the others (recall)
+- Triple-engine review: Claude comprehensive reviewer ‖ `codex review` ‖ omp (via glen), each blind to the others (recall); omp is skipped with a reason when its probe fails
 - Synthesizer (4th Claude agent): dedupes across engines, cross-engine agreement = HIGH confidence, critical survives a single engine (precision)
 - Branch-aware: detects base, reviews authored working-tree changes (incl. uncommitted)
 - Provenance labelling: each finding tagged NEW / MODIFIED / PRE-EXISTING vs the merge-base

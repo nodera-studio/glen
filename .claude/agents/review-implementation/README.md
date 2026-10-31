@@ -12,7 +12,7 @@ flowchart TD
         direction LR
         E1["Claude<br/>comprehensive-review.md<br/>all 6 domains, one pass"]
         E2["Codex<br/>codex review --base<br/>(never codex exec)"]
-        E3["CodeRabbit<br/>coderabbit review<br/>--plain --agent"]
+        E3["omp (Cursor, read-only)<br/>omp-engine.sh review<br/>via glen"]
     end
 
     ENGINES --> SYN["Synthesizer (4th Claude agent)<br/>dedupe by defect · cross-engine agreement = confidence ·<br/>NEW/MODIFIED/PRE-EXISTING provenance vs merge-base ·<br/>ordered fix plan · memory decision"]
@@ -21,8 +21,8 @@ flowchart TD
 ```
 
 Total: 4 agents (3 engines + synthesizer) — no multi-pass voting, no shuffled diffs.
-In glen the CodeRabbit CLI is not installed, so the third engine is skipped and the report
-says so (Claude ‖ Codex + synthesizer).
+omp runs when `omp-engine.sh probe` passes; otherwise the report says it was skipped
+and why (Claude ‖ Codex + synthesizer).
 
 ## Branch awareness
 

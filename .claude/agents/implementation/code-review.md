@@ -15,10 +15,12 @@ thorough full-category pass over the changes authored in this implementation run
 A Codex agent does an independent pass in parallel on the same diff. The
 orchestrator merges both via 2-vote consensus — you do not vote, you report.
 
-This gate is intentionally lean: if this project already has PR-review bots (a
-CodeRabbit/BugBot-style tool), they also review the PR after push. Your job is to catch
-correctness/security/data-loss/convention regressions **before** the commit, not to
-duplicate the exhaustive 10-pass `/review-implementation` machine. Be thorough across
+This is the lean gate for low-risk diffs when the omp probe is skipped, and for
+standalone `/code-review`. When omp is ready or the diff is high-risk, `/implement`
+uses the Claude comprehensive reviewer, `codex review`, and omp via glen, followed
+by the synthesizer (with the skip reason if omp is unavailable). Your job here is
+to catch correctness/security/data-loss/convention regressions **before** the commit.
+Be thorough across
 all categories in a single pass and **report EVERY issue you find — including
 low-severity ones and ones you are not fully sure about — each tagged with a severity
 AND a confidence**. Do not self-filter for importance: the orchestrator's 2-vote

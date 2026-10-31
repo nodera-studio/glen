@@ -161,6 +161,8 @@ The extension uses `ctx.abort/isIdle/hasPendingMessages/compact/getContextUsage/
 4. Without a live endpoint, a held glen lock selects queued RPC, preserving W2 queueing. Otherwise probe the owner lease: free selects RPC; held refuses with `run glen install-extension, then restart that omp session` when absent, or `restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)` when installed. Unknown refuses.
 5. Only RPC/new resolves omp. Its worker re-checks the endpoint before the pre-spawn lease probe and again **endpoint-only** immediately before prompting. An answering or unhealthy endpoint fails no_route without a prompt; no RPC-to-live handoff is attempted. Startup recovery can claim the child's own lease, so no second lease probe is safe.
 
+The worker passes the caller's environment through to omp, subject to the explicit-profile scrubbing in §A3; the harness relies on inherited `PI_CONFIG_FILES`, pinned by `tests/rpc.rs::w9_send_passes_profile_and_config_overlay_env`.
+
 **Residual race.** The extension closes the idle-TUI gap for resumed and brand-new TUI sessions before their first write. An unextended TUI can still open between a lease probe and first RPC write; the RPC path narrows that race and reports a detected fork as exit 11. `show`/`tail` retain W1's brief read-only lease probe and never route. Endpoint-only targets cannot fall back to RPC until a transcript exists.
 
 ### Controls (W3b, AC-351–369)
@@ -178,6 +180,7 @@ Every command has a positive --timeout DUR, default 90s. Hello ≤2s, live abort
 - **Exactly one provider per omp process.** omp rejects a host tool whose name an extension already registered.
   - glen's RPC children run with `GLEN_MANAGED=1`; the extension skips its tool and socket there, and the worker supplies a host tool via `set_host_tools`.
   - TUI and print sessions with the extension installed use the extension's tool.
+- **RPC host-tool approval:** RPC host tools carry no approval tier in omp 18.14.0 (`RpcHostToolDefinition`, `CA/modes/rpc/rpc-types.ts:866-876`; wrapped at `CA/session/session-tools.ts:2600-2607`). Under a non-yolo `tools.approvalMode`, `glen_reply` in an RPC job fails closed unless the profile sets `tools.approval.glen_reply: allow`. Approval prompts fail closed only because glen passes `--no-ui` (`CA/main.ts:2807`).
 - **Delivery:**
   - RPC: append in call order to `jobs/<id>/replies.ndjson`, then the inbox, and include the same records in `result.json.replies`. A job append error returns a tool error without an in-memory record; inbox errors are logged and the job reply is retained.
   - Live: the extension streams a `reply` event to a connected worker (when a glen request is active) and appends to `inbox/<sessionId>.ndjson`: `{v:1, id, session_id, job_id|null, request_id|null, tool_call_id|null, text, final, at}` — every field is always present; absent values are `null`, never omitted.
@@ -255,7 +258,7 @@ Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `
 | `glen ls [--all] [--cwd DIR] [-n N] [--live] [--since DUR]` | List sessions for the cwd bucket (`--all`: every bucket); `--all` conflicts with `--cwd`; `-n 0` lists all. Columns: handle, state, title, last turn, updated ("3m ago"), model; plus project with `--all` | W1 | W1 |
 | `glen show <session> [--cwd DIR] [--thinking] [--tools collapsed\|full\|none] [--raw]` | Active-branch transcript; `--raw` = entries as JSON; `--cwd` scopes session resolution | W1 | W1 |
 | `glen tail <session> [--cwd DIR] [-n N] [-f] [--thinking]` | Last N transcript items; `-f` follows (NDJSON in JSON mode); `-n 0` gives no backlog; `--cwd` scopes initial resolution | W1 | W1 |
-| `glen send <session\|@latest\|@new> <message\|-> [--as auto\|steer\|follow-up] [--steer\|--follow-up] [--wait DUR\|--no-wait] [--cwd DIR]` | Send through the live route or RPC, then wait up to the bound (default 90s) | W2 (RPC), W3 (live) | W2 |
+| `glen send <session\|@latest\|@new> <message\|-> [--as auto\|steer\|follow-up] [--steer\|--follow-up] [--wait DUR\|--no-wait] [--cwd DIR] [--thinking off\|minimal\|low\|medium\|high\|xhigh\|max\|auto]` | Send through the live route or RPC, then wait up to the bound (default 90s); `--thinking` sets the spawned omp's startup reasoning effort and is ignored with a warning on the live route | W2 (RPC), W3 (live) | W2 |
 | `glen wait <job> [--timeout DUR]` | Keep waiting for a job (default 90s) | W2 | W2 |
 | `glen jobs [--session S] [--active] [-n N]` | List glen's jobs | W2 | W2 |
 | `glen abort <session> [--timeout DUR]` (alias `stop`) | Stop the active turn; report queued glen jobs | W3b | visible |
@@ -515,6 +518,7 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 - [ ] Verify `--no-ui`, event-filter scope, settlement after results for started runs, and `agentInvoked:false` local semantics.
 - [ ] Live scratch smoke: verify `omp --mode rpc --resume` does not claim its owner lease before the first prompt; retain Step 15 evidence (not yet run in the sandbox).
 - [ ] Re-check the RPC schema: `prompt_result`, `session_settled` and the `set_host_tools` duplicate rule.
+- [ ] Re-check whether `RpcHostToolDefinition` gained an `approval` field, and whether `fetch.enabled` / `tools.restrictedFolders` still gate the read tools; re-run the glen-harness enforcement probe.
 - [ ] Re-check the extension API: `sendUserMessage` deliverAs, `registerTool` and session events.
 - [ ] Re-check extension agent_end original flags versus tail re-tag, prompt bracket unwinding, before_agent_start prompt joining, hasPendingMessages, loadMode/approval, factory rebinding and ctx.agent, managed timers, and -e/--no-extensions; re-run the Step 14 live smoke.
 - [ ] Bump `TESTED_OMP_VERSION` only after all of these checks.

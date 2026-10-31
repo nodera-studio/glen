@@ -86,6 +86,8 @@ pub struct Job {
     pub live_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_flag: Option<String>,
     pub owners_dir: PathBuf,
     pub job_timeout_ms: u64,
     pub deadline_at: String,
@@ -549,6 +551,7 @@ pub(crate) mod tests {
             live_socket: None,
             live_pid: None,
             profile_flag: None,
+            thinking_flag: None,
             owners_dir: "/fixture/owners".into(),
             job_timeout_ms: 30000,
             deadline_at: jiff::Timestamp::now().to_string(),
@@ -563,6 +566,27 @@ pub(crate) mod tests {
         let encoded = serde_json::to_value(v).unwrap();
         let decoded: T = serde_json::from_value(encoded.clone()).unwrap();
         assert_eq!(serde_json::to_value(decoded).unwrap(), encoded);
+    }
+    #[test]
+    fn old_job_file_without_profile_or_thinking_flag_deserializes() {
+        // A job file written before W9's --profile/--thinking flags carries
+        // neither field; both must default to None, not fail to parse.
+        let encoded = serde_json::json!({
+            "v": 1,
+            "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+            "handle": "j27c0de",
+            "created_at": "2026-01-01T00:00:00Z",
+            "route": "rpc",
+            "deliver_as": "auto",
+            "text": "hello",
+            "cwd": "/fixture",
+            "owners_dir": "/fixture/owners",
+            "job_timeout_ms": 30000,
+            "deadline_at": "2026-01-01T00:00:30Z"
+        });
+        let job: Job = serde_json::from_value(encoded).unwrap();
+        assert_eq!(job.profile_flag, None);
+        assert_eq!(job.thinking_flag, None);
     }
     #[test]
     fn ids_and_handles() {

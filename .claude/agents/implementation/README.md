@@ -34,10 +34,12 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
    **UI Implementer** (`coder-ui.md`, agent `impl-coder-ui`, Opus) takes design-heavy web UI
    instead: same fused loop with the site's build/test commands, the frontend-design skill,
    and a required browser check against the named design reference.
-3. **Review (fresh context)** — the triple-engine review: Claude comprehensive
-   reviewer ‖ `codex review` ‖ CodeRabbit, each blind to the others, folded by the
+3. **Review (fresh context)** — when omp is ready or the diff is high-risk, run the
+   review block: Claude comprehensive reviewer ‖ `codex review` ‖ omp (via glen), each blind to the others, folded by the
    Claude **synthesizer** into one dedup'd, provenance-labelled report + ordered fix
    plan (the `/review-implementation` machinery; never sees the Implementer's transcript).
+   A skipped omp probe is recorded with its reason; low-risk diffs with a skipped
+   probe use the lean Claude ‖ Codex gate instead.
 4. **parallel tail** — once Review is green: **docs-updater** updates docs from the
    landed code, ‖ **conformance-test-writer** runs the author-blind, plan-derived
    conformance gate (the anti-reward-hacking check).

@@ -409,6 +409,16 @@ The tail item example is a shape catalogue: one example per item kind (and per a
 Send once. Exits 10 and 130 leave the job running; never resend to poll. Use `wait`.
 A `--cwd` that is not an existing directory exits 2 `usage` with `details:{reason:"missing_cwd",cwd}`
 before stdin is read or a job is created.
+`--thinking <LEVEL>` passes omp's startup reasoning effort (off, minimal, low, medium, high,
+xhigh, max, auto) through to the spawned omp process; glen rejects any other value as a usage
+error (exit 2) before it ever reaches omp. It is ignored with an `ignored_flag` warning on the
+live route (the session is already running); the warning names the real handle and level for
+`glen thinking <handle> <level>`, and for `auto`, which `glen thinking` does not take, asks for an
+explicit level instead. omp 18.14.0 persists a default thinking level as
+a `<model-id>:<level>` suffix on `modelRoles.default` (honoured by omp itself); the harness's
+`omp-profile-setup.sh` writes that suffix for its model ladder, and `omp-engine.sh` repeats
+exactly that suffix as `--thinking` on every dispatch, as belt and braces on top of it, and
+passes no `--thinking` when the persisted value has none.
 
 | Field | Meaning |
 |---|---|
@@ -1155,6 +1165,7 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
 | `skill_sync_failed` | install-skill | file published successfully, but directory sync failed |
 | `changed_during_install` | install-skill | destination or ancestor changed after inspection; skipped even with --force |
 | `skill_dir_not_empty` | install-skill | removed file, retained nonempty glen directory |
+| `ignored_flag` | send | `--thinking` has no effect on the live route; the message names the `glen thinking` command to run instead |
 | `not_yet_persisted` | show, tail, models, model, thinking | live session has not written a transcript yet; a model or thinking change is written with its first answer |
 | `extension_version_mismatch` | send, abort, models, model, thinking, compact | live extension version differs from glen |
 | `steer_queued` | send, wait | another glen job held the session, so the steer waited and was sent as a prompt |

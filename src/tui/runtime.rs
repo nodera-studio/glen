@@ -521,7 +521,7 @@ fn submit(
     if ctx.stopped() {
         return Err(cancelled());
     }
-    send::submit(&ctx.cli, &ctx.env, Some(&opened), cwd, text, mode)
+    send::submit(&ctx.cli, &ctx.env, Some(&opened), cwd, text, mode, None)
 }
 fn reap(tasks: &mut Vec<JoinHandle<()>>) -> Result<(), GlenError> {
     let mut index = 0;

@@ -34,6 +34,7 @@ fn make(b: &RpcBox, state: State, worker_start: &str) -> JobId {
         live_socket: None,
         live_pid: None,
         profile_flag: None,
+        thinking_flag: None,
         owners_dir: b.owners(),
         job_timeout_ms: 30000,
         deadline_at: now.to_string(),

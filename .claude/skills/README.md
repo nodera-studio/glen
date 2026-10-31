@@ -13,6 +13,7 @@ structural reference when you write your own.
 | `release` | Version-bump PR, then an annotated `v0.x.y` tag on `main`; board issues tagged `released:v0.x.y` |
 | `mnemosyne` | glen's Mnemosyne ids, memory conventions and board operations |
 | `codex` | Dispatching Codex through `codex:codex-rescue` / `codex review` |
+| `omp` | Third review/debug engine: omp on Cursor via glen, read-only (`omp-engine.sh`) |
 | `exa` | All web access (native WebSearch/WebFetch are denied) |
 | `gh` | PRs, checks, run logs, merges |
 

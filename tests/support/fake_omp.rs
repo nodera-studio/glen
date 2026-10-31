@@ -114,6 +114,11 @@ fn run() -> io::Result<u8> {
                     return Ok(64);
                 }
             }
+            "--thinking" => {
+                if iter.next().is_none() {
+                    return Ok(64);
+                }
+            }
             "--resume" => match iter.next() {
                 Some(p) => resume = Some(p.clone()),
                 None => return Ok(64),
@@ -130,7 +135,7 @@ fn run() -> io::Result<u8> {
         signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated.clone())?;
     }
     log(
-        json!({"event":"start","pid":std::process::id(),"pgid":rustix::process::getpgrp().as_raw_nonzero().get(),"argv":args,"cwd":std::env::current_dir()?,"env":{"GLEN_MANAGED":knob("GLEN_MANAGED"),"OMP_PROFILE":knob("OMP_PROFILE"),"PI_PROFILE":knob("PI_PROFILE")}}),
+        json!({"event":"start","pid":std::process::id(),"pgid":rustix::process::getpgrp().as_raw_nonzero().get(),"argv":args,"cwd":std::env::current_dir()?,"env":{"GLEN_MANAGED":knob("GLEN_MANAGED"),"OMP_PROFILE":knob("OMP_PROFILE"),"PI_PROFILE":knob("PI_PROFILE"),"PI_CONFIG_FILES":knob("PI_CONFIG_FILES")}}),
     )?;
     if let Some(message) = knob("FAKE_OMP_STARTUP_STDERR") {
         let mut stderr = io::stderr().lock();

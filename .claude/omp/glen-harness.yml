@@ -1,0 +1,47 @@
+# Review gate: third review engine.
+# /deep-debug: optional third investigator.
+# Discovery id only (18.14.0 discovery/agents.ts); no model provider uses this id.
+# Native profile skills/MCP remain available. Never disable the cursor model provider.
+disabledProviders: [agents]
+tools:
+  approvalMode: always-ask
+  xdev: false
+  approval:
+    bash: deny
+    eval: deny
+    write: deny
+    edit: deny
+    ast_edit: deny
+    delete: deny
+    task: deny
+    manage_skill: deny
+    github: deny
+    security_scan: deny
+    glen_reply: allow
+    mcp__mnemosyne_memory_search: allow
+    mcp__mnemosyne_memory_get: allow
+    mcp__mnemosyne_memory_list: allow
+    mcp__mnemosyne_memory_get_recent: allow
+    mcp__mnemosyne_memory_get_entity: allow
+    mcp__mnemosyne_memory_decision_chain: allow
+    # The live write tools (Step 11 acceptance, item 4).
+    mcp__mnemosyne_memory_store: deny
+    mcp__mnemosyne_memory_update: deny
+    mcp__mnemosyne_memory_delete: deny
+  restrictedFolders: ["~"]
+bash:
+  enabled: false
+eval:
+  py: false
+  js: false
+browser:
+  enabled: false
+lsp:
+  enabled: false
+fetch:
+  enabled: false
+web_search:
+  enabled: false
+mcp:
+  enableProjectConfig: false
+  startupTimeoutMs: 15000
