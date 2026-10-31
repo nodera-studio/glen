@@ -20,7 +20,8 @@ fn deploy_checks_main_immediately_before_wrangler() -> Result {
         .map_while(|line| line.strip_prefix("          "))
         .collect::<Vec<_>>()
         .join("\n");
-    assert!(script.contains("npx --yes wrangler@4.124.0 deploy"));
+    // W8 SEC-6: the locked devDependency, never a registry fetch next to the token.
+    assert!(script.contains("npx --no wrangler deploy"));
     for (remote, git_code, deploys, succeeds) in [
         ("current", 0, true, true),
         ("newer", 0, false, true),
@@ -34,7 +35,7 @@ fn deploy_checks_main_immediately_before_wrangler() -> Result {
             ),
             (
                 "npx",
-                "#!/bin/sh\n[ \"$*\" = '--yes wrangler@4.124.0 deploy' ] || exit 99\nprintf deployed > \"$DEPLOY_MARKER\"\n",
+                "#!/bin/sh\n[ \"$*\" = '--no wrangler deploy' ] || exit 99\nprintf deployed > \"$DEPLOY_MARKER\"\n",
             ),
         ] {
             let path = tmp.path().join(name);
@@ -99,10 +100,162 @@ fn release_reuses_main_git_cache_and_manifest_changes_trigger_it() {
     assert!(CI.contains(&format!(
         "      - if: {MAIN_PUSH} && runner.os == 'Linux'\n        uses: actions/cache@v4\n        with:\n          path: ~/.cargo/git\n          {key}"
     )));
-    assert!(RELEASE.contains("uses: actions/cache/restore@v4"));
+    // W8 SEC-7: the restore action is pinned to the v4 commit, not the moving tag.
+    assert!(
+        RELEASE
+            .contains("uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.")
+    );
     assert!(RELEASE.contains("path: ~/.cargo/git"));
     assert!(RELEASE.contains("restore-keys: |\n            omp-git-v1-"));
     assert!(!RELEASE.contains("uses: actions/cache/save@"));
     assert!(!RELEASE.contains("uses: Swatinem/rust-cache@"));
     assert!(!RELEASE.contains("path: target"));
+}
+
+const FLAKE: &str = include_str!("../.github/workflows/flake-proof.yml");
+
+/// `uses:` targets of a workflow, with the trailing `# version` comment.
+fn uses(workflow: &str) -> Vec<&str> {
+    workflow
+        .lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .trim_start_matches("- ")
+                .strip_prefix("uses: ")
+        })
+        .collect()
+}
+
+/// `owner/repo[/path]@<40 hex> # <version>`.
+fn sha_pinned(action: &str) -> bool {
+    let Some((_, rest)) = action.split_once('@') else {
+        return false;
+    };
+    let Some((sha, comment)) = rest.split_once(" # ") else {
+        return false;
+    };
+    sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) && !comment.trim().is_empty()
+}
+
+#[test]
+fn third_party_actions_are_pinned_to_commit_shas() {
+    // W8 SEC-7: every action in the release build, and every non-`actions/*`
+    // action anywhere, is a full commit SHA with a version comment.
+    let release = uses(RELEASE);
+    assert!(release.len() >= 8, "{release:?}");
+    for action in release {
+        assert!(sha_pinned(action), "release.yml: {action}");
+    }
+    for (name, workflow) in [("ci.yml", CI), ("flake-proof.yml", FLAKE)] {
+        let third_party = uses(workflow)
+            .into_iter()
+            .filter(|action| !action.starts_with("actions/"))
+            .collect::<Vec<_>>();
+        assert!(!third_party.is_empty(), "{name}");
+        for action in third_party {
+            assert!(sha_pinned(action), "{name}: {action}");
+        }
+    }
+}
+
+#[test]
+fn toolchain_comes_from_rust_toolchain_toml_and_msrv_is_checked() {
+    // W8 DEBT-7.
+    let pin = include_str!("../rust-toolchain.toml");
+    let channel = pin
+        .lines()
+        .find_map(|line| line.strip_prefix("channel = \""))
+        .and_then(|rest| rest.strip_suffix('"'))
+        .expect("rust-toolchain.toml channel");
+    assert_eq!(
+        channel.split('.').count(),
+        3,
+        "pin an exact stable: {channel}"
+    );
+    assert!(channel.split('.').all(|part| part.parse::<u32>().is_ok()));
+    assert!(pin.contains("components = [\"clippy\", \"rustfmt\"]"));
+    assert!(include_str!("../Cargo.toml").contains("\nrust-version = \"1.89\"\n"));
+    let read_pin = "run: echo \"channel=$(sed -n 's/^channel = \"\\(.*\\)\"$/\\1/p' rust-toolchain.toml)\" >> \"$GITHUB_OUTPUT\"";
+    for (name, workflow, jobs) in [
+        ("ci.yml", CI, 2),
+        ("release.yml", RELEASE, 1),
+        ("flake-proof.yml", FLAKE, 1),
+    ] {
+        assert!(!workflow.contains("rust-toolchain@stable"), "{name}");
+        assert_eq!(workflow.matches(read_pin).count(), jobs, "{name}");
+        assert_eq!(
+            workflow
+                .matches("toolchain: ${{ steps.toolchain.outputs.channel }}")
+                .count(),
+            jobs,
+            "{name}"
+        );
+    }
+    let msrv = CI.split("\n  msrv:\n").nth(1).expect("msrv job");
+    let msrv = msrv.split("\n\n").next().unwrap_or(msrv);
+    assert!(msrv.contains("echo \"RUSTUP_TOOLCHAIN=$version\" >> \"$GITHUB_ENV\""));
+    assert!(msrv.contains("toolchain: ${{ steps.msrv.outputs.version }}"));
+    assert!(msrv.contains("- run: cargo check --locked --all-targets"));
+}
+
+#[test]
+fn release_archives_carry_generated_third_party_licenses() {
+    // W8 DEBT-3: the build job generates the notices per target with a pinned
+    // cargo-about and hands them to the packager; musl targets get musl's notice.
+    assert!(RELEASE.contains("cargo install --locked cargo-about --version 0.9.2 --features cli"));
+    assert!(RELEASE.contains(
+        "cargo about generate --locked --fail -c licenses/about.toml --target \"$t\" -o \"$notices\" licenses/about.hbs"
+    ));
+    assert!(RELEASE.contains("*-linux-musl) cat licenses/musl.txt >> \"$notices\" ;;"));
+    assert!(RELEASE.contains("sh scripts/package-release.sh \"$t\" \"$bin\" \"$notices\" dist"));
+    assert!(RELEASE.contains("'rust-toolchain.toml', 'licenses/**']"));
+    // The template's MPL-2.0 source line names the option-ext the lockfile builds.
+    let lock = include_str!("../Cargo.lock");
+    let option_ext = lock
+        .split("[[package]]\nname = \"option-ext\"\nversion = \"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("option-ext in Cargo.lock");
+    let line = format!("https://crates.io/crates/option-ext/{option_ext}");
+    assert!(
+        include_str!("../licenses/about.hbs").contains(&line),
+        "{line}"
+    );
+    assert!(RELEASE.contains(&format!("option-ext {option_ext}: {line}$")));
+    assert!(
+        include_str!("../licenses/musl.txt").contains("Copyright © 2005-2020 Rich Felker, et al.")
+    );
+}
+
+#[test]
+fn site_deploy_uses_the_locked_wrangler() -> Result {
+    // W8 SEC-6: wrangler is an exact devDependency with an integrity hash, and
+    // `npm ci` installs it in a step that never sees the Cloudflare token.
+    let package: serde_json::Value = serde_json::from_str(include_str!("../site/package.json"))
+        .map_err(std::io::Error::other)?;
+    assert_eq!(package["devDependencies"]["wrangler"], "4.124.0");
+    for script in ["deploy", "deploy:dry"] {
+        let script = package["scripts"][script].as_str().unwrap_or_default();
+        assert!(script.contains("npx --no wrangler deploy"), "{script}");
+    }
+    let lock: serde_json::Value = serde_json::from_str(include_str!("../site/package-lock.json"))
+        .map_err(std::io::Error::other)?;
+    let wrangler = &lock["packages"]["node_modules/wrangler"];
+    assert_eq!(wrangler["version"], "4.124.0");
+    assert!(
+        wrangler["integrity"]
+            .as_str()
+            .is_some_and(|i| i.starts_with("sha512-"))
+    );
+    for text in [CI, include_str!("../site/package.json")] {
+        assert!(!text.contains("wrangler@") && !text.contains("npx --yes"));
+    }
+    let deploy = CI
+        .split("\n  site-deploy:\n")
+        .nth(1)
+        .expect("site-deploy job");
+    let npm_ci = deploy.find("      - run: npm ci\n").expect("npm ci step");
+    assert!(npm_ci < deploy.find("--dry-run").expect("dry run"));
+    assert!(npm_ci < deploy.find("CLOUDFLARE_API_TOKEN").expect("token"));
+    Ok(())
 }

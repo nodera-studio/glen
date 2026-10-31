@@ -108,7 +108,12 @@ fn ac025_harness_refers_to_issues_by_wave_and_document_id() {
 #[test]
 fn ac026_ci_caches_cargo_with_rust_cache_on_failure() {
     let ci = read(".github/workflows/ci.yml");
-    assert!(ci.contains("Swatinem/rust-cache@v2"));
+    // W8 SEC-7: rust-cache is pinned to a v2 commit SHA instead of the moving v2 tag.
+    assert!(ci.lines().any(|line| {
+        line.trim_start()
+            .starts_with("- uses: Swatinem/rust-cache@")
+            && line.contains(" # v2.")
+    }));
     assert!(ci.contains("cache-on-failure: true"));
     assert!(!ci.contains("save-if"), "no save-if (plan Step 11)");
     assert!(ci.contains("ubuntu-latest") && ci.contains("macos-latest"));

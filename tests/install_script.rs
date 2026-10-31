@@ -68,6 +68,7 @@ struct Installer {
     shim: PathBuf,
     rel: PathBuf,
     binary: PathBuf,
+    notices: PathBuf,
     scratch: PathBuf,
 }
 impl Installer {
@@ -83,6 +84,8 @@ impl Installer {
         }
         let binary = root.join("fake-glen");
         executable(&binary, "#!/bin/sh\necho \"glen 9.9.9\"\n")?;
+        let notices = root.join("THIRD-PARTY-LICENSES");
+        fs::write(&notices, "THIRD-PARTY SOFTWARE NOTICES FOR glen\n")?;
         Ok(Self {
             _tmp: tmp,
             root,
@@ -90,6 +93,7 @@ impl Installer {
             shim,
             rel,
             binary,
+            notices,
             scratch,
         })
     }
@@ -118,6 +122,7 @@ impl Installer {
             .arg("scripts/package-release.sh")
             .arg(target())
             .arg(&self.binary)
+            .arg(&self.notices)
             .arg(out)
             .output()?)
     }
@@ -607,13 +612,23 @@ fn package_layout_checksum_and_executable_mode() -> Result {
     let name = format!("glen-{}", target());
     let mut entries = stdout(&o).lines().map(str::to_owned).collect::<Vec<_>>();
     entries.sort();
+    // W8 DEBT-3: the third-party notices ship beside glen's own LICENSE.
     let mut expected = [
         format!("{name}/"),
         format!("{name}/glen"),
         format!("{name}/LICENSE"),
+        format!("{name}/THIRD-PARTY-LICENSES"),
     ];
     expected.sort();
     assert_eq!(entries, expected);
+    let o = b
+        .command("tar")
+        .arg("-xOzf")
+        .arg(b.asset())
+        .arg(format!("{name}/THIRD-PARTY-LICENSES"))
+        .output()?;
+    check(&o, 0);
+    assert_eq!(stdout(&o), fs::read_to_string(&b.notices)?);
     let sum = fs::read_to_string(b.asset().with_extension("gz.sha256"))?;
     assert!(sum.len() >= 64);
     assert!(
@@ -641,25 +656,30 @@ fn argument_errors_help_and_home_override() -> Result {
         check(&o, 2);
         assert!(stderr(&o).contains("Usage:"), "{o:?}");
     }
-    for args in [
-        vec![],
-        vec!["bad/target", "missing", "out"],
-        vec![target(), "missing", "out"],
-        vec![target(), "a", "b", "c"],
+    // W8 DEBT-3: the packager takes the notices file as a fourth argument, so
+    // three arguments are now a usage error and five are the "too many" case.
+    let binary = b.binary.to_string_lossy().into_owned();
+    let empty = b.root.join("empty-notices");
+    fs::write(&empty, "")?;
+    let empty = empty.to_string_lossy().into_owned();
+    for (args, code) in [
+        (vec![], 2),
+        (vec!["bad/target", "missing", "notices", "out"], 2),
+        (vec![target(), "missing", "notices", "out"], 1),
+        (vec![target(), &binary, "missing", "out"], 1),
+        (vec![target(), &binary, &empty, "out"], 1),
+        (vec![target(), &binary, "out"], 2),
+        (vec![target(), "a", "b", "c", "d"], 2),
     ] {
         let o = b
             .command("sh")
             .arg("scripts/package-release.sh")
             .args(&args)
             .output()?;
-        check(
-            &o,
-            if args.len() == 3 && args[0] == target() {
-                1
-            } else {
-                2
-            },
-        );
+        check(&o, code);
+        if code == 1 && args[1] == binary {
+            assert!(stderr(&o).contains("third-party licenses"), "{o:?}");
+        }
     }
     let o = b.install(&["--help"])?;
     check(&o, 0);

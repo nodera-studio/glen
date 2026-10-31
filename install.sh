@@ -139,7 +139,7 @@ main() {
     tar -tzf "$tmp/$asset" > "$tmp/entries" || fail "could not list $asset"
     while IFS= read -r entry; do
         case "$entry" in
-            "glen-$target/"|"glen-$target/glen"|"glen-$target/LICENSE") ;;
+            "glen-$target/"|"glen-$target/glen"|"glen-$target/LICENSE"|"glen-$target/THIRD-PARTY-LICENSES") ;;
             *) fail "unexpected archive entry $entry" ;;
         esac
     done < "$tmp/entries"
