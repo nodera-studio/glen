@@ -112,6 +112,11 @@ fn run() -> io::Result<u8> {
                     return Ok(64);
                 }
             }
+            "--thinking" => {
+                if iter.next().is_none() {
+                    return Ok(64);
+                }
+            }
             "--resume" => match iter.next() {
                 Some(p) => resume = Some(p.clone()),
                 None => return Ok(64),

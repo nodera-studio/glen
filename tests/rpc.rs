@@ -432,6 +432,37 @@ fn w9_send_passes_profile_and_config_overlay_env() {
     assert_eq!(start["env"]["PI_CONFIG_FILES"], "/abs/policy.yml");
 }
 #[test]
+fn w9_send_passes_thinking_flag() {
+    for thinking in [None, Some("medium"), Some("high")] {
+        let b = RpcBox::new();
+        let cwd = b.omp.alpha();
+        let mut args = vec![
+            "send",
+            "@new",
+            "hi",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+        ];
+        if let Some(level) = thinking {
+            args.extend(["--thinking", level]);
+        }
+        let o = b.glen(&args).output().unwrap();
+        let v = envelope(&o, 0);
+        b.wait_worker_gone(&job_id(&v));
+        let start = b
+            .fake_log()
+            .into_iter()
+            .find(|v| v["event"] == "start")
+            .unwrap();
+        let expected = match thinking {
+            None => json!(["--mode", "rpc", "--no-ui"]),
+            Some(level) => json!(["--mode", "rpc", "--no-ui", "--thinking", level]),
+        };
+        assert_eq!(start["argv"], expected);
+    }
+}
+#[test]
 fn ac210_bad_reply_args_are_tool_errors() {
     let b = RpcBox::new();
     let v = send(&b, "bad_reply", &[], 0);

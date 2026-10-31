@@ -202,6 +202,12 @@ pub struct SendArgs {
         help = "with @new: the new session’s directory; with @latest: the project to pick from"
     )]
     pub cwd: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        help = "omp's startup reasoning effort for the spawned process (e.g. off, low, medium, high); passed through unchanged, omp validates it"
+    )]
+    pub thinking: Option<String>,
 }
 impl SendArgs {
     pub fn deliver(&self) -> DeliverAs {

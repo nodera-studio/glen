@@ -73,6 +73,9 @@ pub fn omp_command(job: &Job) -> Command {
             .env_remove("OMP_PROFILE")
             .env_remove("PI_PROFILE");
     }
+    if let Some(t) = &job.thinking_flag {
+        c.args(["--thinking", t]);
+    }
     if job.route == Route::Rpc
         && let Some(file) = &job.session_file
     {

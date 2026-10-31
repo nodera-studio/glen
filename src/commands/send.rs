@@ -239,6 +239,12 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             .as_deref()
             .map(str::trim)
             .map(str::to_owned),
+        thinking_flag: args
+            .thinking
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned),
         owners_dir: paths.session_owners_dir,
         job_timeout_ms: timeout.as_millis() as u64,
         deadline_at: deadline.to_string(),

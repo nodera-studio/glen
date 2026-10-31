@@ -86,6 +86,8 @@ pub struct Job {
     pub live_pid: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_flag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_flag: Option<String>,
     pub owners_dir: PathBuf,
     pub job_timeout_ms: u64,
     pub deadline_at: String,
@@ -465,6 +467,7 @@ pub(crate) mod tests {
             live_socket: None,
             live_pid: None,
             profile_flag: None,
+            thinking_flag: None,
             owners_dir: "/fixture/owners".into(),
             job_timeout_ms: 30000,
             deadline_at: jiff::Timestamp::now().to_string(),

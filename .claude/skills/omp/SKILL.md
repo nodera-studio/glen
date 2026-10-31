@@ -19,9 +19,15 @@ the `glen-harness` profile. It has no supervisor or plan-judge role.
 The owner runs `omp --profile glen-harness login cursor`, then
 `.claude/scripts/omp-profile-setup.sh`, then `.claude/scripts/omp-profile-setup.sh --check`.
 Cursor login detection and the predicted `mcp__mnemosyne_memory_*` tool names await
-the owner's live login. Setup prefers `cursor/gemini-4-argon`, falling back to
-`cursor/gemini-3.8-flash` from the live Cursor model list. `--model cursor/<id>` selects
-another model and requires that exact id; it does not use the fallback.
+the owner's live login. Setup picks the first id present in the live Cursor model list from
+an ordered ladder, each entry with its own startup thinking level: `cursor/gemini-4-argon`
+at medium, then `cursor/gemini-3.8-flash` at medium, then `cursor/grok-4.7` at high. It writes
+the chosen id to `modelRoles.default` and passes the matching thinking level on every
+dispatch (there is no profile-level thinking default in omp 18.14.0, only per-level token
+budgets, so the engine passes `--thinking <level>` on each `glen send`, mirrored in
+`omp-engine.sh`'s own `MODEL_LADDER`/`THINKING_LADDER`). If none of the three ids is present,
+omp is unavailable, with a reason naming all three. `--model cursor/<id>` selects another
+model and requires that exact id; it does not use the ladder or its thinking level.
 
 ## How to invoke
 

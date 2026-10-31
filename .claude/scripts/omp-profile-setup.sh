@@ -4,8 +4,11 @@
 set -euo pipefail
 
 PROFILE=glen-harness
-DEFAULT_MODEL_PREFERENCE=(cursor/gemini-4-argon cursor/gemini-3.8-flash)
+# Ordered ladder: each model's own default thinking level, picked together.
+DEFAULT_MODEL_PREFERENCE=(cursor/gemini-4-argon cursor/gemini-3.8-flash cursor/grok-4.7)
+DEFAULT_THINKING_PREFERENCE=(medium medium high)
 MODEL="${DEFAULT_MODEL_PREFERENCE[0]}"
+THINKING="${DEFAULT_THINKING_PREFERENCE[0]}"
 EXPLICIT_MODEL=0
 CHECK=0
 DRY_RUN=0
@@ -218,15 +221,21 @@ model_available() {
 if [ "$LOGIN" -eq 1 ]; then
   if [ "$EXPLICIT_MODEL" -eq 0 ]; then
     MODEL=''
+    ladder_index=0
     for candidate in "${DEFAULT_MODEL_PREFERENCE[@]}"; do
-      if model_available "$candidate"; then MODEL="$candidate"; break; fi
+      if model_available "$candidate"; then
+        MODEL="$candidate"
+        THINKING="${DEFAULT_THINKING_PREFERENCE[$ladder_index]}"
+        break
+      fi
+      ladder_index=$((ladder_index + 1))
     done
     if [ -z "$MODEL" ]; then
-      say "ERROR: neither preferred model ${DEFAULT_MODEL_PREFERENCE[0]} nor ${DEFAULT_MODEL_PREFERENCE[1]} is listed. Available ids:" >&2
+      say "ERROR: none of the preferred models (${DEFAULT_MODEL_PREFERENCE[*]}) is listed. Available ids:" >&2
       printf '%s' "$MODELS" | jq -r '.models[] | .selector // (.provider + "/" + .id)' >&2
       exit 1
     fi
-    [ "$CHECK" -eq 1 ] || say "chose $MODEL from preference list"
+    [ "$CHECK" -eq 1 ] || say "chose $MODEL from preference list, thinking $THINKING"
   elif ! model_available "$MODEL"; then
     MODEL_OK=0
     say "ERROR: model $MODEL is not listed. Available ids:" >&2

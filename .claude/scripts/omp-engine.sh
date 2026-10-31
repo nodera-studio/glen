@@ -9,9 +9,25 @@ exec 3>&1
 MODE="${1:-}"
 [ "$#" -eq 0 ] || shift
 PROFILE=glen-harness
+# Mirrors omp-profile-setup.sh's ladder: each model's own thinking level, kept
+# in sync there. The engine never writes config; it only maps the resolved
+# modelRoles.default back to the level setup chose when it selected that id.
+MODEL_LADDER=(cursor/gemini-4-argon cursor/gemini-3.8-flash cursor/grok-4.7)
+THINKING_LADDER=(medium medium high)
+thinking_level_for() {
+  local model="$1" i=0
+  while [ "$i" -lt "${#MODEL_LADDER[@]}" ]; do
+    if [ "${MODEL_LADDER[$i]}" = "$model" ]; then
+      printf '%s\n' "${THINKING_LADDER[$i]}"
+      return 0
+    fi
+    i=$((i + 1))
+  done
+  printf '%s\n' "${THINKING_LADDER[0]}"
+}
 START="$(date +%s)"
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
-MODEL='' PROVIDER='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
+MODEL='' THINKING_LEVEL='' PROVIDER='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
 RUN_DIR='' RUN_GLEN_HOME='' POLICY_PATH='' JOB='' SESSION_HANDLE='' SESSION_PATH=''
 OUT='' PROBE_DIR='' ENVELOPE='' TREE='' ROOT='' MOVED='[]' REPLIES=0 KEEP=0
 OUTPUT_READY=0 JOB_ACTIVE=0 JOB_TIMEOUT_SECONDS=0
@@ -360,6 +376,7 @@ probe_checks() {
   [ "$rc" -eq 0 ] || stop skipped 'modelRoles.default config check failed' 3
   MODEL="$(printf '%s' "$value" | jq -er '.value.default | select(type == "string" and length > 0)')" || \
     stop skipped 'modelRoles.default config check failed' 3
+  THINKING_LEVEL="$(thinking_level_for "$MODEL")"
   STATUS=ready REASON='' EXIT_CODE=0
 }
 
@@ -613,7 +630,7 @@ while :; do
   # Re-check immediately before every new omp cwd use, including capacity retry.
   validate_snapshot_ancestors "$TREE"
   JOB_ACTIVE=1
-  if dispatch_env "$GLEN_BIN" --profile "$PROFILE" send @new - --cwd "$TREE" --wait 30s --json \
+  if dispatch_env "$GLEN_BIN" --profile "$PROFILE" send @new - --cwd "$TREE" --thinking "$THINKING_LEVEL" --wait 30s --json \
     < "$RUN_DIR/prompt.md" > "$RUN_DIR/response.raw"; then RC=0; else RC="$?"; fi
   load_envelope || stop failed 'invalid glen envelope' 4
   while [ "$RC" -eq 10 ] || [ "$RC" -eq 130 ]; do
