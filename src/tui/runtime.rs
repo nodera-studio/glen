@@ -284,6 +284,15 @@ fn start_input(ctx: &Ctx) -> Result<(), GlenError> {
     let reader = thread::Builder::new()
         .name("watch-input".into())
         .spawn(move || {
+            // Test knob: a reader thread scheduled late, as under heavy load (debug builds only).
+            #[cfg(debug_assertions)]
+            if let Some(ms) = ctx
+                .env
+                .get("GLEN_WATCH_TEST_INPUT_DELAY_MS")
+                .and_then(|v| v.parse().ok())
+            {
+                thread::sleep(Duration::from_millis(ms));
+            }
             while !ctx.stopped() {
                 let result = event::poll(Duration::from_millis(50)).and_then(|ready| {
                     if ready {
@@ -512,7 +521,7 @@ fn submit(
     if ctx.stopped() {
         return Err(cancelled());
     }
-    send::submit(&ctx.cli, &ctx.env, Some(&opened), cwd, text, mode)
+    send::submit(&ctx.cli, &ctx.env, Some(&opened), cwd, text, mode, None)
 }
 fn reap(tasks: &mut Vec<JoinHandle<()>>) -> Result<(), GlenError> {
     let mut index = 0;
@@ -712,6 +721,10 @@ pub(crate) fn run(
         let mut terminal =
             Terminal::new(backend).map_err(|e| io_error("initialise terminal", e))?;
         let result = (|| {
+            // crossterm registers its SIGWINCH handler when its event source first polls. Do
+            // that here, before event_loop reads the size, not on the input thread: a resize
+            // that landed before that thread ran was lost, and the old layout stayed (F11).
+            event::poll(Duration::ZERO).map_err(|e| io_error("read terminal input", e))?;
             start_input(&ctx)?;
             effects.execute(Cmd::Refresh)?;
             #[cfg(debug_assertions)]
@@ -1191,26 +1204,48 @@ mod tests {
     }
     #[test]
     fn action_deadline_is_shared_and_readers_are_not_part_of_the_join_set() {
+        // Workers hold until the test drops their gates, so none can finish before
+        // finish_tasks returns unless it joins them (then each waits out the 30 s timeout).
         let (tx, rx) = mpsc::channel();
+        let mut gates = Vec::new();
         let mut tasks = (0..3)
             .map(|_| {
+                let (gate, held) = mpsc::channel::<()>();
+                gates.push(gate);
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(100));
+                    let _ = held.recv_timeout(Duration::from_secs(30));
                     tx.send(()).unwrap();
                 })
             })
             .collect::<Vec<_>>();
+        // Scheduling allowance: the most a loaded CI runner may add in wake-up latency to
+        // finish_tasks' own wait. Far below the 30 s a joined, gated worker would take and
+        // below the 6 s production bound, so either regression still fails.
+        const SCHEDULING_ALLOWANCE: Duration = Duration::from_secs(1);
+        let bound = Duration::from_millis(5);
         let start = Instant::now();
-        finish_tasks(&mut tasks, Duration::from_millis(5)).unwrap();
-        assert!(start.elapsed() < Duration::from_millis(50));
+        finish_tasks(&mut tasks, bound).unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= bound);
+        assert!(
+            elapsed < bound + SCHEDULING_ALLOWANCE,
+            "finish_tasks overran its {bound:?} bound: {elapsed:?}"
+        );
         assert!(tasks.is_empty());
+        assert!(rx.try_recv().is_err());
+        drop(gates);
         for _ in 0..3 {
-            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
+        // An empty set returns at once, whatever the bound: only scheduling latency counts.
         let start = Instant::now();
         finish_tasks(&mut vec![], Duration::from_secs(6)).unwrap();
-        assert!(start.elapsed() < Duration::from_millis(50));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SCHEDULING_ALLOWANCE,
+            "an empty set waited {elapsed:?}"
+        );
     }
     #[cfg(debug_assertions)]
     #[test]

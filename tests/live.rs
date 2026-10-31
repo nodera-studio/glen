@@ -1,7 +1,7 @@
 mod common;
 #[path = "support/fake_ext.rs"]
 mod fake_ext_peer;
-use common::{A_ID, LiveBox, data, json, poll};
+use common::{A_ID, LiveBox, data, json, poll, write_control};
 use glen::{
     glen_home::GlenHome,
     jobs::Deliver,
@@ -43,6 +43,163 @@ fn wait_failed(b: &LiveBox, o: &std::process::Output) {
     let id = v["error"]["details"]["job"]["id"].as_str().unwrap();
     b.rpc.wait_worker_gone(id);
 }
+/// Before the blocking-accept fix this fails deterministically on macOS: the peer
+/// reads WouldBlock and closes, then the delayed client gets EPIPE. Linux passes either way.
+#[test]
+fn fake_ext_answers_a_request_sent_after_a_delay() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixStream;
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let registry = match live::registry::read(&home(&b), A_ID) {
+        live::registry::Read::Ok(registry) => registry,
+        _ => panic!("registry missing"),
+    };
+    let mut stream = UnixStream::connect(&registry.socket).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    writeln!(
+        stream,
+        "{}",
+        Op::Hello {
+            client_version: "test".into()
+        }
+        .request("delayed")
+    )
+    .unwrap();
+    let mut line = String::new();
+    BufReader::new(stream).read_line(&mut line).unwrap();
+    let response: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(response["id"], "delayed");
+    assert_eq!(response["ok"], true);
+}
+
+/// The peer consumes exactly 4 KiB, so the >=1 MiB request cannot finish writing.
+/// It learns the id from the envelope prefix without consuming the large args.
+fn partial_request_peer(
+    path: &std::path::Path,
+    reply: &'static str,
+) -> std::thread::JoinHandle<()> {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixListener;
+    let listener = UnixListener::bind(path).unwrap();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut prefix = [0; 4096];
+        stream.read_exact(&mut prefix).unwrap();
+        assert!(prefix.starts_with(b"{\"id\":"));
+        let id = serde_json::Deserializer::from_slice(&prefix[6..])
+            .into_iter::<String>()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(id.len() < 400);
+        if reply == "response" {
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"v":1,"id":id,"ok":true,"data":{"answer":42}})
+            )
+            .unwrap();
+        }
+        if reply != "none" {
+            writeln!(stream, "{}", serde_json::json!({"v":1,"id":id,"event":"error","error":{"code":"bad_request","message":"peer rejected the request"}})).unwrap();
+        }
+        // Drop with the rest of the request unread; never accept or read a retry.
+    })
+}
+
+#[test]
+fn live_client_drains_a_reply_after_a_partial_request_write() {
+    use client::ClientError;
+    use std::sync::{Arc, atomic::AtomicBool};
+    for route in ["unary", "unary_for", "open_send"] {
+        for reply in ["response", "event", "none"] {
+            let tmp = tempfile::Builder::new()
+                .prefix("gdrain-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path = tmp.path().join("s");
+            let peer = partial_request_peer(&path, reply);
+            let args = SendArgs {
+                text: "x".repeat(1024 * 1024),
+                deliver_as: Deliver::Auto,
+                job_id: None,
+                expect_session_id: Some(A_ID.into()),
+            };
+            if route == "open_send" {
+                let result = client::open_send(&path, "quoted\"\\id", args, &|| false);
+                if reply == "none" {
+                    assert!(
+                        matches!(result, Err(ClientError::Protocol(ref message)) if message == "endpoint closed the connection before reading the request")
+                    );
+                } else {
+                    let conn = result.unwrap();
+                    if reply == "response" {
+                        let first = conn
+                            .rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap()
+                            .unwrap();
+                        assert!(
+                            matches!(first, Frame::Response { id: Some(ref id), ok: true, ref data, .. } if id == "quoted\"\\id" && data["answer"] == 42)
+                        );
+                    }
+                    // Also verifies draining the first line did not discard the next frame.
+                    let event = conn
+                        .rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap()
+                        .unwrap();
+                    assert!(
+                        matches!(event, Frame::Event { id: Some(ref id), ref kind, ref body } if id == "quoted\"\\id" && kind == "error" && body["error"]["code"] == "bad_request")
+                    );
+                    assert!(
+                        conn.rx
+                            .recv_timeout(Duration::from_secs(10))
+                            .unwrap()
+                            .is_err()
+                    );
+                }
+            } else {
+                let op = Op::Send(args);
+                let result = if route == "unary" {
+                    client::unary(&path, &op, Duration::from_secs(10))
+                } else {
+                    client::unary_for(
+                        &path,
+                        &op,
+                        A_ID,
+                        Duration::from_secs(10),
+                        Arc::new(AtomicBool::new(false)),
+                    )
+                };
+                match reply {
+                    "response" => assert_eq!(result.unwrap()["answer"], 42),
+                    "event" => assert!(
+                        matches!(result, Err(ClientError::Protocol(ref message)) if message == "unexpected response id or event")
+                    ),
+                    _ => assert!(
+                        matches!(result, Err(ClientError::Protocol(ref message)) if message == "endpoint closed the connection before reading the request")
+                    ),
+                }
+            }
+            peer.join().unwrap();
+        }
+    }
+}
+
 #[test]
 fn fake_ext_protocol_table() {
     for scenario in [
@@ -76,7 +233,12 @@ fn fake_ext_protocol_table() {
             glen::live::registry::Read::Ok(r) => r,
             _ => panic!("registry missing"),
         };
-        let hello = client::hello(&r.socket, Duration::from_millis(200));
+        let timeout = if scenario == "hang" {
+            Duration::from_millis(200)
+        } else {
+            Duration::from_secs(10)
+        };
+        let hello = client::hello(&r.socket, timeout);
         if scenario == "hang" {
             assert!(matches!(hello, Err(client::ClientError::Timeout)));
             continue;
@@ -86,8 +248,8 @@ fn fake_ext_protocol_table() {
             continue;
         }
         assert!(hello.is_ok());
-        assert!(client::state(&r.socket, Duration::from_secs(1)).is_ok());
-        let err = client::unary(&r.socket, &Op::Abort, Duration::from_secs(1)).unwrap_err();
+        assert!(client::state(&r.socket, Duration::from_secs(10)).is_ok());
+        let err = client::unary(&r.socket, &Op::Abort, Duration::from_secs(10)).unwrap_err();
         match err {
             client::ClientError::Refused(e) => {
                 assert_eq!(e.code, "unsupported_op");
@@ -116,14 +278,14 @@ fn fake_ext_protocol_table() {
         }
         let first = conn
             .rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(Duration::from_secs(10))
             .unwrap()
             .unwrap();
         assert!(matches!(first, Frame::Response { .. }));
         if matches!(scenario, "no_send" | "rekey" | "never_settles" | "queued") {
             continue;
         }
-        let end = Instant::now() + Duration::from_secs(2);
+        let end = Instant::now() + Duration::from_secs(10);
         loop {
             let f = conn
                 .rx
@@ -131,7 +293,11 @@ fn fake_ext_protocol_table() {
                 .unwrap();
             match f {
                 Ok(Frame::Event { kind, .. }) if kind == "settled" || kind == "error" => break,
-                Err(_) => break,
+                Err(error) if matches!(scenario, "malformed" | "crash") => {
+                    assert!(!error.is_empty());
+                    break;
+                }
+                Err(error) => panic!("{scenario}: missing terminal event: {error}"),
                 _ => (),
             }
         }
@@ -401,9 +567,8 @@ fn ac317_foreground_wait_control_and_cancellation() {
     let d = json(&o)["data"].clone();
     let id = job_id(&d);
     let dir = b.rpc.job_dir(id).join("control");
-    fs::create_dir_all(&dir).unwrap();
     let start = Instant::now();
-    fs::write(dir.join("abort.json"), r#"{"v":1,"op":"abort"}"#).unwrap();
+    write_control(&dir, "abort.json", r#"{"v":1,"op":"abort"}"#);
     let result: Value = poll(Duration::from_millis(1500), || {
         fs::read(dir.join("abort.done.json"))
             .ok()
@@ -426,7 +591,7 @@ fn ac317_foreground_wait_control_and_cancellation() {
     assert!(start.elapsed() < Duration::from_secs(2));
     let v = json(&o);
     let id = job_id(&v["data"]);
-    let status = poll(Duration::from_secs(3), || {
+    let status = poll(Duration::from_secs(10), || {
         let s = b.rpc.job(id).1;
         (s["status"] == "accepted").then_some(s)
     });
@@ -498,6 +663,36 @@ fn ac323_version_mismatch_warns() {
     b.rpc.wait_worker_gone(job_id(&v["data"]));
 }
 #[test]
+fn w9_thinking_flag_on_live_route_warns_ignored() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = send(&b, &["--thinking", "high"]);
+    assert!(o.status.success());
+    let v = json(&o);
+    assert_eq!(v["warnings"][0]["code"], "ignored_flag");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("--thinking"));
+    assert!(message.contains("glen thinking "));
+    assert!(message.contains(" high` instead"));
+    assert!(!message.contains("<handle>"));
+    assert!(!message.contains("/effort"));
+    b.rpc.wait_worker_gone(job_id(&v["data"]));
+}
+#[test]
+fn w9_thinking_auto_on_live_route_never_suggests_auto() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = send(&b, &["--thinking", "auto"]);
+    assert!(o.status.success());
+    let v = json(&o);
+    assert_eq!(v["warnings"][0]["code"], "ignored_flag");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("`auto` cannot be set on a running session"));
+    assert!(message.contains("<level>` with an explicit level"));
+    assert!(!message.contains(" auto` instead"));
+    b.rpc.wait_worker_gone(job_id(&v["data"]));
+}
+#[test]
 fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
     let mut b = LiveBox::new();
     let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";
@@ -538,7 +733,7 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
         b.rpc.wait_worker_gone(job_id(&d));
     }
     assert!(matches!(
-        live::route::find(&home(&b), id, Duration::from_secs(1)),
+        live::route::find(&home(&b), id, Duration::from_secs(10)),
         Endpoint::Live { .. }
     ));
 }
@@ -578,11 +773,11 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
         }
     });
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap()["event"],
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
         "session"
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap()["code"],
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["code"],
         "not_yet_persisted"
     );
     assert!(child.try_wait().unwrap().is_none());
@@ -592,7 +787,7 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
     )
     .unwrap();
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap()["event"],
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
         "end"
     );
     assert_eq!(child.wait().unwrap().code(), Some(130));

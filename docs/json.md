@@ -7,13 +7,14 @@ not the prose of diagnostic messages. `tests/json_contract.rs` compares these sh
 ## Modes and streams
 
 A TTY gets human output; other stdout gets compact JSON. `--json` and `--human` override this choice.
-Explicit JSON on a TTY is pretty printed. JSON stdout contains the result and stderr is empty.
+Explicit JSON on a TTY is pretty printed. JSON stdout contains the result and stderr is empty, with one
+exception: a deferred `inbox` cursor write that fails after its envelope was printed (see `glen inbox`).
 `--help` and `--version` always print text. `completions` defaults to raw shell script, including on a pipe;
 add `--json` for its envelope. Its errors without `--json` go to stderr as human text.
 
 Success is `{"v":1,"ok":true,"data":{…}}`. Errors are `{"v":1,"ok":false,"error":{"code":"…","message":"…"}}`.
 Error `hint` and `details` are optional. Optional top-level `warnings` is an array of `{code,message}`.
-`ok:true` applies to exits 0, 10, 11 and 130. A spilled success replaces `data` with
+`ok:true` applies to exits 0, 10, 11 and 130, except that same deferred `inbox` failure. A spilled success replaces `data` with
 `spilled:{path,bytes,format}`: open that absolute path to read the full envelope (0600, exact byte count).
 `GLEN_MAX_OUTPUT` defaults to 24000 bytes on a non-TTY; 0 disables spilling. Streams never spill.
 
@@ -402,6 +403,16 @@ The tail item example is a shape catalogue: one example per item kind (and per a
 ## `glen send`
 
 Send once. Exits 10 and 130 leave the job running; never resend to poll. Use `wait`.
+`--thinking <LEVEL>` passes omp's startup reasoning effort (off, minimal, low, medium, high,
+xhigh, max, auto) through to the spawned omp process; glen rejects any other value as a usage
+error (exit 2) before it ever reaches omp. It is ignored with an `ignored_flag` warning on the
+live route (the session is already running); the warning names the real handle and level for
+`glen thinking <handle> <level>`, and for `auto`, which `glen thinking` does not take, asks for an
+explicit level instead. omp 18.14.0 persists a default thinking level as
+a `<model-id>:<level>` suffix on `modelRoles.default` (honoured by omp itself); the harness's
+`omp-profile-setup.sh` writes that suffix for its model ladder, and `omp-engine.sh` repeats
+exactly that suffix as `--thinking` on every dispatch, as belt and braces on top of it, and
+passes no `--thinking` when the persisted value has none.
 
 | Field | Meaning |
 |---|---|
@@ -647,10 +658,22 @@ List jobs, newest first. Absent glen home gives an empty list without creating i
 Replies omp sent with `glen_reply`, oldest first. Reading marks them read unless `--peek`; `--all` includes read ones.
 Missing glen home or inbox gives an empty list without creating it. `-f` streams NDJSON `message` events.
 
+Marking read writes a cursor under GLEN_HOME after the envelope is on stdout. glen first checks, before printing
+anything, that it can write that cursor. When it cannot, the call prints only the error envelope and leaves every
+message unread: inside Codex's sandbox (`CODEX_SANDBOX` or `CODEX_SANDBOX_NETWORK_DISABLED=1`) that is exit 6
+`no_route` with `details.reason:"sandboxed"` and `details.glen_home_writable:false`, otherwise exit 1 `io`.
+A write that still fails after the check (the disk fills, a permission changes in between) cannot replace the
+envelope already printed: the call exits with that error's own code (6 or 1) and writes `glen: <message>` to stderr,
+so `ok:true` with a non-zero exit means the cursors did not move and the messages will come back.
+
+With `--cwd`, only replies of sessions in that project are returned and marked read. A reply that no session or
+registry places in any project (an orphan) is left out and stays unread; `-f` streams it once its session appears
+in the project.
+
 | Field | Meaning |
 |---|---|
 | `total` | messages returned |
-| `marked_read` | true when this call advanced the read cursors |
+| `marked_read` | true when this call moved at least one read cursor, including past malformed lines only (then `total` can be 0); false with `--peek` and when no cursor moved |
 | `skipped_lines` | malformed inbox lines skipped |
 | `messages` | reply records plus session_handle and job_handle (null without a job) |
 
@@ -871,7 +894,9 @@ Help and version are text in every output mode, with no JSON envelope.
 ## Error details
 
 Usage errors may include clap diagnostics in details. Not-found errors supply a hint. Ambiguous errors include
-`details.candidates`. Job failure has `details:{status,job,error,forked}`. A held lease has a hint without details.
+`details.candidates`. Job failure has `details:{status,job,error,forked}`. Every exit-6 `no_route` envelope
+includes a string `details.reason`; worker-side refusals also copy it beside `status`, `job`, `error` and `forked`.
+Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`, `endpoint_gone`, `endpoint_appeared`, `rpc_job_running`, `sandboxed`, `extension_outdated`, `unknown` (a legacy job record persisted before this list existed; wait normalises it, never a missing reason).
 Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permission-denied glen-home write adds
 `glen_home_writable:false` and a hint naming `$TMPDIR` and writable_roots. Doctor failures embed data in
 `details.report`. Install-skill filesystem failures include `details.done` (targets processed before failure).
@@ -898,6 +923,24 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
     "code": "not_found",
     "hint": "run `glen ls --all`",
     "message": "no omp session matches `fffffff`"
+  },
+  "ok": false,
+  "v": 1
+}
+```
+
+With `--cwd`, session handles, ids and prefixes are resolved within that directory's project bucket.
+A match found only in another project is `not_found` (exit 3) with `details.reason:"outside_cwd"`
+and the absolute scope directory. File paths bypass project filtering and remain relative to the process cwd.
+
+<!-- contract: error.not_found.outside_cwd -->
+```json
+{
+  "error": {
+    "code": "not_found",
+    "details": {"reason": "outside_cwd", "cwd": "/home/fixture/work/beta"},
+    "hint": "it is in /home/fixture/work/alpha; drop --cwd or run `glen ls --all`",
+    "message": "`e27c0de` is not a session in /home/fixture/work/beta"
   },
   "ok": false,
   "v": 1
@@ -972,6 +1015,7 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 {
   "error": {
     "code": "no_route",
+    "details": {"reason": "live_owner"},
     "hint": "run `glen install-extension`, then restart that omp session",
     "message": "session e27c0de is open in another omp process"
   },
@@ -979,6 +1023,9 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
   "v": 1
 }
 ```
+
+On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to resume an existing session adds
+`"lease": "unknown"` to these details, whichever sandbox check refused first; `@new` never carries it.
 
 <!-- contract: error.no_route.sandboxed -->
 ```json
@@ -1108,6 +1155,8 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 | `extension_newer`, `extension_modified`, `extension_foreign` | install-extension | file skipped unless --force |
 | `extension_dir_not_empty` | install-extension | removed file, retained nonempty glen directory |
 | `changed_during_install` | install-extension | extension file or directory changed during install; skipped |
+| `replace_not_atomic` | install-extension, install-skill | the filesystem has no atomic exchange; the file was replaced with a plain rename, so a concurrent change in that window may have been overwritten |
+| `outside_cwd` | inbox | with --cwd and --session, every matching inbox session is outside that project; nothing returned (not -f) |
 
 New visible commands and visible aliases must add a section and contract runner in their own wave.
 

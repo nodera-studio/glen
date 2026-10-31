@@ -14,6 +14,8 @@
 //!   `docs/json.md`): agent. The acceptance modes (AC-414…AC-418, AC-420, AC-421) need real omp.
 //! - W5 (`.claude/plans/v010-wave-5-watch.md`, AC-501…AC-526 and the reference-study amendments;
 //!   §A3, §A9–§A11, §A15): watch, on a pseudo-terminal with a VT emulator.
+//! - W10 (`.claude/plans/v010-wave-10-tech-debt.md`, AC-1001…AC-1029, the orchestrator decisions
+//!   and fix cycle 1): w10. The bwrap-only ACs live in `tests/linux_sandbox.rs`.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!
@@ -73,6 +75,8 @@ mod show;
 mod state;
 #[path = "conformance/tail.rs"]
 mod tail;
+#[path = "conformance/w10.rs"]
+mod w10;
 #[path = "conformance/w3_surface.rs"]
 mod w3_surface;
 #[path = "conformance/watch.rs"]

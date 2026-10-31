@@ -7,7 +7,8 @@ model: inherit
 
 Run the lean dual-engine code-review gate as a standalone pass — the same gate
 `/implement` runs at Step 13, but on demand against the current working changes.
-This is intentionally lean (BugBot + CodeRabbit cover the PR); for the
+This is intentionally lean (the omp third engine runs in `/review-implementation` and
+in `/implement`'s triple-engine block); for the
 exhaustive multi-pass audit use `/review-implementation` instead.
 
 Optional scope hint: $ARGUMENTS

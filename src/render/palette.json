@@ -40,8 +40,8 @@
     {
       "name": "accent_2",
       "light": {
-        "hex": "#12A594",
-        "xterm": 36
+        "hex": "#0E7C70",
+        "xterm": 23
       },
       "dark": {
         "hex": "#12A594",

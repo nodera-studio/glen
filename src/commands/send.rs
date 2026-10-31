@@ -1,7 +1,7 @@
 use crate::{
     cli::{Cli, DeliverAs, SendArgs},
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason, Warning},
     glen_home,
     jobs::{Job, JobError, JobId, JobStore, Route, State, lock, wait},
     omp::{
@@ -20,25 +20,19 @@ use std::{
     time::{Duration, Instant},
 };
 pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
-    if args.cwd.is_some() && !matches!(args.session.as_str(), "@new" | "@latest") {
-        return Err(GlenError::new(
-            ErrorCode::Usage,
-            "--cwd only applies to @new and @latest",
-        ));
-    }
     paths::resolve(env, cli.global.profile.as_deref())?;
     let scope = args
         .cwd
         .as_deref()
         .map(|p| paths::absolute(env, &p.to_string_lossy()));
-    let scoped = scope.as_ref().map(|p| env.with_cwd(p));
     let opened = if args.session == "@new" {
         None
     } else {
-        Some(super::open::open_unprobed(
+        Some(super::open::open_unprobed_in(
             cli,
-            scoped.as_ref().unwrap_or(env),
+            env,
             &args.session,
+            scope.as_deref(),
         )?)
     };
     let cwd = send_cwd(opened.as_ref(), scope.as_deref(), env)?;
@@ -73,7 +67,15 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         store,
         mut child,
         created,
-    } = submit(cli, env, opened.as_ref(), cwd, text, args.deliver())?;
+    } = submit(
+        cli,
+        env,
+        opened.as_ref(),
+        cwd,
+        text,
+        args.deliver(),
+        args.thinking.as_deref(),
+    )?;
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
         ctx.mode == Mode::Human && ctx.stderr_tty,
@@ -138,6 +140,7 @@ pub(crate) fn submit(
     cwd: PathBuf,
     text: String,
     deliver: DeliverAs,
+    thinking: Option<&str>,
 ) -> Result<Submitted, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     if text.trim().is_empty() {
@@ -149,7 +152,10 @@ pub(crate) fn submit(
             "message is larger than 512 KiB",
         ));
     }
-    crate::sandbox::refuse_unreachable(env, "send")?;
+    crate::sandbox::refuse_unreachable(env, "send").map_err(|e| match opened {
+        Some(_) => crate::sandbox::with_hidden_lease(env, e),
+        None => e,
+    })?;
     // Inside a sandbox, only the live route can work: @new is always RPC, and an
     // existing session is refused below once no live endpoint answers.
     if opened.is_none() {
@@ -162,7 +168,7 @@ pub(crate) fn submit(
         match crate::live::route::find(&home, &o.session.header.id, crate::live::HELLO_SEND) {
             crate::live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, &o.session.header.id) {
-                    return Err(GlenError::new(ErrorCode::NoRoute,format!("session {} is open in a live omp session and a glen RPC job is still running on it",o.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",o.handle)));
+                    return Err(GlenError::no_route(NoRouteReason::RpcJobRunning,format!("session {} is open in a live omp session and a glen RPC job is still running on it",o.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",o.handle)));
                 }
                 if hello.ext_version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
                     route_warnings.push(Warning{code:"extension_version_mismatch".into(),message:format!("extension version {} differs from glen {}; run `glen install-extension` and restart omp",hello.ext_version.as_deref().unwrap_or("unknown"),env!("CARGO_PKG_VERSION"))});
@@ -186,8 +192,8 @@ pub(crate) fn submit(
                         return Err(err);
                     }
                 }
-                return Err(GlenError::new(
-                    ErrorCode::NoRoute,
+                return Err(GlenError::no_route(
+                    NoRouteReason::UnhealthyEndpoint,
                     format!(
                         "session {} has a glen live endpoint that cannot take messages ({reason})",
                         o.handle
@@ -198,14 +204,20 @@ pub(crate) fn submit(
             _ => (),
         }
         if live.is_none() {
-            crate::sandbox::refuse_rpc(env, "send")?;
+            crate::sandbox::refuse_rpc(env, "send")
+                .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
         }
         if live.is_none() && o.not_yet_persisted {
-            return Err(GlenError::new(
-                ErrorCode::NoRoute,
+            return Err(GlenError::no_route(
+                NoRouteReason::EndpointGone,
                 "the live session has not persisted a transcript and its endpoint went away",
             )
             .with_hint("restart that omp session and run `glen ls`"));
+        }
+        // Before the lock check: a held glen lock would otherwise skip the lease probe and
+        // queue a job the worker could only refuse (W10 fix cycle 2 decision 2).
+        if live.is_none() {
+            crate::sandbox::refuse_hidden_lease(env)?;
         }
         if live.is_none() && !lock::is_held(&home, &o.session.header.id) {
             #[cfg(debug_assertions)]
@@ -242,7 +254,12 @@ pub(crate) fn submit(
                     _ => format!("session {} is open in another omp process", o.handle),
                 };
                 let hint = crate::live::route::lease_held_hint(&paths);
-                return Err(GlenError::new(ErrorCode::NoRoute, message).with_hint(hint));
+                let reason = if matches!(lease, Lease::Held) {
+                    NoRouteReason::LiveOwner
+                } else {
+                    NoRouteReason::UnknownLease
+                };
+                return Err(GlenError::no_route(reason, message).with_hint(hint));
             }
         }
     }
@@ -291,6 +308,10 @@ pub(crate) fn submit(
             .as_deref()
             .map(str::trim)
             .map(str::to_owned),
+        thinking_flag: thinking
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned),
         owners_dir: paths.session_owners_dir,
         job_timeout_ms: timeout.as_millis() as u64,
         deadline_at: deadline.to_string(),
@@ -298,6 +319,25 @@ pub(crate) fn submit(
     let store = JobStore::new(home.clone());
     store.create_for_send(&job, env)?;
     store.prune(now);
+    if live.is_some()
+        && let Some(level) = thinking.map(str::trim).filter(|t| !t.is_empty())
+    {
+        let handle = job.session_handle.as_deref().unwrap_or("<handle>");
+        // `glen thinking` takes explicit levels only; never suggest `auto` to it.
+        let advice = if level == "auto" {
+            format!(
+                "`auto` cannot be set on a running session; run `glen thinking {handle} <level>` with an explicit level instead"
+            )
+        } else {
+            format!("run `glen thinking {handle} {level}` instead")
+        };
+        route_warnings.push(Warning {
+            code: "ignored_flag".into(),
+            message: format!(
+                "--thinking has no effect on the live route (the session is already running); {advice}"
+            ),
+        });
+    }
     route_warnings.extend(warning);
     if !route_warnings.is_empty() {
         let mut s = store.read_status(&id)?;
@@ -386,6 +426,126 @@ mod tests {
             }
         }
     }
+    /// W10 fix cycle 2 decision 2: a hidden lease refuses an RPC resume whether or not a glen
+    /// job lock is held, before the lease probe, the omp lookup and any job write.
+    #[test]
+    fn a_hidden_lease_refuses_rpc_resume_even_while_the_glen_lock_is_held() {
+        let tree = crate::omp::fixtures::tree();
+        let target = crate::omp::fixtures::path(&tree, 'A');
+        let glen = tempfile::tempdir().unwrap();
+        let home = crate::glen_home::GlenHome {
+            root: glen.path().join("glen"),
+        };
+        let agent = tree.path().join("unused-agent");
+        let env = Env::for_test(
+            Some(tree.path()),
+            tree.path(),
+            &[
+                ("GLEN_HOME", home.root.to_str().unwrap()),
+                ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+                // A lookup would fail as omp_unavailable, never sandboxed.
+                ("GLEN_OMP_BIN", "/nonexistent/omp"),
+                ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+            ],
+        );
+        let id = crate::omp::session::Session::load(&target)
+            .unwrap()
+            .header
+            .id;
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        for held in [true, false] {
+            let lock = held.then(|| lock::try_acquire(&home, &id).unwrap().unwrap());
+            let cli =
+                Cli::try_parse_from(["glen", "send", target.to_str().unwrap(), "hi"]).unwrap();
+            let crate::cli::Command::Send(args) = &cli.command else {
+                panic!("send")
+            };
+            let ctx = OutputCtx::new(
+                &cli.global,
+                OutputKind::Document,
+                &env,
+                &Terminal {
+                    stdout_tty: false,
+                    stderr_tty: false,
+                    stdout_cols: None,
+                },
+            )
+            .unwrap();
+            lease::PROBE_CALLS.with(|calls| calls.set(0));
+            let err = match run(&cli, args, &env, &ctx) {
+                Err(e) => e,
+                Ok(_) => panic!("held={held}: unexpected success"),
+            };
+            assert_eq!(err.code, ErrorCode::NoRoute, "held={held}: {}", err.message);
+            let details = err.details.unwrap();
+            assert_eq!(details["reason"], "sandboxed", "held={held}");
+            assert_eq!(details["lease"], "unknown", "held={held}");
+            lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "held={held}"));
+            assert!(!home.root.join("jobs").exists(), "held={held}: no job");
+            drop(lock);
+        }
+        crate::sandbox::force_lease_hidden_for_test(None);
+    }
+    /// W10 fix cycle 3 (Codex P2): `refuse_rpc` (non-empty `CODEX_SANDBOX`) and the
+    /// network-disabled early return (both markers) fire before `refuse_hidden_lease`, and still
+    /// name the hidden lease for an existing session; `@new` resumes nothing and never does.
+    #[test]
+    fn every_sandbox_refusal_of_an_existing_session_names_a_hidden_lease() {
+        let tree = crate::omp::fixtures::tree();
+        let target = crate::omp::fixtures::path(&tree, 'A');
+        let glen = tempfile::tempdir().unwrap();
+        let agent = tree.path().join("unused-agent");
+        let home = glen.path().join("glen");
+        for network in [None, Some("1")] {
+            let mut vars = vec![
+                ("GLEN_HOME", home.to_str().unwrap()),
+                ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+                ("GLEN_OMP_BIN", "/nonexistent/omp"),
+                ("CODEX_SANDBOX", "seatbelt"),
+            ];
+            vars.extend(network.map(|v| ("CODEX_SANDBOX_NETWORK_DISABLED", v)));
+            let env = Env::for_test(Some(tree.path()), tree.path(), &vars);
+            for hidden in [true, false] {
+                crate::sandbox::force_lease_hidden_for_test(Some(hidden));
+                for (to, existing) in [(target.to_str().unwrap(), true), ("@new", false)] {
+                    let cli = Cli::try_parse_from(["glen", "send", to, "hi"]).unwrap();
+                    let crate::cli::Command::Send(args) = &cli.command else {
+                        panic!("send")
+                    };
+                    let ctx = OutputCtx::new(
+                        &cli.global,
+                        OutputKind::Document,
+                        &env,
+                        &Terminal {
+                            stdout_tty: false,
+                            stderr_tty: false,
+                            stdout_cols: None,
+                        },
+                    )
+                    .unwrap();
+                    lease::PROBE_CALLS.with(|calls| calls.set(0));
+                    let case = format!("network={network:?} hidden={hidden} to={to}");
+                    let err = match run(&cli, args, &env, &ctx) {
+                        Err(e) => e,
+                        Ok(_) => panic!("{case}: unexpected success"),
+                    };
+                    assert_eq!(err.code, ErrorCode::NoRoute, "{case}: {}", err.message);
+                    let details = err.details.unwrap();
+                    assert_eq!(details["reason"], "sandboxed", "{case}");
+                    assert_eq!(details["sandbox"], "seatbelt", "{case}");
+                    assert_eq!(details["network"], network.is_none(), "{case}");
+                    assert_eq!(
+                        details.get("lease"),
+                        (hidden && existing).then_some(&serde_json::json!("unknown")),
+                        "{case}: {details}"
+                    );
+                    lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "{case}"));
+                    assert!(!home.join("jobs").exists(), "{case}: no job");
+                }
+            }
+        }
+        crate::sandbox::force_lease_hidden_for_test(None);
+    }
 }
 
 #[cfg(test)]
@@ -409,7 +569,8 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "-"]).unwrap();
         let cwd = send_cwd(None, None, &env).unwrap();
-        let mut submitted = submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp).unwrap();
+        let mut submitted =
+            submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp, None).unwrap();
         // The worker child is this unit-test binary, not a live omp process.
         if submitted.child.try_wait().unwrap().is_none() {
             submitted.child.kill().unwrap();
@@ -430,9 +591,17 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "text"]).unwrap();
         for text in [" \n".to_string(), "x".repeat(rpc::MAX_MESSAGE_BYTES + 1)] {
-            let e = submit(&cli, &env, None, tree.path().into(), text, DeliverAs::Auto)
-                .err()
-                .unwrap();
+            let e = submit(
+                &cli,
+                &env,
+                None,
+                tree.path().into(),
+                text,
+                DeliverAs::Auto,
+                None,
+            )
+            .err()
+            .unwrap();
             assert_eq!(e.code, ErrorCode::Usage);
             assert!(!home.exists());
         }

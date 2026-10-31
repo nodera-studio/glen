@@ -250,12 +250,13 @@ fn ac206_fork_detected() {
 fn ac207_live_owner_refused() {
     let b = RpcBox::new();
     let mut owner = b.hold_lease(A_ID);
-    envelope(
+    let refusal = envelope(
         &b.glen(&["send", "e27c0de", "hi", "--json"])
             .output()
             .unwrap(),
         6,
     );
+    assert_eq!(refusal["error"]["details"]["reason"], "live_owner");
     assert!(!b.omp.glen_home.exists());
     assert!(b.fake_log().is_empty());
     drop(owner.stdin.take());
@@ -270,7 +271,142 @@ fn ac207_worker_probe_before_spawn() {
     drop(lock);
     let out = wait(&b, &v, 6);
     assert_eq!(out["error"]["details"]["error"]["code"], "no_route");
+    assert_eq!(out["error"]["details"]["reason"], "live_owner");
+    assert_eq!(
+        out["error"]["details"]["error"]["details"]["reason"],
+        "live_owner"
+    );
     assert!(b.fake_log().is_empty());
+    drop(owner.stdin.take());
+    owner.wait().unwrap();
+}
+// On Linux the session lease is an abstract socket (src/omp/lease.rs probe_abstract):
+// `bind` never touches the owners directory at all, so corrupting it (this test's technique)
+// has no effect there and the lease probes Free instead of Unknown. Meaningful only for the
+// flock-based probe (macOS and other non-Linux Unix).
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn unreadable_lease_names_unknown_lease_for_send_and_controls() {
+    let b = RpcBox::new();
+    fs::create_dir_all(b.owners().parent().unwrap()).unwrap();
+    fs::write(b.owners(), "not a directory").unwrap();
+    for args in [
+        vec!["send", "e27c0de", "hi", "--json"],
+        vec!["compact", "e27c0de", "--json"],
+    ] {
+        let out = b.glen(&args).output().unwrap();
+        let value = envelope(&out, 6);
+        assert_eq!(value["error"]["details"]["reason"], "unknown_lease");
+    }
+    assert!(b.fake_log().is_empty());
+}
+// The Linux equivalent (W10 fix cycle 2 decision 8), run on every platform: a resolvable
+// session whose id is not a plain lease token makes `lease::probe` return `Lease::Unknown`
+// before any socket or flock, so send and a control reach the CLI's unknown-lease refusal
+// end to end, through an explicit session path.
+#[test]
+fn a_non_token_session_id_names_unknown_lease_for_send_and_controls() {
+    let b = RpcBox::new();
+    let source = b.omp.session('A');
+    let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.copy";
+    assert!(glen::omp::lease::lease_name(id).is_none());
+    let text = fs::read_to_string(&source)
+        .unwrap()
+        .replace("01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de", id);
+    let target = source
+        .parent()
+        .unwrap()
+        .join(format!("2026-10-01T10-00-00-000Z_{id}.jsonl"));
+    fs::write(&target, text).unwrap();
+    let target = target.to_str().unwrap();
+    for args in [
+        vec!["send", target, "hi", "--json"],
+        vec!["compact", target, "--json"],
+    ] {
+        let out = b.glen(&args).output().unwrap();
+        let value = envelope(&out, 6);
+        assert_eq!(value["error"]["code"], "no_route", "{args:?}: {value}");
+        assert_eq!(
+            value["error"]["details"]["reason"], "unknown_lease",
+            "{args:?}: {value}"
+        );
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session id is not a plain token"),
+            "the refusal comes from the lease probe: {value}"
+        );
+    }
+    assert!(!b.omp.glen_home.join("jobs").exists(), "no job was created");
+    assert!(b.fake_log().is_empty(), "omp was never started");
+}
+
+#[test]
+fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
+    let b = RpcBox::new();
+    let gate = b.omp.home.join("reason-probe-release");
+    let mut child = b
+        .glen(&["send", "e27c0de", "hi", "--wait", "30s", "--json"])
+        .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    poll(Duration::from_secs(10), || {
+        gate.with_extension("ready").exists().then_some(())
+    });
+    // The foreground already saw a free glen lock. Holding it now makes its fresh
+    // lease probe queue a job; only the worker can observe the later refusal.
+    let lock = b.hold_glen_lock(A_ID);
+    let mut owner = b.hold_lease(A_ID);
+    fs::write(&gate, "go").unwrap();
+    let id = poll(Duration::from_secs(10), || {
+        fs::read_dir(b.omp.glen_home.join("jobs"))
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                let id = entry.file_name().to_str()?.to_owned();
+                glen::jobs::JobId::parse(&id)?;
+                let status: Value =
+                    serde_json::from_slice(&fs::read(entry.path().join("status.json")).ok()?)
+                        .ok()?;
+                (status["waiting_for_lock"] == true).then_some(id)
+            })
+    });
+    let handle = b.job(&id).0["handle"].as_str().unwrap().to_owned();
+    drop(lock);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("send did not report the worker refusal: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sent = envelope(&child.wait_with_output().unwrap(), 6);
+    let waited = envelope(
+        &b.glen(&["wait", &handle, "--timeout", "10s", "--json"])
+            .output()
+            .unwrap(),
+        6,
+    );
+    for value in [&sent, &waited] {
+        let details = &value["error"]["details"];
+        assert_eq!(details["reason"], "live_owner");
+        assert_eq!(details["status"], "failed");
+        assert_eq!(details["job"]["handle"], handle);
+        assert_eq!(details["error"]["code"], "no_route");
+        assert_eq!(details["error"]["details"]["reason"], "live_owner");
+        assert!(details.get("forked").is_some());
+        assert!(details["forked"].is_null());
+    }
+    b.wait_worker_gone(&id);
+    assert!(
+        b.fake_log().is_empty(),
+        "the refusal must happen before omp resumes"
+    );
     drop(owner.stdin.take());
     owner.wait().unwrap();
 }
@@ -386,12 +522,13 @@ fn ac209_new_session_and_profile() {
         }
     }
     let b = RpcBox::new();
-    envelope(
+    let outside = envelope(
         &b.glen(&["send", "e27c0de", "hi", "--cwd", "/tmp", "--json"])
             .output()
             .unwrap(),
-        2,
+        3,
     );
+    assert_eq!(outside["error"]["details"]["reason"], "outside_cwd");
     envelope(
         &b.glen(&["send", "@new", "hi", "--cwd", "/missing-glen-dir", "--json"])
             .output()
@@ -399,6 +536,68 @@ fn ac209_new_session_and_profile() {
         3,
     );
     assert!(!b.omp.glen_home.exists());
+}
+#[test]
+fn w9_send_passes_profile_and_config_overlay_env() {
+    let b = RpcBox::new();
+    let cwd = b.omp.alpha();
+    let o = b
+        .glen(&[
+            "send",
+            "@new",
+            "hi",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--profile",
+            "glen-harness",
+            "--json",
+        ])
+        .env("PI_CONFIG_FILES", "/abs/policy.yml")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 0);
+    b.wait_worker_gone(&job_id(&v));
+    let start = b
+        .fake_log()
+        .into_iter()
+        .find(|v| v["event"] == "start")
+        .unwrap();
+    assert_eq!(
+        start["argv"],
+        json!(["--mode", "rpc", "--no-ui", "--profile", "glen-harness"])
+    );
+    assert_eq!(start["env"]["PI_CONFIG_FILES"], "/abs/policy.yml");
+}
+#[test]
+fn w9_send_passes_thinking_flag() {
+    for thinking in [None, Some("medium"), Some("high")] {
+        let b = RpcBox::new();
+        let cwd = b.omp.alpha();
+        let mut args = vec![
+            "send",
+            "@new",
+            "hi",
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--json",
+        ];
+        if let Some(level) = thinking {
+            args.extend(["--thinking", level]);
+        }
+        let o = b.glen(&args).output().unwrap();
+        let v = envelope(&o, 0);
+        b.wait_worker_gone(&job_id(&v));
+        let start = b
+            .fake_log()
+            .into_iter()
+            .find(|v| v["event"] == "start")
+            .unwrap();
+        let expected = match thinking {
+            None => json!(["--mode", "rpc", "--no-ui"]),
+            Some(level) => json!(["--mode", "rpc", "--no-ui", "--thinking", level]),
+        };
+        assert_eq!(start["argv"], expected);
+    }
 }
 #[test]
 fn ac210_bad_reply_args_are_tool_errors() {
@@ -1417,4 +1616,49 @@ fn cycle3_stale_state_responses_cannot_revert_reply_identity() {
                 .exists()
         );
     }
+}
+
+#[test]
+fn cwd_resolves_a_handle_in_its_bucket_but_recorded_cwd_still_wins() {
+    let b = RpcBox::new();
+    // These distinct directories encode to the same project bucket (-work-alpha).
+    let scope = b.omp.home.join("work-alpha");
+    fs::create_dir(&scope).unwrap();
+    let file = b.omp.session('A');
+    let original = fs::read_to_string(&file).unwrap();
+    let mut changed = false;
+    let lines = original
+        .lines()
+        .map(|line| {
+            let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if record["type"] == "session" {
+                record["cwd"] = json!(b.omp.alpha());
+                changed = true;
+                record.to_string()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(changed, "fixture must contain a session header");
+    fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+    let out = b
+        .glen(&[
+            "send",
+            "e27c0de",
+            "hi",
+            "--cwd",
+            scope.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let value = envelope(&out, 0);
+    let log = b.fake_log();
+    let started = log.iter().find(|event| event["event"] == "start").unwrap();
+    assert_eq!(started["cwd"], b.omp.alpha().to_str().unwrap());
+    assert_ne!(started["cwd"], scope.to_str().unwrap());
+    b.wait_worker_gone(&job_id(&value));
 }

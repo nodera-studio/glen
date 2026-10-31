@@ -56,8 +56,8 @@ Several agent prompts were written for a TypeScript web monorepo. Apply them to 
   `tests/conformance/`) and runs it with `cargo test --test conformance`.
 - There is no dev stack to start: skip "ensure Docker / the dev stack is running". Manual testing
   is `cargo run -- <args>`.
-- Review engines are Claude and Codex. The CodeRabbit CLI is not installed, so review orchestrators
-  skip the third engine and say so.
+- Review engines are Claude, Codex and omp (third engine: a Cursor model, read-only, via glen and
+  `.claude/scripts/omp-engine.sh`; skipped with a note when `omp-engine.sh probe` fails).
 - The `/implement` re-index step (Role 4) applies only if `code_index_status` with project `glen`
   shows an index; otherwise skip it and say so.
 - The Implementer's deterministic gate is `.claude/scripts/quality-gate.sh` (rustfmt check +
@@ -76,8 +76,9 @@ The full agent index is `.claude/agents/README.md`; commands are listed in
 | Command | Use for |
 | --- | --- |
 | `/plan-implementation` → `/implement` (`/implement-quick` for small changes) | Plan, then build with the Codex Implementer, the Claude ‖ Codex review gate and the conformance tail |
-| `/code-review`, `/review-implementation`, `/respond-to-review` | Review the current diff or branch; answer PR review comments |
-| `/deep-debug` | Root-cause a bug: Claude ‖ Codex investigator, then the adversary |
+| `/code-review`, `/respond-to-review` | Review the current diff; answer PR review comments |
+| `/review-implementation` | Claude ‖ Codex ‖ omp |
+| `/deep-debug` | Claude ‖ Codex investigator (+ optional omp), then the adversary |
 | `/run-ci` | Run the same checks as `.github/workflows/ci.yml` locally |
 | `/goal` + `/auto-mode` | Carry a multi-wave goal to merged completion on `main` |
 | `/explore`, `/research`, `/brainstorm` | Map code, research a topic with Exa, turn an idea into requirements |
@@ -130,6 +131,16 @@ Codex is the second engine for review, debug and audits. Dispatch it only throug
 `block-old-codex` hook blocks `codex exec`. Harness prompts do not pass a Codex model; model
 choice is configured outside the harness (see `AGENTS.md`).
 
+## omp
+
+The third review/debug engine uses profile `glen-harness` on Cursor.
+Sessions are read-only under omp's approval policy plus read containment (`.claude/omp/glen-harness.yml`).
+Configure it with `.claude/scripts/omp-profile-setup.sh`; see `.claude/skills/omp/SKILL.md`.
+Claude Code's `permissions.deny` rules are best-effort typing guardrails, not a security boundary.
+Default-profile protection relies on explicit `--profile glen-harness` in harness scripts,
+setup's fingerprint check, and the OS sandbox.
+Set `GLEN_OMP_ENGINE=off` to skip the engine.
+
 ## Tool routing
 
 The CLI tool table (rg, sd, ast-grep, difft, yq, gron, scc) is in
@@ -146,6 +157,7 @@ The CLI tool table (rg, sd, ast-grep, difft, yq, gron, scc) is in
 | Secrets | Mnemosyne secrets, project `glen` | never echo a value |
 | PRs, CI checks, run logs | `gh`, `/gh` | git stays git |
 | Second opinion, hard bug | `codex:codex-rescue`, `/codex` | never `codex exec` |
+| Third-model review or debug pass | `.claude/skills/omp/SKILL.md` → `.claude/scripts/omp-engine.sh` | never `omp` directly, never the default profile |
 
 ## `.claude/` layout
 

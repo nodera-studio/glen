@@ -8,6 +8,11 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+fn closed_stdout() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
 const A: &str = common::A_ID;
 const B: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e2fffff";
 fn record(id: &str, text: &str, at: &str) -> Value {
@@ -127,16 +132,14 @@ fn ac319_output_failure_keeps_cursor() {
             ),
         );
     }
-    let mut c = b
+    let o = b
         .command(&["inbox", "--json"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stdout(closed_stdout())
+        .output()
         .unwrap();
-    drop(c.stdout.take());
-    let o = c.wait_with_output().unwrap();
-    assert!(!o.status.success());
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty());
     assert!(!b.glen_home.join("inbox/.read").exists());
 }
 #[test]
@@ -203,15 +206,132 @@ fn ac325_rpc_reply_nulls() {
     assert!(r.get("request_id").unwrap().is_null());
 }
 
+/// W8-ERR-1 re-derived this test: an unwritable cursor is now caught before any output, so
+/// the failure is the one JSON error envelope on stdout (stderr stays empty), not `ok:true`
+/// followed by a stderr line.
 #[test]
-fn mark_read_failure_is_reported_on_stderr_and_leaves_messages_unread() {
+fn mark_read_failure_is_an_error_envelope_and_leaves_messages_unread() {
     let b = OmpBox::new();
     append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
     fs::write(b.glen_home.join("inbox/.read"), "blocked").unwrap();
     let o = inbox(&b, &[]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("cannot mark inbox {A} read")));
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let v = common::json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "io");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("cannot mark inbox {A} read")),
+        "{v}"
+    );
     assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 1);
+}
+
+/// W8-ERR-1: inside Codex's sandbox an unwritable GLEN_HOME is exit 6 `sandboxed`, and the
+/// messages stay unread. `.read` does not exist yet, so the probe must catch a read-only
+/// `inbox/` where `mark` would create it.
+#[test]
+fn sandboxed_mark_read_failure_is_exit_six_and_leaves_messages_unread() {
+    if rustix::process::geteuid().is_root() {
+        return; // root ignores the read-only mode this test relies on
+    }
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+    let dir = b.glen_home.join("inbox");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let o = b
+        .command(&["inbox", "--json"], &b.alpha())
+        .env("CODEX_SANDBOX", "seatbelt")
+        .output()
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(6), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let v = common::json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
+    assert!(!dir.join(".read").exists());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no probe file left");
+    let d = data(&inbox(&b, &["--peek"]));
+    assert_eq!(d["total"], 1);
+    assert_eq!(d["messages"][0]["text"], "keep");
+}
+
+/// W8-DOC-7: `marked_read` is true only when a cursor moves; `--all` after everything was
+/// read returns the old messages without moving anything.
+#[test]
+fn marked_read_is_false_when_no_cursor_moves() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "one", "2026-10-30T00:00:00Z"));
+    append(&b, B, &record(B, "two", "2026-10-30T00:00:01Z"));
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(d["marked_read"], true);
+    let cursor = b.glen_home.join("inbox/.read").join(A);
+    let before = fs::read(&cursor).unwrap();
+    let d = data(&inbox(&b, &["--all"]));
+    assert_eq!(d["total"], 2);
+    assert_eq!(d["marked_read"], false);
+    assert_eq!(fs::read(&cursor).unwrap(), before);
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (d["total"].clone(), d["marked_read"].clone()),
+        (j!(0), j!(false))
+    );
+    append(&b, B, &record(B, "three", "2026-10-30T00:00:02Z"));
+    let d = data(&inbox(&b, &["--all"]));
+    assert_eq!(d["total"], 3);
+    assert_eq!(d["marked_read"], true);
+    assert_eq!(data(&inbox(&b, &[]))["total"], 0);
+}
+
+/// NEW-LOW-003 (W10 fix cycle 3): the human footer says "marked read" only when a cursor
+/// moved, like `marked_read`; `--all` of messages already read says so.
+#[test]
+fn human_footer_says_marked_read_only_when_a_cursor_moves() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "one", "2026-10-30T00:00:00Z"));
+    let human = |args: &[&str]| {
+        let mut argv = vec!["inbox", "--human"];
+        argv.extend(args);
+        let o = b.command(&argv, &b.alpha()).output().unwrap();
+        assert!(o.status.success(), "{args:?}");
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert!(human(&[]).contains("1 message · 1 session · marked read"));
+    let again = human(&["--all"]);
+    assert!(
+        again.contains("1 message · 1 session · already read"),
+        "{again}"
+    );
+    assert!(!again.contains("marked read"), "{again}");
+}
+
+/// NEW-LOW-003: a batch of only malformed lines moves the cursor past them, so `marked_read`
+/// is true with `total:0` (docs/json.md), and the lines are not skipped again.
+#[test]
+fn malformed_only_lines_move_the_cursor_and_count_as_marked_read() {
+    let b = OmpBox::new();
+    let p = path(&b, A);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(&p, "{not json\n").unwrap();
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (
+            d["total"].clone(),
+            d["marked_read"].clone(),
+            d["skipped_lines"].clone()
+        ),
+        (j!(0), j!(true), j!(1))
+    );
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (d["marked_read"].clone(), d["skipped_lines"].clone()),
+        (j!(false), j!(0))
+    );
 }
 
 #[test]
@@ -243,32 +363,52 @@ fn footer_counts_only_sessions_with_displayed_messages() {
 
 #[test]
 fn closed_stdout_does_not_mark_inbox_read() {
-    use std::os::unix::process::CommandExt;
     let b = OmpBox::new();
     append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
-    let mut command = b.command(&["inbox", "--json"], &b.alpha());
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let mut pipe = [-1; 2];
-    // SAFETY: pipe points to two valid descriptor slots. Each returned fd gets
-    // exactly one owner; dropping the read end guarantees EPIPE on the writer.
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let read_end = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-    let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    drop(read_end);
-    // SAFETY: dup2 is async-signal-safe. fd 1 stays open across exec, so Rust's
-    // startup sanitizer cannot replace it with /dev/null.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(write_end.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let o = command.output().unwrap();
-    assert_eq!(o.status.code(), Some(1));
+    let o = b
+        .command(&["inbox", "--json"], &b.alpha())
+        .stdout(closed_stdout())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
     assert!(!b.glen_home.join("inbox/.read").exists());
-    assert!(String::from_utf8_lossy(&o.stderr).contains("messages remain unread"));
+    assert!(o.stderr.is_empty());
+}
+
+#[test]
+fn inbox_with_a_closed_stdout_keeps_messages_unread() {
+    for follow in [false, true] {
+        let b = OmpBox::new();
+        append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+        let args = if follow {
+            vec!["inbox", "--json", "-f"]
+        } else {
+            vec!["inbox", "--json"]
+        };
+        let mut child = b
+            .command(&args, &b.alpha())
+            .stdout(closed_stdout())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("inbox did not stop after EPIPE: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{o:?}");
+        assert!(o.stderr.is_empty(), "{o:?}");
+        assert!(!b.glen_home.join("inbox/.read").exists());
+        let remaining = data(&inbox(&b, &["--peek"]));
+        assert_eq!(remaining["total"], 1);
+        assert_eq!(remaining["messages"][0]["text"], "keep");
+        assert!(!b.glen_home.join("inbox/.read").exists());
+    }
 }
 
 #[test]
@@ -284,4 +424,187 @@ fn inbox_rejects_hex_suffixes_shorter_than_four_digits() {
     }
     assert_eq!(data(&inbox(&b, &["--session", "abcd"]))["total"], 0);
     assert!(!b.glen_home.exists());
+}
+
+fn fixture_session_id(b: &OmpBox, key: char) -> String {
+    glen::omp::session::Session::load(&b.session(key))
+        .unwrap()
+        .header
+        .id
+}
+
+#[test]
+fn cwd_inbox_intersects_session_filters_and_leaves_foreign_and_orphan_replies_unread() {
+    let b = OmpBox::new();
+    let beta = fixture_session_id(&b, 'E');
+    let registry_alpha = "registry-alpha";
+    let registry_unknown = "registry-unknown";
+    for (id, text) in [
+        (A, "alpha"),
+        (beta.as_str(), "beta"),
+        (B, "orphan"),
+        (registry_alpha, "live alpha"),
+        (registry_unknown, "unknown project"),
+    ] {
+        append(&b, id, &record(id, text, "2026-10-30T00:00:00Z"));
+    }
+    let home = glen::glen_home::GlenHome {
+        root: b.glen_home.clone(),
+    };
+    fs::create_dir_all(glen::live::run_dir(&home)).unwrap();
+    for (id, cwd) in [(registry_alpha, Some(b.alpha())), (registry_unknown, None)] {
+        fs::write(glen::live::registry::path(&home, id), j!({"v":1,"pid":std::process::id(),"session_id":id,"socket":glen::live::run_dir(&home).join(format!("{id}.sock")),"cwd":cwd}).to_string()).unwrap();
+    }
+    let alpha = b.alpha();
+    let flags = ["--cwd", alpha.to_str().unwrap()];
+    let prefix = inbox(
+        &b,
+        &[
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--session",
+            "01a0f6b1",
+            "--peek",
+        ],
+    );
+    assert_eq!(data(&prefix)["total"], 1);
+    assert_eq!(data(&prefix)["messages"][0]["session_id"], A);
+    let legacy = inbox(
+        &b,
+        &[
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--session",
+            "registr",
+            "--peek",
+        ],
+    );
+    assert_eq!(data(&legacy)["total"], 1);
+    assert_eq!(data(&legacy)["messages"][0]["session_id"], registry_alpha);
+    let selected = data(&inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--peek"]));
+    assert_eq!(selected["total"], 2);
+    assert!(
+        selected["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["session_id"] == A || message["session_id"] == registry_alpha)
+    );
+    assert_eq!(data(&inbox(&b, &flags))["total"], 2);
+    for id in [&beta, B, registry_unknown] {
+        assert!(!b.glen_home.join("inbox/.read").join(id).exists());
+    }
+    let remaining = data(&inbox(&b, &["--peek"]));
+    assert_eq!(remaining["total"], 3);
+    let outside = inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--session", &beta]);
+    assert_eq!(data(&outside)["total"], 0);
+    assert_eq!(common::json(&outside)["warnings"][0]["code"], "outside_cwd");
+    let included = inbox(
+        &b,
+        &[
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--session",
+            A,
+            "--all",
+            "--peek",
+        ],
+    );
+    assert_eq!(data(&included)["total"], 1);
+    assert!(common::json(&included).get("warnings").is_none());
+}
+
+struct ScopedInboxChild(std::process::Child);
+impl Drop for ScopedInboxChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            self.0.kill().unwrap();
+            self.0.wait().unwrap();
+        }
+    }
+}
+
+#[test]
+fn cwd_inbox_follow_discovers_new_sessions_and_reclassifies_an_orphan_within_ten_seconds() {
+    let b = OmpBox::new();
+    let beta = fixture_session_id(&b, 'E');
+    for (id, text) in [(A, "alpha"), (beta.as_str(), "beta"), (B, "orphan")] {
+        append(&b, id, &record(id, text, "2026-10-30T00:00:00Z"));
+    }
+    let mut child = ScopedInboxChild(
+        b.command(
+            &[
+                "inbox",
+                "-f",
+                "--cwd",
+                b.alpha().to_str().unwrap(),
+                "--json",
+            ],
+            &b.alpha(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["message"]["text"],
+        "alpha"
+    );
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_millis(300)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    let new = "00000000-0000-7000-8000-000009876abc";
+    append(&b, new, &record(new, "new alpha", "2026-10-30T00:00:01Z"));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_millis(300)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(!b.glen_home.join("inbox/.read").join(new).exists());
+    fs::write(
+        b.agent
+            .join("sessions/-work-alpha")
+            .join(format!("{new}.jsonl")),
+        format!(
+            "{}\n",
+            j!({"type":"session","version":3,"id":new,"cwd":b.alpha()})
+        ),
+    )
+    .unwrap();
+    let message = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(message["event"], "message");
+    assert_eq!(message["message"]["session_id"], new);
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.0.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
+        "end"
+    );
+    assert_eq!(
+        poll(Duration::from_secs(10), || child.0.try_wait().unwrap()).code(),
+        Some(130)
+    );
+    reader.join().unwrap();
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut err).unwrap();
+    assert!(err.is_empty(), "{err}");
+    assert!(b.glen_home.join("inbox/.read").join(A).exists());
+    assert!(b.glen_home.join("inbox/.read").join(new).exists());
+    assert!(!b.glen_home.join("inbox/.read").join(&beta).exists());
+    assert!(!b.glen_home.join("inbox/.read").join(B).exists());
+    assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 2);
 }

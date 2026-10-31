@@ -108,7 +108,7 @@ pub fn run(
                 },
             )
             .map_err(io)?;
-        if !applied {
+        if matches!(applied, crate::atomic_swap::Applied::Lost) {
             action = "skipped";
             warnings.push(Warning {
                 code: "changed_during_install".into(),
@@ -117,20 +117,31 @@ pub fn run(
                     target.display()
                 ),
             });
-        } else if a.uninstall {
-            match guard.remove_empty_parent(&target) {
-                Ok(true) => (),
-                Ok(false) => warnings.push(Warning {
-                    code: "changed_during_install".into(),
-                    message: format!("kept changed extension directory {}", dir.display()),
-                }),
-                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                    warnings.push(Warning {
-                        code: "extension_dir_not_empty".into(),
-                        message: format!("kept nonempty {}", dir.display()),
-                    })
+        } else {
+            if matches!(applied, crate::atomic_swap::Applied::PublishedNotAtomic) {
+                warnings.push(Warning {
+                    code: "replace_not_atomic".into(),
+                    message: format!(
+                        "the filesystem at {} cannot swap files atomically; a concurrent change during this install may have been overwritten",
+                        dir.display()
+                    ),
+                });
+            }
+            if a.uninstall {
+                match guard.remove_empty_parent(&target) {
+                    Ok(true) => (),
+                    Ok(false) => warnings.push(Warning {
+                        code: "changed_during_install".into(),
+                        message: format!("kept changed extension directory {}", dir.display()),
+                    }),
+                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                        warnings.push(Warning {
+                            code: "extension_dir_not_empty".into(),
+                            message: format!("kept nonempty {}", dir.display()),
+                        })
+                    }
+                    Err(e) => return Err(io(e)),
                 }
-                Err(e) => return Err(io(e)),
             }
         }
     }
@@ -188,4 +199,69 @@ pub fn run(
     );
     o.warnings = warnings;
     Ok(o)
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::output::{OutputKind, Terminal};
+    use clap::Parser;
+    use std::fs;
+    /// Fixes2 decision 6: an error after the exchange is an `io` error naming the kept
+    /// displaced file, never a `skipped` extension.
+    #[test]
+    fn an_error_after_the_exchange_fails_the_install_and_names_the_kept_file() {
+        let t = tempfile::tempdir().unwrap();
+        let agent = t.path().join("agent");
+        let env = Env::for_test(
+            Some(t.path()),
+            t.path(),
+            &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())],
+        );
+        let cli = Cli::try_parse_from(["glen", "install-extension", "--force"]).unwrap();
+        let crate::cli::Command::InstallExtension(args) = &cli.command else {
+            panic!("install-extension")
+        };
+        let dir = paths::resolve(&env, None)
+            .unwrap()
+            .extensions_dir
+            .join("glen");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("index.ts"), "foreign extension").unwrap();
+        let ctx = OutputCtx::new(
+            &cli.global,
+            OutputKind::Document,
+            &env,
+            &Terminal {
+                stdout_tty: false,
+                stderr_tty: false,
+                stdout_cols: None,
+            },
+        )
+        .unwrap();
+        let _hook = crate::atomic_swap::set_test_hook(|stage| {
+            if stage == "exchanged" {
+                Err(std::io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        });
+        let Err(error) = run(&cli, args, &env, &ctx) else {
+            panic!("the install must fail")
+        };
+        assert_eq!(error.code, ErrorCode::Io);
+        let kept = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().ends_with(".tmp"))
+            .expect("the displaced file is kept");
+        assert!(
+            error
+                .message
+                .contains(&format!("displaced copy kept at {}", kept.display())),
+            "{}",
+            error.message
+        );
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "foreign extension");
+    }
 }

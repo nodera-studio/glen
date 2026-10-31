@@ -1374,7 +1374,7 @@ fn ac121_show_human_prose_wraps_to_columns() {
 }
 
 #[test]
-fn a10_show_and_tail_on_a_closed_stdout_exit_1() {
+fn a10_show_and_tail_on_a_closed_stdout_exit_0() {
     let bx = OmpBox::new();
     for args in [
         vec!["show", A.handle, "--json"],
@@ -1383,6 +1383,6 @@ fn a10_show_and_tail_on_a_closed_stdout_exit_1() {
     ] {
         let out = bx.glen(&args).stdout(closed_stdout()).run();
         out.assert_no_panic();
-        out.assert_exit(1);
+        out.assert_exit(0);
     }
 }

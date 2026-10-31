@@ -1,4 +1,4 @@
-use super::{Mode, OutputCtx};
+use super::{Mode, OutputCtx, stdout_failure_exit};
 use crate::{
     error::{ErrorCode, GlenError, OkExit, Warning},
     glen_home::{self, write_private_atomic},
@@ -29,16 +29,11 @@ impl Outcome {
         }
     }
 }
-fn writers(
-    ctx: &OutputCtx,
-) -> (
-    anstream::AutoStream<io::StdoutLock<'static>>,
-    anstream::AutoStream<io::StderrLock<'static>>,
-) {
+fn writers(ctx: &OutputCtx) -> (impl Write, impl Write) {
     use anstream::ColorChoice::{Always, Never};
     (
         anstream::AutoStream::new(
-            io::stdout().lock(),
+            super::stdout_writer(),
             // JSON and raw script output never carry ANSI (serde escapes ESC; completion
             // scripts are static) and must round-trip untrusted bytes such as DEL exactly, so
             // they bypass stripping rather than going through `Never`.
@@ -49,7 +44,7 @@ fn writers(
             },
         ),
         anstream::AutoStream::new(
-            io::stderr().lock(),
+            super::stderr_writer(),
             if ctx.stderr_color { Always } else { Never },
         ),
     )
@@ -78,18 +73,25 @@ fn with_warnings(mut value: Value, warnings: &[Warning]) -> Value {
     }
     value
 }
-fn write_output(ctx: &OutputCtx, bytes: &[u8], out: &mut dyn Write, err: &mut dyn Write) -> bool {
+fn write_output(
+    ctx: &OutputCtx,
+    bytes: &[u8],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<()> {
     match out.write_all(bytes).and_then(|_| out.flush()) {
-        Ok(()) => true,
+        Ok(()) => Ok(()),
         Err(e) => {
             if ctx.mode == Mode::Human && e.kind() != io::ErrorKind::BrokenPipe {
-                let _ = writeln!(
+                writeln!(
                     err,
                     "error: cannot write output: {}",
                     sanitize(&e.to_string())
-                );
+                )
+                .and_then(|()| err.flush())
+                .map_err(io::Error::other)?;
             }
-            false
+            Err(e)
         }
     }
 }
@@ -228,7 +230,10 @@ pub fn emit_to(
     } else {
         bytes
     };
-    if !write_output(ctx, &bytes, out, err) {
+    if let Err(e) = write_output(ctx, &bytes, out, err) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            return stdout_failure_exit(&e, ExitCode::from(outcome.exit.exit_code()));
+        }
         if after_output.is_some()
             && writeln!(
                 err,
@@ -247,17 +252,30 @@ pub fn emit_to(
     if let Some(commit) = after_output
         && let Err(e) = commit()
     {
+        // The deferred write (e.g. inbox::mark) failed after stdout already succeeded.
+        // Surface its own classification (e.g. exit 6 sandboxed for a denied GLEN_HOME
+        // write), never a flat exit 1 that discards it.
+        let code = ExitCode::from(e.code.exit_code());
         if writeln!(err, "glen: {}", sanitize(&e.to_string()))
             .and_then(|()| err.flush())
             .is_err()
         {
             return ExitCode::from(1);
         }
-        return ExitCode::from(1);
+        return code;
     }
     ExitCode::from(outcome.exit.exit_code())
 }
 pub(crate) fn error_value(error: &GlenError, warnings: &[Warning]) -> Value {
+    debug_assert!(
+        error.code != ErrorCode::NoRoute
+            || error
+                .details
+                .as_deref()
+                .and_then(|details| details.get("reason"))
+                .is_some_and(Value::is_string),
+        "no_route errors require a string details.reason"
+    );
     let mut object = json!({"code":error.code,"message":error.message});
     if let Some(hint) = &error.hint {
         object["hint"] = json!(hint);
@@ -291,17 +309,17 @@ pub fn emit_error_to(
         let rendered = json_bytes(&error_value(&error, &ctx.warnings), ctx.stdout_tty);
         match rendered {
             Ok(b) => {
-                if !write_output(ctx, &b, out, err) {
-                    return ExitCode::from(1);
+                if let Err(e) = write_output(ctx, &b, out, err) {
+                    return stdout_failure_exit(&e, ExitCode::from(error.code.exit_code()));
                 }
             }
             Err(_) => return ExitCode::from(1),
         }
     } else {
         if let Some(report) = error.report
-            && !write_output(ctx, format!("{report}\n").as_bytes(), out, err)
+            && let Err(e) = write_output(ctx, format!("{report}\n").as_bytes(), out, err)
         {
-            return ExitCode::from(1);
+            return stdout_failure_exit(&e, ExitCode::from(error.code.exit_code()));
         }
         let p = &ctx.err_painter;
         let result = (|| {
@@ -344,6 +362,20 @@ mod tests {
         output::{OutputKind, Terminal},
     };
     use std::path::Path;
+    #[cfg(debug_assertions)]
+    #[test]
+    fn no_route_envelopes_require_a_string_reason_even_with_a_dynamic_code() {
+        let code = ErrorCode::NoRoute;
+        for details in [json!({}), json!({"reason":null}), json!({"reason":42})] {
+            let error = GlenError::new(code, "invalid no_route fixture").with_details(details);
+            assert!(std::panic::catch_unwind(|| error_value(&error, &[])).is_err());
+        }
+        let error = GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "refused");
+        assert_eq!(
+            error_value(&error, &[])["error"]["details"]["reason"],
+            "live_owner"
+        );
+    }
     fn ctx(home: &Path, mode: Mode, tty: bool) -> OutputCtx {
         let env = Env::for_test(
             Some(home),
@@ -356,7 +388,11 @@ mod tests {
                 human: mode == Mode::Human,
                 ..Default::default()
             },
-            OutputKind::Document,
+            if mode == Mode::Raw {
+                OutputKind::Raw
+            } else {
+                OutputKind::Document
+            },
             &env,
             &Terminal {
                 stdout_tty: tty,
@@ -527,12 +563,14 @@ mod tests {
         bytes: Vec<u8>,
         remaining: usize,
         calls: usize,
+        kind: io::ErrorKind,
+        flush_failure: bool,
     }
     impl Write for Failing {
         fn write(&mut self, b: &[u8]) -> io::Result<usize> {
             self.calls += 1;
             if self.remaining == 0 {
-                return Err(io::ErrorKind::BrokenPipe.into());
+                return Err(self.kind.into());
             }
             let n = self.remaining.min(b.len());
             self.bytes.extend_from_slice(&b[..n]);
@@ -540,7 +578,11 @@ mod tests {
             Ok(n)
         }
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            if self.flush_failure {
+                Err(self.kind.into())
+            } else {
+                Ok(())
+            }
         }
     }
     #[test]
@@ -552,6 +594,8 @@ mod tests {
                 bytes: vec![],
                 remaining: n,
                 calls: 0,
+                kind: io::ErrorKind::BrokenPipe,
+                flush_failure: false,
             };
             let mut err = Vec::new();
             assert_eq!(
@@ -562,12 +606,204 @@ mod tests {
                     &mut out,
                     &mut err
                 ),
-                ExitCode::from(1)
+                ExitCode::SUCCESS
             );
             assert_eq!(out.bytes.len(), n);
             assert_eq!(out.calls, if n == 0 { 1 } else { 2 });
             assert!(err.is_empty());
         }
+    }
+    #[test]
+    fn output_failures_keep_outcomes_only_for_broken_pipes_and_never_commit() {
+        use std::{cell::Cell, rc::Rc};
+        let t = tempfile::tempdir().unwrap();
+        for mode in [Mode::Json, Mode::Human, Mode::Raw] {
+            let c = ctx(t.path(), mode, false);
+            for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                for flush_failure in [false, true] {
+                    for exit in [
+                        OkExit::Done,
+                        OkExit::Running,
+                        OkExit::Forked,
+                        OkExit::Interrupted,
+                    ] {
+                        let committed = Rc::new(Cell::new(0));
+                        let counter = committed.clone();
+                        let mut outcome = Outcome::new(json!({"answer":42}), "answer");
+                        outcome.exit = exit;
+                        outcome.warnings.push(Warning {
+                            code: "test".into(),
+                            message: "must not print this warning".into(),
+                        });
+                        outcome.after_output = Some(Box::new(move || {
+                            counter.set(counter.get() + 1);
+                            Ok(())
+                        }));
+                        let mut out = Failing {
+                            bytes: Vec::new(),
+                            remaining: if flush_failure { usize::MAX } else { 0 },
+                            calls: 0,
+                            kind,
+                            flush_failure,
+                        };
+                        let mut err = Vec::new();
+                        let code = emit_to(&c, outcome, "test", &mut out, &mut err);
+                        assert_eq!(
+                            code,
+                            ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                                exit.exit_code()
+                            } else {
+                                1
+                            })
+                        );
+                        assert_eq!(committed.get(), 0);
+                        assert_eq!(out.calls, 1);
+                        if kind == io::ErrorKind::BrokenPipe {
+                            assert!(err.is_empty());
+                        }
+                        assert!(
+                            !String::from_utf8_lossy(&err).contains("must not print this warning")
+                        );
+                    }
+                }
+            }
+            let committed = Rc::new(Cell::new(0));
+            let counter = committed.clone();
+            let mut outcome = Outcome::new(json!({}), "ok");
+            outcome.after_output = Some(Box::new(move || {
+                counter.set(counter.get() + 1);
+                Ok(())
+            }));
+            assert_eq!(
+                emit_to(&c, outcome, "test", &mut Vec::new(), &mut Vec::new()),
+                ExitCode::SUCCESS
+            );
+            assert_eq!(committed.get(), 1);
+        }
+    }
+    /// A deferred `after_output` failure (e.g. `inbox::mark`'s GLEN_HOME write) keeps its own
+    /// classification instead of a flat exit 1, so a sandboxed GLEN_HOME write still reports
+    /// exit 6 even though the success envelope already reached stdout.
+    #[test]
+    fn a_failed_after_output_commit_keeps_its_own_exit_code() {
+        let tree = tempfile::tempdir().unwrap();
+        let c = ctx(tree.path(), Mode::Json, false);
+        for (error, expected) in [
+            (
+                GlenError::no_route(crate::error::NoRouteReason::Sandboxed, "denied"),
+                6,
+            ),
+            (GlenError::new(ErrorCode::Io, "denied"), 1),
+        ] {
+            let mut outcome = Outcome::new(json!({"marked_read": true}), "ok");
+            outcome.after_output = Some(Box::new(move || Err(error)));
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = emit_to(&c, outcome, "test", &mut out, &mut err);
+            assert_eq!(code, ExitCode::from(expected));
+            // The envelope was already committed to stdout before the deferred failure.
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["ok"], true, "{v}");
+            assert_eq!(v["data"]["marked_read"], true, "{v}");
+        }
+    }
+    #[test]
+    fn error_output_failures_keep_the_errors_code_only_for_broken_pipes() {
+        let t = tempfile::tempdir().unwrap();
+        for mode in [Mode::Json, Mode::Human, Mode::Raw] {
+            let c = ctx(t.path(), mode, false);
+            for code in ErrorCode::ALL {
+                for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                    for flush_failure in [false, true] {
+                        let mut out = Failing {
+                            bytes: Vec::new(),
+                            remaining: if flush_failure { usize::MAX } else { 0 },
+                            calls: 0,
+                            kind,
+                            flush_failure,
+                        };
+                        let mut err = Vec::new();
+                        let error = if code == ErrorCode::NoRoute {
+                            GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "failed")
+                        } else {
+                            GlenError::new(code, "failed")
+                        };
+                        let exit =
+                            emit_error_to(&c, error.with_report("report"), &mut out, &mut err);
+                        assert_eq!(
+                            exit,
+                            ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                                code.exit_code()
+                            } else {
+                                1
+                            })
+                        );
+                        assert_eq!(out.calls, 1);
+                        if kind == io::ErrorKind::BrokenPipe || mode == Mode::Json {
+                            assert!(err.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn failed_stderr_writes_always_exit_one() {
+        let t = tempfile::tempdir().unwrap();
+        for mode in [Mode::Human, Mode::Raw] {
+            let c = ctx(t.path(), mode, false);
+            for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                for flush_failure in [false, true] {
+                    let mut err = Failing {
+                        bytes: Vec::new(),
+                        remaining: if flush_failure { usize::MAX } else { 0 },
+                        calls: 0,
+                        kind,
+                        flush_failure,
+                    };
+                    let mut out = Vec::new();
+                    assert_eq!(
+                        emit_error_to(
+                            &c,
+                            GlenError::no_route(
+                                crate::error::NoRouteReason::LiveOwner,
+                                "unavailable"
+                            ),
+                            &mut out,
+                            &mut err
+                        ),
+                        ExitCode::from(1)
+                    );
+                    assert!(out.is_empty());
+                }
+            }
+        }
+        // A broken stderr must not turn a different stdout failure into EPIPE success.
+        let c = ctx(t.path(), Mode::Human, false);
+        let mut out = Failing {
+            bytes: Vec::new(),
+            remaining: 0,
+            calls: 0,
+            kind: io::ErrorKind::Other,
+            flush_failure: false,
+        };
+        let mut err = Failing {
+            bytes: Vec::new(),
+            remaining: 0,
+            calls: 0,
+            kind: io::ErrorKind::BrokenPipe,
+            flush_failure: false,
+        };
+        assert_eq!(
+            emit_error_to(
+                &c,
+                GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "unavailable")
+                    .with_report("report"),
+                &mut out,
+                &mut err
+            ),
+            ExitCode::from(1)
+        );
     }
     #[test]
     fn raw_unmodified_and_errors_never_spill() {

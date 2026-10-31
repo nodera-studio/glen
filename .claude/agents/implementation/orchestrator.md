@@ -372,10 +372,12 @@ the remainder (a fresh context is the entire point of splitting). For wave plans
 dispatch one Implementer per wave. Between slices, the handoff is `progress.md` +
 the plan's `<task>` XML — never the previous Implementer's transcript.
 
-### Role 2 — Review (fresh context, dual-engine by default)
+### Role 2 — Review (fresh context, engine readiness and risk select the gate)
 
 A fresh, independent review of the diff + spec — **never** the Implementer's
-transcript. By default run the lean **`/code-review` dual-engine gate** (see
+transcript. Probe omp before dispatch: when it is ready or the diff is high-risk,
+use the review block described below. Only low-risk diffs with a skipped probe
+run the lean **`/code-review` dual-engine gate** (see
 `.claude/commands/code-review.md`): the Claude pass (`implementation/code-review.md`)
 ‖ a Codex pass (`codex:codex-rescue`) in ONE message, merged by 2-vote consensus into
 one must-fix / recommended / notes report. No lint/type/style re-check — the
@@ -411,7 +413,8 @@ fails too, record Codex as unavailable, proceed with the Claude pass as a single
 verdict, and say so in the Report. Never drop the engine silently.
 
 **Review file names.** If you save the passes to disk, name them `claude-review.md` and
-`codex-review.md` (plan files `<engine>-plan.md`), never `claude.md`: on macOS's
+`codex-review.md`, plus `omp-review.txt` for the triple-engine block (plan files
+`<engine>-plan.md`), never `claude.md`: on macOS's
 case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
 `CLAUDE.md`, which injects the review as project instructions. This holds for every way
 of creating a file, including shell redirects and `mv`. The `guard-claude-md-name.sh`
@@ -419,11 +422,12 @@ hook refuses such a name on the Write tool only.
 
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer
-‖ `codex review` ‖ `coderabbit review --plain --agent` → synthesizer) only when
-`command -v coderabbit` succeeds or the diff is high-risk (the risk heuristic
+‖ `codex review` ‖ the omp engine, `.claude/scripts/omp-engine.sh review` → synthesizer) when
+`bash .claude/scripts/omp-engine.sh probe` exits 0 or the diff is high-risk (the risk heuristic
 `.claude/scripts/quick-classify.sh` uses: omp session writes, RPC/bridge, secrets,
-releases, dependency changes). CodeRabbit is not installed for glen today, so a
-high-risk diff runs that block with its two available engines and says so.
+releases, dependency changes). When the probe is skipped, a high-risk diff still runs
+that block with its two available engines and names the probe's reason in the report;
+otherwise (not high-risk, probe skipped) the lean two-engine gate runs.
 
 Use the default-branch merge-base as `BASE` (no prompt — this is the in-pipeline
 path). If the report has must-fix items, dispatch a **fresh**

@@ -165,6 +165,8 @@ pub enum Tools {
 pub struct ShowArgs {
     #[arg(help = "session handle or @latest")]
     pub session: String,
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "resolve the session in this project directory")]
+    pub cwd: Option<PathBuf>,
     #[arg(long, help = "include model thinking")]
     pub thinking: bool,
     #[arg(
@@ -181,6 +183,8 @@ pub struct ShowArgs {
 pub struct TailArgs {
     #[arg(help = "session handle or @latest")]
     pub session: String,
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "resolve the session in this project directory")]
+    pub cwd: Option<PathBuf>,
     #[arg(
         short = 'n',
         long,
@@ -228,9 +232,31 @@ pub struct SendArgs {
         long,
         value_name = "DIR",
         value_hint = clap::ValueHint::DirPath,
-        help = "with @new: the new session’s directory; with @latest: the project to pick from"
+        help = "with @new: the new session’s directory; otherwise: the project to resolve the session in"
     )]
     pub cwd: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        help = "omp's startup reasoning effort for the spawned process: off, minimal, low, medium, high, xhigh, max or auto",
+        value_parser = parse_thinking_level
+    )]
+    pub thinking: Option<String>,
+}
+/// omp 18.14.0's full thinking-level list (coding-agent/src/cli/flag-tables.ts).
+/// A bad value is a usage error (exit 2), not a dispatch-time omp failure.
+pub fn parse_thinking_level(s: &str) -> Result<String, String> {
+    const LEVELS: &[&str] = &[
+        "off", "minimal", "low", "medium", "high", "xhigh", "max", "auto",
+    ];
+    if LEVELS.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "thinking level must be one of {} (got {s:?})",
+            LEVELS.join(", ")
+        ))
+    }
 }
 impl SendArgs {
     pub fn deliver(&self) -> DeliverAs {
@@ -270,6 +296,8 @@ pub struct JobsArgs {
 }
 #[derive(Debug, Args)]
 pub struct InboxArgs {
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "show messages from this project directory")]
+    pub cwd: Option<PathBuf>,
     #[arg(long, help = "a session id or hex tail")]
     pub session: Option<String>,
     #[arg(long, help = "do not mark messages read")]

@@ -13,9 +13,12 @@ flowchart TD
         direction LR
         C["Claude subagent<br/>investigator.md or queue.md"]
         X["Codex agent<br/>codex:codex-rescue"]
+        O["omp investigator (optional)<br/>omp-engine.sh debug"]
     end
 
-    ENGINES --> M["Cross-reference the two reports"]
+    T -.->|"omp-engine.sh probe exits 0"| O
+    ENGINES --> M["Cross-reference the two or three reports"]
+    O -.-> M
     M --> ADV["Mandatory adversarial verification<br/>(adversary.md, fresh context,<br/>max 3 cycles) — tries to DISPROVE<br/>the leading hypothesis"]
     ADV --> RC["Evidence-verified report<br/>(never fixes the bug — you decide<br/>whether to fix manually or run /implement)"]
 ```
@@ -37,6 +40,7 @@ shipping a wrong fix.
 
 Invoke via `/deep-debug` slash command. Dual-engine dispatch is mandatory — cross-model
 consensus is the point of this workflow, not an optional extra.
+Dual-engine is mandatory; omp is an optional third.
 
 ## When to Use
 

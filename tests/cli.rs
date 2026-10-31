@@ -7,6 +7,11 @@ use std::{
 fn fake() -> String {
     fixture("bin/fake-omp").to_str().unwrap().into()
 }
+fn closed_stdout() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
 #[test]
 fn public_help() {
     let o = glen(&["--help"], &[]);
@@ -47,6 +52,14 @@ fn public_help() {
     );
 }
 #[test]
+fn send_help_documents_thinking_flag() {
+    let o = glen(&["send", "--help"], &[]);
+    assert!(o.status.success());
+    let s = String::from_utf8(o.stdout).unwrap();
+    assert!(s.contains("--thinking <LEVEL>"));
+    assert!(s.contains("omp's startup reasoning effort"));
+}
+#[test]
 fn watch_requires_an_interactive_terminal() {
     let o = glen(&["watch"], &[]);
     assert_eq!(o.status.code(), Some(2));
@@ -72,6 +85,7 @@ fn usage_envelopes() {
         vec!["bogus"],
         vec!["doctor", "--bad"],
         vec!["send", "a", "b", "--wait", "25h"],
+        vec!["send", "a", "b", "--thinking", "bogus"],
     ] {
         let o = glen(&args, &[]);
         assert_eq!(o.status.code(), Some(2));
@@ -303,20 +317,118 @@ fn lazy_state() {
 #[test]
 fn closed_stdout_pipe() {
     let t = tempfile::tempdir().unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_glen"))
+    let o = Command::new(env!("CARGO_BIN_EXE_glen"))
         .args(["doctor", "--human"])
         .env_clear()
         .env("HOME", t.path())
         .env("GLEN_OMP_BIN", fake())
         .env("PATH", t.path())
-        .stdout(Stdio::piped())
+        .stdout(closed_stdout())
         .stderr(Stdio::piped())
-        .spawn()
+        .output()
         .unwrap();
-    drop(child.stdout.take());
-    let o = child.wait_with_output().unwrap();
-    assert_eq!(o.status.code(), Some(1));
-    assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"));
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty());
+}
+#[test]
+fn closed_stdout_keeps_each_commands_outcome() {
+    for (args, healthy_omp, exit) in [
+        (vec!["doctor", "--json"], true, 0),
+        (vec!["doctor", "--human"], true, 0),
+        (vec!["completions", "bash"], false, 0),
+        (vec!["--help"], false, 0),
+        (vec!["--version"], false, 0),
+        (vec!["ls"], false, 0),
+        (vec!["bogus"], false, 2),
+        (vec!["doctor"], false, 5),
+        (vec!["doctor", "--human"], false, 5),
+    ] {
+        let t = tempfile::tempdir().unwrap();
+        let o = Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args(&args)
+            .env_clear()
+            .env("HOME", t.path())
+            .env("PATH", t.path())
+            .env(
+                "GLEN_OMP_BIN",
+                if healthy_omp {
+                    fake()
+                } else {
+                    "/nonexistent".into()
+                },
+            )
+            .stdout(closed_stdout())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(exit), "{args:?}: {o:?}");
+        assert!(o.stderr.is_empty(), "{args:?}: {o:?}");
+    }
+}
+#[test]
+fn a_failure_envelope_on_a_closed_stdout_keeps_its_exit_code() {
+    let b = common::OmpBox::new();
+    let o = b
+        .command(&["show", "fffffff", "--json"], &b.alpha())
+        .stdout(closed_stdout())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3));
+    assert!(o.stderr.is_empty());
+}
+#[test]
+fn readonly_stdout_exits_one_without_another_document() {
+    for args in [vec!["doctor", "--json"], vec!["ls"]] {
+        let t = tempfile::tempdir().unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let o = Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args(&args)
+            .env_clear()
+            .env("HOME", t.path())
+            .env("PATH", t.path())
+            .env("GLEN_OMP_BIN", fake())
+            .stdout(fs::File::open(file.path()).unwrap())
+            .output()
+            .unwrap();
+        assert_eq!(o.status.code(), Some(1), "{args:?}: {o:?}");
+        assert!(o.stderr.is_empty());
+        assert!(fs::read(file.path()).unwrap().is_empty());
+    }
+}
+#[test]
+fn human_usage_depends_on_stderr_even_when_stdout_is_broken() {
+    for readonly in [false, true] {
+        for stderr in ["ok", "closed", "readonly"] {
+            let t = tempfile::tempdir().unwrap();
+            let file = tempfile::NamedTempFile::new().unwrap();
+            let stdout = if readonly {
+                Stdio::from(fs::File::open(file.path()).unwrap())
+            } else {
+                closed_stdout()
+            };
+            let o = Command::new(env!("CARGO_BIN_EXE_glen"))
+                .args(["bogus", "--human"])
+                .env_clear()
+                .env("HOME", t.path())
+                .env("PATH", t.path())
+                .stdout(stdout)
+                .stderr(match stderr {
+                    "closed" => closed_stdout(),
+                    "readonly" => Stdio::from(fs::File::open(file.path()).unwrap()),
+                    _ => Stdio::piped(),
+                })
+                .output()
+                .unwrap();
+            assert_eq!(
+                o.status.code(),
+                Some(if stderr == "ok" { 2 } else { 1 }),
+                "{o:?}"
+            );
+            if stderr == "ok" {
+                assert!(String::from_utf8_lossy(&o.stderr).contains("Usage:"));
+                assert!(!String::from_utf8_lossy(&o.stderr).contains("panicked"));
+            }
+        }
+    }
 }
 #[test]
 fn external_controls_escaped() {

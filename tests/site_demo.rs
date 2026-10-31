@@ -163,6 +163,7 @@ fn demo_capture_matches() -> Result<(), GlenError> {
         live_socket: None,
         live_pid: None,
         profile_flag: None,
+        thinking_flag: None,
         owners_dir: owners,
         job_timeout_ms: 30000,
         deadline_at: updated.into(),
