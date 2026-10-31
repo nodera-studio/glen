@@ -830,6 +830,9 @@ run_hook() {
   if jq -cn --arg command "$1" '{tool_name:"Bash",tool_input:{command:$command}}' |
     /bin/bash "$GUARD" > "$STDOUT" 2> "$STDERR"; then CODE=0; else CODE="$?"; fi
 }
+# Config/install/auth writes now stay denied even with a named profile. Bare
+# models, usage, gc, agents, session and unknown verbs lost their old allowances
+# under the audited read-only allowlist; cases are preserved verbatim below.
 while IFS= read -r command; do
   run_hook "$command"
   assert_exit "guard denies: $command" 2
@@ -905,17 +908,9 @@ OMP_PROFILE=glen-harness omp --profile="$(printf default)" login
 omp "$GUARD_UNSET_VERB" a b
 omp config "$GUARD_UNSET_VERB" a b
 echo > "$(omp login)"
-EOF
-while IFS= read -r command; do
-  run_hook "$command"
-  assert_exit "guard allows: $command" 0
-  assert 'guard allow has no stdout' test ! -s "$STDOUT"
-  assert 'guard allow has no stderr' test ! -s "$STDERR"
-done <<'EOF'
 omp --profile glen-harness config set a b
 glen --profile glen-harness install-extension
 glen install-extension --dry-run
-omp --version
 omp models cursor --json
 omp usage accounts --json
 omp models update
@@ -925,17 +920,7 @@ omp --profile=glen-harness config reset a
 OMP_PROFILE=glen-harness omp update
 cd x && glen --profile glen-harness install-extension
 omp --profile "glen-harness" skills install x
-not-omp login
 glen install-extension-extra
-rg -n "omp config set"
-git commit -m "omp login"
-gh pr create --body "...omp config set..."
-echo omp login
-printf '%s' 'omp login; glen install-extension'
-echo ';' 'omp' 'login'
-echo '$(omp login)'
-echo '#'; rg -n "omp config set # still an argument"
-# omp config set a b
 OMP_PROFILE=glen-harness omp update # omp login
 env -- OMP_PROFILE=glen-harness omp update
 PI_PROFILE=glen-harness omp login
@@ -947,8 +932,6 @@ PI_CODING_AGENT_DIR=/tmp/x omp config set a b
 PI_CODING_AGENT_DIR="$TMPDIR/omp-fixture" omp update
 env 'PI_CODING_AGENT_DIR=/tmp/x' glen install-extension
 env -u OMP_PROFILE OMP_PROFILE=glen-harness omp login
-command -v omp
-command -V omp
 command -- omp --profile glen-harness login
 sudo -u root nice -n 5 omp --profile glen-harness config set a b
 glen install-extension --dry-run --uninstall
@@ -967,6 +950,199 @@ OMP_PROFILE=glen-harness sudo -E omp login
 OMP_PROFILE=glen-harness env -i PATH="$PATH" PI_PROFILE=glen-harness omp login
 omp config
 omp --profile glen-harness "$GUARD_UNSET_VERB" a b
+omp
+$'omp' login
+$'\x6fmp' login
+omp models --json
+omp models --profile glen-harness --json
+OMP_PROFILE=glen-harness omp models --json
+PI_CODING_AGENT_DIR=/tmp/x omp models --json
+omp -- --profile glen-harness models --json
+omp --profile default models --json
+omp login --profile glen-harness
+omp stats --profile glen-harness
+omp stats --profile=glen-harness
+omp -- --profile glen-harness stats
+omp -- --version
+omp config path
+omp config get theme.dark
+omp config list
+omp --profile glen-harness config path
+omp --profile glen-harness config get theme.dark
+omp ssh add x
+omp --profile glen-harness ssh add x
+omp tiny-models download x
+omp --profile glen-harness tiny-models download x
+omp --profile glen-harness tiny-models
+omp worktree clear
+omp --profile glen-harness worktree clear
+omp --profile glen-harness wt clear
+omp launch
+omp read file.txt
+omp find query
+omp render
+omp stats --json
+omp ps list
+omp token anthropic
+omp completions zsh
+omp __complete sessions
+omp collab list
+omp search query
+omp new-unregistered-verb
+{ omp login; }
+! omp login
+if omp login; then :; fi
+if true; then omp login; fi
+if true; then :; else omp login; fi
+if false; then :; elif omp login; then :; fi
+while omp login; do :; done
+until omp login; do :; done
+for x in one; do omp login; done
+case x in x) omp login;; esac
+function f { omp login; }
+f(){ omp login; }
+time omp login
+builtin omp login
+nohup omp login
+exec omp login
+timeout 30 omp login
+timeout -k 2s -s TERM 30s omp login
+caffeinate -dims omp login
+caffeinate -t 5 -w 123 omp login
+stdbuf -oL omp login
+stdbuf -i 0 -eL -o L omp login
+stdbuf --output=L omp login
+xargs
+xargs -0
+xargs -n 1 omp login
+xargs -I {} omp config set a b
+xargs --replace={} omp login
+xargs --eof omp login
+xargs --max-lines omp login
+xargs --process-slot-var SLOT omp login
+bash -c "omp login"
+bash -lc 'omp login'
+bash -O extglob -c 'omp login'
+bash -oc posix 'omp login'
+sh -c 'omp config set a b'
+zsh -fc 'omp login'
+bash -c "sh -c 'omp login'"
+bash -c "$GUARD_UNSET_SCRIPT"
+zsh -c "$(something)"
+eval 'omp login'
+eval -- 'omp login'
+eval omp config set a b
+eval "$GUARD_UNSET_SCRIPT"
+env -S 'omp login'
+env -vS 'omp login'
+env -iS 'omp login'
+env --split-string='omp config path'
+env -S'omp\_login'
+env -S 'bash -c "omp login"'
+O=omp env -S '${O} login'
+$O login
+${GUARD_UNSET_PROGRAM} help config
+$(printf omp) help login
+$O harmless 'install-extension'
+$O something --apply
+OMP_PROFILE=default PI_PROFILE=glen-harness omp stats
+OMP_PROFILE='' PI_PROFILE=glen-harness omp stats
+OMP_PROFILE=glen-harness env -u OMP_PROFILE omp stats
+OMP_PROFILE=glen-harness env -i omp stats
+OMP_PROFILE=glen-harness exec -c omp stats
+OMP_PROFILE=glen-harness sudo omp stats
+PI_CODING_AGENT_DIR=/tmp/x omp --profile default stats
+OMP_PROFILE=glen-harness omp --profile default stats
+OMP_PROFILE=glen-harness omp --profile "$OMP_PROFILE" stats
+EOF
+while IFS= read -r command; do
+  run_hook "$command"
+  assert_exit "guard allows: $command" 0
+  assert 'guard allow has no stdout' test ! -s "$STDOUT"
+  assert 'guard allow has no stderr' test ! -s "$STDERR"
+done <<'EOF'
+omp --version
+not-omp login
+rg -n "omp config set"
+git commit -m "omp login"
+gh pr create --body "...omp config set..."
+echo omp login
+printf '%s' 'omp login; glen install-extension'
+echo ';' 'omp' 'login'
+echo '$(omp login)'
+echo '#'; rg -n "omp config set # still an argument"
+# omp config set a b
+command -v omp
+command -V omp
+omp --help
+$'omp' --version
+omp -h
+omp -v
+omp --profile glen-harness models cursor --json
+omp --profile=other-profile models --json
+omp grep 'omp login' .
+omp toks 'plain text'
+omp play recording.ompcast
+glen completions zsh
+{ omp --version; }
+! omp --version
+if omp --version; then :; fi
+if true; then omp --version; else omp --help; fi
+if false; then :; elif omp --version; then :; fi
+while omp --version; do :; done
+until omp --version; do :; done
+for x in omp login; do omp --version; done
+case omp in login) omp --version;; esac
+function f { omp --version; }
+f(){ omp --version; }
+omp(){ echo fixture; }
+time omp --version
+env omp --version
+command omp --version
+builtin omp --version
+sudo -u root omp --version
+nice -n 5 omp --version
+nohup omp --version
+exec omp --version
+timeout 30s omp --version
+caffeinate -dims omp --version
+stdbuf -oL omp --version
+stdbuf -i 0 -eL -o L omp --version
+xargs -n 1 omp --version
+xargs --eof omp --version
+xargs --max-lines omp --version
+xargs --process-slot-var SLOT omp --version
+xargs -0 echo omp login
+bash -c "omp --version"
+bash -lc 'omp --help'
+bash -O extglob -c 'omp --help'
+bash -oc posix 'omp --version'
+sh -c 'omp --version'
+zsh -fc 'omp --version'
+bash -c "sh -c 'omp --version'"
+eval 'omp --version'
+eval -- 'omp --version'
+eval omp --version
+env -S 'omp --version'
+env -vS 'omp --version'
+env --split-string='omp --help'
+env -S'omp\_--version'
+env -S 'bash -c "omp --version"'
+env -S 'echo omp; login'
+env -S 'omp --version\c ignored'
+O=omp env -S '${O} --version'
+echo $'omp login\n$(omp config path)'
+echo {omp} login
+echo foo{omp}login
+OMP_PROFILE=glen-harness omp stats
+PI_PROFILE=glen-harness omp stats
+PI_CODING_AGENT_DIR=/tmp/x omp stats
+OMP_PROFILE=default omp --profile glen-harness stats
+omp --profile default --profile glen-harness stats
+OMP_PROFILE=glen-harness env --unset=OMP_PROFILE OMP_PROFILE=other omp stats
+OMP_PROFILE=glen-harness sudo -E omp stats
+OMP_PROFILE=glen-harness bash -c 'omp stats'
+OMP_PROFILE=glen-harness env -i PI_PROFILE=glen-harness omp stats
 EOF
 
 # Multiline boundaries must be checked after joining continuations and removing
@@ -980,19 +1156,84 @@ assert_exit 'guard joins continuation before stripping comments' 2
 run_hook $'rg -n "omp \\\nconfig set"'
 assert_exit 'guard preserves quoted argument across continuation' 0
 run_hook $'omp --profile \\\nglen-harness update'
-assert_exit 'guard recognizes continued explicit profile' 0
+assert_exit 'guard continued profile cannot authorize an update' 2
+
+# Heredoc bodies need direct calls: each table row above is one physical line.
+run_hook $'git commit -F - <<\'EOF\'\nIt\'s a commit about omp.\nomp config set a b\n$(omp login) and `omp login` are documentation.\nEOF'
+assert_exit 'guard quoted commit heredoc is opaque' 0
+assert 'guard quoted commit heredoc has no stdout' test ! -s "$STDOUT"
+assert 'guard quoted commit heredoc has no stderr' test ! -s "$STDERR"
+run_hook $'gh pr create --body-file - <<"EOF"\nomp login\n$(omp config path)\nEOF'
+assert_exit 'guard double-quoted PR heredoc is opaque' 0
+run_hook $'cat <<E\'OF\'\n$(omp login)\nEOF'
+assert_exit 'guard partly quoted heredoc delimiter is opaque' 0
+run_hook $'cat <<\\EOF\n$(omp login)\nEOF'
+assert_exit 'guard backslash-quoted heredoc delimiter is opaque' 0
+run_hook $'cat <<$\'EOF\'\n$(omp login)\nEOF'
+assert_exit 'guard ANSI-quoted heredoc delimiter is opaque' 0
+run_hook $'cat <<EOF\nIt\'s documentation.\nomp login\nEOF'
+assert_exit 'guard unquoted heredoc bare commands are data' 0
+run_hook $'cat <<EOF\n<(omp login)\nEOF'
+assert_exit 'guard unquoted heredoc process substitution notation is data' 0
+run_hook $'cat <<E*F\nomp login\nE*F'
+assert_exit 'guard heredoc delimiters do not glob' 0
+run_hook $'cat <<EOF\n$(omp login)\nEOF'
+assert_exit 'guard unquoted heredoc substitution is inspected' 2
+assert_contains 'guard heredoc substitution deny reason' "This would write the owner's default omp profile" "$STDERR"
+run_hook $'cat <<EOF\nIt\'s \"$(omp login)\"\nEOF'
+assert_exit 'guard unquoted heredoc quotes do not suppress expansion' 2
+run_hook $'cat <<EOF\n`omp login`\nEOF'
+assert_exit 'guard unquoted heredoc backticks are inspected' 2
+run_hook $'cat <<\'A\' <<\'B\'\nomp login\nA\nomp config set a b\nB'
+assert_exit 'guard skips multiple quoted heredocs in order' 0
+run_hook $'cat <<\'A\' <<B\nomp login\nA\n$(omp login)\nB'
+assert_exit 'guard inspects second unquoted heredoc substitution' 2
+run_hook $'cat <<-\'EOF\'\n\tomp login\n\tEOF\nomp --version'
+assert_exit 'guard tab-stripped quoted heredoc ends correctly' 0
+run_hook $'cat <<-\'EOF\'\n\tdata\n\tEOF\nomp login'
+assert_exit 'guard resumes commands after tab-stripped heredoc' 2
+run_hook $'git commit -m "$(cat <<\'EOF\'\nIt\'s about omp config set.\nEOF\n)"'
+assert_exit 'guard quoted heredoc inside substitution is opaque' 0
 
 mkdir "$WORK/parser-failure"
-printf '#!/bin/sh\nexit 127\n' > "$WORK/parser-failure/python3"
+export SMOKE_PYTHON_CALLED="$WORK/python-called"
+cat > "$WORK/parser-failure/python3" <<'PYTHON_STUB'
+#!/bin/sh
+: > "$SMOKE_PYTHON_CALLED"
+printf 'broken Python placeholder\n' >&2
+exit 127
+PYTHON_STUB
 chmod +x "$WORK/parser-failure/python3"
-(
-  export PATH="$WORK/parser-failure:$PATH"
-  run_hook 'omp login'
-  printf '%s\n' "$CODE" > "$WORK/parser-code"
-)
-CODE="$(cat "$WORK/parser-code")"
+PATH="$WORK/parser-failure:$PATH" run_hook 'echo hello world'
+assert_exit 'guard static fast path allows without Python' 0
+assert 'guard static fast path never invokes Python' test ! -e "$SMOKE_PYTHON_CALLED"
+assert 'guard static fast path has no stdout' test ! -s "$STDOUT"
+assert 'guard static fast path has no stderr' test ! -s "$STDERR"
+PATH="$WORK/parser-failure:$PATH" run_hook "git log --format='%h'"
+assert_exit 'guard static quoted command skips Python' 0
+assert 'guard static quoted command never invokes Python' test ! -e "$SMOKE_PYTHON_CALLED"
+# shellcheck disable=SC2016 # The guard, not this test shell, expands variables.
+PATH="$WORK/parser-failure:$PATH" run_hook '$GUARD_UNSET_PROGRAM login'
+assert_exit 'guard dynamic command without omp substring fails closed' 2
+assert 'guard dynamic command reaches Python' test -e "$SMOKE_PYTHON_CALLED"
+PATH="$WORK/parser-failure:$PATH" run_hook 'omp login'
 assert_exit 'guard parser startup failure blocks command' 2
 assert_contains 'guard parser startup failure names problem' 'Cannot run the omp profile guard parser' "$STDERR"
+PATH="$WORK/parser-failure:$PATH" run_hook 'echo hello'
+assert_exit 'guard broken Python still allows static safe command' 0
+assert 'guard safe fallback has no stderr' test ! -s "$STDERR"
+# CLT-like placeholders can return success without actually running Python.
+printf '#!/bin/sh\nprintf "xcode-select: developer tools missing\\n" >&2\nexit 0\n' > "$WORK/parser-failure/python3"
+PATH="$WORK/parser-failure:$PATH" run_hook 'omp login'
+assert_exit 'guard zero-exit Python placeholder fails closed' 2
+assert_contains 'guard placeholder fallback names parser failure' 'Cannot run the omp profile guard parser' "$STDERR"
+mkdir "$WORK/no-python"
+ln -s "$(command -v jq)" "$WORK/no-python/jq"
+PATH="$WORK/no-python" run_hook 'omp login'
+assert_exit 'guard missing Python fails closed for omp' 2
+PATH="$WORK/no-python" run_hook 'echo hello'
+assert_exit 'guard missing Python permits static safe command' 0
+assert 'guard missing Python safe command stays quiet' test ! -s "$STDERR"
 
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]
