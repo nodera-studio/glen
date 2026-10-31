@@ -7,7 +7,8 @@ use super::{
 };
 use crate::{
     cli::DeliverAs,
-    error::{ErrorCode, GlenError},
+    error::{ErrorCode, GlenError, Warning},
+    omp::items::Item,
     render::{self, palette::Token, text, transcript},
 };
 use ratatui::{
@@ -223,6 +224,12 @@ fn sessions(app: &mut App, snapshot: ListSnapshot) -> Vec<Cmd> {
     app.list.rows = snapshot.rows;
     app.list.total_all = snapshot.total_all;
     app.list.sessions_dir_missing = snapshot.sessions_dir_missing;
+    if let (Some(target), Some(header)) = (&app.transcript.target, &mut app.transcript.header)
+        && let Some(row) = app.list.rows.iter().find(|row| row.id == target.id)
+    {
+        header.title = text::single_line(&row.title);
+        header.handle = text::single_line(&row.handle);
+    }
     app.list.offset = app
         .list
         .offset
@@ -636,13 +643,44 @@ fn control_done(app: &mut App, local: u64, op: ControlOp, result: Result<Control
     };
     match result {
         Err(err) => app.prompt.notice = Some(err),
-        Ok(ControlData::Done(s)) => toast(app, s),
+        Ok(ControlData::Done {
+            summary,
+            model,
+            warnings,
+        }) => {
+            if matches!(op, ControlOp::SetModel { .. } | ControlOp::SetThinking(_))
+                && let (Some(header), Some(model)) = (&mut app.transcript.header, model)
+            {
+                header.model = Some(text::single_line(&model));
+            }
+            control_notices(app, warnings);
+            toast(app, summary);
+        }
         Ok(ControlData::Models {
             models,
             thinking_levels,
+            thinking_level,
+            warnings,
         }) => {
+            control_notices(app, warnings);
+            let current_model = models.iter().position(|model| model.current);
+            let thinking_levels = if current_model.is_some() {
+                thinking_levels
+            } else {
+                crate::ops::THINKING_LEVELS
+                    .iter()
+                    .map(|level| (*level).to_owned())
+                    .collect()
+            };
             let Some(kind) = pending.picker else {
                 return;
+            };
+            let selected = match kind {
+                PickerKind::Model => current_model.unwrap_or(0),
+                PickerKind::Thinking => thinking_levels
+                    .iter()
+                    .position(|level| Some(level) == thinking_level.as_ref())
+                    .unwrap_or(0),
             };
             let entries = match kind {
                 PickerKind::Model => models
@@ -670,11 +708,40 @@ fn control_done(app: &mut App, local: u64, op: ControlOp, result: Result<Control
                     filter: String::new(),
                     kind,
                     entries,
-                    selected: 0,
+                    selected,
                     target: pending.target,
                 }));
             }
         }
+    }
+}
+fn control_notices(app: &mut App, warnings: Vec<Warning>) {
+    if let Some(warning) = ErrView::control_warnings(&warnings) {
+        match &mut app.prompt.notice {
+            None => app.prompt.notice = Some(warning),
+            Some(old) if old.is_warning() => {
+                old.message.push_str("; ");
+                old.message.push_str(&warning.message);
+            }
+            Some(_) => (), // Keep a send refusal or another error ahead of a control warning.
+        }
+    }
+}
+fn header_model(app: &mut App, items: &[Item]) {
+    if let Some(header) = &mut app.transcript.header
+        && let Some(model) = items.iter().rev().find_map(|item| match item {
+            Item::Assistant {
+                model: Some(model), ..
+            }
+            | Item::ModelChange { model, .. }
+                if !model.is_empty() =>
+            {
+                Some(model)
+            }
+            _ => None,
+        })
+    {
+        header.model = Some(text::single_line(model));
     }
 }
 fn followed(app: &mut App, ev: FollowMsg) {
@@ -686,6 +753,7 @@ fn followed(app: &mut App, ev: FollowMsg) {
             not_yet_persisted,
         } => {
             app.transcript.header = Some(header);
+            header_model(app, &items);
             app.transcript.blocks.clear();
             app.transcript.dropped = dropped;
             app.transcript
@@ -701,6 +769,7 @@ fn followed(app: &mut App, ev: FollowMsg) {
         }
         FollowMsg::NotYetPersisted => app.transcript.status = TranscriptStatus::NotYetPersisted,
         FollowMsg::Items(items) => {
+            header_model(app, &items);
             app.transcript.status = TranscriptStatus::Ready;
             let n = items.len();
             let start = app.transcript.blocks.len();
@@ -1897,7 +1966,11 @@ mod tests {
                 Msg::ControlDone {
                     local: id,
                     op: op.clone(),
-                    result: Ok(ControlData::Done("done".into())),
+                    result: Ok(ControlData::Done {
+                        summary: "done".into(),
+                        model: None,
+                        warnings: vec![],
+                    }),
                 },
             );
             assert_eq!(a.toast.as_ref().unwrap().text, "done");
@@ -1945,8 +2018,11 @@ mod tests {
                             provider: "provider".into(),
                             id: "model".into(),
                             label: "Model".into(),
+                            current: true,
                         }],
                         thinking_levels: vec!["high".into()],
+                        thinking_level: Some("high".into()),
+                        warnings: vec![],
                     }),
                 },
             );
@@ -1964,6 +2040,269 @@ mod tests {
             );
             assert_eq!(a.prompt.notice.as_ref(), Some(&error()));
         }
+    }
+    fn assistant(model: Option<&str>) -> Item {
+        Item::Assistant {
+            id: "assistant".into(),
+            timestamp: None,
+            text: "reply".into(),
+            model: model.map(str::to_owned),
+            stop_reason: Some("stop".into()),
+            error: None,
+            has_thinking: false,
+            thinking_words: 0,
+            thinking: None,
+            tool_calls: vec![],
+        }
+    }
+    #[test]
+    fn transcript_header_tracks_new_models_and_session_title_snapshots() {
+        let mut a = app();
+        open(&mut a, vec![assistant(Some("p/old"))]);
+        items(&mut a, vec![assistant(Some("p/new")), assistant(None)]);
+        assert_eq!(
+            a.transcript.header.as_ref().unwrap().model.as_deref(),
+            Some("p/new")
+        );
+        items(
+            &mut a,
+            vec![Item::ModelChange {
+                id: "setting".into(),
+                timestamp: None,
+                model: "p/configured".into(),
+            }],
+        );
+        assert_eq!(
+            a.transcript.header.as_ref().unwrap().model.as_deref(),
+            Some("p/configured")
+        );
+        let generation = a.transcript.r#gen;
+        update(
+            &mut a,
+            Msg::Follow {
+                r#gen: generation + 1,
+                ev: FollowMsg::Items(vec![assistant(Some("p/stale"))]),
+            },
+        );
+        assert_eq!(
+            a.transcript.header.as_ref().unwrap().model.as_deref(),
+            Some("p/configured")
+        );
+        let mut renamed = row("a");
+        renamed.title = "new title\n\x1b[31m".into();
+        renamed.model = Some("p/stale-list-model".into());
+        update(
+            &mut a,
+            Msg::Sessions(ListSnapshot {
+                rows: vec![row("b"), renamed.clone()],
+                total_all: 2,
+                sessions_dir_missing: None,
+            }),
+        );
+        let header = a.transcript.header.as_ref().unwrap();
+        assert_eq!(header.title, text::single_line(&renamed.title));
+        assert_eq!(header.handle, renamed.handle);
+        assert_eq!(header.model.as_deref(), Some("p/configured"));
+        assert_eq!(a.transcript.r#gen, generation);
+    }
+    #[test]
+    fn successful_model_and_thinking_controls_refresh_the_header_from_the_acknowledgement() {
+        for op in [
+            ControlOp::SetModel {
+                provider: "p".into(),
+                id: "requested".into(),
+            },
+            ControlOp::SetThinking("high".into()),
+        ] {
+            let mut a = app();
+            open(&mut a, vec![assistant(Some("p/old"))]);
+            let id = local(control(&mut a, op.clone(), None));
+            update(
+                &mut a,
+                Msg::ControlDone {
+                    local: id,
+                    op,
+                    result: Ok(ControlData::Done {
+                        summary: "✓ changed".into(),
+                        model: Some("p/acknowledged".into()),
+                        warnings: vec![],
+                    }),
+                },
+            );
+            assert_eq!(
+                a.transcript.header.as_ref().unwrap().model.as_deref(),
+                Some("p/acknowledged")
+            );
+        }
+    }
+    fn model_choices() -> Vec<ModelChoice> {
+        [("first", false), ("current", true), ("last", false)]
+            .into_iter()
+            .map(|(id, current)| ModelChoice {
+                provider: "p".into(),
+                id: id.into(),
+                label: id.into(),
+                current,
+            })
+            .collect()
+    }
+    #[test]
+    fn pickers_start_on_the_current_model_or_thinking_level() {
+        for (kind, expected, op) in [
+            (
+                PickerKind::Model,
+                1,
+                ControlOp::SetModel {
+                    provider: "p".into(),
+                    id: "current".into(),
+                },
+            ),
+            (
+                PickerKind::Thinking,
+                3,
+                ControlOp::SetThinking("high".into()),
+            ),
+        ] {
+            let mut a = app();
+            let id = local(control(&mut a, ControlOp::ListModels, Some(kind)));
+            update(
+                &mut a,
+                Msg::ControlDone {
+                    local: id,
+                    op: ControlOp::ListModels,
+                    result: Ok(ControlData::Models {
+                        models: model_choices(),
+                        thinking_levels: vec![
+                            "off".into(),
+                            "low".into(),
+                            "medium".into(),
+                            "high".into(),
+                        ],
+                        thinking_level: Some("high".into()),
+                        warnings: vec![],
+                    }),
+                },
+            );
+            let Some(Overlay::Picker(p)) = &a.overlay else {
+                panic!("picker")
+            };
+            assert_eq!(p.selected, expected);
+            assert!(
+                matches!(plain(&mut a, KeyCode::Enter).as_slice(), [Cmd::Control { op: actual, .. }] if actual == &op)
+            );
+        }
+    }
+    #[test]
+    fn unknown_model_thinking_picker_offers_every_canonical_level() {
+        let mut a = app();
+        let id = local(control(
+            &mut a,
+            ControlOp::ListModels,
+            Some(PickerKind::Thinking),
+        ));
+        let mut models = model_choices();
+        for model in &mut models {
+            model.current = false;
+        }
+        update(
+            &mut a,
+            Msg::ControlDone {
+                local: id,
+                op: ControlOp::ListModels,
+                result: Ok(ControlData::Models {
+                    models,
+                    thinking_levels: vec!["off".into()],
+                    thinking_level: None,
+                    warnings: vec![],
+                }),
+            },
+        );
+        let Some(Overlay::Picker(p)) = &a.overlay else {
+            panic!("picker")
+        };
+        assert_eq!(
+            p.entries
+                .iter()
+                .map(|entry| entry.label.as_str())
+                .collect::<Vec<_>>(),
+            crate::ops::THINKING_LEVELS
+        );
+        assert_eq!(p.selected, 0);
+    }
+    #[test]
+    fn control_warnings_use_the_inline_notice_and_keep_more_urgent_errors() {
+        let mut a = app();
+        let message =
+            "the operation may still be running; check the session before retrying".repeat(2);
+        let warning = Warning {
+            code: "abort_pending".into(),
+            message: message.clone(),
+        };
+        let id = local(control(&mut a, ControlOp::Abort, None));
+        update(
+            &mut a,
+            Msg::ControlDone {
+                local: id,
+                op: ControlOp::Abort,
+                result: Ok(ControlData::Done {
+                    summary: "✓ stopped".into(),
+                    model: None,
+                    warnings: vec![warning.clone()],
+                }),
+            },
+        );
+        let notice = a.prompt.notice.as_ref().unwrap();
+        assert!(notice.is_warning());
+        assert_eq!(notice.message, message);
+        assert_eq!(a.toast.as_ref().unwrap().text, "✓ stopped");
+        a.prompt.notice = Some(error());
+        let id = local(control(
+            &mut a,
+            ControlOp::ListModels,
+            Some(PickerKind::Model),
+        ));
+        update(
+            &mut a,
+            Msg::ControlDone {
+                local: id,
+                op: ControlOp::ListModels,
+                result: Ok(ControlData::Models {
+                    models: model_choices(),
+                    thinking_levels: vec!["off".into()],
+                    thinking_level: None,
+                    warnings: vec![warning],
+                }),
+            },
+        );
+        assert_eq!(a.prompt.notice.as_ref(), Some(&error()));
+        a.prompt.notice = None;
+        a.toast = None;
+        let id = local(control(
+            &mut a,
+            ControlOp::ListModels,
+            Some(PickerKind::Model),
+        ));
+        update(
+            &mut a,
+            Msg::ControlDone {
+                local: id,
+                op: ControlOp::ListModels,
+                result: Ok(ControlData::Models {
+                    models: model_choices(),
+                    thinking_levels: vec!["off".into()],
+                    thinking_level: None,
+                    warnings: vec![Warning {
+                        code: "extension_outdated".into(),
+                        message: "restart that omp session".into(),
+                    }],
+                }),
+            },
+        );
+        assert_eq!(
+            a.prompt.notice.as_ref().unwrap().message,
+            "restart that omp session"
+        );
+        assert!(a.toast.is_none());
     }
     #[test]
     fn quit_keys_signals_and_interrupt_clear() {
@@ -2215,8 +2554,11 @@ mod edge_tests {
                 provider: "p".into(),
                 id: "m".into(),
                 label: "M".into(),
+                current: true,
             }],
             thinking_levels: vec![],
+            thinking_level: None,
+            warnings: vec![],
         };
         update(
             &mut a,

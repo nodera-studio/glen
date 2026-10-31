@@ -5,7 +5,7 @@ use super::{
 };
 use crate::{
     cli::{DeliverAs, Tools},
-    error::GlenError,
+    error::{GlenError, Warning},
     jobs::{JobResult, Route, Status},
     omp::{
         items::{Item, ItemOpts},
@@ -233,6 +233,22 @@ pub struct ErrView {
     pub message: String,
     pub hint: Option<String>,
 }
+impl ErrView {
+    pub fn control_warnings(warnings: &[Warning]) -> Option<Self> {
+        (!warnings.is_empty()).then(|| Self {
+            code: "control_warning".into(),
+            message: warnings
+                .iter()
+                .map(|w| w.message.as_str())
+                .collect::<Vec<_>>()
+                .join("; "),
+            hint: None,
+        })
+    }
+    pub fn is_warning(&self) -> bool {
+        self.code == "control_warning"
+    }
+}
 impl From<GlenError> for ErrView {
     fn from(e: GlenError) -> Self {
         Self {
@@ -356,14 +372,21 @@ pub struct ModelChoice {
     pub provider: String,
     pub id: String,
     pub label: String,
+    pub current: bool,
 }
 #[derive(Clone, Debug)]
 pub enum ControlData {
     Models {
         models: Vec<ModelChoice>,
         thinking_levels: Vec<String>,
+        thinking_level: Option<String>,
+        warnings: Vec<Warning>,
     },
-    Done(String),
+    Done {
+        summary: String,
+        model: Option<String>,
+        warnings: Vec<Warning>,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct PendingControl {

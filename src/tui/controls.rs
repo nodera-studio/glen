@@ -11,7 +11,7 @@ use crate::{
         route::{self, ModelsSource},
     },
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError},
     ops::{self, ModelRow, Op, OpError},
     render::text,
 };
@@ -92,7 +92,15 @@ pub fn run(
         warnings.extend(op_warnings);
         warnings.extend(finish_warnings);
         if let Some(source) = source {
-            return model_choices(&mut data, source, &context);
+            return model_choices(&mut data, source, &context).map(|mut choices| {
+                if let ControlData::Models {
+                    warnings: notices, ..
+                } = &mut choices
+                {
+                    *notices = warnings;
+                }
+                choices
+            });
         }
         if opened.not_yet_persisted
             && matches!(op, ControlOp::SetModel { .. } | ControlOp::SetThinking(_))
@@ -105,12 +113,17 @@ pub fn run(
                 .filter(|id| *id != opened.session.header.id)
                 .map(str::to_owned)
         });
+        let model = to.is_none().then(|| model_pair(&data["model"])).flatten();
         let summary = if let Some(to) = to {
             format!("✓ forked → {}", crate::rpc::session_handle(&to))
         } else {
             summary(&opened, op, &data)
         };
-        return Ok(ControlData::Done(with_warnings(summary, warnings)));
+        return Ok(ControlData::Done {
+            summary,
+            model,
+            warnings,
+        });
     }
     Err(GlenError::new(
         ErrorCode::ControlFailed,
@@ -156,12 +169,18 @@ fn model_choices(
         .iter()
         .find(|row| current(row))
         .map(|row| row.thinking_levels.clone())
-        .unwrap_or_default();
+        .unwrap_or_else(|| {
+            ops::THINKING_LEVELS
+                .iter()
+                .map(|level| (*level).to_owned())
+                .collect()
+        });
     let models = rows
         .iter()
         .map(|row| ModelChoice {
             provider: row.provider.clone(),
             id: row.id.clone(),
+            current: current(row),
             label: text::single_line(&format!(
                 "{}/{} — {}{}",
                 row.provider,
@@ -174,13 +193,19 @@ fn model_choices(
     Ok(ControlData::Models {
         models,
         thinking_levels,
+        thinking_level: data["thinking_level"].as_str().map(str::to_owned),
+        warnings: vec![],
     })
 }
+fn model_pair(data: &Value) -> Option<String> {
+    Some(text::single_line(&format!(
+        "{}/{}",
+        data["provider"].as_str()?,
+        data["id"].as_str()?
+    )))
+}
 fn pair(data: &Value) -> String {
-    match (data["provider"].as_str(), data["id"].as_str()) {
-        (Some(provider), Some(id)) => text::single_line(&format!("{provider}/{id}")),
-        _ => "unknown model".into(),
-    }
+    model_pair(data).unwrap_or_else(|| "unknown model".into())
 }
 fn summary(opened: &Opened, op: &ControlOp, data: &Value) -> String {
     let handle = text::single_line(&opened.handle);
@@ -198,14 +223,6 @@ fn summary(opened: &Opened, op: &ControlOp, data: &Value) -> String {
         ControlOp::ListModels => unreachable!("model listings return choices"),
     }
 }
-fn with_warnings(mut summary: String, warnings: Vec<Warning>) -> String {
-    for warning in warnings {
-        summary.push_str(" · ");
-        summary.push_str(&text::single_line(&warning.message));
-    }
-    summary
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,7 +297,7 @@ mod tests {
             &Arc::new(AtomicBool::new(false)),
         )
         .unwrap();
-        assert!(matches!(result, ControlData::Done(s) if s == "✓ e27c0de idle"));
+        assert!(matches!(result, ControlData::Done { summary: s, .. } if s == "✓ e27c0de idle"));
         assert!(!rig.home.root.exists());
         assert_eq!(
             before,
@@ -339,16 +356,16 @@ mod tests {
         let ControlData::Models {
             models,
             thinking_levels,
+            ..
         } = result
         else {
             panic!("model choices")
         };
         assert!(!models.is_empty());
-        assert!(
-            models.iter().any(|m| m.provider == "fake"
-                && m.id == "fake-1"
-                && m.label.ends_with(" (current)"))
-        );
+        assert!(models.iter().any(|m| m.provider == "fake"
+            && m.id == "fake-1"
+            && m.current
+            && m.label.ends_with(" (current)")));
         assert_eq!(thinking_levels, ["off", "low", "medium", "high"]);
         assert!(!rig.home.root.exists());
         let frames = std::fs::read_to_string(log).unwrap();
@@ -393,7 +410,9 @@ mod tests {
             (ControlOp::Compact, "✓ e27c0de compacted"),
         ] {
             let result = run(&cli, &env, &target, &op, &stop).unwrap();
-            assert!(matches!(result, ControlData::Done(s) if s.starts_with(expected)));
+            assert!(
+                matches!(result, ControlData::Done { summary: s, .. } if s.starts_with(expected))
+            );
         }
         let opened =
             open::open_unprobed(&cli, &env, target.path.as_ref().unwrap().to_str().unwrap())
@@ -401,6 +420,29 @@ mod tests {
         let selected = opened.session.selection();
         assert_eq!(selected.model.as_deref(), Some("fake/fake-1"));
         assert_eq!(selected.thinking_level.as_deref(), Some("high"));
+        let changed = run(
+            &cli,
+            &env,
+            &target,
+            &ControlOp::SetModel {
+                provider: "fake".into(),
+                id: "fake-2".into(),
+            },
+            &stop,
+        )
+        .unwrap();
+        let ControlData::Done {
+            summary,
+            model,
+            warnings,
+        } = changed
+        else {
+            panic!("control result")
+        };
+        assert_eq!(model.as_deref(), Some("fake/fake-2"));
+        assert_eq!(warnings.len(), 1);
+        assert_eq!(warnings[0].code, "thinking_changed");
+        assert!(!summary.contains(&warnings[0].message));
         let error = run(
             &cli,
             &env,
@@ -464,7 +506,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            matches!(result, ControlData::Models { models, thinking_levels } if thinking_levels.is_empty() && models.iter().all(|m| !m.label.ends_with(" (current)")))
+            matches!(result, ControlData::Models { models, thinking_levels, thinking_level, .. } if thinking_levels == ops::THINKING_LEVELS && thinking_level.is_none() && models.iter().all(|m| !m.current && !m.label.ends_with(" (current)")))
         );
     }
 }

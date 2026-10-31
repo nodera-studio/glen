@@ -936,6 +936,8 @@ fn notice(f: &mut Frame, app: &App, rect: Rect) {
                     s,
                     app.theme.style(if has_hint && i == last {
                         Token::Muted
+                    } else if app.prompt.notice.as_ref().is_some_and(ErrView::is_warning) {
+                        Token::Warning
                     } else {
                         Token::Danger
                     }),
@@ -2593,6 +2595,105 @@ pub(crate) mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(dump.contains("not in this build"));
+    }
+    #[test]
+    fn control_warning_notice_wraps_in_warning_style_without_putting_text_in_the_status_bar() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        let message = "the operation may still finish in the omp session; check its state before retrying so it does not get applied twice; request fresh state before trying again";
+        app.prompt.notice = ErrView::control_warnings(&[crate::error::Warning {
+            code: "abort_pending".into(),
+            message: message.into(),
+        }]);
+        let (buffer, _, _) = screenshot(&mut app);
+        let a = layout::areas(&app);
+        assert_eq!(a.notice.height, 2);
+        let shown = (a.notice.y..a.notice.bottom())
+            .map(|y| row_text(&buffer, y).trim().to_owned())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert_eq!(shown, format!("! {message}"));
+        assert!(!row_text(&buffer, a.status.y).contains("operation"));
+        for y in a.notice.y..a.notice.bottom() {
+            for x in a.notice.x..a.notice.right() {
+                if buffer[(x, y)].symbol() != " " {
+                    assert_eq!(
+                        buffer[(x, y)].fg,
+                        app.theme.style(Token::Warning).fg.unwrap()
+                    );
+                }
+            }
+        }
+    }
+    #[test]
+    fn transcript_pairs_results_within_a_batch_and_keeps_later_results_standalone() {
+        use crate::omp::{fixtures, items, session::Session};
+        let session =
+            Session::parse(std::path::Path::new("fixture"), fixtures::bytes('A')).unwrap();
+        let branch = session.active_branch();
+        let result = branch
+            .iter()
+            .position(|entry| entry.raw["message"]["role"] == "toolResult")
+            .unwrap();
+        let opts = items::ItemOpts {
+            thinking: false,
+            tools: crate::cli::Tools::Collapsed,
+        };
+        for paired in [true, false] {
+            let mut app = scene(palette(ColorDepth::None, Theme::Dark));
+            app.size = (140, 50);
+            let items = items::build(&branch[..if paired { result + 1 } else { result }], &opts);
+            let generation = app.transcript.r#gen;
+            update::update(
+                &mut app,
+                Msg::Follow {
+                    r#gen: generation,
+                    ev: FollowMsg::Opened {
+                        header: Header {
+                            title: "tools".into(),
+                            handle: "ha".into(),
+                            model: None,
+                        },
+                        items,
+                        dropped: 0,
+                        not_yet_persisted: false,
+                    },
+                },
+            );
+            if !paired {
+                let result = items::build(&branch[result..=result], &opts);
+                assert!(matches!(
+                    result.as_slice(),
+                    [crate::omp::items::Item::ToolResult { .. }]
+                ));
+                update::update(
+                    &mut app,
+                    Msg::Follow {
+                        r#gen: generation,
+                        ev: FollowMsg::Items(result),
+                    },
+                );
+            }
+            let (buffer, _, _) = screenshot(&mut app);
+            let shown = (0..buffer.area.height)
+                .map(|y| row_text(&buffer, y))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(shown.contains("fn parser_test() { … }"));
+            assert!(!shown.contains("· · no result"));
+            assert_eq!(shown.matches("no result").count(), usize::from(!paired));
+            let call = app
+                .transcript
+                .blocks
+                .iter()
+                .find_map(|block| match block {
+                    Block::Item(crate::omp::items::Item::Assistant { tool_calls, .. }) => {
+                        tool_calls.first()
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert_eq!(call.result.is_some(), paired);
+        }
     }
     #[test]
     fn picker_filters_selects_the_filtered_op_and_toasts_expire_at_three_seconds() {

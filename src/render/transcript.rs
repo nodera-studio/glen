@@ -104,7 +104,7 @@ fn tool(call: &ToolCall, st: &Style<'_>) -> String {
             )
         }
     } else {
-        muted("· no result", st)
+        muted("no result", st)
     };
     if call.name == "glen_reply"
         && let Some(reply) = call
@@ -596,5 +596,38 @@ mod reply_tests {
         let json = serde_json::to_value(&call).unwrap();
         assert_eq!(json["arguments"], args);
         assert!(json.get("reply_text").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pending_tool_tests {
+    use super::*;
+    use crate::render::palette::{ColorDepth, Theme};
+    #[test]
+    fn pending_generic_and_reply_tools_have_only_the_callers_separator() {
+        for depth in [ColorDepth::None, ColorDepth::TrueColor] {
+            let painter = Painter::new(depth, Theme::Dark);
+            let style = Style {
+                painter: &painter,
+                width: Some(100),
+                tools: Tools::Collapsed,
+                thinking: false,
+            };
+            for name in ["read", "glen_reply"] {
+                let call = ToolCall {
+                    id: "pending".into(),
+                    name: name.into(),
+                    summary: "pending.rs".into(),
+                    reply_text: (name == "glen_reply").then(|| "pending reply".into()),
+                    arguments: None,
+                    result: None,
+                };
+                let row = tool(&call, &style);
+                let plain = anstream::adapter::strip_str(&row).to_string();
+                assert!(plain.ends_with(" · no result"), "{plain}");
+                assert!(!plain.contains("· ·"), "{plain}");
+                assert_eq!(plain.matches("no result").count(), 1);
+            }
+        }
     }
 }

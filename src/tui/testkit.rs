@@ -491,10 +491,13 @@ pub fn scene(kind: SceneKind, size: (u16, u16), theme: TuiTheme) -> App {
                                         ""
                                     }
                                 ),
+                                current: m.provider == "fake" && m.id == "fake-1",
                                 provider: m.provider,
                                 id: m.id,
                             })
                             .collect(),
+                        thinking_level: Some("medium".into()),
+                        warnings: vec![],
                         thinking_levels: vec![
                             "off".into(),
                             "low".into(),

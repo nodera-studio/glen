@@ -67,7 +67,11 @@ pub fn notice_lines(app: &App, width: u16) -> Vec<String> {
     if w == 0 {
         return vec![];
     }
-    let wrapped = text::wrap(&format!("✗ {}", text::single_line(&err.message)), Some(w));
+    let marker = if err.is_warning() { "!" } else { "✗" };
+    let wrapped = text::wrap(
+        &format!("{marker} {}", text::single_line(&err.message)),
+        Some(w),
+    );
     let cut = wrapped.len() > 2;
     let mut lines = wrapped
         .into_iter()

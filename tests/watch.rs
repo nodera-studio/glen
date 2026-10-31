@@ -753,6 +753,83 @@ fn transcript_streaming_waits_for_the_complete_line() {
 }
 
 #[test]
+fn pending_tools_headers_and_same_batch_pairing_match_show_tail_and_watch() {
+    let b = OmpBox::new();
+    let path = b.session('A');
+    let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 160, 50);
+    pty.ready();
+    let call = j!({"type":"message", "id":"watch-tools", "parentId":"10000009", "message":{
+        "role":"assistant", "provider":"vendor", "model":"stream-model", "stopReason":"toolUse",
+        "content":[{"type":"toolCall", "id":"watch-read", "name":"read", "arguments":{"path":"pending.rs"}},
+                   {"type":"toolCall", "id":"watch-reply", "name":"glen_reply", "arguments":{"text":"awaiting reply"}}]
+    }});
+    append(&path, format!("{call}\n").as_bytes());
+    pty.wait_for("read pending.rs · no result", DATA);
+    pty.wait_for("glen_reply \"awaiting reply\" · no result", DATA);
+    poll(DATA, || {
+        pty.text_from(0)
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.contains("stream-model"))
+            .then_some(())
+    });
+    for name in ["show", "tail"] {
+        let out = b.glen(&[name, "e27c0de", "--human"], &b.alpha());
+        assert!(out.status.success());
+        let output = String::from_utf8(out.stdout).unwrap();
+        assert!(output.contains("read pending.rs · no result"), "{output}");
+        assert!(
+            output.contains("glen_reply \"awaiting reply\" · no result"),
+            "{output}"
+        );
+        assert!(!output.contains("· · no result"));
+    }
+    let results = [
+        j!({"type":"message", "id":"watch-read-result", "parentId":"watch-tools", "message":{
+            "role":"toolResult", "toolCallId":"watch-read", "toolName":"read", "content":"streamed read result", "isError":false}}),
+        j!({"type":"message", "id":"watch-reply-result", "parentId":"watch-read-result", "message":{
+            "role":"toolResult", "toolCallId":"watch-reply", "toolName":"glen_reply", "content":"delivered talkback", "isError":false}}),
+    ].into_iter().map(|entry| format!("{entry}\n")).collect::<String>();
+    append(&path, results.as_bytes());
+    pty.wait_for("streamed read result", DATA);
+    pty.wait_for("delivered talkback", DATA);
+    // Calls already streamed stay on screen; later results are standalone (AC-504).
+    assert_eq!(pty.text_from(0).matches("no result").count(), 2);
+    assert!(!pty.text_from(0).contains("· · no result"));
+    for name in ["show", "tail"] {
+        let out = b.glen(&[name, "e27c0de", "--human"], &b.alpha());
+        assert!(out.status.success());
+        let output = String::from_utf8(out.stdout).unwrap();
+        assert!(
+            !output.contains("no result"),
+            "within-batch results must pair: {output}"
+        );
+        assert!(output.contains("streamed read result"));
+        assert!(output.contains("delivered talkback"));
+    }
+    let old_title = "Fix the flaky parser test";
+    let title = "Updated watch tab";
+    let replacement = format!("{title}{}", " ".repeat(old_title.len() - title.len()));
+    fs::write(
+        &path,
+        fs::read_to_string(&path)
+            .unwrap()
+            .replace(old_title, &replacement),
+    )
+    .unwrap();
+    pty.send(b"r");
+    poll(START, || {
+        pty.text_from(0)
+            .lines()
+            .nth(1)
+            .is_some_and(|line| line.contains(title))
+            .then_some(())
+    });
+    pty.quit();
+    b.clean();
+}
+
+#[test]
 fn same_inode_rewrite_is_noticed_and_fresh_content_is_visible() {
     let b = OmpBox::new();
     let path = b.session('A');
