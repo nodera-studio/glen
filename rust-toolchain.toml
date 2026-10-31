@@ -1,0 +1,6 @@
+# The toolchain CI and the release build use (W8 DEBT-7). The supported
+# minimum is `rust-version` in Cargo.toml, which ci.yml's msrv job checks.
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"
