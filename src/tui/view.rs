@@ -1762,6 +1762,7 @@ pub(crate) mod tests {
             kind: PickerKind::Model,
             entries: vec![
                 PickerEntry {
+                    current: false,
                     label: "model-test".into(),
                     op: ControlOp::SetModel {
                         provider: "provider".into(),
@@ -1769,6 +1770,7 @@ pub(crate) mod tests {
                     },
                 },
                 PickerEntry {
+                    current: false,
                     label: "Other model 界".into(),
                     op: ControlOp::SetThinking("high".into()),
                 },
@@ -3058,10 +3060,12 @@ mod refinements {
             kind: PickerKind::Thinking,
             entries: vec![
                 PickerEntry {
+                    current: false,
                     label: "high".into(),
                     op: ControlOp::SetThinking("high".into()),
                 },
                 PickerEntry {
+                    current: false,
                     label: "low".into(),
                     op: ControlOp::SetThinking("low".into()),
                 },

@@ -3663,13 +3663,13 @@ fn ac516_control_keys_dispatch_the_matching_control() {
 
     t.key(b"m");
     t.wait_for("the model picker", UI, |v| v.contains("model · filter:"));
-    t.typ("fake/fake-1");
+    t.typ("other/fake-2");
     t.key(ENTER);
     t.wait_for("the chosen model reached the endpoint", UI, |_| {
         ext.frames("in").iter().any(|f| {
             f["op"] == "set_model"
-                && f["args"]["provider"] == "fake"
-                && f["args"]["model_id"] == "fake-1"
+                && f["args"]["provider"] == "other"
+                && f["args"]["model_id"] == "fake-2"
         })
     });
     t.wait_for("model change completed", UI, |v| {

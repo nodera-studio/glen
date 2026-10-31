@@ -364,6 +364,7 @@ impl Picker {
 }
 #[derive(Clone, Debug)]
 pub struct PickerEntry {
+    pub current: bool,
     pub label: String,
     pub op: ControlOp,
 }

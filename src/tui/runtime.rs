@@ -30,7 +30,7 @@ use std::{
     io, panic,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread::{self, JoinHandle},
@@ -82,6 +82,12 @@ fn restore_with(
     // A caller preparing to exit must wait for an already-started restore to finish,
     // even though that restore has cleared active to prevent duplicate teardown.
     let _restoring = restoring.lock().unwrap_or_else(|error| error.into_inner());
+    restore_locked_with(active, &mut step)
+}
+fn restore_locked_with(
+    active: &AtomicBool,
+    mut step: impl FnMut(TerminalStep) -> io::Result<()>,
+) -> io::Result<()> {
     if !active.swap(false, Ordering::AcqRel) {
         return Ok(());
     }
@@ -96,8 +102,17 @@ fn restore_with(
 fn enter_with(
     active: &AtomicBool,
     restoring: &Mutex<()>,
+    cancelled: impl FnOnce() -> bool,
     mut step: impl FnMut(TerminalStep) -> io::Result<()>,
 ) -> io::Result<()> {
+    // Entry and teardown are one serialized terminal-mode transaction.
+    let _restoring = restoring.lock().unwrap_or_else(|error| error.into_inner());
+    if cancelled() {
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "watch interrupted before terminal entry",
+        ));
+    }
     // Set before raw mode: failures at any stage still run every teardown step.
     active
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
@@ -109,7 +124,7 @@ fn enter_with(
         })?;
     for action in ENTER {
         if let Err(first) = step(action) {
-            return match restore_with(active, restoring, &mut step) {
+            return match restore_locked_with(active, &mut step) {
                 Ok(()) | Err(_) => Err(first),
             };
         }
@@ -121,8 +136,8 @@ fn restore_terminal() -> io::Result<()> {
 }
 struct TerminalGuard;
 impl TerminalGuard {
-    fn enter() -> io::Result<Self> {
-        enter_with(&ACTIVE, &RESTORING, terminal_step)?;
+    fn enter(cancelled: impl FnOnce() -> bool) -> io::Result<Self> {
+        enter_with(&ACTIVE, &RESTORING, cancelled, terminal_step)?;
         Ok(Self)
     }
     fn restore(&self) -> io::Result<()> {
@@ -163,7 +178,32 @@ fn io_error(action: &str, error: io::Error) -> GlenError {
 }
 
 #[cfg(unix)]
-struct Signals(signal_hook::iterator::Handle);
+#[derive(Default)]
+struct SignalCount {
+    count: AtomicUsize,
+    latest: AtomicUsize,
+}
+#[cfg(unix)]
+impl SignalCount {
+    fn record(&self, signal: i32) {
+        // Only lock-free atomics: this method also runs in the raw signal handler.
+        self.latest.store(signal as usize, Ordering::SeqCst);
+        self.count.fetch_add(1, Ordering::SeqCst);
+    }
+    fn pending(&self) -> i32 {
+        if self.count.load(Ordering::SeqCst) == 0 {
+            0
+        } else {
+            self.latest.load(Ordering::SeqCst) as i32
+        }
+    }
+}
+#[cfg(unix)]
+struct Signals {
+    handlers: Vec<signal_hook::SigId>,
+    count: Arc<SignalCount>,
+    closed: Arc<AtomicBool>,
+}
 #[cfg(unix)]
 impl Signals {
     fn start(
@@ -171,42 +211,63 @@ impl Signals {
         hup: Arc<AtomicBool>,
         quitting: Arc<AtomicBool>,
     ) -> Result<Self, GlenError> {
-        use signal_hook::{
-            consts::{SIGHUP, SIGINT, SIGTERM},
-            iterator::Signals,
+        use signal_hook::consts::{SIGHUP, SIGINT, SIGTERM};
+        let mut handle = Self {
+            handlers: vec![],
+            count: Arc::new(SignalCount::default()),
+            closed: Arc::new(AtomicBool::new(false)),
         };
-        let mut signals = Signals::new([SIGINT, SIGTERM, SIGHUP])
-            .map_err(|e| io_error("install signal reader", e))?;
-        let handle = Self(signals.handle());
+        for signal in [SIGINT, SIGTERM, SIGHUP] {
+            let count = handle.count.clone();
+            // SAFETY: the handler touches only preallocated, lock-free atomic counters;
+            // allocation, channel delivery and terminal I/O run on the watcher thread.
+            let id =
+                unsafe { signal_hook::low_level::register(signal, move || count.record(signal)) }
+                    .map_err(|e| io_error("install signal counter", e))?;
+            handle.handlers.push(id);
+        }
+        let (count, closed) = (handle.count.clone(), handle.closed.clone());
         let ctx = ctx.clone();
         let thread = thread::Builder::new()
             .name("watch-signals".into())
             .spawn(move || {
-                let mut seen = false;
-                for signal in signals.forever() {
-                    if seen || quitting.load(Ordering::Acquire) {
-                        if let Err(_error) = restore_terminal() {}
-                        std::process::exit(128 + signal);
+                let mut forwarded = false;
+                while !closed.load(Ordering::Acquire) {
+                    let deliveries = count.count.load(Ordering::SeqCst);
+                    if deliveries != 0 {
+                        // Use the most recently observed signal when several arrive before
+                        // polling. Unlike an iterator's pending bits, the counter retains
+                        // repeated deliveries of the same signal number.
+                        let signal = count.latest.load(Ordering::SeqCst) as i32;
+                        if deliveries >= 2 || (!forwarded && quitting.load(Ordering::Acquire)) {
+                            if let Err(_error) = restore_terminal() {}
+                            std::process::exit(128 + signal);
+                        }
+                        if !forwarded {
+                            forwarded = true;
+                            if signal == SIGHUP {
+                                hup.store(true, Ordering::Release);
+                            }
+                            if !ctx.send(Msg::Signal(signal)) {
+                                break;
+                            }
+                        }
                     }
-                    // Count delivery here, before the UI can observe the first signal.
-                    seen = true;
-                    if signal == SIGHUP {
-                        hup.store(true, Ordering::Release);
-                    }
-                    if !ctx.send(Msg::Signal(signal)) {
-                        break;
-                    }
+                    thread::sleep(Duration::from_millis(5));
                 }
             })
             .map_err(|e| io_error("start signal reader", e))?;
-        drop(thread); // Closing the iterator wakes it; never wait for a reader at quit.
+        drop(thread); // Keep watching through the effect wait; never join a reader at quit.
         Ok(handle)
     }
 }
 #[cfg(unix)]
 impl Drop for Signals {
     fn drop(&mut self) {
-        self.0.close();
+        self.closed.store(true, Ordering::Release);
+        for id in self.handlers.drain(..) {
+            signal_hook::low_level::unregister(id);
+        }
     }
 }
 fn input_msg(event: Event) -> Option<Msg> {
@@ -625,7 +686,26 @@ pub(crate) fn run(
     let quitting = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
     let signals = Signals::start(&ctx, hup.clone(), quitting.clone())?;
-    let guard = TerminalGuard::enter().map_err(|e| io_error("enter terminal", e))?;
+    let cancelled = || {
+        #[cfg(unix)]
+        {
+            signals.count.pending() != 0
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    };
+    let guard = match TerminalGuard::enter(cancelled) {
+        Ok(guard) => guard,
+        Err(error) => {
+            #[cfg(unix)]
+            if error.kind() == io::ErrorKind::Interrupted {
+                return Ok(128 + signals.count.pending());
+            }
+            return Err(io_error("enter terminal", error));
+        }
+    };
     let mut effects = Effects::start(ctx.clone(), &app, opened);
     let result = (|| {
         let backend = CrosstermBackend::new(Box::new(io::stdout()) as Box<dyn io::Write>);
@@ -713,24 +793,140 @@ mod tests {
         )
     }
     #[test]
+    #[cfg(unix)]
+    fn raw_signal_counter_keeps_identical_deliveries_before_the_watcher_polls() {
+        let count = SignalCount::default();
+        count.record(signal_hook::consts::SIGINT);
+        count.record(signal_hook::consts::SIGINT);
+        assert_eq!(count.count.load(Ordering::SeqCst), 2);
+        assert_eq!(count.pending(), signal_hook::consts::SIGINT);
+        count.record(signal_hook::consts::SIGTERM);
+        assert_eq!(count.count.load(Ordering::SeqCst), 3);
+        assert_eq!(count.pending(), signal_hook::consts::SIGTERM);
+    }
+    #[test]
+    fn a_signal_seen_before_entry_skips_every_terminal_step() {
+        let active = AtomicBool::new(false);
+        let restoring = Mutex::new(());
+        let error = enter_with(
+            &active,
+            &restoring,
+            || true,
+            |_| panic!("entered after quit"),
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert!(!active.load(Ordering::Acquire));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn a_signal_during_entry_waits_for_setup_and_restores_the_slave_to_cooked_mode() {
+        use rustix::{
+            fs::{Mode, OFlags},
+            pty::{self, OpenptFlags},
+            termios::{self, LocalModes, OptionalActions},
+        };
+        let master = pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+        pty::grantpt(&master).unwrap();
+        pty::unlockpt(&master).unwrap();
+        let name = pty::ptsname(&master, Vec::new()).unwrap();
+        let slave = rustix::fs::open(name, OFlags::RDWR | OFlags::NOCTTY, Mode::empty()).unwrap();
+        let cooked = termios::tcgetattr(&slave).unwrap();
+        let mut raw = cooked.clone();
+        raw.make_raw();
+        let active = AtomicBool::new(false);
+        let restoring = Mutex::new(());
+        let signal = SignalCount::default();
+        let steps = Mutex::new(vec![]);
+        let (entered, entering) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let (attempt, attempted) = mpsc::channel();
+        let (done, restored) = mpsc::channel();
+        thread::scope(|scope| {
+            let (active, restoring, signal, steps, slave, raw) =
+                (&active, &restoring, &signal, &steps, &slave, &raw);
+            let entry = scope.spawn(move || {
+                enter_with(
+                    active,
+                    restoring,
+                    || signal.pending() != 0,
+                    |step| {
+                        steps.lock().unwrap().push(step);
+                        if step == TerminalStep::Raw {
+                            termios::tcsetattr(slave, OptionalActions::Now, raw)?;
+                            entered.send(()).unwrap();
+                            paused.recv_timeout(Duration::from_secs(2)).unwrap();
+                        }
+                        Ok(())
+                    },
+                )
+                .unwrap();
+            });
+            entering.recv_timeout(Duration::from_secs(2)).unwrap();
+            assert!(
+                !termios::tcgetattr(slave)
+                    .unwrap()
+                    .local_modes
+                    .intersects(LocalModes::ICANON | LocalModes::ECHO),
+                "raw mode must be observed during setup"
+            );
+            signal.record(signal_hook::consts::SIGINT);
+            let cooked = &cooked;
+            let exit = scope.spawn(move || {
+                attempt.send(()).unwrap();
+                restore_with(active, restoring, |step| {
+                    steps.lock().unwrap().push(step);
+                    if step == TerminalStep::NoRaw {
+                        termios::tcsetattr(slave, OptionalActions::Now, cooked)?;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+                done.send(()).unwrap();
+            });
+            attempted.recv_timeout(Duration::from_secs(2)).unwrap();
+            let early = restored.recv_timeout(Duration::from_millis(50));
+            resume.send(()).unwrap();
+            entry.join().unwrap();
+            exit.join().unwrap();
+            assert!(
+                matches!(early, Err(RecvTimeoutError::Timeout)),
+                "restore raced terminal entry"
+            );
+        });
+        assert_eq!(*steps.lock().unwrap(), [ENTER, LEAVE].concat());
+        assert!(
+            termios::tcgetattr(&slave)
+                .unwrap()
+                .local_modes
+                .contains(LocalModes::ICANON | LocalModes::ECHO)
+        );
+        assert!(!active.load(Ordering::Acquire));
+    }
+    #[test]
     fn partial_enter_restores_every_step_and_keeps_the_original_error() {
         for failed in ENTER {
             let active = AtomicBool::new(false);
             let mut seen = vec![];
             let restoring = Mutex::new(());
-            let result = enter_with(&active, &restoring, |step| {
-                if step == TerminalStep::Raw {
-                    assert!(active.load(Ordering::Acquire));
-                }
-                seen.push(step);
-                if step == failed {
-                    Err(io::Error::other("enter failed"))
-                } else if LEAVE.contains(&step) {
-                    Err(io::Error::other("cleanup failed"))
-                } else {
-                    Ok(())
-                }
-            });
+            let result = enter_with(
+                &active,
+                &restoring,
+                || false,
+                |step| {
+                    if step == TerminalStep::Raw {
+                        assert!(active.load(Ordering::Acquire));
+                    }
+                    seen.push(step);
+                    if step == failed {
+                        Err(io::Error::other("enter failed"))
+                    } else if LEAVE.contains(&step) {
+                        Err(io::Error::other("cleanup failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
             assert_eq!(result.unwrap_err().to_string(), "enter failed");
             assert!(!active.load(Ordering::Acquire));
             assert_eq!(&seen[seen.len() - 4..], &LEAVE);
@@ -752,7 +948,7 @@ mod tests {
         assert!(!active.load(Ordering::Acquire));
         active.store(true, Ordering::Release);
         assert_eq!(
-            enter_with(&active, &restoring, |_| panic!("already entered"))
+            enter_with(&active, &restoring, || false, |_| panic!("already entered"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists

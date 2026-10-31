@@ -1308,6 +1308,63 @@ fn back_to_back_signals_exit_within_one_second_and_finish_teardown() {
 }
 
 #[test]
+#[cfg(debug_assertions)]
+fn repeated_sigint_interrupts_an_in_flight_submit_after_observed_delivery() {
+    for controlling in terminal_modes() {
+        for _ in 0..4 {
+            let b = RpcBox::new();
+            let gate = b.omp.tmp.path().join("identical-probe");
+            let ready = gate.with_file_name("identical-probe.ready");
+            let mut cmd = b.glen(&["watch", "e27c0de"]);
+            cmd.env("TERM", "xterm-256color")
+                .env("FAKE_OMP_LEASE_PROBE_GATE", &gate);
+            let mut pty = Pty::open(120, 40);
+            pty.controlling = controlling;
+            pty.spawn(cmd);
+            pty.ready();
+            pty.send(b"\tin flight\r");
+            poll(START, || ready.exists().then_some(()));
+            let signalled = Instant::now();
+            pty.signal_process(Signal::INT);
+            // Standard signals may coalesce in the kernel before any handler runs.
+            // Observe the first delivery before sending the same number again; the
+            // unit counter test covers two deliveries before the watcher can poll.
+            poll(EXIT, || {
+                (pty.bytes().windows(8).any(|b| b == b"\x1b[?1049l")
+                    && termios::tcgetattr(&pty.slave)
+                        .unwrap()
+                        .local_modes
+                        .contains(LocalModes::ICANON | LocalModes::ECHO))
+                .then_some(())
+            });
+            assert!(
+                pty.child.as_mut().unwrap().0.try_wait().unwrap().is_none(),
+                "first SIGINT must still wait for the held submit"
+            );
+            pty.signal_process(Signal::INT);
+            assert_eq!(pty.wait_exit(EXIT), 130);
+            assert!(
+                signalled.elapsed() < EXIT,
+                "identical signals took at least 1s"
+            );
+            pty.assert_teardown();
+            let bytes = pty.bytes();
+            let leave = b"\x1b[?2004l\x1b[?1049l\x1b[?25h";
+            assert_eq!(
+                bytes
+                    .windows(leave.len())
+                    .filter(|bytes| *bytes == leave)
+                    .count(),
+                1,
+                "teardown must finish without interleaving: {bytes:?}"
+            );
+            assert!(!gate.exists());
+            b.omp.clean();
+        }
+    }
+}
+
+#[test]
 fn hung_endpoint_keeps_focus_responsive_refuses_and_bounds_quit() {
     let mut b = LiveBox::new();
     b.start_ext(A_ID, "hang", &[]);

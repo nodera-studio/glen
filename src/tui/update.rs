@@ -482,14 +482,18 @@ fn dispatch(app: &mut App, action: Action) -> Vec<Cmd> {
                     .then(|| {
                         p.visible_entries()
                             .get(p.selected)
-                            .map(|entry| entry.op.clone())
+                            .map(|entry| (entry.op.clone(), entry.current))
                     })
                     .flatten()
             } else {
                 None
             };
-            if let Some(op) = op {
+            if let Some((op, current)) = op {
                 app.overlay = None;
+                if current {
+                    toast(app, "unchanged");
+                    return vec![];
+                }
                 return control(app, op, None);
             }
         }
@@ -686,6 +690,7 @@ fn control_done(app: &mut App, local: u64, op: ControlOp, result: Result<Control
                 PickerKind::Model => models
                     .into_iter()
                     .map(|m| PickerEntry {
+                        current: m.current,
                         label: text::single_line(&m.label),
                         op: ControlOp::SetModel {
                             provider: m.provider,
@@ -696,6 +701,7 @@ fn control_done(app: &mut App, local: u64, op: ControlOp, result: Result<Control
                 PickerKind::Thinking => thinking_levels
                     .into_iter()
                     .map(|level| PickerEntry {
+                        current: Some(&level) == thinking_level.as_ref(),
                         label: text::single_line(&level),
                         op: ControlOp::SetThinking(level),
                     })
@@ -2018,10 +2024,10 @@ mod tests {
                             provider: "provider".into(),
                             id: "model".into(),
                             label: "Model".into(),
-                            current: true,
+                            current: code == 'T',
                         }],
                         thinking_levels: vec!["high".into()],
-                        thinking_level: Some("high".into()),
+                        thinking_level: Some("medium".into()),
                         warnings: vec![],
                     }),
                 },
@@ -2148,21 +2154,7 @@ mod tests {
     }
     #[test]
     fn pickers_start_on_the_current_model_or_thinking_level() {
-        for (kind, expected, op) in [
-            (
-                PickerKind::Model,
-                1,
-                ControlOp::SetModel {
-                    provider: "p".into(),
-                    id: "current".into(),
-                },
-            ),
-            (
-                PickerKind::Thinking,
-                3,
-                ControlOp::SetThinking("high".into()),
-            ),
-        ] {
+        for (kind, expected) in [(PickerKind::Model, 1), (PickerKind::Thinking, 3)] {
             let mut a = app();
             let id = local(control(&mut a, ControlOp::ListModels, Some(kind)));
             update(
@@ -2187,9 +2179,48 @@ mod tests {
                 panic!("picker")
             };
             assert_eq!(p.selected, expected);
-            assert!(
-                matches!(plain(&mut a, KeyCode::Enter).as_slice(), [Cmd::Control { op: actual, .. }] if actual == &op)
+            assert!(p.entries[p.selected].current);
+            // Filtering changes the visible index, not the identity of the current choice.
+            let label = p.entries[p.selected].label.clone();
+            update(&mut a, Msg::Paste(label));
+            assert!(plain(&mut a, KeyCode::Enter).is_empty());
+            assert!(a.overlay.is_none());
+            assert_eq!(a.toast.as_ref().unwrap().text, "unchanged");
+            assert!(a.pending_control.is_none());
+        }
+    }
+    #[test]
+    fn picking_a_different_model_or_thinking_level_dispatches_the_setter() {
+        for (kind, expected) in [
+            (
+                PickerKind::Model,
+                ControlOp::SetModel {
+                    provider: "p".into(),
+                    id: "first".into(),
+                },
+            ),
+            (PickerKind::Thinking, ControlOp::SetThinking("low".into())),
+        ] {
+            let mut a = app();
+            let id = local(control(&mut a, ControlOp::ListModels, Some(kind)));
+            update(
+                &mut a,
+                Msg::ControlDone {
+                    local: id,
+                    op: ControlOp::ListModels,
+                    result: Ok(ControlData::Models {
+                        models: model_choices(),
+                        thinking_levels: vec!["low".into(), "high".into()],
+                        thinking_level: Some("high".into()),
+                        warnings: vec![],
+                    }),
+                },
             );
+            plain(&mut a, KeyCode::Up);
+            let commands = plain(&mut a, KeyCode::Enter);
+            assert!(matches!(commands.as_slice(), [Cmd::Control { op, .. }] if op == &expected));
+            assert!(a.overlay.is_none());
+            assert!(a.pending_control.is_some());
         }
     }
     #[test]
@@ -2402,6 +2433,7 @@ mod tests {
                 filter: String::new(),
                 kind: PickerKind::Thinking,
                 entries: vec![PickerEntry {
+                    current: false,
                     label: "high".into(),
                     op: ControlOp::SetThinking("high".into()),
                 }],
