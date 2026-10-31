@@ -21,7 +21,11 @@ do not spawn further subagents.
 
 **Done when:** the slice's tests pass (`cargo test --locked`) AND
 `bash .claude/scripts/quality-gate.sh` (rustfmt check + clippy `-D warnings`) exits 0,
-`progress.md` is updated, and you've returned a tight report.
+`progress.md` is updated, and you've returned a tight report. A stress or repeat run
+(N/N green) proves only non-flakiness. A fix counts as correct only with a test that fails
+before the fix and passes after it (red → green), or a targeted assertion of the exact
+property it fixes. W10's 10/10 local stress run hid the lstat-nanosecond compare and the
+swap-cleanup bugs.
 
 Ground every decision in `AGENTS.md`, `.claude/CLAUDE.md` and the relevant area doc
 (`docs/design.md` for the omp surfaces glen builds on). Read the affected area before
@@ -97,13 +101,20 @@ after a crash or compaction.
 
 - Files created / modified (one line each).
 - Key decisions made and why (anything a reviewer must know).
-- Tests added + what they cover.
+- Tests added + what they cover. For each fix, the red → green test or the targeted
+  assertion that proves it. Never cite stress or repeat results (N/N green) as correctness
+  evidence: they show only non-flakiness.
 - Gate state (clean / remaining warn-tier signal).
 - Deferred risks or anything the next stage (review) should scrutinize.
 
 ## Rules
 
 - Run tests on the host with cargo: `cargo test --locked` (filter with `cargo test <name>`); omp data comes from `tests/fixtures/`, never a live `~/.omp`.
+- Run any omp probe, smoke or experiment with `HOME="$(mktemp -d)"` (no profile) or
+  `--profile glen-harness`. Never create another `~/.omp/profiles/<name>`, and never point
+  `PI_CONFIG_DIR` at an absolute temp path: omp joins it onto `$HOME`
+  (`packages/utils/src/dirs.ts:116-118` in the omp clone). The `steer-bash.sh` hook enforces
+  part of this.
 - User-facing messages, errors and logs are in English.
 - Never `--no-verify`; never weaken a test or silence the gate to go green.
 - Never delete, move, rename or revert a file you did not create in this task, tracked or

@@ -75,7 +75,7 @@ The full agent index is `.claude/agents/README.md`; commands are listed in
 
 | Command | Use for |
 | --- | --- |
-| `/plan-implementation` → `/implement` (`/implement-quick` for small changes) | Plan, then build with the Codex Implementer, the Claude ‖ Codex review gate and the conformance tail |
+| `/plan-implementation` → `/implement` (`/implement-quick` for small changes) | Plan, then build with the routed Implementer (`routing.sh implementation`, Claude by default), the Claude ‖ Codex review gate and the conformance tail |
 | `/code-review`, `/respond-to-review` | Review the current diff; answer PR review comments |
 | `/review-implementation` | Claude ‖ Codex ‖ omp |
 | `/deep-debug` | Claude ‖ Codex investigator (+ optional omp), then the adversary |
@@ -126,8 +126,11 @@ skills (`mnemosyne:mnemosyne`, `mnemosyne:mnemosyne-workspace`) are the full man
 
 ## Codex
 
-Codex is the second engine for review, debug and audits. Dispatch it only through the
-`codex:codex-rescue` agent, `codex-companion.mjs` (the Implementer) or `codex review`; the
+Roles come from `.claude/routing.json`, read through `bash .claude/scripts/routing.sh <key>`
+(an owner-confirmed override in `.claude/auto-mode/routing.json` wins). Current (decision
+148655d9): Claude implements (`impl-coder-claude`); Codex reviews, plans, debugs and audits.
+Dispatch Codex only through the `codex:codex-rescue` agent, `codex-companion.mjs` (the
+Implementer, only when `routing.sh implementation` prints `codex`) or `codex review`; the
 `block-old-codex` hook blocks `codex exec`. Harness prompts do not pass a Codex model; model
 choice is configured outside the harness (see `AGENTS.md`).
 
@@ -166,6 +169,7 @@ The CLI tool table (rg, sd, ast-grep, difft, yq, gron, scc) is in
 | `agents/`, `commands/`, `skills/` | Agent prompts, slash commands, skills |
 | `hooks/` | Enforcement scripts wired in `settings.json` |
 | `rules/` | Path-scoped conventions; `behavioral-preamble.md` is the one always-loaded rule |
+| `routing.json` | Who does each kind of work (implementation, UI, review, planning, debug, audits) and the fan-out caps; read it through `scripts/routing.sh`, never directly |
 | `docs/`, `prompts/`, `scripts/` | Harness reference, prompt-engineering guides, tooling |
 | `plans/`, `research/`, `handoffs/`, `evidence/`, `tech-debt/`, `testing/` | Working material, git-ignored; plans are kept after execution as history |
 | `auto-mode/` | `/goal` and `/auto-mode` state file (git-ignored: per-machine loop state) |

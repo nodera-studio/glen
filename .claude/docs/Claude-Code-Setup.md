@@ -96,6 +96,12 @@ cheaper models (mechanical roles) and per-role `effort`. A global
 `CLAUDE_CODE_SUBAGENT_MODEL` would flatten all of that. This survives "optimization"
 passes by being written down here.
 
+Which engine does a kind of work (Claude or Codex for implementation, review, planning, debug
+and audits; the UI Implementer; the fan-out caps) is a separate question: it lives in
+`.claude/routing.json`, read through `bash .claude/scripts/routing.sh <key>`, never hard-coded in
+a prompt. How many agents one Workflow may run, and which work may fan out at all, is in
+`.claude/docs/Workflow-Fanout.md`.
+
 ## CLI tooling — `bootstrap-tools.sh`
 
 `.claude/scripts/bootstrap-tools.sh` installs the productivity CLI layer.

@@ -1,0 +1,5 @@
+{"implementation":"claude","ui":"impl-coder-ui",
+ "review":["claude","codex"],"planning":["claude","codex"],"debug":["claude","codex"],
+ "audits":["claude","codex"],"integration":"claude",
+ "workflow_max_agents":50,"heavy_concurrency":8,
+ "decision":"148655d9","decided":"2026-10-31"}

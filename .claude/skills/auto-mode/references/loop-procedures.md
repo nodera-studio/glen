@@ -148,8 +148,9 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    `in_progress` (`document_get` → `document_update`).
 2. **Plan if needed.** `board-children` + non-trivial wave → run `/plan-implementation`
    scoped to this wave. `plan-doc` / `fresh-plan` → the plan exists; skip re-planning.
-3. **Implement.** Invoke `/implement` for the wave. It owns its gates: the Codex
-   Implementer's cargo loop and `.claude/scripts/quality-gate.sh`, the local
+3. **Implement.** Invoke `/implement` for the wave. It owns its gates: the cargo loop of
+   the Implementer `bash .claude/scripts/routing.sh implementation` names
+   (`impl-coder-claude` or `impl-coder-codex`) and `.claude/scripts/quality-gate.sh`, the local
    `/code-review` gate (1 Claude ‖ 1 Codex pass, 2-vote), the conformance tail
    (`cargo test --test conformance`) and the docs updater. This local gate is the code
    review; nothing on GitHub reviews the PR. Saved review or plan files per engine are
@@ -159,11 +160,12 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    Codex review pass hits a capacity or rate error, the gate retries once and then runs
    single-engine (see `.claude/commands/code-review.md`); record that in the wave-end note.
    **UI routing:** design-heavy UI (`site/`, landing pages, web (non-Rust) visual
-   components) is built by the Claude UI Implementer (`impl-coder-ui`,
-   `implementation/coder-ui.md`: Opus, `frontend-design:frontend-design` skill), which
-   verifies its own work in a browser against the named design reference; Codex
-   still reviews it, and the Rust crate stays with the Codex Implementer
-   (`implementation/orchestrator.md` → UI implementation routing). UI waves also get the
+   components) is built by the agent `bash .claude/scripts/routing.sh ui` names
+   (`impl-coder-ui`, `implementation/coder-ui.md`: Opus, `frontend-design:frontend-design`
+   skill), which verifies its own work in a browser against the named design reference;
+   Codex still reviews it, and the Rust crate stays with the Implementer
+   `routing.sh implementation` names (`implementation/orchestrator.md` → UI implementation
+   routing). UI waves also get the
    catalogue survey at planning and the reference-fidelity check in the visual gate.
    **Live smoke:** a wave that builds a test harness driving a real TUI, agent CLI or network
    service runs it live once before the PR (`implementation/orchestrator.md` → Live smoke).
@@ -189,7 +191,47 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
      `gh pr view <N> --json reviews,mergeable,mergeStateStatus`.
    - Update the poll cursor in the state file.
    On red CI: `gh run view <run-id> --log-failed` for the failing step.
-7. **Triage + fix.** CI red → fix the cause (never relax a lint or a test to go green).
+
+   **Waiting on background work.** Whenever the session will idle longer than about 10 min on
+   background agents, a workflow or CI, schedule a `ScheduleWakeup` heartbeat about every
+   20 min. CI polling itself stays at about 270 s, as above.
+   - On each wake, compare against the previous wake, for every running agent:
+     `git -C "$WT" status --short` and the last commit time (`git -C "$WT" log -1 --format=%cI`),
+     the companion `status` where Codex runs, and the workflow and CI status.
+   - Two wakes in a row with no change for an agent → run "Check before stopping an
+     Implementer" (`implementation/orchestrator.md` → Role 1). Never use a wake as a reason to
+     stop an agent by itself.
+   - Stop scheduling heartbeats once everything has reported.
+
+   **CI-owner marker.** When a background agent owns a PR's CI loop (it polls and fixes that
+   PR), write `.claude/auto-mode/ci-owner/pr-<N>.json` in the main checkout:
+   `{"owner":"<agent name>","since":"<date -u +%Y-%m-%dT%H:%M:%SZ>","head":"<sha>"}`. The
+   directory is git-ignored (under `.claude/auto-mode/`).
+   - On a CI-monitor event for PR N with a marker whose owner is still running, take no action
+     yourself. Relay one line to the owner by SendMessage only for a failing check its last
+     report did not name.
+   - Delete the marker when the owner returns. A marker whose owner has finished is stale:
+     delete it and handle the event yourself.
+   - If the session's PR monitor can be paused for a delegated PR (`mcp__ccd_pr__set_monitor`;
+     load its schema with ToolSearch first), pause it when you write the marker and resume it
+     when you delete the marker.
+7. **Triage + fix.** **Merge main at the start of every fix cycle**, before briefing any fix
+   (CI, review or conformance), with `WT` = the wave's checkout:
+   `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit origin/main`. Never rebase.
+   - Who merges: when a CI-owner agent (marker above) works in `$WT`, it merges main as its
+     first fix step and you do not. Otherwise you merge, and only when
+     `git -C "$WT" status --short` is empty; with uncommitted edits, have their agent commit
+     or stash first.
+   - A conflict goes to integration routing (`bash .claude/scripts/routing.sh integration`),
+     recorded as in Shared seams item 4 below.
+   - After a non-trivial merge, re-run `bash .claude/scripts/quality-gate.sh` and
+     `cargo test --locked` before the fix. Name the merged `origin/main` SHA
+     (`git -C "$WT" rev-parse origin/main`) in the fix brief.
+   - Why: W9 was cut before W3b merged, so its live-route hint could not name `glen thinking`.
+   - A merge changes the head SHA, so a SHA-bound proof (W10's flake proof) has to re-run on
+     the new head.
+
+   Then: CI red → fix the cause (never relax a lint or a test to go green).
    A review comment with a real defect → fix, push, reply on the thread. A comment that
    is wrong → reply with evidence (file:line, a test) and resolve it. Theoretical-only →
    one-line reply with the reason. A Linux-only failure (paths, `dirs` locations) cannot
@@ -236,7 +278,11 @@ A goal without a release is **done** once its last wave is merged, `done` and ta
 
 The run fixes its own harness as it goes. Whenever something in `.claude/` slows or misleads
 a wave, add a line to the state file's **Harness friction log** (and log a gap in
-`.claude/orchestrator/gaps.jsonl` when no agent fits). With each wave PR, run one batch:
+`.claude/orchestrator/gaps.jsonl` when no agent fits). With each wave PR, run one batch.
+Plan the batch as independent fix groups by file (no two groups edit the same file) and run
+it as a workflow: one implementer per group in its own worktree, one reviewer per group, and
+the group branches merged into the batch branch (`.claude/docs/Workflow-Fanout.md`). Steps 1–4
+describe the batch branch; each group worktree is cut and removed the same way.
 
 1. `git worktree add .claude/worktrees/harness-<n> -b chore/harness-selfimprove-<n>
    origin/main` — an isolated worktree, so the wave checkout is untouched.
@@ -258,6 +304,9 @@ is planned and built in its own worktree while the main checkout carries the cur
 loop there. Each wave still PRs into `main` separately and is squash-merged on its own bar. If
 the first merge conflicts with the later wave, bring `main` into it with
 `git merge origin/main`; a wave that merged another wave's branch early never rebases.
+W8-style fix groups (independent fixes split by file) run the same way as a harness batch: a
+workflow with one implementer per group in its own worktree and one reviewer per group, merged
+into the wave branch (`.claude/docs/Workflow-Fanout.md`).
 
 **Shared seams.** W3 (live route) and W4 (agent surface) ran in parallel and both edited
 `send.rs`, `doctor.rs`, `cli.rs` and the conformance command-surface rows, which cost a 16-file
@@ -283,12 +332,14 @@ semantic merge at PR time. So, when planning waves to run in parallel:
 3. A shared surface list (the visible-command set, doctor checks, the conformance
    command-surface rows) has one owner wave per run. Only the owner edits it; another wave
    hands its entries to the owner's plan or adds them after the owner merges.
-4. Integrating two already-reviewed waves (the early merge, or a conflict left at PR time) may
-   go to a Claude agent (`general-purpose`) instead of the Codex Implementer, since it is
-   merge resolution, not new product code (the second exception to "Claude writes no
-   product code", next to UI; `implementation/orchestrator.md` → Role 1). Record it as a
-   routing deviation in the decision log and the PR body, then re-run the gate and tests and
-   a scoped Claude ‖ Codex `/code-review` of the resolved files.
+4. Integrating two already-reviewed waves (the early merge, a conflict left at PR time, or a
+   conflict from a fix cycle's main merge) goes to the agent
+   `bash .claude/scripts/routing.sh integration` names (a Claude `general-purpose` agent when
+   it prints `claude`), not necessarily the Implementer `routing.sh implementation` names,
+   since it is merge resolution, not new product code (`implementation/orchestrator.md` →
+   Role 1). When the two differ, record it as a routing deviation in the decision log and the
+   PR body. Then re-run the gate and tests and a scoped Claude ‖ Codex `/code-review` of the
+   resolved files.
 
 `.claude/plans/` is git-ignored, so the new worktree does not contain the wave's plan. Every
 brief for that wave (Implementer, fix, conformance, docs, reviewers) passes the plan by absolute
@@ -313,8 +364,9 @@ its absolute path, from the main checkout
 2. `bash "$MAIN/.claude/scripts/remove-worktree.sh" "$WT" [<branch>]` (`--dry-run` first if in
    doubt). It refuses unless `$WT` is a registered worktree directly under `.claude/worktrees/`
    and your cwd is outside it; with `<branch>`, unless that branch is checked out there and its
-   tip is in `origin/main` or on its fetched upstream. It refuses while a live job (in either
-   companion state store) or a task process is in `$WT`, printing the cancel commands; else it
+   tip is in `origin/main` or on its fetched upstream. It refuses while a live job (queued, or
+   running with a live companion task pid, in either companion state store) or a task process
+   is in `$WT`, printing the cancel commands; else it
    stops `$WT`'s brokers (TERM, wait, KILL), confirms nothing is left, then
    `git worktree remove --force` and `git branch -D`. Never do these steps by hand or in
    another order.

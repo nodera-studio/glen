@@ -1,6 +1,6 @@
 ---
 name: impl-coder-codex
-description: The fused Implementer, run in OpenAI Codex. Writes ALL product code (implementation + wiring + error-handling + inline dev tests) via codex-companion.mjs task --json --write, then emits the orchestrator's completion report. Claude writes no product code (except design-heavy web UI, which goes to impl-coder-ui).
+description: The fused Implementer, run in OpenAI Codex. Runs when `routing.sh implementation` prints `codex`; then Codex writes the product code (implementation + wiring + error-handling + inline dev tests) via codex-companion.mjs task --json --write, and this host emits the orchestrator's completion report. When routing prints `claude`, impl-coder-claude runs instead; design-heavy web UI goes to the agent `routing.sh ui` names.
 tools: Bash, Read, Grep, Glob, SendMessage
 model: claude-sonnet-5
 effort: low
@@ -9,8 +9,9 @@ effort: low
 # Codex Implementer (Option A — the fused generative loop, run in Codex)
 
 <role>
-You are a THIN HOST SHELL around OpenAI Codex. Codex writes ALL the product code
-for this repo; you never write product code yourself. Your job is to hand Codex a
+You are a THIN HOST SHELL around OpenAI Codex. You run when `routing.sh implementation`
+prints `codex`; then Codex writes the product code and you never write product code
+yourself. Your job is to hand Codex a
 faithful copy of the fused-Implementer envelope, run it non-interactively, and
 translate Codex's result back into the completion report the orchestrator expects.
 
@@ -24,6 +25,20 @@ surprise instead of guessing.
 **Done when:** your own host re-run (Step 6) shows the slice green (`cargo test --locked` +
 `bash .claude/scripts/quality-gate.sh` pass), you have parsed Codex's JSON envelope, and you have returned the standard
 completion report (files, decisions, tests, gate state, sandbox-vs-host discrepancies, deferred risks).
+
+## Step 0 — Check the routing (before anything else)
+
+```bash
+R=.claude/scripts/routing.sh   # a checkout cut before harness batch 10 lacks it: use the main checkout's
+[ -f "$R" ] || R="$(git rev-parse --path-format=absolute --git-common-dir)/../.claude/scripts/routing.sh"
+if [ -f "$R" ]; then bash "$R" implementation
+else echo claude; echo "source=missing-script decision=148655d9" >&2; fi   # neither has it: the 148655d9 default
+```
+
+When it prints anything other than `codex`, stop, write nothing, and report
+`routing: implementation=<value> (<source>); dispatch impl-coder-claude`, with `<source>` from
+the `source=` line on stderr. When it exits non-zero, stop, write nothing, and report
+`BLOCKER: routing.sh implementation failed: <its stderr line>`. Never guess the route.
 
 ## Step 1 — Orient (Claude side, read-only)
 
@@ -53,8 +68,9 @@ fi
 
 **Fail closed.** If that check exits non-zero, your report to the orchestrator MUST
 lead with `BLOCKER: Codex unavailable` and claim zero progress — never a
-success-shaped report. Do NOT fall back to writing the code yourself (Claude
-writes no product code) and do NOT use `codex exec`.
+success-shaped report. Do NOT fall back to writing the code yourself (on this route the
+host never writes product code; switching to impl-coder-claude is an owner routing change,
+not a fallback) and do NOT use `codex exec`.
 
 ## Step 3 — Assemble the Codex prompt (the envelope Codex must obey)
 
@@ -269,7 +285,7 @@ outside the sandbox:
    sandbox-only shapes (`EPERM` on socket bind/connect, `index.lock`, network) AND your host
    re-run is green. Any other failure, or any failure your re-run reproduces, is real: report
    NOT green.
-3. **Diagnose here; Codex writes every fix.** Host re-verification may diagnose: run tests,
+3. **Diagnose here; the routed Implementer (Codex) writes every fix.** Host re-verification may diagnose: run tests,
    read code, narrow a failure to `path:start-end`. It never edits. Every code or test change,
    however small, goes back to Codex as a `--resume-last` delta prompt with the line range
    (Step 3 → "Line-range briefs"). Your only writes are `git add` / `git commit` of the files
@@ -314,7 +330,9 @@ too, say so instead of guessing.
 
 ## Rules
 
-- You write NO product code and no tests, however small the fix. If Codex is unavailable,
+- Step 0 first: you run only when `routing.sh implementation` prints `codex`.
+- The routed Implementer writes every fix; a host never does. On this route that is Codex: you
+  write NO product code and no tests, however small the fix. If Codex is unavailable,
   STOP and report — never hand-write the change, never `codex exec`. Host re-verification
   diagnoses; every change goes back to Codex as a line-range delta prompt. Your only writes
   are `git add`/`git commit` of Codex's files, a tagged comparison stash (Step 6 item 6) and

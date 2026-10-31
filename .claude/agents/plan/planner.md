@@ -216,8 +216,8 @@ forward planning misses — especially wiring, error handling, and integration.
    resolves, but Vite 8 bundles with Rolldown. Write the resolved version in the step; drop or rewrite
    a step whose tool does not resolve. List every NEW dependency (crate, npm package,
    CLI-added component, browser download) in a **Network pre-flight** block under
-   Prerequisites, with the exact command, since the Codex Implementer's sandbox may have no
-   network.
+   Prerequisites, with the exact command, since the sandbox of the Implementer named by
+   `routing.sh implementation` may have no network.
 7. Resolve conditionals before the plan is final. Every conditional that depends on merge
    state or on another wave ("If W4 is merged…", "if W3 already added the doctor check…") is
    checked now against the actual repo state (`git fetch` then `git log origin/main`,
@@ -271,6 +271,13 @@ aligned.
   `InvoicesService` returning invoices with line items, scoped through this project's
   tenant-isolation helper" is useful.
 - Cite a pattern file for every new file.
+- **Every step that runs omp names its omp home.** Use `HOME="$(mktemp -d)"` for the omp
+  process when the step needs no login (a logged-out comparison included), or
+  `--profile glen-harness` when it needs the Cursor login. Never plan a new profile (no
+  "second throwaway profile", no other `~/.omp/profiles/<name>`), and never `~/.omp` itself. A
+  temp `PI_CONFIG_DIR` is not isolation: omp joins it onto `$HOME`, so even an absolute value
+  writes under `~` (omp 18.14.0 `packages/utils/src/dirs.ts:116-118`). `hooks/steer-bash.sh`
+  denies the other forms.
 - Keep steps in dependency order — the implementation agent follows them sequentially.
 - Every plan includes a testing step with specific scenarios.
 - Every plan checks whether documentation needs updating.

@@ -90,9 +90,17 @@ Per wave, in order — this sequence is the spine of the mode:
    in the title or body; flip the issue → `in_review`.
 6. **Poll** — `gh pr checks <N> --watch` (blocks until CI settles), or wake ~270s apart
    with ScheduleWakeup; each cycle also fetch new PR comments and reviews since the poll
-   cursor; update the cursor.
-7. **Triage + fix** — CI red or a comment with a real defect → fix, push, poll again;
-   keep tests + docs in sync.
+   cursor; update the cursor. Idling over ~10 min on background agents, a workflow or CI →
+   a `ScheduleWakeup` heartbeat about every 20 min; a background agent that owns a PR's CI
+   loop gets a `.claude/auto-mode/ci-owner/pr-<N>.json` marker, and you leave that PR's CI
+   events to it (references → step 6).
+7. **Triage + fix** — start every fix cycle (CI, review or conformance) by merging main
+   into the wave checkout: `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit
+   origin/main`, never a rebase (a CI-owner agent merges in its own checkout; you merge only
+   into a clean `$WT`); a conflict goes to `routing.sh integration`; after a
+   non-trivial merge re-run `quality-gate.sh` and `cargo test --locked`, and name the merged
+   SHA in the fix brief (references → step 7). Then CI red or a comment with a real defect →
+   fix, push, poll again; keep tests + docs in sync.
 8. **Capture, then merge when the bar is met** — the `ci` checks green on both runners
    (`check (ubuntu-latest)`, `check (macos-latest)`: fmt, clippy `-D warnings`, test),
    no unresolved review comments, the PR mergeable. THEN **store the wave's durable
@@ -133,6 +141,13 @@ Per wave, in order — this sequence is the spine of the mode:
   (`mode: "add"`), which leaves existing tags alone.
 - **glen's invariants hold in every wave**: never write to an omp session `.jsonl`; tests
   use `tests/fixtures/`, never a live `~/.omp`; never edit `../metis/references/oh-my-pi`.
+- **Confirm a routing change before broadcasting it.** Restate an owner routing directive
+  in chat as one line ("Routing: implementation → claude (Codex keeps
+  review/plan/debug/audit). Apply and tell N running agents?") and apply it only after the
+  owner confirms. Then store the decision memory, write `.claude/auto-mode/routing.json`
+  with `decision` set to its id, and only then SendMessage the running agents, pointing
+  them at `bash .claude/scripts/routing.sh` instead of restating the rule. Why: e5464a64
+  was broadcast and reversed minutes later, then superseded by 148655d9.
 - **Commit attribution**: follow the attribution lines the session provides; never invent
   a different trailer.
 

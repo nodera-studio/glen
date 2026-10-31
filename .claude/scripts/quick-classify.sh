@@ -29,6 +29,26 @@ base="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD 2>/dev
 
 changed="$( { git diff --name-only "$base"; git ls-files --others --exclude-standard; } 2>/dev/null | sort -u )" || { echo "escalate: git diff failed" >&2; exit 4; }
 
+# Linux-only code is verified only by a CI run, so it never takes the quick path. Three
+# checks, each on its own so one leg's "no match" can never mask another leg's match: the
+# changed paths, the tracked diff, and each untracked file. A grep error escalates.
+linux_msg="escalate: Linux-only code: review needs a CI run"
+linux_only='target_os *= *"linux"|bwrap|unshare|netns|renameat2'
+linux_paths='(^|/)omp-sandboxed-linux\.sh$|^src/sandbox\.rs$|^tests/linux_sandbox\.rs$'
+if [ -n "$(printf '%s\n' "$changed" | grep -E "$linux_paths" || true)" ]; then
+  echo "$linux_msg" >&2; exit 3
+fi
+diff_text="$(git diff "$base" 2>/dev/null)" || { echo "escalate: git diff failed" >&2; exit 4; }
+if [[ "$diff_text" =~ $linux_only ]]; then
+  echo "$linux_msg" >&2; exit 3
+fi
+while IFS= read -r -d '' f; do
+  [ -d "$f" ] && continue
+  grep -sIqE "$linux_only" -- "$f"; rc=$?
+  if [ "$rc" -eq 0 ]; then echo "$linux_msg" >&2; exit 3; fi
+  [ "$rc" -eq 1 ] || { echo "escalate: cannot scan untracked file ($f)" >&2; exit 4; }
+done < <(git ls-files -z --others --exclude-standard 2>/dev/null)
+
 protected='^(Cargo\.toml|Cargo\.lock|\.github/|lefthook\.yml|AGENTS\.md|CLAUDE\.md|\.claude/(settings\.json|hooks/|CLAUDE\.md))'
 hit="$(printf '%s\n' "$changed" | grep -E "$protected" | head -1 || true)"
 if [ -n "$hit" ]; then

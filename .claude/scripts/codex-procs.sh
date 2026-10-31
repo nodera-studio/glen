@@ -9,7 +9,11 @@
 #   broker       node .../app-server-broker.mjs serve --endpoint E --cwd C --pid-file P
 #   task-worker  node .../codex-companion.mjs task-worker --cwd C --job-id J
 #   task         node .../codex-companion.mjs task ...   (argv beyond "task" is never read)
-# Jobs come from the companion's own state, in both stores companion 1.0.6 uses (load_roots).
+#   review       node .../codex-companion.mjs review|adversarial-review ...   (likewise; the kind
+#                is the verb. A foreground review records its own pid as the job's pid.)
+# Jobs come from the companion's own state, in both stores companion 1.0.6 uses (load_roots),
+# merged into one record per job id in which the per-job file is authoritative (codex_jobs). A
+# running job is live only while its pid is a companion task, task-worker or review of PROCS.
 #
 # Callers set SNAP (snapshot file), PROCS (codex_procs output) and JOBS (codex_jobs output).
 
@@ -56,9 +60,6 @@ valid() {
   [ -n "$want" ] && [ "$now" = "$want" ]
 }
 
-# in_snapshot PID: PID is a process in the snapshot.
-in_snapshot() { awk -F "$SEP" -v p="$1" '$1 == p { f = 1 } END { exit !f }' "$SNAP"; }
-
 # proc_cwd PID: the process's current directory (for report and refusal checks only).
 proc_cwd() {
   if [ -L "/proc/$1/cwd" ]; then
@@ -84,7 +85,8 @@ codex_procs() {
     elif [ $# -eq 7 ] && [ "${2##*/}" = codex-companion.mjs ] && [ "$3" = task-worker ] \
       && [ "$4" = --cwd ] && [ "$6" = --job-id ]; then
       kind=task-worker cwd="$5" job="$7"
-    elif [ "${2##*/}" = codex-companion.mjs ] && { [ "$3" = task ] || [ "$3" = task-worker ]; }; then
+    elif [ "${2##*/}" = codex-companion.mjs ] && { [ "$3" = task ] || [ "$3" = task-worker ] \
+      || [ "$3" = review ] || [ "$3" = adversarial-review ]; }; then
       kind="$3" cwd="" job=""
     else
       continue
@@ -110,8 +112,13 @@ load_roots() {
   done
 }
 
-# codex_jobs ROOT...: every job, "root SEP id SEP status SEP workspaceRoot SEP cwd SEP pid".
-# A jobs/<id>.json record overrides the state.json entry (it is written first and is fuller).
+# codex_jobs ROOT...: every job, one line per id across ALL roots and dirs,
+# "root SEP id SEP status SEP workspaceRoot SEP cwd SEP pid". Pass 1 reads every state.json index
+# entry; pass 2 overlays every jobs/<id>.json (oldest mtime first), which the companion writes
+# before the index. A field the per-job file sets wins outright, null included; an index value
+# only fills a field the file lacks. Between index entries for one id (several stores), a
+# terminal one (completed, failed, cancelled) is never replaced by a running or queued one: the
+# companion writes terminal states last. root is the store holding the authoritative record.
 codex_jobs() {
   [ $# -gt 0 ] || return 0
   node - "$@" <<'EOF'
@@ -119,52 +126,82 @@ const fs = require("fs");
 const path = require("path");
 const read = (f) => { try { return JSON.parse(fs.readFileSync(f, "utf8")); } catch { return null; } };
 const clean = (v) => String(v ?? "").replace(/[\x1f\n\r]/g, " ");
+const has = (o, k) => o !== null && typeof o === "object" && Object.prototype.hasOwnProperty.call(o, k);
+// fields JOB: only the fields the record sets (a present null counts as set).
+const fields = (j) => {
+  const f = {};
+  for (const k of ["status", "workspaceRoot", "pid"]) if (has(j, k)) f[k] = j[k];
+  if (has(j.request, "cwd")) f.cwd = j.request.cwd;
+  else if (has(j, "cwd")) f.cwd = j.cwd;
+  return f;
+};
+const terminal = (s) => s === "completed" || s === "failed" || s === "cancelled";
+const index = new Map(), files = new Map();
+const fileList = [];
 for (const root of process.argv.slice(2)) {
-  const jobs = new Map();
-  const add = (job) => {
-    if (job && typeof job.id === "string") jobs.set(job.id, { ...(jobs.get(job.id) || {}), ...job });
-  };
   let dirs = [];
   try { dirs = fs.readdirSync(root); } catch {}
   for (const d of dirs) {
     const dir = path.join(root, d);
     const state = read(path.join(dir, "state.json"));
-    for (const j of (state && Array.isArray(state.jobs) ? state.jobs : [])) add(j);
-    let files = [];
-    try { files = fs.readdirSync(path.join(dir, "jobs")).filter((f) => f.endsWith(".json")); } catch {}
-    for (const f of files) add(read(path.join(dir, "jobs", f)));
+    for (const j of (state && Array.isArray(state.jobs) ? state.jobs : [])) {
+      if (!j || typeof j.id !== "string") continue;
+      const prev = index.get(j.id) || {};
+      if (terminal(prev.status) && !terminal(j.status)) continue;
+      index.set(j.id, { ...prev, ...fields(j), root });
+    }
+    let names = [];
+    try { names = fs.readdirSync(path.join(dir, "jobs")).filter((f) => f.endsWith(".json")); } catch {}
+    for (const n of names) {
+      const f = path.join(dir, "jobs", n);
+      let mtime = 0;
+      try { mtime = fs.statSync(f).mtimeMs; } catch {}
+      fileList.push({ root, f, mtime });
+    }
   }
-  for (const j of jobs.values()) {
-    const cwd = (j.request && j.request.cwd) ?? j.cwd ?? "";
-    console.log([root, j.id, j.status, j.workspaceRoot, cwd, j.pid].map(clean).join("\x1f"));
-  }
+}
+fileList.sort((a, b) => a.mtime - b.mtime);
+for (const { root, f } of fileList) {
+  const j = read(f);
+  if (j && typeof j.id === "string") files.set(j.id, { ...(files.get(j.id) || {}), ...fields(j), root });
+}
+for (const id of new Set([...index.keys(), ...files.keys()])) {
+  const j = { ...(index.get(id) || {}), ...(files.get(id) || {}) };
+  console.log([j.root, id, j.status, j.workspaceRoot, j.cwd, j.pid].map(clean).join("\x1f"));
 }
 EOF
 }
 
-# live_jobs_at PATH: live jobs (queued, or running with a pid in the snapshot) whose
-# workspaceRoot or cwd is at or below PATH, "root SEP id SEP workspaceRoot".
+# live_jobs_at PATH: live jobs whose workspaceRoot or cwd is at or below PATH,
+# "root SEP id SEP workspaceRoot SEP status SEP pid". Live means queued, or running with a pid
+# that is a task, review, adversarial-review or task-worker record of $PROCS (a task-worker's
+# --job-id must be this job's id or empty). Any other process with that pid is a reused pid, and
+# the record is stale.
 live_jobs_at() {
   local root id st ws cwd pid p c
   while IFS="$SEP" read -r root id st ws cwd pid; do
     case "$st" in
       queued) ;;
-      running) if [ -z "$pid" ] || ! in_snapshot "$pid"; then continue; fi ;;
+      running)
+        if [ -z "$pid" ] || ! awk -F "$SEP" -v p="$pid" -v j="$id" \
+          '$2 == p && ($1 == "task" || $1 == "review" || $1 == "adversarial-review" || ($1 == "task-worker" && ($4 == "" || $4 == j))) { f = 1 } END { exit !f }' \
+          "$PROCS"; then continue; fi
+        ;;
       *) continue ;;
     esac
     for p in "$ws" "$cwd"; do
       [ -n "$p" ] || continue
       c="$(canon "$p" || true)"
       if [ -n "$c" ] && under "$c" "$1"; then
-        printf '%s%s%s%s%s\n' "$root" "$SEP" "$id" "$SEP" "$ws"
+        printf '%s%s%s%s%s%s%s%s%s\n' "$root" "$SEP" "$id" "$SEP" "$ws" "$SEP" "$st" "$SEP" "$pid"
         break
       fi
     done
   done <"$JOBS"
 }
 
-# tasks_at PATH: task and task-worker processes whose fixed-argv cwd or process cwd is at or
-# below PATH, "kind SEP pid SEP cwd".
+# tasks_at PATH: task, task-worker and review processes whose fixed-argv cwd or process cwd is at
+# or below PATH, "kind SEP pid SEP cwd".
 tasks_at() {
   local kind pid cwd job pcwd c
   while IFS="$SEP" read -r kind pid cwd job pcwd; do
