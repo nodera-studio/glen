@@ -42,13 +42,14 @@ struct Row {
     detail: Option<String>,
 }
 #[cfg(test)]
-fn read_row(summary: Summary, owners: &Path) -> Option<Row> {
-    read_endpoint_row(summary, owners, &HashMap::new())
+fn read_row(summary: Summary, owners: &Path, env: &Env) -> Option<Row> {
+    read_endpoint_row(summary, owners, &HashMap::new(), env)
 }
 fn read_endpoint_row(
     mut summary: Summary,
     owners: &Path,
     endpoints: &HashMap<String, crate::live::client::Hello>,
+    env: &Env,
 ) -> Option<Row> {
     let endpoint = endpoints.get(&summary.id);
     if endpoint.is_some() {
@@ -63,7 +64,7 @@ fn read_endpoint_row(
         state,
         source,
         detail,
-    } = infer_row(&mut summary, endpoint, |s| lease::probe(owners, &s.id));
+    } = infer_row(&mut summary, endpoint, env, |s| lease::probe(owners, &s.id));
     Some(Row {
         summary,
         handle: String::new(),
@@ -82,6 +83,7 @@ pub(crate) struct RowState {
 pub(crate) fn infer_row(
     summary: &mut Summary,
     endpoint: Option<&crate::live::client::Hello>,
+    env: &Env,
     probe: impl FnOnce(&Summary) -> Lease,
 ) -> RowState {
     if let Some(h) = endpoint {
@@ -97,7 +99,13 @@ pub(crate) fn infer_row(
     }
     let lease = probe(summary);
     refine_held(summary, &lease);
-    let state = lease::infer_state(&lease, summary.in_flight);
+    // A probed lease this host cannot trust (orchestrator decision 2, item 2): display stays
+    // consistent with routing, which also treats it as unknown.
+    let state = if crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) {
+        State::Unknown
+    } else {
+        lease::infer_state(&lease, summary.in_flight)
+    };
     RowState {
         lease,
         state,
@@ -112,8 +120,9 @@ fn read_rows(
     candidates: Vec<&Summary>,
     args: &LsArgs,
     owners: &Path,
+    env: &Env,
 ) -> (Vec<Row>, usize, usize) {
-    read_endpoint_rows(catalog, candidates, args, owners, &HashMap::new())
+    read_endpoint_rows(catalog, candidates, args, owners, &HashMap::new(), env)
 }
 fn read_endpoint_rows(
     catalog: &Catalog,
@@ -121,6 +130,7 @@ fn read_endpoint_rows(
     args: &LsArgs,
     owners: &Path,
     endpoints: &HashMap<String, crate::live::client::Hello>,
+    env: &Env,
 ) -> (Vec<Row>, usize, usize) {
     let mut total_all = catalog.sessions.len();
     let mut total = candidates.len();
@@ -129,7 +139,7 @@ fn read_endpoint_rows(
         if !args.live && args.limit > 0 && rows.len() >= args.limit {
             break;
         }
-        let Some(mut row) = read_endpoint_row(s.clone(), owners, endpoints) else {
+        let Some(mut row) = read_endpoint_row(s.clone(), owners, endpoints, env) else {
             total = total.saturating_sub(1);
             total_all = total_all.saturating_sub(1);
             continue;
@@ -201,6 +211,7 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         args,
         &paths.session_owners_dir,
         &endpoints,
+        env,
     );
     spinner.finish();
     if ctx.mode == Mode::Json {
@@ -440,9 +451,10 @@ mod regression_tests {
         let b = fixtures::path(&tree, 'B');
         let rows = [&a, &b].map(|p| scan_head(SessionFile::at(p).unwrap()).unwrap());
         fs::remove_file(a).unwrap();
+        let env = Env::for_test(None, tree.path(), &[]);
         let rows = rows
             .into_iter()
-            .filter_map(|s| read_row(s, tree.path()))
+            .filter_map(|s| read_row(s, tree.path(), &env))
             .collect::<Vec<_>>();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].summary.file.path, b);
@@ -461,7 +473,8 @@ mod regression_tests {
             live: false,
             since: None,
         };
-        let (rows, total, total_all) = read_rows(&catalog, candidates, &args, tree.path());
+        let env = Env::for_test(None, tree.path(), &[]);
+        let (rows, total, total_all) = read_rows(&catalog, candidates, &args, tree.path(), &env);
         assert_eq!(rows.len(), 6);
         assert_eq!(total, 6);
         assert_eq!(total_all, 6);
@@ -471,6 +484,7 @@ mod regression_tests {
             catalog.sessions.iter().collect(),
             &args,
             tree.path(),
+            &env,
         );
         assert!(rows.is_empty());
         assert_eq!(total, 0);
@@ -590,9 +604,10 @@ mod inference_tests {
             queued: false,
             active_requests: 0,
         };
+        let env = Env::for_test(None, tree.path(), &[]);
         for busy in [false, true] {
             endpoint.busy = busy;
-            let row = infer_row(&mut summary, Some(&endpoint), |_| {
+            let row = infer_row(&mut summary, Some(&endpoint), &env, |_| {
                 panic!("endpoint must not probe")
             });
             assert_eq!(row.state, if busy { State::Busy } else { State::Live });
@@ -603,7 +618,7 @@ mod inference_tests {
             );
         }
         let mut probes = 0;
-        let row = infer_row(&mut summary, None, |_| {
+        let row = infer_row(&mut summary, None, &env, |_| {
             probes += 1;
             Lease::Free
         });
@@ -611,5 +626,35 @@ mod inference_tests {
         assert_eq!(row.state, State::Idle);
         assert_eq!(row.source, "disk");
         assert!(row.detail.is_none());
+    }
+    /// Orchestrator decision item 2: display stays consistent with the routing refusal
+    /// (sandbox::lease_hidden). Forces the namespace comparison deterministically so this
+    /// runs the same on macOS and Linux.
+    #[test]
+    fn a_hidden_lease_displays_as_unknown_state_not_its_probed_value() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let mut summary = scan_head(SessionFile::at(&path).unwrap()).unwrap();
+        let env = Env::for_test(None, tree.path(), &[("CODEX_SANDBOX", "linux-ci")]);
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        for name in ["Free", "Held"] {
+            let lease = if name == "Free" {
+                Lease::Free
+            } else {
+                Lease::Held
+            };
+            let row = infer_row(&mut summary, None, &env, |_| lease);
+            assert_eq!(row.state, State::Unknown, "{name}");
+        }
+        crate::sandbox::force_lease_hidden_for_test(None);
+        // Without the marker, or with the comparison forced visible, display is unaffected.
+        let no_marker = Env::for_test(None, tree.path(), &[]);
+        let row = infer_row(&mut summary, None, &no_marker, |_| Lease::Free);
+        assert_eq!(row.state, State::Idle);
+        crate::sandbox::force_lease_hidden_for_test(Some(false));
+        let row = infer_row(&mut summary, None, &env, |_| Lease::Held);
+        assert_eq!(row.state, State::Live);
+        crate::sandbox::force_lease_hidden_for_test(None);
+        // An extension endpoint row is unaffected: it never goes through the lease probe.
     }
 }

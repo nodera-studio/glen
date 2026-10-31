@@ -182,13 +182,12 @@ impl Guard {
         )?;
         let mut file = fs::File::from(fd);
         // `publish_over` only needs this to recognize our own temp copy if a competing writer
-        // forces a swap-back; take it from the fd we already hold, never a path lookup.
-        let ours = file
-            .metadata()
-            .map(|m| (m.dev(), m.ino()))
-            .unwrap_or((0, 0));
-        let mut swapped = false;
+        // forces a swap-back; take it from the fd we already hold, never a path lookup. A
+        // fallback like `(0, 0)` here would make that recognition impossible (LOW-002): if
+        // this fails, propagate it, same as any other write-phase error.
+        let mut temp_unsafe_to_clean = false;
         let result = (|| {
+            let ours = file.metadata().map(|m| (m.dev(), m.ino()))?;
             file.write_all(bytes)?;
             file.sync_all()?;
             if !self.unchanged() {
@@ -202,19 +201,34 @@ impl Guard {
                         Err(e) => return Err(e.into()),
                     }
                 }
-                Some(expected) => {
-                    swapped = true;
-                    atomic_swap::publish_over(&dir, &temp, name, expected, ours, force_fallback)?
-                }
+                Some(expected) => atomic_swap::publish_over(
+                    &dir,
+                    &temp,
+                    name,
+                    expected,
+                    ours,
+                    force_fallback,
+                    "extension",
+                )
+                .map_err(|e| {
+                    temp_unsafe_to_clean = !e.temp_is_safe_to_clean();
+                    e.into_io()
+                })?,
             };
             if matches!(applied, Applied::Published | Applied::PublishedNotAtomic) {
+                // This can still fail and propagate as an ordinary `Err`, but — unlike inside
+                // `publish_over` before this fix — it can no longer be reinterpreted as `Lost`:
+                // `applied` is already decided, and `temp` is already gone, so the cleanup
+                // below is a harmless no-op on this path (MED-002).
                 at::fsync(&dir)?;
             }
             Ok(applied)
         })();
-        // `publish_over`'s own swap path already unlinks `temp` on both Published and Lost; the
-        // create (NOREPLACE) path and any error before the swap leave `temp` for us to clean up.
-        if !swapped
+        // `publish_over`'s own swap path already unlinks `temp` on Published and on a verified
+        // Lost; it leaves `temp` untouched, and unsafe to touch, once the exchange has
+        // completed but could not be re-verified (HIGH-002). The create (NOREPLACE) path and
+        // any error before the exchange leave our own `temp` for us to clean up here.
+        if !temp_unsafe_to_clean
             && !matches!(result, Ok(Applied::Published))
             && at::statat(&dir, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok()
         {

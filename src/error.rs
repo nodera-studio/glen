@@ -75,9 +75,14 @@ pub enum NoRouteReason {
     RpcJobRunning,
     Sandboxed,
     ExtensionOutdated,
+    /// A documented fallback, never constructed by current code: a job record persisted by a
+    /// pre-W10 glen has the no_route error code with no `details.reason` at all. `wait`
+    /// normalises those legacy records to this instead of a reasonless (and in debug builds,
+    /// panicking) envelope.
+    Unknown,
 }
 impl NoRouteReason {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::LiveOwner,
         Self::UnknownLease,
         Self::UnhealthyEndpoint,
@@ -86,6 +91,7 @@ impl NoRouteReason {
         Self::RpcJobRunning,
         Self::Sandboxed,
         Self::ExtensionOutdated,
+        Self::Unknown,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
@@ -97,6 +103,7 @@ impl NoRouteReason {
             Self::RpcJobRunning => "rpc_job_running",
             Self::Sandboxed => "sandboxed",
             Self::ExtensionOutdated => "extension_outdated",
+            Self::Unknown => "unknown",
         }
     }
 }

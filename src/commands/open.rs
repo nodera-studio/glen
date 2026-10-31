@@ -157,6 +157,8 @@ fn open_mode(
         };
         let state = if extension.as_ref().is_some_and(|s| s.busy) {
             State::Busy
+        } else if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) {
+            State::Unknown
         } else {
             State::Live
         };
@@ -215,7 +217,16 @@ fn open_mode(
         None
     };
     let state = extension.as_ref().map_or_else(
-        || lease::infer_state(&lease, summary.in_flight),
+        || {
+            // Display stays consistent with the routing refusal (orchestrator decision item
+            // 2): a probed lease this host cannot trust is shown as unknown, not its raw
+            // probed value.
+            if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) {
+                State::Unknown
+            } else {
+                lease::infer_state(&lease, summary.in_flight)
+            }
+        },
         |s| if s.busy { State::Busy } else { State::Live },
     );
     if !catalog.handles.contains_key(&session.header.id) {
@@ -358,5 +369,26 @@ mod assignment_tests {
             assert_eq!(opened.handle, expected);
             handle::ASSIGN_CALLS.with(|count| assert_eq!(count.get(), 1));
         }
+    }
+    /// Orchestrator decision item 2: display stays consistent with the routing refusal.
+    /// Forces the lease-hidden seam, so this is deterministic on every host OS.
+    #[test]
+    fn a_hidden_lease_displays_as_unknown_state() {
+        let tree = tempfile::tempdir().unwrap();
+        let agent = tree.path().join("agent");
+        let bucket = agent.join("sessions/bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let inside = bucket.join("inside.jsonl");
+        fs::write(&inside, fixtures::bytes('A')).unwrap();
+        let env = Env::for_test(
+            Some(tree.path()),
+            tree.path(),
+            &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())],
+        );
+        let cli = Cli::try_parse_from(["glen", "show", "e27c0de"]).unwrap();
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        let opened = open(&cli, &env, "e27c0de").unwrap();
+        crate::sandbox::force_lease_hidden_for_test(None);
+        assert_eq!(opened.state, State::Unknown);
     }
 }

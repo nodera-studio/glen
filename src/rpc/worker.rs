@@ -1642,6 +1642,21 @@ mod tests {
         }
     }
     #[test]
+    fn route_probe_refuses_even_a_free_lease_when_hidden() {
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        let env = Env::for_test(
+            None,
+            std::path::Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        let error = route_probe(Lease::Free, "e27c0de", &env).unwrap_err();
+        assert_eq!(error.code, "no_route");
+        let details = error.details.unwrap();
+        assert_eq!(details["reason"], "sandboxed");
+        assert_eq!(details["lease"], "unknown");
+        crate::sandbox::force_lease_hidden_for_test(None);
+    }
+    #[test]
     fn review11_refusal_identifies_pre_spawn_phase() {
         for (lease, reason) in [
             (Lease::Held, "live_owner"),

@@ -99,12 +99,16 @@ pub(crate) fn job_error(store: &JobStore, job: &Job, s: &Status) -> Result<GlenE
         ),
     )
     .with_details(json!({"status":s.status,"job":view,"error":s.error,"forked":forked}));
-    if code == ErrorCode::NoRoute
-        && let Some(reason) = error
+    if code == ErrorCode::NoRoute {
+        // A pre-W10 job record's error can be the no_route code with no `details.reason` at all
+        // (AC-1004 postdates it); normalise to the documented fallback instead of a
+        // reasonless envelope (which would also trip envelope.rs's debug_assert).
+        let reason = error
             .and_then(|error| error.details.as_ref())
             .and_then(|details| details.get("reason"))
-    {
-        e = e.with_detail("reason", reason.clone());
+            .cloned()
+            .unwrap_or_else(|| json!(crate::error::NoRouteReason::Unknown.as_str()));
+        e = e.with_detail("reason", reason);
     }
     e.hint =
         if error.and_then(|e| e.hint.as_ref()).is_some() {
@@ -412,6 +416,11 @@ mod tests {
             assert_eq!(details["status"], state.as_str());
             assert_eq!(details["error"]["code"], error);
             assert!(details["job"].is_object());
+            if error == "no_route" {
+                // A pre-W10 (or otherwise reasonless) no_route job record normalises to the
+                // documented fallback, never a missing details.reason (LOW-007).
+                assert_eq!(details["reason"], "unknown", "{details}");
+            }
         }
     }
     #[test]

@@ -111,25 +111,80 @@ pub fn map_socket_failure(env: &Env, action: &str, err: &io::Error) -> Option<Gl
 /// True under any Codex marker when glen's network namespace differs from PID 1's (the init
 /// namespace escalated commands still run in) or that comparison cannot be made.
 pub fn lease_hidden(env: &Env, linux: bool) -> bool {
+    if let Some(forced) = FORCE_LEASE_HIDDEN.with(|f| f.get()) {
+        return forced;
+    }
     if !linux {
         return false;
     }
     let marker = detect(env).is_some() || env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1");
     marker && net_namespace_hidden()
 }
+thread_local! { static FORCE_LEASE_HIDDEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+/// Test-only seam: forces `lease_hidden`'s result for the current thread, so a caller like
+/// `ls::infer_row`'s display mapping can be exercised deterministically on every host OS,
+/// never the real `cfg!(target_os)` / `/proc` namespace identity. Call with `None` to restore
+/// the real logic before the test ends.
+#[cfg(test)]
+pub(crate) fn force_lease_hidden_for_test(value: Option<bool>) {
+    FORCE_LEASE_HIDDEN.with(|f| f.set(value));
+}
+/// Decides whether this process's network namespace is hidden from PID 1's, given three
+/// injectable facts so the whole truth table is a deterministic unit test on every OS,
+/// never real `/proc` reads:
+/// - `self_ns`: this process's own namespace identity (following the `/proc/self/ns/net`
+///   symlink to the nsfs target, never the per-process link's own inode — `fs::metadata`,
+///   not `symlink_metadata`/`lstat`, which differs per pid even in the same namespace).
+/// - `init_ns`: PID 1's namespace identity, the same way; unreadable on most hosts, since a
+///   non-root process cannot follow another uid's `/proc/<pid>/ns/net` when PID 1 is root.
+/// - `loopback_only`: true when this namespace has no interface but `lo` (the shape of a
+///   freshly `--unshare-net`'d namespace), used only when `init_ns` is unreadable.
+///
+/// Hidden when: `self_ns` itself cannot be read (fail closed); or both are readable and
+/// differ; or `init_ns` is unreadable and this namespace is loopback-only. Visible only when
+/// both are readable and equal, or `init_ns` is unreadable and this namespace has a real
+/// interface (the common non-root, non-sandboxed case: §A13's escalated commands).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only called by the Linux probe; kept visible for the cross-platform unit test
-fn differs_by_identity(a: &std::path::Path, b: &std::path::Path) -> bool {
+fn net_namespace_hidden_with(
+    self_ns: impl FnOnce() -> std::io::Result<(u64, u64)>,
+    init_ns: impl FnOnce() -> std::io::Result<(u64, u64)>,
+    loopback_only: impl FnOnce() -> bool,
+) -> bool {
+    let Ok(self_id) = self_ns() else {
+        return true;
+    };
+    match init_ns() {
+        Ok(init_id) => self_id != init_id,
+        Err(_) => loopback_only(),
+    }
+}
+#[cfg(target_os = "linux")]
+fn ns_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
-    match (std::fs::symlink_metadata(a), std::fs::symlink_metadata(b)) {
-        (Ok(ma), Ok(mb)) => (ma.dev(), ma.ino()) != (mb.dev(), mb.ino()),
-        _ => true,
+    // Follow the magic symlink to the nsfs target; `symlink_metadata` (lstat) would instead
+    // return the per-process link's own, always-distinct procfs inode.
+    std::fs::metadata(path).map(|m| (m.dev(), m.ino()))
+}
+#[cfg(target_os = "linux")]
+fn is_loopback_only() -> bool {
+    match std::fs::read_dir("/sys/class/net") {
+        Ok(entries) => {
+            let mut names: Vec<_> = entries
+                .filter_map(|e| e.ok().map(|e| e.file_name()))
+                .collect();
+            names.sort();
+            names == ["lo"]
+        }
+        // Can't tell: do not assume isolation from an unrelated read failure.
+        Err(_) => false,
     }
 }
 #[cfg(target_os = "linux")]
 fn net_namespace_hidden() -> bool {
-    differs_by_identity(
-        std::path::Path::new("/proc/self/ns/net"),
-        std::path::Path::new("/proc/1/ns/net"),
+    net_namespace_hidden_with(
+        || ns_identity(std::path::Path::new("/proc/self/ns/net")),
+        || ns_identity(std::path::Path::new("/proc/1/ns/net")),
+        is_loopback_only,
     )
 }
 #[cfg(not(target_os = "linux"))]
@@ -252,7 +307,11 @@ fn describe_with_extension(env: &Env, extension: bool) -> (&'static str, String,
         None if env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1") => (
             "info",
             "host network off".into(),
-            "network disabled by the host; escalated commands still work".into(),
+            if cfg!(target_os = "linux") && lease_hidden(env, true) {
+                "network disabled by the host; this process is in its own network namespace, so RPC resume of an existing session refuses as sandboxed; the live route and new sessions still work".into()
+            } else {
+                "network disabled by the host; escalated commands still work".into()
+            },
         ),
         None => ("info", "none".into(), String::new()),
         Some(s) if !s.network => (
@@ -417,28 +476,39 @@ mod tests {
         }
     }
     #[test]
-    fn differs_by_identity_truth_table() {
-        let t = tempfile::tempdir().unwrap();
-        let a = t.path().join("a");
-        let b = t.path().join("b");
-        std::fs::write(&a, b"x").unwrap();
-        std::fs::write(&b, b"x").unwrap();
-        assert!(
-            !differs_by_identity(&a, &a),
-            "same path is the same namespace"
-        );
-        assert!(
-            differs_by_identity(&a, &b),
-            "different files are different namespaces"
-        );
-        assert!(
-            differs_by_identity(&a, &t.path().join("missing")),
-            "unreadable means hidden, never assumed visible"
-        );
+    fn net_namespace_hidden_with_truth_table() {
+        let ok = |v: (u64, u64)| -> std::io::Result<(u64, u64)> { Ok(v) };
+        let eacces = || -> std::io::Result<(u64, u64)> {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        };
+        // Same target via distinct links: readable and equal -> visible.
+        assert!(!net_namespace_hidden_with(
+            || ok((5, 100)),
+            || ok((5, 100)),
+            || true
+        ));
+        // Different targets -> hidden, regardless of loopback_only.
+        assert!(net_namespace_hidden_with(
+            || ok((5, 100)),
+            || ok((5, 101)),
+            || false
+        ));
+        // Reference (PID 1) unreadable + loopback-only (a fresh --unshare-net) -> hidden.
+        assert!(net_namespace_hidden_with(|| ok((5, 100)), eacces, || true));
+        // Reference unreadable but this namespace has a real interface (eth0 present, the
+        // common non-root escalated-command case) -> visible.
+        assert!(!net_namespace_hidden_with(
+            || ok((5, 100)),
+            eacces,
+            || false
+        ));
+        // Our own /proc/self/ns/net unreadable -> fail closed, hidden.
+        assert!(net_namespace_hidden_with(eacces, || ok((5, 100)), || false));
     }
     #[test]
     fn lease_hidden_truth_table() {
-        // Linux is a pure function of (linux, marker). macOS never hides a lease.
+        // Linux is a pure function of (linux, marker, the namespace comparison). macOS never
+        // hides a lease; the comparison itself is exhaustively tested above through the seam.
         for (vars, linux, expected) in [
             (vec![], true, false),
             (vec![("CODEX_SANDBOX", "")], true, false),
@@ -447,17 +517,6 @@ mod tests {
         ] {
             let e = Env::for_test(None, Path::new("/"), &vars);
             assert_eq!(lease_hidden(&e, linux), expected, "{vars:?} linux={linux}");
-        }
-        // A marker on Linux only hides the lease when the namespace comparison itself says
-        // "hidden" (net_namespace_hidden); on this test host that is whatever
-        // /proc/self/ns/net vs /proc/1/ns/net actually report, so assert the two Linux marker
-        // cases agree with `net_namespace_hidden()` rather than a fixed boolean.
-        for vars in [
-            vec![("CODEX_SANDBOX", "seatbelt")],
-            vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
-        ] {
-            let e = Env::for_test(None, Path::new("/"), &vars);
-            assert_eq!(lease_hidden(&e, true), net_namespace_hidden());
         }
     }
     #[test]
@@ -468,11 +527,7 @@ mod tests {
             Path::new("/"),
             &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
         );
-        // Force the hidden path deterministically by asserting against the real
-        // `lease_hidden(&e, true)` result rather than the host's actual OS.
-        if !lease_hidden(&e, true) {
-            return; // this host's /proc identity makes the lease visible; nothing to assert
-        }
+        force_lease_hidden_for_test(Some(true));
         for lease in [
             Lease::Free,
             Lease::Held,
@@ -488,6 +543,7 @@ mod tests {
             assert_eq!(details["lease"], "unknown");
             assert!(!error.hint.unwrap().contains("escalat"));
         }
+        force_lease_hidden_for_test(None);
     }
     #[test]
     fn map_probe_failure_when_not_hidden_only_maps_a_real_probe_error() {

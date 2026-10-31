@@ -192,6 +192,21 @@ fn write_request(
                 if cancelled() {
                     return Err(ClientError::Cancelled);
                 }
+                // AC-1014: bound the drain itself at min(1s, what's left of the write
+                // deadline), an absolute instant, never the caller's own (possibly longer)
+                // read timeout. unary_inner/unary_for set theirs to the full remaining
+                // deadline for the real response wait; open_send already caps its own read
+                // timeout the same way before calling this, so this is a no-op there.
+                let drain = end
+                    .saturating_duration_since(Instant::now())
+                    .min(Duration::from_secs(1))
+                    .max(Duration::from_millis(1));
+                // macOS can reject a timeout change once the peer has already closed.
+                if let Err(e) = stream.set_read_timeout(Some(drain))
+                    && e.raw_os_error() != Some(libc::EINVAL)
+                {
+                    return Err(ClientError::Protocol(e.to_string()));
+                }
                 // Do not read ahead: open_send's reader still needs subsequent frames.
                 return read_line(&mut BufReader::with_capacity(1, stream))
                     .map(Some)
@@ -592,6 +607,49 @@ mod unary_tests {
             matches!(read_frame(&mut BufReader::new(&client)).unwrap(), Frame::Event { kind, .. } if kind == "error")
         );
         worker.join().unwrap();
+    }
+
+    /// AC-1014 / LOW-004: once the write fails and the drain starts, a peer that never
+    /// answers must not make the drain wait the whole remaining write deadline; it is bounded
+    /// at ~1s, not the 10s deadline below. The peer is gone before the write even starts (the
+    /// deterministic way to force EPIPE on this platform); what this test actually pins is
+    /// the *read* bound once that drain begins, which `end` alone would not have capped.
+    #[test]
+    fn a_peer_that_never_answers_bounds_the_drain_at_about_one_second_not_the_full_deadline() {
+        let (mut client, peer) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        drop(peer);
+        let bytes = crate::ops::request_bytes(
+            &Op::Send(SendArgs {
+                text: "x".repeat(1024 * 1024),
+                deliver_as: crate::jobs::Deliver::Auto,
+                job_id: None,
+                expect_session_id: None,
+            })
+            .request("half-closed"),
+        )
+        .unwrap();
+        let start = Instant::now();
+        let result = write_request(
+            &mut client,
+            &bytes,
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+        );
+        let elapsed = start.elapsed();
+        assert!(
+            result.is_err(),
+            "a peer that is gone before it ever answers must not return a frame"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "drain took {elapsed:?}, the full 10s deadline was not meant to be reachable"
+        );
     }
 
     #[test]

@@ -107,6 +107,7 @@ impl Guard {
         use std::io::Write;
         let mut published = false;
         let mut fallback_used = false;
+        let mut temp_unsafe_to_clean = false;
         let mut created_dirs = Vec::new();
         let result = (|| {
             if !self.unchanged() {
@@ -193,11 +194,10 @@ impl Guard {
                 Mode::from_raw_mode(0o644),
             )?;
             let mut file = fs::File::from(fd);
-            let ours = file
-                .metadata()
-                .map(|m| (m.dev(), m.ino()))
-                .unwrap_or((0, 0));
             let result = (|| {
+                // LOW-002: a fallback like (0, 0) here would make `publish_over` unable to
+                // recognize our own temp copy on a swap-back; propagate instead.
+                let ours = file.metadata().map(|m| (m.dev(), m.ino()))?;
                 step("write", path)?;
                 file.write_all(bytes)?;
                 file.sync_all()?;
@@ -221,7 +221,12 @@ impl Guard {
                         expected,
                         ours,
                         force_fallback,
-                    )?,
+                        "skill",
+                    )
+                    .map_err(|e| {
+                        temp_unsafe_to_clean = !e.temp_is_safe_to_clean();
+                        e.into_io()
+                    })?,
                 };
                 if matches!(applied, Applied::Lost) {
                     return Ok(Applied::Lost);
@@ -239,19 +244,27 @@ impl Guard {
                 }
                 Ok(applied)
             })();
-            if !published && at::statat(&dir, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok() {
-                // This unique temporary file belongs to this operation, on the pinned
-                // directory; `publish_over`'s own Lost outcome already unlinks it itself.
-                if let Err(e) = step("cleanup", path).and_then(|()| {
+            // `publish_over`'s own swap path already unlinks `temp` on Published and on a
+            // verified Lost; once the exchange has completed but could not be re-verified
+            // (HIGH-002), `temp` is left untouched and unsafe for us to touch too.
+            if !published
+                && !temp_unsafe_to_clean
+                && at::statat(&dir, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok()
+                && let Err(e) = step("cleanup", path).and_then(|()| {
                     at::unlinkat(&dir, &temp, AtFlags::empty()).map_err(io::Error::from)
-                }) {
-                    eprintln!("warning: cannot clean temporary skill file {temp}: {e}");
-                }
+                })
+            {
+                eprintln!("warning: cannot clean temporary skill file {temp}: {e}");
             }
             result
         })();
         let result = match result {
-            Err(_) if !published && !self.unchanged() => Ok(Applied::Lost),
+            // Only when the exchange never completed: a changed ancestor/mkdir/revalidate
+            // check failing with some unrelated error, while the directory has genuinely
+            // moved on, is the same "competing write won" outcome as returning Lost directly.
+            // Once the exchange has completed (HIGH-002), the error already says exactly what
+            // happened and must reach the caller, never be silently downgraded to Lost.
+            Err(_) if !published && !temp_unsafe_to_clean && !self.unchanged() => Ok(Applied::Lost),
             other => other,
         };
         let result = result.map(|applied| {
