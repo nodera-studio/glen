@@ -103,27 +103,36 @@ pub fn is_lost(s: &Status, now: jiff::Timestamp) -> bool {
         }
 }
 pub fn mark_lost(store: &JobStore, id: &JobId, s: Status) -> Status {
-    persist_lost(store, id, s, false)
+    report_lost(id, s, try_mark_lost(store, id, false))
 }
-fn persist_lost(store: &JobStore, id: &JobId, observed: Status, recheck: bool) -> Status {
-    let result = (|| -> Result<Status, crate::error::GlenError> {
-        // The worker uses the same lock for every publication. Re-read while holding it.
-        let _lock = store.status_lock(id)?;
-        let mut s = store.read_status(id)?;
-        if s.status.is_terminal() || (recheck && !is_lost(&s, jiff::Timestamp::now())) {
-            return Ok(s);
-        }
-        s.status = State::Lost;
-        s.updated_at = jiff::Timestamp::now().to_string();
-        s.error = Some(JobError {
-            code: "lost".into(),
-            message: "the glen worker exited without reporting a result".into(),
-            hint: None,
-            details: None,
-        });
-        store.write_status_locked(id, &s)?;
-        Ok(s)
-    })();
+/// Re-read and publish under the worker's status lock; never reports to stderr.
+pub(crate) fn try_mark_lost(
+    store: &JobStore,
+    id: &JobId,
+    recheck: bool,
+) -> Result<Status, crate::error::GlenError> {
+    // The worker uses the same lock for every publication. Re-read while holding it.
+    let _lock = store.status_lock(id)?;
+    let mut s = store.read_status(id)?;
+    if s.status.is_terminal() || (recheck && !is_lost(&s, jiff::Timestamp::now())) {
+        return Ok(s);
+    }
+    s.status = State::Lost;
+    s.updated_at = jiff::Timestamp::now().to_string();
+    s.error = Some(JobError {
+        code: "lost".into(),
+        message: "the glen worker exited without reporting a result".into(),
+        hint: None,
+        details: None,
+    });
+    store.write_status_locked(id, &s)?;
+    Ok(s)
+}
+fn report_lost(
+    id: &JobId,
+    observed: Status,
+    result: Result<Status, crate::error::GlenError>,
+) -> Status {
     match result {
         Ok(s) => s,
         Err(e) => {
@@ -132,12 +141,20 @@ fn persist_lost(store: &JobStore, id: &JobId, observed: Status, recheck: bool) -
         }
     }
 }
-pub fn refresh(store: &JobStore, id: &JobId, s: Status) -> Status {
+pub(crate) fn refresh_quiet(
+    store: &JobStore,
+    id: &JobId,
+    s: Status,
+) -> Result<Status, crate::error::GlenError> {
     if is_lost(&s, jiff::Timestamp::now()) {
-        persist_lost(store, id, s, true)
+        try_mark_lost(store, id, true)
     } else {
-        s
+        Ok(s)
     }
+}
+pub fn refresh(store: &JobStore, id: &JobId, s: Status) -> Status {
+    let result = refresh_quiet(store, id, s.clone());
+    report_lost(id, s, result)
 }
 
 #[cfg(all(test, unix))]
@@ -264,5 +281,36 @@ mod tests {
         assert_eq!(s.status, State::Lost);
         assert_eq!(s.omp_pid, Some(123));
         assert_eq!(store.read_status(&id).unwrap().error.unwrap().code, "lost");
+    }
+}
+
+#[cfg(test)]
+mod quiet_tests {
+    use super::*;
+    #[test]
+    fn quiet_refresh_returns_write_failure_and_preserves_completed_status() {
+        let tree = tempfile::tempdir().unwrap();
+        let store = super::super::tests::store(tree.path());
+        let j = super::super::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        let stale = Status {
+            updated_at: "2000-01-01T00:00:00Z".into(),
+            ..Status::default()
+        };
+        let err = refresh_quiet(&store, &id, stale.clone()).unwrap_err();
+        assert!(err.message.contains("status.lock"));
+        assert!(try_mark_lost(&store, &id, false).is_err());
+        store.create(&j).unwrap();
+        let mut completed = stale.clone();
+        completed.status = State::Completed;
+        store.write_status(&id, &completed).unwrap();
+        assert_eq!(
+            refresh_quiet(&store, &id, stale).unwrap().status,
+            State::Completed
+        );
+        assert_eq!(
+            try_mark_lost(&store, &id, false).unwrap().status,
+            State::Completed
+        );
     }
 }

@@ -1118,32 +1118,24 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
         out.assert_exit(0);
         assert_eq!(
             command_names(&out.out()),
-            [
-                "completions",
-                "doctor",
-                "help",
-                "inbox",
-                "install-extension",
-                "install-skill",
-                "jobs",
-                "ls",
-                "send",
-                "show",
-                "tail",
-                "wait"
-            ],
+            {
+                let mut names = VISIBLE;
+                names.sort();
+                names
+            },
             "{}",
             out.ctx()
         );
     }
 }
 
-/// AC-401 + the W4 spec change: `watch` stays hidden (exit 8); `inbox` and
-/// `install-extension` became visible with W3.
+/// Watch is visible; on a pipe its interactive-terminal gate returns usage.
+/// `inbox` and `install-extension` became visible with W3.
 #[test]
-fn ac401_watch_stays_hidden_and_exits_8() {
+fn ac401_watch_is_visible_and_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let listed = command_names(&sb.glen(["--help"]).run().out());
+    assert!(listed.iter().any(|name| name == "watch"), "{listed:?}");
     for name in HIDDEN {
         assert!(
             !listed.iter().any(|c| c == name),
@@ -1153,9 +1145,7 @@ fn ac401_watch_stays_hidden_and_exits_8() {
         out.error_envelope("not_implemented");
         out.assert_exit(8).assert_stderr_empty();
     }
-    sb.glen(["watch", "abc1234"])
-        .run()
-        .error_envelope("not_implemented");
+    sb.glen(["watch", "abc1234"]).run().error_envelope("usage");
     assert!(!sb.glen_home.exists());
 }
 
@@ -1446,7 +1436,11 @@ fn ac404_the_conformance_skill_checker_catches_each_mutation() {
             format!("{base}\n`glen show <handle> --tools everything`\n"),
             "everything",
         ),
-        ("hidden command", format!("{base}\n`glen watch`\n"), "watch"),
+        (
+            "hidden command",
+            format!("{base}\n`glen __worker`\n"),
+            "__worker",
+        ),
         (
             "removed visible-command reference",
             base.replace("glen doctor", "glen ls"),
@@ -3190,7 +3184,7 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 24] = [
+const CONTRACT_IDS: [&str; 32] = [
     "ls",
     "show",
     "show.raw",
@@ -3207,10 +3201,18 @@ const CONTRACT_IDS: [&str; 24] = [
     "inbox",
     "inbox.follow",
     "install-extension",
+    "models",
+    "models.session",
+    "model",
+    "thinking",
+    "abort.idle",
+    "abort.aborted",
+    "compact",
     "error.usage",
     "error.not_found",
     "error.ambiguous",
     "error.job_failed",
+    "error.control_failed",
     "error.no_route",
     "error.no_route.sandboxed",
     "error.omp_unavailable",

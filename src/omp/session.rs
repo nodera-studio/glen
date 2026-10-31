@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
 };
+use xxhash_rust::xxh3::Xxh3;
 #[derive(Debug, Clone)]
 pub struct Header {
     pub id: String,
@@ -33,6 +34,24 @@ pub struct Session {
     pub entries: Vec<Entry>,
     pub skipped_lines: usize,
     pub consumed: u64,
+    consumed_tail: Vec<u8>,
+    consumed_hash: ConsumedHash,
+}
+const CONSUMED_WINDOW: usize = 4096;
+// The streaming hasher has no Debug implementation; expose only its digest in Session's debug view.
+struct ConsumedHash(Xxh3);
+impl std::fmt::Debug for ConsumedHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ConsumedHash")
+            .field(&self.0.digest())
+            .finish()
+    }
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Selection {
+    pub model: Option<String>,
+    pub thinking_level: Option<String>,
+    pub thinking_configured: Option<String>,
 }
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -101,16 +120,18 @@ impl Session {
             continuation_of: string(&raw, "continuationOf"),
             raw,
         };
+        let consumed = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let mut consumed_hash = Xxh3::new();
+        consumed_hash.update(&bytes[..consumed]);
         let mut s = Self {
             path: path.into(),
             slot_title,
             header,
             entries: vec![],
             skipped_lines: 0,
-            consumed: bytes
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map_or(0, |i| i as u64 + 1),
+            consumed: consumed as u64,
+            consumed_tail: bytes[consumed.saturating_sub(CONSUMED_WINDOW)..consumed].to_vec(),
+            consumed_hash: ConsumedHash(consumed_hash),
         };
         for l in lines {
             s.parse_entry(l);
@@ -145,7 +166,21 @@ impl Session {
             self.parse_entry(l);
         }
         self.consumed += complete_lines.len() as u64;
+        self.consumed_hash.0.update(complete_lines);
+        let keep = CONSUMED_WINDOW.saturating_sub(complete_lines.len());
+        self.consumed_tail
+            .drain(..self.consumed_tail.len().saturating_sub(keep));
+        self.consumed_tail.extend_from_slice(
+            &complete_lines[complete_lines.len().saturating_sub(CONSUMED_WINDOW)..],
+        );
         start..self.entries.len()
+    }
+    /// Exact snapshot bytes let followers validate an apparent append without reopening the path.
+    pub(crate) fn consumed_tail(&self) -> &[u8] {
+        &self.consumed_tail
+    }
+    pub(crate) fn consumed_hash(&self) -> u64 {
+        self.consumed_hash.0.digest()
     }
     pub fn leaf_id(&self) -> Option<&str> {
         let last = self.entries.last()?;
@@ -188,6 +223,44 @@ impl Session {
             .unwrap_or(&self.header.title)
             .as_deref()
             .and_then(display_name)
+    }
+    /// omp's resume selection, restricted to the active branch. With no thinking
+    /// entry omp chooses from settings or the model default, so leave it unknown.
+    pub fn selection(&self) -> Selection {
+        let mut selection = Selection::default();
+        let mut explicit_model = false;
+        for entry in self.active_branch() {
+            let raw = &entry.raw;
+            match entry.kind.as_str() {
+                "thinking_level_change" => {
+                    selection.thinking_level =
+                        Some(string(raw, "thinkingLevel").unwrap_or_else(|| "off".into()));
+                    selection.thinking_configured =
+                        string(raw, "configured").or_else(|| string(raw, "thinkingLevel"));
+                }
+                "model_change"
+                    if raw
+                        .get("role")
+                        .is_none_or(|r| r.is_null() || r == "default") =>
+                {
+                    if let Some(model) = string(raw, "model").filter(|m| !m.is_empty()) {
+                        selection.model = Some(model);
+                        explicit_model = true;
+                    }
+                }
+                "message" if !explicit_model && raw["message"]["role"] == "assistant" => {
+                    let message = &raw["message"];
+                    if let (Some(provider), Some(model)) =
+                        (string(message, "provider"), string(message, "model"))
+                        && model != "<synthetic>"
+                    {
+                        selection.model = Some(format!("{provider}/{model}"));
+                    }
+                }
+                _ => (),
+            }
+        }
+        selection
     }
 }
 fn entry_leaf(e: &Entry) -> Option<&str> {
@@ -333,6 +406,40 @@ mod tests {
             1..3
         );
         assert_eq!(s.skipped_lines, 3);
+    }
+    #[test]
+    fn consumed_tail_is_bounded_exact_and_excludes_the_unfinished_line() {
+        let mut bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"window\"}\n".to_vec();
+        bytes.extend(
+            format!(
+                "{}\n",
+                json!({"type":"future", "id":"one", "data":"x".repeat(9000)})
+            )
+            .bytes(),
+        );
+        let mut unfinished = bytes.clone();
+        unfinished.extend_from_slice(b"unfinished");
+        let mut session = parse(&unfinished);
+        assert_eq!(session.consumed, bytes.len() as u64);
+        assert_eq!(session.consumed_hash(), xxhash_rust::xxh3::xxh3_64(&bytes));
+        assert_eq!(
+            session.consumed_tail(),
+            &bytes[bytes.len() - CONSUMED_WINDOW..]
+        );
+        for size in [1, 8000, 2] {
+            let line = format!(
+                "{}\n",
+                json!({"type":"future", "id":size.to_string(), "data":"y".repeat(size)})
+            );
+            session.append(line.as_bytes());
+            bytes.extend_from_slice(line.as_bytes());
+            assert_eq!(session.consumed_tail().len(), CONSUMED_WINDOW);
+            assert_eq!(session.consumed_hash(), xxhash_rust::xxh3::xxh3_64(&bytes));
+            assert_eq!(
+                session.consumed_tail(),
+                &bytes[bytes.len() - CONSUMED_WINDOW..]
+            );
+        }
     }
     #[test]
     fn leaves() {
@@ -494,6 +601,105 @@ mod regression_tests {
         assert_eq!(
             include_bytes!("../../tests/fixtures/v1-session.jsonl"),
             bytes
+        );
+    }
+}
+
+#[cfg(test)]
+mod selection_tests {
+    use super::*;
+    use serde_json::json;
+    fn selection(entries: Vec<Value>) -> Selection {
+        let mut lines = vec![json!({"type":"session","id":"s","version":3}).to_string()];
+        let mut parent = None;
+        for (i, mut entry) in entries.into_iter().enumerate() {
+            let id = format!("e{i}");
+            entry["id"] = json!(id);
+            entry["parentId"] = json!(parent);
+            parent = Some(id);
+            lines.push(entry.to_string());
+        }
+        Session::parse(
+            Path::new("/fixture/selection.jsonl"),
+            lines.join("\n").as_bytes(),
+        )
+        .unwrap()
+        .selection()
+    }
+    fn assistant(provider: &str, model: &str) -> Value {
+        json!({"type":"message","message":{"role":"assistant","provider":provider,"model":model}})
+    }
+    #[test]
+    fn selection_follows_omp_resume_rules() {
+        let explicit = json!({"type":"model_change","model":"p/chosen","role":"default"});
+        for entries in [
+            vec![assistant("p", "old"), explicit.clone()],
+            vec![explicit.clone(), assistant("p", "temporary")],
+        ] {
+            assert_eq!(selection(entries).model.as_deref(), Some("p/chosen"));
+        }
+        assert_eq!(
+            selection(vec![
+                assistant("p", "old"),
+                json!({"type":"model_change","model":"p/temp","role":"temporary"}),
+                assistant("p", "new"),
+                assistant("p", "<synthetic>")
+            ])
+            .model
+            .as_deref(),
+            Some("p/new")
+        );
+        assert_eq!(selection(vec![]), Selection::default());
+        assert_eq!(
+            selection(vec![json!({"type":"model_change","model":"p/legacy"})])
+                .model
+                .as_deref(),
+            Some("p/legacy")
+        );
+        for (entry, level, configured) in [
+            (
+                json!({"type":"thinking_level_change","thinkingLevel":"high","configured":"auto"}),
+                "high",
+                Some("auto"),
+            ),
+            (
+                json!({"type":"thinking_level_change","thinkingLevel":"low"}),
+                "low",
+                Some("low"),
+            ),
+            (
+                json!({"type":"thinking_level_change","thinkingLevel":null}),
+                "off",
+                None,
+            ),
+        ] {
+            let s = selection(vec![
+                json!({"type":"thinking_level_change","thinkingLevel":"medium"}),
+                entry,
+            ]);
+            assert_eq!(s.thinking_level.as_deref(), Some(level));
+            assert_eq!(s.thinking_configured.as_deref(), configured);
+        }
+    }
+    #[test]
+    fn selection_ignores_inactive_branch_and_unknown_records() {
+        let session = Session::parse(
+            Path::new("/fixture/branch.jsonl"),
+            br#"{"type":"session","id":"s","version":3}
+{"type":"model_change","id":"a","parentId":null,"model":"p/chosen"}
+{"type":"model_change","id":"b","parentId":"a","model":"p/inactive"}
+{"type":"thinking_level_change","id":"c","parentId":"a","thinkingLevel":"high","configured":"auto"}
+{"type":"future","id":"d","parentId":"c"}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            session.selection(),
+            Selection {
+                model: Some("p/chosen".into()),
+                thinking_level: Some("high".into()),
+                thinking_configured: Some("auto".into())
+            }
         );
     }
 }

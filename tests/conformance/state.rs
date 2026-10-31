@@ -250,7 +250,7 @@ fn ac018_error_envelopes_and_raw_output_are_never_spilled() {
     sb.glen(["watch"])
         .env("GLEN_MAX_OUTPUT", "10")
         .run()
-        .error_envelope("not_implemented");
+        .error_envelope("usage");
 
     let out = sb.glen(["doctor"]).env("GLEN_MAX_OUTPUT", "10").run();
     let err = out.error_envelope("omp_unavailable");
@@ -346,6 +346,7 @@ fn ac027_commands_do_not_create_glen_home_or_omp_dirs() {
         (&["doctor", "--human"], false),
         (&["ls"], false),
         (&["jobs"], false),
+        (&["models"], false),
         (&["wait", "j1234567"], false),
         (&["show", "abc1234"], false),
         (&["send", "abc1234", "hi"], false),
@@ -412,4 +413,17 @@ fn a1_doctor_never_writes_into_omp_directories() {
         .ok_data();
     assert!(is_empty_dir(&data.join("omp")) && is_empty_dir(&state.join("omp")));
     assert!(is_empty_dir(&sb.home));
+}
+
+#[test]
+fn ac027_models_and_idle_abort_are_lazy_with_a_real_fixture_copy() {
+    let b = crate::rpc_support::RpcBox::new();
+    for args in [
+        vec!["models"],
+        vec!["models", crate::reader::A.handle],
+        vec!["abort", crate::reader::A.handle],
+    ] {
+        b.glen(&args).run().ok_data();
+        assert!(!b.bx.glen_home.exists());
+    }
 }

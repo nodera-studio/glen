@@ -65,6 +65,7 @@ fn role(
     timestamp: &Option<String>,
     model: Option<&str>,
     st: &Style<'_>,
+    timezone: &jiff::tz::TimeZone,
 ) -> String {
     let mut s = st.painter.paint(token, &st.painter.bold(name));
     if let Some(m) = model {
@@ -77,7 +78,10 @@ fn role(
         .as_deref()
         .and_then(|s| s.parse::<jiff::Timestamp>().ok())
     {
-        s.push_str(&muted(&format!(" · {}", text::local_hm(&t)), st))
+        s.push_str(&muted(
+            &format!(" · {}", text::local_hm_in(&t, timezone)),
+            st,
+        ))
     }
     s
 }
@@ -100,7 +104,7 @@ fn tool(call: &ToolCall, st: &Style<'_>) -> String {
             )
         }
     } else {
-        muted("· no result", st)
+        muted("no result", st)
     };
     if call.name == "glen_reply"
         && let Some(reply) = call
@@ -200,13 +204,22 @@ pub fn render_items(items: &[Item], st: &Style<'_>) -> String {
         .join("\n\n")
 }
 pub fn render_item(item: &Item, prev_model: &mut Option<String>, st: &Style<'_>) -> String {
+    render_item_in(item, prev_model, st, &jiff::tz::TimeZone::system())
+}
+/// Render using a caller-owned timezone; full-screen callers perform no timezone discovery.
+pub fn render_item_in(
+    item: &Item,
+    prev_model: &mut Option<String>,
+    st: &Style<'_>,
+    timezone: &jiff::tz::TimeZone,
+) -> String {
     let p = st.painter;
     match item {
         Item::User {
             text, timestamp, ..
         } => format!(
             "{}\n{}",
-            role("❯ user", Token::Accent, timestamp, None, st),
+            role("❯ user", Token::Accent, timestamp, None, st, timezone),
             body(text, None, st)
         ),
         Item::Assistant {
@@ -231,6 +244,7 @@ pub fn render_item(item: &Item, prev_model: &mut Option<String>, st: &Style<'_>)
                     None
                 },
                 st,
+                timezone,
             );
             *prev_model = model.clone();
             if *has_thinking {
@@ -582,5 +596,38 @@ mod reply_tests {
         let json = serde_json::to_value(&call).unwrap();
         assert_eq!(json["arguments"], args);
         assert!(json.get("reply_text").is_none());
+    }
+}
+
+#[cfg(test)]
+mod pending_tool_tests {
+    use super::*;
+    use crate::render::palette::{ColorDepth, Theme};
+    #[test]
+    fn pending_generic_and_reply_tools_have_only_the_callers_separator() {
+        for depth in [ColorDepth::None, ColorDepth::TrueColor] {
+            let painter = Painter::new(depth, Theme::Dark);
+            let style = Style {
+                painter: &painter,
+                width: Some(100),
+                tools: Tools::Collapsed,
+                thinking: false,
+            };
+            for name in ["read", "glen_reply"] {
+                let call = ToolCall {
+                    id: "pending".into(),
+                    name: name.into(),
+                    summary: "pending.rs".into(),
+                    reply_text: (name == "glen_reply").then(|| "pending reply".into()),
+                    arguments: None,
+                    result: None,
+                };
+                let row = tool(&call, &style);
+                let plain = anstream::adapter::strip_str(&row).to_string();
+                assert!(plain.ends_with(" · no result"), "{plain}");
+                assert!(!plain.contains("· ·"), "{plain}");
+                assert_eq!(plain.matches("no result").count(), 1);
+            }
+        }
     }
 }

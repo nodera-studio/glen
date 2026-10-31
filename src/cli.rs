@@ -76,6 +76,32 @@ pub enum Command {
     )]
     Jobs(JobsArgs),
     #[command(
+        visible_alias = "stop",
+        about = "Stop the running turn of a session",
+        after_help = "Examples:\n  glen abort e27c0de\n  glen stop @latest"
+    )]
+    Abort(CtlArgs),
+    #[command(
+        about = "List models (with providers) a session can use",
+        after_help = "Examples:\n  glen models\n  glen models e27c0de --provider prov-a"
+    )]
+    Models(ModelsArgs),
+    #[command(
+        about = "Switch a session's model and provider",
+        after_help = "Examples:\n  glen model e27c0de prov-a/model-1"
+    )]
+    Model(ModelArgs),
+    #[command(
+        about = "Set a session's thinking level",
+        after_help = "Examples:\n  glen thinking @latest high"
+    )]
+    Thinking(ThinkingArgs),
+    #[command(
+        about = "Compact a session's context",
+        after_help = "Examples:\n  glen compact e27c0de --instructions 'keep decisions'"
+    )]
+    Compact(CompactArgs),
+    #[command(
         about = "Show replies omp sent back with glen_reply",
         after_help = "Examples:
   glen inbox
@@ -85,7 +111,10 @@ pub enum Command {
     Inbox(InboxArgs),
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
     Worker(WorkerArgs),
-    #[command(hide = true, about = "Watch a session live")]
+    #[command(
+        about = "Watch sessions live: transcripts, replies and a prompt (full screen)",
+        after_help = "Examples:\n  glen watch\n  glen watch e27c0de\n  glen watch --all"
+    )]
     Watch(WatchArgs),
     #[command(
         about = "Install the bundled omp extension (live sessions, glen_reply)",
@@ -274,7 +303,12 @@ pub struct InboxArgs {
 }
 #[derive(Debug, Args)]
 pub struct WatchArgs {
+    #[arg(help = "session handle or @latest; otherwise select from the session list")]
     pub session: Option<String>,
+    #[arg(long, conflicts_with = "cwd", help = "watch every project")]
+    pub all: bool,
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "watch this project directory; scope @latest to it")]
+    pub cwd: Option<PathBuf>,
 }
 #[derive(Debug, Args)]
 pub struct InstallExtensionArgs {
@@ -304,6 +338,84 @@ pub struct InstallSkillArgs {
     pub uninstall: bool,
 }
 #[derive(Debug, Args)]
+pub struct CtlArgs {
+    #[arg(help = "session handle or @latest")]
+    pub session: String,
+    #[arg(long,value_name="DUR",default_value="90s",value_parser=parse_control_timeout,help="bound the whole command (default 90s)")]
+    pub timeout: Duration,
+}
+#[derive(Debug, Args)]
+pub struct ModelsArgs {
+    #[arg(help = "session handle or @latest (omit for the profile's models)")]
+    pub session: Option<String>,
+    #[arg(long, value_name = "P", help = "filter providers case-insensitively")]
+    pub provider: Option<String>,
+    #[arg(long,value_name="DUR",default_value="90s",value_parser=parse_control_timeout,help="bound the whole command (default 90s)")]
+    pub timeout: Duration,
+}
+#[derive(Debug, Args)]
+pub struct ModelArgs {
+    #[arg(help = "session handle or @latest")]
+    pub session: String,
+    #[arg(help = "exact provider/model or an unambiguous model id")]
+    pub model: String,
+    #[arg(long,value_name="DUR",default_value="90s",value_parser=parse_control_timeout,help="bound the whole command (default 90s)")]
+    pub timeout: Duration,
+}
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub enum ThinkingLevelArg {
+    Off,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+impl ThinkingLevelArg {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+}
+#[derive(Debug, Args)]
+pub struct ThinkingArgs {
+    #[arg(help = "session handle or @latest")]
+    pub session: String,
+    #[arg(value_enum, help = "thinking level supported by the session's model")]
+    pub level: ThinkingLevelArg,
+    #[arg(long,value_name="DUR",default_value="90s",value_parser=parse_control_timeout,help="bound the whole command (default 90s)")]
+    pub timeout: Duration,
+}
+#[derive(Debug, Args)]
+pub struct CompactArgs {
+    #[arg(help = "session handle or @latest")]
+    pub session: String,
+    #[arg(
+        long,
+        value_name = "TEXT",
+        help = "instructions for the compaction (at most 512 KiB)"
+    )]
+    pub instructions: Option<String>,
+    #[arg(long,value_name="DUR",default_value="90s",value_parser=parse_control_timeout,help="bound the whole command (default 90s)")]
+    pub timeout: Duration,
+}
+pub fn parse_control_timeout(raw: &str) -> Result<Duration, String> {
+    let value = parse_duration(raw)?;
+    if value.is_zero() {
+        Err("timeout must be greater than zero".into())
+    } else {
+        Ok(value)
+    }
+}
+#[derive(Debug, Args)]
 pub struct DoctorArgs {}
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
@@ -319,6 +431,11 @@ impl Command {
             Self::Send(_) => "send",
             Self::Wait(_) => "wait",
             Self::Jobs(_) => "jobs",
+            Self::Abort(_) => "abort",
+            Self::Models(_) => "models",
+            Self::Model(_) => "model",
+            Self::Thinking(_) => "thinking",
+            Self::Compact(_) => "compact",
             Self::Inbox(_) => "inbox",
             Self::Worker(_) => "__worker",
             Self::Watch(_) => "watch",
@@ -494,4 +611,25 @@ mod help_tests {
             }
         }
     }
+}
+
+/// clap_complete's fish, elvish and PowerShell generators omit positional
+/// values. Add the thinking vocabulary without changing the clap grammar.
+pub fn complete_controls(shell: clap_complete::Shell, mut script: String) -> String {
+    use clap_complete::Shell;
+    match shell {
+        Shell::Fish=>script.push_str(&format!("\ncomplete -c glen -n '__fish_glen_using_subcommand thinking; and test (count (commandline -opc)) -ge 3' -f -a '{}'\n",crate::ops::THINKING_LEVELS.join(" "))),
+        Shell::Elvish=>{
+            script=script.replace("for word $words[1..-1] {","for word $words[1..-1] {\n        if (str:has-prefix $command 'glen;thinking') { break }");
+            let candidates=crate::ops::THINKING_LEVELS.iter().map(|level|format!("            cand {level} 'thinking level'\n")).collect::<String>();
+            script=script.replace("&'glen;thinking'= {",&format!("&'glen;thinking'= {{\n{candidates}"));
+        }
+        Shell::PowerShell=>{
+            script=script.replace("$element = $commandElements[$i]","if ($i -gt 1 -and $commandElements[$i-1].Value -eq 'thinking') { break }\n            $element = $commandElements[$i]");
+            let candidates=crate::ops::THINKING_LEVELS.iter().map(|level|format!("            [CompletionResult]::new('{level}', '{level}', [CompletionResultType]::ParameterValue, 'thinking level')\n")).collect::<String>();
+            script=script.replace("'glen;thinking' {",&format!("'glen;thinking' {{\n{candidates}"));
+        }
+        _=>(),
+    }
+    script
 }

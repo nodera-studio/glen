@@ -18,8 +18,8 @@ fn human_lines(out: &Out) -> Vec<String> {
     out.out().lines().map(strip_ansi).collect()
 }
 
-/// AC-101 as superseded by W2 AC-201: the reader commands plus `send`, `wait` and `jobs` are
-/// listed; the remaining v0.1.0 commands stay hidden and exit 8.
+/// Earlier-wave help expectations track the current visible commands; any remaining
+/// unimplemented public commands stay hidden and exit 8.
 #[test]
 fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
     let bx = OmpBox::new();
@@ -36,20 +36,11 @@ fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
     names.sort_unstable();
     assert_eq!(
         names,
-        [
-            "completions",
-            "doctor",
-            "help",
-            "inbox",
-            "install-extension",
-            "install-skill",
-            "jobs",
-            "ls",
-            "send",
-            "show",
-            "tail",
-            "wait"
-        ],
+        {
+            let mut names = VISIBLE;
+            names.sort();
+            names
+        },
         "{}",
         out.ctx()
     );

@@ -213,6 +213,98 @@ pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientErr
     });
     rx.recv_timeout(timeout).map_err(|_| ClientError::Timeout)?
 }
+/// Control requests carry an expected session id and close their connection on
+/// interruption. The worker checks the deadline again before sending any bytes.
+pub fn unary_for(
+    path: &Path,
+    op: &Op,
+    expect: &str,
+    timeout: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Value, ClientError> {
+    use std::sync::{Arc, Mutex, atomic::Ordering};
+    let end = Instant::now() + timeout;
+    let active = Arc::new(Mutex::new(None::<UnixStream>));
+    let thread_active = active.clone();
+    let thread_stop = stop.clone();
+    let path = path.to_owned();
+    let id = uuid::Uuid::now_v7().to_string();
+    let request = op.request_for(&id, Some(expect));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let result = (|| {
+            let mut stream = bounded_connect(&path, end, &|| thread_stop.load(Ordering::SeqCst))?;
+            *thread_active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                Some(stream.try_clone().map_err(unary_io)?);
+            if thread_stop.load(Ordering::SeqCst) {
+                return Err(ClientError::Cancelled);
+            }
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ClientError::Timeout);
+            }
+            stream.set_write_timeout(Some(left)).map_err(unary_io)?;
+            writeln!(stream, "{request}").map_err(unary_io)?;
+            let left = end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(ClientError::Timeout);
+            }
+            stream.set_read_timeout(Some(left)).map_err(unary_io)?;
+            let line = read_line(&mut BufReader::new(stream)).map_err(unary_io)?;
+            match parse_frame(&line).map_err(ClientError::Protocol)? {
+                Frame::Response {
+                    id: Some(got),
+                    ok,
+                    data,
+                    error,
+                } if got == id => {
+                    if ok {
+                        Ok(data)
+                    } else {
+                        Err(ClientError::Refused(error.ok_or_else(|| {
+                            ClientError::Protocol("missing response error".into())
+                        })?))
+                    }
+                }
+                _ => Err(ClientError::Protocol(
+                    "unexpected response id or event".into(),
+                )),
+            }
+        })();
+        if tx.send(result).is_err() {
+            drop(thread_active);
+        }
+    });
+    loop {
+        let stopped = stop.load(Ordering::SeqCst);
+        let left = end.saturating_duration_since(Instant::now());
+        if stopped || left.is_zero() {
+            if let Some(stream) = active
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take()
+                && let Err(error) = stream.shutdown(Shutdown::Both)
+                && error.kind() != io::ErrorKind::NotConnected
+            {
+                return Err(ClientError::Protocol(format!(
+                    "cannot close control socket: {error}"
+                )));
+            }
+            return Err(if stopped {
+                ClientError::Cancelled
+            } else {
+                ClientError::Timeout
+            });
+        }
+        match rx.recv_timeout(left.min(Duration::from_millis(50))) {
+            Ok(result) => return result,
+            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(_) => return Err(ClientError::Protocol("control socket thread ended".into())),
+        }
+    }
+}
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub struct Hello {

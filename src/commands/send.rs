@@ -1,5 +1,5 @@
 use crate::{
-    cli::{Cli, SendArgs},
+    cli::{Cli, DeliverAs, SendArgs},
     env::Env,
     error::{ErrorCode, GlenError, Warning},
     glen_home,
@@ -15,7 +15,8 @@ use crate::{
 };
 use std::{
     io::{self, Read},
-    path::Path,
+    path::{Path, PathBuf},
+    process::Child,
     time::{Duration, Instant},
 };
 pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
@@ -25,7 +26,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             "--cwd only applies to @new and @latest",
         ));
     }
-    let paths = paths::resolve(env, cli.global.profile.as_deref())?;
+    paths::resolve(env, cli.global.profile.as_deref())?;
     let scope = args
         .cwd
         .as_deref()
@@ -40,25 +41,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             &args.session,
         )?)
     };
-    let cwd = if let Some(o) = &opened {
-        o.session
-            .header
-            .cwd
-            .as_deref()
-            .map(Path::new)
-            .filter(|p| p.is_dir())
-            .or(scope.as_deref())
-            .unwrap_or(env.cwd())
-            .to_path_buf()
-    } else {
-        scope.unwrap_or_else(|| env.cwd().to_path_buf())
-    };
-    if !cwd.is_dir() {
-        return Err(GlenError::new(
-            ErrorCode::NotFound,
-            format!("no such directory: {}", cwd.display()),
-        ));
-    }
+    let cwd = send_cwd(opened.as_ref(), scope.as_deref(), env)?;
     let text = if args.message == "-" {
         let mut bytes = vec![];
         io::stdin()
@@ -84,6 +67,80 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     } else {
         args.message.clone()
     };
+    let Submitted {
+        job,
+        id,
+        store,
+        mut child,
+        created,
+    } = submit(cli, env, opened.as_ref(), cwd, text, args.deliver(), args.thinking.as_deref())?;
+    let flag = wait::install_interrupt()?;
+    let spinner = Spinner::start(
+        ctx.mode == Mode::Human && ctx.stderr_tty,
+        &super::wait::job_progress(&job, &store.read_status(&id)?),
+    );
+    let waited = wait::observe(
+        &store,
+        &id,
+        created,
+        if args.no_wait {
+            Duration::ZERO
+        } else {
+            args.wait
+        },
+        &flag,
+        Some(&mut child),
+        |s| spinner.set_message(&super::wait::job_progress(&job, s)),
+    );
+    spinner.finish();
+    super::wait::outcome(&store, &job, waited?, ctx)
+}
+
+pub(crate) struct Submitted {
+    pub job: Job,
+    pub id: JobId,
+    pub store: JobStore,
+    pub child: Child,
+    pub created: Instant,
+}
+/// Validate before reading stdin, preserving send's error precedence.
+pub(crate) fn send_cwd(
+    opened: Option<&super::open::Opened>,
+    scope: Option<&Path>,
+    env: &Env,
+) -> Result<PathBuf, GlenError> {
+    let cwd = if let Some(o) = opened {
+        o.session
+            .header
+            .cwd
+            .as_deref()
+            .map(Path::new)
+            .filter(|p| p.is_dir())
+            .or(scope)
+            .unwrap_or(env.cwd())
+            .to_path_buf()
+    } else {
+        scope.unwrap_or(env.cwd()).to_path_buf()
+    };
+    if !cwd.is_dir() {
+        return Err(GlenError::new(
+            ErrorCode::NotFound,
+            format!("no such directory: {}", cwd.display()),
+        ));
+    }
+    Ok(cwd)
+}
+/// Submit an already-read message. No stdin, signal handlers, or terminal output.
+pub(crate) fn submit(
+    cli: &Cli,
+    env: &Env,
+    opened: Option<&super::open::Opened>,
+    cwd: PathBuf,
+    text: String,
+    deliver: DeliverAs,
+    thinking: Option<&str>,
+) -> Result<Submitted, GlenError> {
+    let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     if text.trim().is_empty() {
         return Err(GlenError::new(ErrorCode::Usage, "message is empty"));
     }
@@ -185,11 +242,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
                     ),
                     _ => format!("session {} is open in another omp process", o.handle),
                 };
-                let hint = if paths.extensions_dir.join("glen/index.ts").is_file() {
-                    "restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)"
-                } else {
-                    "run `glen install-extension`, then restart that omp session"
-                };
+                let hint = crate::live::route::lease_held_hint(&paths);
                 return Err(GlenError::new(ErrorCode::NoRoute, message).with_hint(hint));
             }
         }
@@ -227,7 +280,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             .filter(|o| !o.not_yet_persisted)
             .map(|o| o.session.path.clone()),
         session_handle: opened.as_ref().map(|o| o.handle.clone()),
-        deliver_as: args.deliver().into(),
+        deliver_as: deliver.into(),
         text,
         cwd,
         omp_bin,
@@ -239,9 +292,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             .as_deref()
             .map(str::trim)
             .map(str::to_owned),
-        thinking_flag: args
-            .thinking
-            .as_deref()
+        thinking_flag: thinking
             .map(str::trim)
             .filter(|t| !t.is_empty())
             .map(str::to_owned),
@@ -252,7 +303,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     let store = JobStore::new(home.clone());
     store.create_for_send(&job, env)?;
     store.prune(now);
-    if live.is_some() && args.thinking.is_some() {
+    if live.is_some() && thinking.is_some() {
         route_warnings.push(Warning {
             code: "ignored_flag".into(),
             message: "--thinking has no effect on the live route (the session is already running); send \"/effort <level>\" as a message to change it in-session instead".into(),
@@ -264,7 +315,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         s.warnings.extend(route_warnings);
         store.write_status(&id, &s)?;
     }
-    let mut child = match rpc::spawn_worker(&home, &id) {
+    let child = match rpc::spawn_worker(&home, &id) {
         Ok(c) => c,
         Err(e) => {
             let mut s = store.read_status(&id)?;
@@ -287,26 +338,13 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             ));
         }
     };
-    let flag = wait::install_interrupt()?;
-    let spinner = Spinner::start(
-        ctx.mode == Mode::Human && ctx.stderr_tty,
-        &super::wait::job_progress(&job, &store.read_status(&id)?),
-    );
-    let waited = wait::observe(
-        &store,
-        &id,
+    Ok(Submitted {
+        job,
+        id,
+        store,
+        child,
         created,
-        if args.no_wait {
-            Duration::ZERO
-        } else {
-            args.wait
-        },
-        &flag,
-        Some(&mut child),
-        |s| spinner.set_message(&super::wait::job_progress(&job, s)),
-    );
-    spinner.finish();
-    super::wait::outcome(&store, &job, waited?, ctx)
+    })
 }
 
 #[cfg(test)]
@@ -358,5 +396,89 @@ mod tests {
                 lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::*;
+    use clap::Parser;
+    #[test]
+    fn literal_hyphen_is_submitted_without_reading_stdin() {
+        let tree = tempfile::tempdir().unwrap();
+        let home = tree.path().join("glen");
+        let agent = tree.path().join("agent");
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin/fake-omp");
+        let env = Env::for_test(
+            Some(tree.path()),
+            tree.path(),
+            &[
+                ("GLEN_HOME", home.to_str().unwrap()),
+                ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+                ("GLEN_OMP_BIN", bin.to_str().unwrap()),
+            ],
+        );
+        let cli = Cli::try_parse_from(["glen", "send", "@new", "-"]).unwrap();
+        let cwd = send_cwd(None, None, &env).unwrap();
+        let mut submitted = submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp, None).unwrap();
+        // The worker child is this unit-test binary, not a live omp process.
+        if submitted.child.try_wait().unwrap().is_none() {
+            submitted.child.kill().unwrap();
+        }
+        submitted.child.wait().unwrap();
+        let stored = submitted.store.read_job(&submitted.id).unwrap();
+        assert_eq!(stored.text, "-");
+        assert_eq!(stored.deliver_as, crate::jobs::Deliver::FollowUp);
+    }
+    #[test]
+    fn submit_rejects_empty_and_oversize_before_creating_home() {
+        let tree = tempfile::tempdir().unwrap();
+        let home = tree.path().join("glen");
+        let env = Env::for_test(
+            Some(tree.path()),
+            tree.path(),
+            &[("GLEN_HOME", home.to_str().unwrap())],
+        );
+        let cli = Cli::try_parse_from(["glen", "send", "@new", "text"]).unwrap();
+        for text in [" \n".to_string(), "x".repeat(rpc::MAX_MESSAGE_BYTES + 1)] {
+            let e = submit(&cli, &env, None, tree.path().into(), text, DeliverAs::Auto, None)
+                .err()
+                .unwrap();
+            assert_eq!(e.code, ErrorCode::Usage);
+            assert!(!home.exists());
+        }
+    }
+    #[test]
+    fn run_checks_missing_cwd_before_stdin() {
+        let tree = tempfile::tempdir().unwrap();
+        let missing = tree.path().join("missing");
+        let env = Env::for_test(Some(tree.path()), tree.path(), &[]);
+        let cli = Cli::try_parse_from([
+            "glen",
+            "send",
+            "@new",
+            "-",
+            "--cwd",
+            missing.to_str().unwrap(),
+        ])
+        .unwrap();
+        let crate::cli::Command::Send(args) = &cli.command else {
+            panic!("send")
+        };
+        let ctx = OutputCtx::fallback(
+            Mode::Json,
+            &env,
+            &crate::output::Terminal {
+                stdout_tty: false,
+                stderr_tty: false,
+                stdout_cols: None,
+            },
+        );
+        let err = run(&cli, args, &env, &ctx).err().unwrap();
+        assert_eq!(err.code, ErrorCode::NotFound);
+        assert_eq!(
+            err.message,
+            format!("no such directory: {}", missing.display())
+        );
     }
 }

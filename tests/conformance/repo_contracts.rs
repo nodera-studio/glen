@@ -71,6 +71,7 @@ fn ac010_design_exit_table_matches_the_plan() {
         ("omp_unavailable", 5),
         ("no_route", 6),
         ("job_failed", 7),
+        ("control_failed", 7),
         ("not_implemented", 8),
         ("running", 10),
         ("forked", 11),

@@ -29,20 +29,7 @@ fn listed_commands(help: &str) -> Vec<String> {
 #[test]
 fn ac301_help_lists_exactly_the_w3_commands() {
     let sb = Sandbox::new();
-    let mut want = vec![
-        "ls",
-        "show",
-        "tail",
-        "send",
-        "wait",
-        "jobs",
-        "inbox",
-        "install-extension",
-        "install-skill",
-        "doctor",
-        "completions",
-        "help",
-    ];
+    let mut want = VISIBLE;
     want.sort();
     for args in [&["--help"][..], &["-h"][..], &["help"][..]] {
         let out = sb.glen(args).run();
@@ -64,7 +51,7 @@ fn ac301_completions_offer_inbox_and_install_extension_but_never_worker() {
         let out = sb.glen(["completions", shell]).run();
         out.assert_exit(0);
         let script = out.out();
-        for name in ["inbox", "install-extension"] {
+        for name in ["inbox", "watch", "install-extension"] {
             assert!(script.contains(name), "{shell} lacks {name}");
         }
         assert!(!script.contains("__worker"), "{shell} exposes __worker");

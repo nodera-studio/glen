@@ -12,10 +12,11 @@ pub enum ErrorCode {
     OmpUnavailable,
     NoRoute,
     JobFailed,
+    ControlFailed,
     NotImplemented,
 }
 impl ErrorCode {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Internal,
         Self::Io,
         Self::Usage,
@@ -25,6 +26,7 @@ impl ErrorCode {
         Self::OmpUnavailable,
         Self::NoRoute,
         Self::JobFailed,
+        Self::ControlFailed,
         Self::NotImplemented,
     ];
     pub fn as_str(self) -> &'static str {
@@ -38,6 +40,7 @@ impl ErrorCode {
             Self::OmpUnavailable => "omp_unavailable",
             Self::NoRoute => "no_route",
             Self::JobFailed => "job_failed",
+            Self::ControlFailed => "control_failed",
             Self::NotImplemented => "not_implemented",
         }
     }
@@ -49,7 +52,7 @@ impl ErrorCode {
             Self::Ambiguous => 4,
             Self::OmpUnavailable => 5,
             Self::NoRoute => 6,
-            Self::JobFailed => 7,
+            Self::JobFailed | Self::ControlFailed => 7,
             Self::NotImplemented => 8,
         }
     }
@@ -140,6 +143,7 @@ mod tests {
             (ErrorCode::OmpUnavailable, 5, "omp_unavailable"),
             (ErrorCode::NoRoute, 6, "no_route"),
             (ErrorCode::JobFailed, 7, "job_failed"),
+            (ErrorCode::ControlFailed, 7, "control_failed"),
             (ErrorCode::NotImplemented, 8, "not_implemented"),
         ];
         assert_eq!(table.len(), ErrorCode::ALL.len());

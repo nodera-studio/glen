@@ -1,4 +1,4 @@
-//! Independent JSON-lines omp peer. Only startup_recovery appends to a test fixture transcript.
+//! Independent JSON-lines omp peer. Writes only resumed, test-owned fixture copies.
 use serde_json::{Value, json};
 #[cfg(not(target_os = "linux"))]
 use std::fs::File;
@@ -101,12 +101,14 @@ fn run() -> io::Result<u8> {
         return Ok(0);
     }
     let mut resume = None;
+    let mut no_session = false;
     let mut mode = false;
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--mode" if iter.next().map(String::as_str) == Some("rpc") => mode = true,
             "--no-ui" => (),
+            "--no-session" => no_session = true,
             "--profile" => {
                 if iter.next().is_none() {
                     return Ok(64);
@@ -124,7 +126,7 @@ fn run() -> io::Result<u8> {
             _ => return Ok(64),
         }
     }
-    if !mode {
+    if !mode || (no_session && resume.is_some()) {
         return Ok(64);
     }
     let scenario = knob("FAKE_OMP_SCENARIO").unwrap_or_else(|| "ok".into());
@@ -135,6 +137,14 @@ fn run() -> io::Result<u8> {
     log(
         json!({"event":"start","pid":std::process::id(),"pgid":rustix::process::getpgrp().as_raw_nonzero().get(),"argv":args,"cwd":std::env::current_dir()?,"env":{"GLEN_MANAGED":knob("GLEN_MANAGED"),"OMP_PROFILE":knob("OMP_PROFILE"),"PI_PROFILE":knob("PI_PROFILE"),"PI_CONFIG_FILES":knob("PI_CONFIG_FILES")}}),
     )?;
+    if let Some(message) = knob("FAKE_OMP_STARTUP_STDERR") {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(message.as_bytes())?;
+        stderr.flush()?;
+    }
+    if scenario == "startup_exit" {
+        return Ok(1);
+    }
     let mut id = if let Some(path) = &resume {
         fs::read_to_string(path)?
             .lines()
@@ -166,6 +176,30 @@ fn run() -> io::Result<u8> {
         }
     }
     let mut session_file = resume;
+    let models: Vec<Value> = serde_json::from_str(include_str!("fake_models.json"))?;
+    let selected = session_file
+        .as_deref()
+        .and_then(|p| glen::omp::session::Session::load(Path::new(p)).ok())
+        .map(|s| s.selection());
+    let mut model = selected
+        .as_ref()
+        .and_then(|s| s.model.as_deref())
+        .and_then(|pair| {
+            models.iter().find(|m| {
+                format!(
+                    "{}/{}",
+                    m["provider"].as_str().unwrap_or(""),
+                    m["id"].as_str().unwrap_or("")
+                ) == pair
+            })
+        })
+        .cloned()
+        .unwrap_or_else(|| models[0].clone());
+    let mut thinking = selected
+        .and_then(|s| s.thinking_level)
+        .unwrap_or_else(|| "medium".into());
+    let mut tokens = 1234;
+    let serial = knob("FAKE_OMP_SERIAL").as_deref() == Some("1");
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         for line in io::stdin().lock().lines() {
@@ -184,6 +218,11 @@ fn run() -> io::Result<u8> {
     if let Some(release) = knob("FAKE_OMP_READY_RELEASE") {
         let deadline = Instant::now() + Duration::from_secs(20);
         while !Path::new(&release).exists() {
+            if terminated.load(Ordering::SeqCst)
+                || matches!(rx.try_recv(), Err(mpsc::TryRecvError::Disconnected))
+            {
+                return Ok(0);
+            }
             if Instant::now() >= deadline {
                 return Err(io::Error::other("ready release timed out"));
             }
@@ -205,6 +244,7 @@ fn run() -> io::Result<u8> {
     let mut replies: Vec<Value> = vec![];
     let mut reply_index = 0;
     let mut running_queries = 0;
+    let mut state_queries = 0;
     loop {
         if scenario != "wedge" && terminated.load(Ordering::SeqCst) {
             break;
@@ -225,20 +265,31 @@ fn run() -> io::Result<u8> {
                     }
                     "set_event_filter" => response(&f, json!({"events":f["events"]}))?,
                     "get_state" => {
-                        let data = json!({"sessionId":id,"sessionFile":session_file,"isStreaming":false,"isSettled":stage==0||stage==4,"messageCount":0});
+                        state_queries += 1;
+                        let data = json!({"sessionId":id,"sessionFile":session_file,"isStreaming":stage!=0&&stage!=4,"isCompacting":false,"isSettled":stage==0||stage==4,"messageCount":0,"model":model,"thinkingLevel":thinking,"queuedMessageCount":0,"contextUsage":{"tokens":tokens,"contextWindow":200000,"percent":0.617}});
                         if stage != 0 {
                             running_queries += 1;
                         }
-                        let delay = if scenario == "stale_state" && running_queries == 1 {
+                        let delay = if knob("FAKE_OMP_STATE_DELAY_AT")
+                            .and_then(|v| v.parse::<usize>().ok())
+                            == Some(state_queries)
+                        {
+                            ms("FAKE_OMP_PREFLIGHT_DELAY_MS", 0)
+                        } else if scenario == "stale_state" && running_queries == 1 {
                             id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
                             ms("FAKE_OMP_OLD_STATE_DELAY_MS", 1500)
                         } else if stage != 0 {
                             ms("FAKE_OMP_STATE_DELAY_MS", 0)
                         } else {
-                            Duration::ZERO
+                            ms("FAKE_OMP_BASELINE_DELAY_MS", 0)
                         };
                         let stale_reply = scenario == "stale_state" && running_queries == 1;
                         if delay.is_zero() {
+                            response(&f, data)?;
+                        } else if serial {
+                            if !delay_while_alive(delay, &terminated) {
+                                break;
+                            }
                             response(&f, data)?;
                         } else {
                             std::thread::spawn(move || {
@@ -258,6 +309,107 @@ fn run() -> io::Result<u8> {
                                     }
                                 }
                             });
+                        }
+                    }
+                    "get_available_models" => response(&f, json!({"models":models}))?,
+                    "get_available_thinking_levels" => {
+                        response(&f, json!({"levels":fake_levels(&model)}))?
+                    }
+                    "set_model" => {
+                        let found = models
+                            .iter()
+                            .find(|m| m["provider"] == f["provider"] && m["id"] == f["modelId"]);
+                        if let Some(found) = found {
+                            if found["provider"] == "nokey" {
+                                reject(
+                                    &f,
+                                    &format!(
+                                        "No API key for nokey/{}",
+                                        f["modelId"].as_str().unwrap_or("")
+                                    ),
+                                )?;
+                            } else {
+                                model = found.clone();
+                                append_entry(
+                                    session_file.as_deref().filter(|_| !no_session),
+                                    json!({"type":"model_change","model":format!("{}/{}",model["provider"].as_str().unwrap_or(""),model["id"].as_str().unwrap_or("")),"role":"default"}),
+                                )?;
+                                if model["reasoning"] == false && thinking != "off" {
+                                    thinking = "off".into();
+                                    append_entry(
+                                        session_file.as_deref().filter(|_| !no_session),
+                                        json!({"type":"thinking_level_change","thinkingLevel":thinking,"configured":thinking}),
+                                    )?;
+                                }
+                                if scenario == "fork_control" {
+                                    id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
+                                }
+                                if !delay_while_alive(
+                                    ms("FAKE_OMP_SET_MODEL_DELAY_MS", 0),
+                                    &terminated,
+                                ) {
+                                    break;
+                                }
+                                if knob("FAKE_OMP_SET_MODEL_DROP").as_deref()
+                                    == Some("before_reply")
+                                {
+                                    return Ok(0);
+                                }
+                                response(&f, model.clone())?;
+                                if knob("FAKE_OMP_SET_MODEL_DROP").as_deref() == Some("after_reply")
+                                {
+                                    return Ok(0);
+                                }
+                            }
+                        } else {
+                            reject(
+                                &f,
+                                &format!(
+                                    "Model not found: {}/{}",
+                                    f["provider"].as_str().unwrap_or(""),
+                                    f["modelId"].as_str().unwrap_or("")
+                                ),
+                            )?;
+                        }
+                    }
+                    "set_thinking_level" => {
+                        let requested = f["level"].as_str().unwrap_or("off");
+                        let level = if fake_levels(&model).iter().any(|l| l == requested) {
+                            requested
+                        } else {
+                            "off"
+                        };
+                        if thinking != level {
+                            thinking = level.into();
+                            append_entry(
+                                session_file.as_deref().filter(|_| !no_session),
+                                json!({"type":"thinking_level_change","thinkingLevel":thinking,"configured":thinking}),
+                            )?;
+                        }
+                        if scenario == "fork_control" {
+                            id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
+                        }
+                        response(&f, json!({}))?;
+                    }
+                    "compact" => {
+                        if scenario == "compact_error" {
+                            reject(&f, "Nothing to compact")?;
+                        } else {
+                            if !delay_while_alive(ms("FAKE_OMP_COMPACT_DELAY_MS", 0), &terminated) {
+                                break;
+                            }
+                            append_entry(
+                                session_file.as_deref().filter(|_| !no_session),
+                                json!({"type":"compaction","summary":"fake compacted context","firstKeptEntryId":"fake-kept","tokensBefore":1234}),
+                            )?;
+                            tokens = 123;
+                            if scenario == "fork_control" {
+                                id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);
+                            }
+                            response(
+                                &f,
+                                json!({"summary":"fake compacted context","firstKeptEntryId":"fake-kept","tokensBefore":1234}),
+                            )?;
                         }
                     }
                     "abort" => {
@@ -461,4 +613,37 @@ fn emit_call(i: usize, args: &Value) -> io::Result<()> {
     out(
         json!({"type":"host_tool_call","id":format!("htc_{}",i+1),"toolName":"glen_reply","toolCallId":format!("call_{}",i+1),"arguments":args}),
     )
+}
+
+fn fake_levels(model: &Value) -> Vec<String> {
+    let efforts = model["thinking"]["efforts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    glen::ctl::levels_of(model["reasoning"].as_bool().unwrap_or(false), &efforts)
+}
+fn delay_while_alive(delay: Duration, terminated: &AtomicBool) -> bool {
+    let end = Instant::now() + delay;
+    while Instant::now() < end {
+        if terminated.load(Ordering::SeqCst) {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    !terminated.load(Ordering::SeqCst)
+}
+fn append_entry(path: Option<&str>, mut entry: Value) -> io::Result<()> {
+    let Some(path) = path.filter(|p| Path::new(p).is_file()) else {
+        return Ok(());
+    };
+    let session = glen::omp::session::Session::load(Path::new(path)).map_err(io::Error::other)?;
+    entry["parentId"] = json!(session.leaf_id());
+    entry["id"] = json!(uuid::Uuid::now_v7().to_string());
+    entry["timestamp"] = json!(jiff::Timestamp::now().to_string());
+    let mut file = OpenOptions::new().append(true).open(path)?;
+    writeln!(file, "{entry}")?;
+    file.sync_all()
 }

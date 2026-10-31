@@ -1,4 +1,6 @@
 mod common;
+#[path = "support/fake_ext.rs"]
+mod fake_ext_peer;
 use common::{A_ID, LiveBox, data, json, poll};
 use glen::{
     glen_home::GlenHome,
@@ -65,7 +67,11 @@ fn fake_ext_protocol_table() {
         "queued",
     ] {
         let mut b = LiveBox::new();
-        b.start_ext(A_ID, scenario, &[("FAKE_EXT_DELAY_MS", "10")]);
+        b.start_ext(
+            A_ID,
+            scenario,
+            &[("FAKE_EXT_DELAY_MS", "10"), ("FAKE_EXT_OPS", "w3")],
+        );
         let r = match glen::live::registry::read(&home(&b), A_ID) {
             glen::live::registry::Read::Ok(r) => r,
             _ => panic!("registry missing"),

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createGlen, resolveGlenHome, isPlainToken, parseReplyArgs, RESERVED_OPS, sunPathMax, LIMITS } from "../index.ts";
+import { createGlen, resolveGlenHome, isPlainToken, parseReplyArgs, OPS, RESERVED_OPS, sunPathMax, LIMITS } from "../index.ts";
 import { fixture, request, client, frame } from "./fake-pi.ts";
 test("AC306 managed registers nothing", async () => { const f = await fixture({}, { GLEN_MANAGED: "1" }); try { await f.start(); assert.equal(f.tools.length, 0); assert.equal(f.handlers.size, 0); assert.deepEqual(fs.readdirSync(f.home), []); } finally { await f.close(); } });
 test("AC305/308 endpoint lifecycle, private registry and state", async () => {
@@ -10,7 +10,7 @@ test("AC305/308 endpoint lifecycle, private registry and state", async () => {
         const e = await f.start(); assert.ok(e, f.notes.join("\n")); const r = JSON.parse(fs.readFileSync(e.registry, "utf8"));
         for (const [file, mode] of [[e.registry, 0o600], [e.socket, 0o600], [path.dirname(e.socket), 0o700]] as const) assert.equal(fs.statSync(file).mode & 0o777, mode);
         assert.equal(r.session_id, f.fields.sessionId); assert.equal(r.mode, "tui"); assert.equal(r.protocol, 1); assert.equal(r.omp_version, "18.14.0"); assert.equal(r.cwd, f.ctx.cwd);
-        const [hello] = await request(e.socket, frame("hello")); assert.deepEqual(hello.data.ops, ["hello", "state", "send"]); assert.equal(hello.data.state, "idle"); assert.equal(hello.data.active_requests, 0);
+        const [hello] = await request(e.socket, frame("hello")); assert.deepEqual(hello.data.ops, OPS); assert.equal(hello.data.state, "idle"); assert.equal(hello.data.active_requests, 0);
         f.fields.idle = false; f.fields.pending = true; const [state] = await request(e.socket, frame("state")); assert.equal(state.data.busy, true); assert.equal(state.data.queued, true); assert.equal(state.data.protocol, undefined);
         const old = fs.readFileSync(e.registry, "utf8"); f.ctx.agent.kind = "sub"; f.fields.sessionId = "sub"; await f.emit("session_start"); assert.equal(fs.readFileSync(e.registry, "utf8"), old); f.ctx.agent.kind = "main"; f.fields.sessionId = r.session_id;
         await f.emit("session_shutdown"); assert.ok(!fs.existsSync(e.socket)); assert.ok(!fs.existsSync(e.registry));
@@ -24,7 +24,8 @@ test("AC305 exclusions and utf8 sun_path boundary", async () => {
 test("AC307 protocol table and idle bound", async () => {
     const f = await fixture(); try { const e = await f.start();
         for (const [input, code] of [[{ ...frame("hello"), v: 2 }, "unsupported_version"], [frame("wat"), "unsupported_op"], ["bad\n", "bad_request"], [JSON.stringify({ v: 1, op: "state" }) + "\n", "bad_request"], ["x".repeat(LIMITS.maxLine + 1) + "\n", "bad_request"]] as const) { const r = await request(e.socket, input); assert.equal(r.length, 1); assert.equal(r[0].error.code, code); }
-        for (const op of RESERVED_OPS) { const [r] = await request(e.socket, frame(op)); assert.equal(r.error.code, "unsupported_op"); assert.deepEqual(r.error.details, { op, ops: ["hello", "state", "send"], reserved: true }); }
+        assert.deepEqual(RESERVED_OPS, []);
+        for (const op of ["future_op", "steer"]) { const [r] = await request(e.socket, frame(op)); assert.equal(r.error.code, "unsupported_op"); assert.deepEqual(r.error.details, { op, ops: OPS, reserved: false }); }
         const c = await client(e.socket); await c.until(() => c.ended, 500);
         const [r] = await request(e.socket, { ...frame("hello"), unknown: true }); assert.equal(r.ok, true);
     } finally { await f.close(); }

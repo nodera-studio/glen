@@ -1,0 +1,48 @@
+---
+source: src/tui/view.rs
+description: main · 60x20 · Dark None
+---
+cursor: 29,18
+grid 60x20
+glen watch               4 sessions · 2 live · ◐ 1 job · ↩ 1
+ sessions   │▍e27c0de · ◐ busy
+ · model anthropic/claude-sonnet-4-5
+
+ ❯ user · 12:00
+   Why does parser_test flake?
+
+ ◆ assistant · claude-sonnet-4-5 · 12:00
+   ∴ thinking · 4 words
+   Let me read the test.
+   ↳ read tests/parser_test.rs · ✓ fn parser_test() { … }
+
+ ◆ assistant · 12:00
+   The test depends on map order. Fixed.
+ ──────────────────────────────────────────────────────────
+ ⠁ j1234567 · waiting for the reply · 17s
+ ↩ I found the flaky assertion.
+──────────────────────────────────────────────────── auto ──
+e27c0de ❯ run the tests again
+enter send  alt-enter new line  ^t auto / steer / follow-up
+styles (zero-based, half-open columns):
+r0 c0-60 fg=default
+r1 c0-60 fg=default
+r2 c0-60 fg=default
+r3 c0-60 fg=default
+r4 c0-60 fg=default
+r5 c0-60 fg=default
+r6 c0-60 fg=default
+r7 c0-60 fg=default
+r8 c0-60 fg=default
+r9 c0-60 fg=default
+r10 c0-60 fg=default
+r11 c0-60 fg=default
+r12 c0-60 fg=default
+r13 c0-60 fg=default
+r14 c0-60 fg=default
+r15 c0-60 fg=default
+r16 c0-60 fg=default
+r17 c0-60 fg=default
+r18 c0-60 fg=default
+r19 c0-60 fg=default
+bg: none

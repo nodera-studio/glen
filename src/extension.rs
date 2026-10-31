@@ -104,7 +104,22 @@ pub fn inspect(path: &Path, version: &str, home: &Path) -> io::Result<(State, Op
     let state = match compare(fields[0], version) {
         Ordering::Less => State::Outdated(fields[0].into()),
         Ordering::Greater => State::Newer(fields[0].into()),
-        Ordering::Equal => State::DifferentHome,
+        Ordering::Equal => {
+            let baked = std::str::from_utf8(&bytes[end + 1..])
+                .ok()
+                .and_then(|body| {
+                    body.lines()
+                        .find_map(|line| line.strip_prefix("const BAKED_GLEN_HOME = "))
+                })
+                .and_then(|literal| {
+                    serde_json::from_str::<String>(literal.trim_end_matches(';')).ok()
+                });
+            if baked.as_deref().map(Path::new) == Some(home) {
+                State::Outdated(format!("{} (older build)", fields[0]))
+            } else {
+                State::DifferentHome
+            }
+        }
     };
     Ok((state, installed))
 }
@@ -117,6 +132,22 @@ mod tests {
     use super::*;
     #[test]
     fn source_contract() {
+        for (declaration, expected) in [
+            ("export const OPS", crate::ops::IMPLEMENTED),
+            ("export const RESERVED_OPS", crate::ops::RESERVED),
+        ] {
+            let literal = SOURCE
+                .lines()
+                .find(|line| line.starts_with(declaration))
+                .unwrap()
+                .split_once('=')
+                .unwrap()
+                .1
+                .trim()
+                .trim_end_matches(';');
+            let actual: Vec<String> = serde_json::from_str(literal).unwrap();
+            assert_eq!(actual, expected);
+        }
         for marker in ["__GLEN_HOME__", "__GLEN_VERSION__"] {
             assert_eq!(SOURCE.matches(marker).count(), 1);
         }
@@ -165,6 +196,29 @@ mod tests {
         ] {
             fs::write(&p, body).unwrap();
             assert_eq!(inspect(&p, "0.1.0", h).unwrap().0, want);
+        }
+    }
+    #[test]
+    fn same_version_intact_older_body_is_outdated_only_for_the_same_home() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("index.ts");
+        let home = Path::new("/tmp/g");
+        for (baked, expected) in [
+            (home, State::Outdated("0.1.0 (older build)".into())),
+            (Path::new("/tmp/other"), State::DifferentHome),
+        ] {
+            let old = render("0.1.0", baked);
+            let body = old
+                .split_once('\n')
+                .unwrap()
+                .1
+                .replace("export const OPS =", "export const OLD_OPS =");
+            let installed = format!(
+                "// glen-extension version=0.1.0 protocol=1 digest={:016x}\n{body}",
+                xxh64(body.as_bytes(), 0)
+            );
+            fs::write(&path, installed).unwrap();
+            assert_eq!(inspect(&path, "0.1.0", home).unwrap().0, expected);
         }
     }
 }

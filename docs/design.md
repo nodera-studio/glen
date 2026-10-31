@@ -38,6 +38,14 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 | Explicit extension | `CA/cli/args.ts:382` | `--no-extensions -e FILE` still loads the explicit file |
 | Directories | `packages/utils/src/dirs.ts` | §A12 |
 
+**Session controls (W3b).** `rpc-mode.ts` implements `abort`, `get_available_models`, `set_model {provider,modelId}`, `get_available_thinking_levels`, `set_thinking_level {level}`, and `compact {customInstructions?}`. Ordinary commands are serialized: abort does not overtake a registry refresh or compaction. Only prompt/steer/follow_up and a few side channels bypass that queue.
+
+`ModelControls.setModel` appends a default-role `model_change` even when unchanged, requires auth, re-applies thinking, and records model usage. `setThinkingLevel` clamps to model capabilities and appends `thinking_level_change {thinkingLevel,configured}` only when the effective level changes. RPC and the extension do not pass persist; global settings stay unchanged. Resume restores the last default-role (or absent-role) model change on the active branch; assistant provider/model is only a fallback before an explicit default, excluding `<synthetic>`. The last thinking change carries configured; no thinking entry means the level comes from settings/model defaults, so disk reporting is null.
+
+Manual compaction aborts and later resumes a running turn. Explicit abort cancels manual compaction but keeps queued steer/follow-up messages queued without starting them. `ctx.isIdle()` only reflects streaming, so glen separately tracks compactions it starts. Session files are lazy until the first assistant answer; earlier model/thinking changes are in memory. `--no-session` creates an in-memory session and cannot combine with resume.
+
+The extension uses `ctx.abort/isIdle/hasPendingMessages/compact/getContextUsage/model/models.list`, and `pi.setModel/getThinkingLevel/setThinkingLevel`. `ctx.models.list()` uses available models without RPC's enabled-model filter; supported levels are off plus thinking.efforts only for reasoning models.
+
 ## §A3 The three channels
 **Disk reader (W1)**
 - **Discovery.** Buckets are the immediate subdirectories of `sessions_dir`. Session files are `<bucket>/*.jsonl` with a valid header. Skip dotfiles (`.lock.os`, `.*.tmp`), symlinked buckets and everything inside subdirectories. Follow symlinked regular files and deduplicate canonical paths. Header scanning falls back from 4 KiB to at most 64 KiB when no complete header fits.
@@ -114,12 +122,18 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 | Transport | UTF-8 NDJSON, one request per connection; extra request lines ignored |
 | Request | `{v:1,id:string,op,args:{…}}`; hello/state may omit args |
 | Response | Exactly one `{v:1,id,ok:true,data:{…}}` or `{v:1,id,ok:false,error:{code,message,details?}}` |
-| hello | Args `{client,client_version,protocols:[1]}`; data `{protocol:1,protocols:[1],ops:["hello","state","send"],ext_version,omp_version,pid,session_id,session_file,mode,state:"idle"|"busy",busy,queued,active_requests}` |
+| hello | Args `{client,client_version,protocols:[1]}`; data `{protocol:1,protocols:[1],ops:["hello","state","send","abort","list_models","set_model","set_thinking_level","compact"],ext_version,omp_version,pid,session_id,session_file,mode,state:"idle"|"busy",busy,queued,active_requests}` |
 | state | Same data without protocol/protocols/ops; identity is re-read on every request |
 | send | Args `{text,deliver_as:"auto"|"steer"|"follow_up",job_id:null|string,expect_session_id:null|string}`; ack data `{delivered_as,session_id,request_id}` precedes every event |
 | Events after successful send | `consumed` at most once; `reply {reply}`; `session_changed {from,to,reason}`; exactly one terminal `settled {status,assistant_text,stop_reason,error_message}` or `error {error:{code,message}}`, then close |
 | Errors | `unsupported_version` details `{supported:[1]}`; `unsupported_op` details `{op,ops,reserved}`; `bad_request`, `session_mismatch` details `{session_id}`, `send_failed`, `internal` |
-| Reserved W3b | `abort {}`, `list_models {}`, `set_model {provider,model_id}`, `set_thinking_level {level}`, `compact {instructions?}` return unsupported_op, reserved true |
+| abort | Args `{expect_session_id?}`; data `{session_id,was:"busy"|"idle",aborted,idle_after,queued}`. Idle does not call ctx.abort. Busy calls it once and waits at most 3s in managed 50ms ticks. |
+| list_models | Args `{expect_session_id?}`; data `{session_id,current:{provider,id}|null,thinking_level,models:[{provider,id,name,reasoning,thinking_levels,context_window,max_tokens}]}` |
+| set_model | Args `{provider,model_id,expect_session_id?}`; data `{session_id,model:{provider,id,name},previous:{provider,id}|null,thinking_level,thinking_levels,busy}` |
+| set_thinking_level | Args `{level,expect_session_id?}`; data `{session_id,thinking_level,previous,model:{provider,id}|null,available,busy}`; reject unsupported levels before the setter |
+| compact | Args `{instructions?,expect_session_id?}`; data `{session_id,tokens_before,tokens_after}`. Refuse streaming, queued messages, or another glen compaction. Instructions ≤524288 UTF-8 bytes. |
+| Capabilities | hello.ops is authoritative; no reserved ops. Unknown ops return unsupported_op with `{op,ops,reserved:false}`. Missing capability or unsupported_op becomes no_route/extension_outdated and install/restart guidance. |
+| Control errors | model_not_found, no_auth, invalid_level (details available/model), busy, omp_error, timeout, job_ended, plus existing protocol errors. Identity is checked before effect and re-read after each awaited call. |
 | Limits | Request line ≤4 MiB; client frame ≤16 MiB; text ≤524288 UTF-8 bytes; no complete request within 5s closes the connection |
 
 - Unknown fields and unknown client event kinds are ignored. Malformed JSON, invalid UTF-8, missing string id or oversized request returns `bad_request` (unknown id null). Duplicate held/settled request ids are rejected before injection (bounded settled-id history). Session mismatch never injects.
@@ -131,6 +145,13 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 - **Cleanup:** shutdown emits `error shutdown`, closes the server and unlinks its socket and pid-owned registry synchronously within omp's 2s budget. A synchronous process exit backstop repeats the unlinks. Raw callbacks are guarded, socket/server errors have listeners, timers use the managed ctx API (socket idle timeout is the Node socket API). No terminal output; TUI notices use `ctx.ui.notify`.
 - `GLEN_EXT_TRACE=<absolute file>` appends guarded NDJSON event/flags/idle/queue/request state snapshots. Step 14 was **run on the host — see evidence** in `.claude/evidence/v010-wave-3-live/README.md`, `05-trace.ndjson` and `05-transcript.txt`. Step 5 failed attribution under the original idle-only rule; the O6 amendment above supersedes it. Re-run Step 5 on the host after this fix; fake-host replay is regression evidence, not live acceptance.
 
+**Watch (W5)**
+- Four long-lived readers own their I/O and caches and send messages to the UI; the reducer and view do no I/O. Sessions refresh every 2s, or immediately on refresh/scope changes. Follow polls every 250ms. Jobs refresh active statuses every 250ms and list the store every 1s. Inbox reads new records every 500ms and re-reads persisted cursors every 1s.
+- **Probe on change.** A disk row with a previously free lease skips the next probe while its device, inode, size and mtime are unchanged. Changed files, held leases and unknown leases are probed again; matching extension-backed rows are never probed. Head and refined-tail caches avoid rescanning unchanged files.
+- **Shared cores.** Watch reuses `tail -f`'s `Follower` and `send`'s `submit` path; the extraction preserves CLI output byte-for-byte and retains the same routing/refusal behavior. The transcript updates per persisted entry, not per token; partial lines wait for their newline.
+- **Peek-only inbox.** Watch never marks replies read or writes `inbox/.read`; persisted cursors only inform unread counts.
+- **Controls gate.** W3b has not landed in this base: `controls::AVAILABLE = false`, and the controls adapter is a stub. Unavailable controls show “session controls are not in this build”.
+
 ## §A4 Routing (`glen send`)
 1. Resolve the target including endpoint-only sessions, follow continuations, read/validate text. Target resolution for send does **not** probe the lease. `@new` always uses RPC.
 2. Before consulting either lock, inspect `run/live/<lock_key(id)>.json`. A 2s matching hello with protocol 1 and send in ops selects live; no omp binary or owner-lease probe is needed. If the glen session lock is also held, refuse exit 6 with `glen jobs --active --session <handle>` guidance. Extension version mismatch warns with both versions and still routes live.
@@ -141,6 +162,15 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 The worker passes the caller's environment through to omp, subject to the explicit-profile scrubbing in §A3; the harness relies on inherited `PI_CONFIG_FILES`, pinned by `tests/rpc.rs::w9_send_passes_profile_and_config_overlay_env`.
 
 **Residual race.** The extension closes the idle-TUI gap for resumed and brand-new TUI sessions before their first write. An unextended TUI can still open between a lease probe and first RPC write; the RPC path narrows that race and reports a detected fork as exit 11. `show`/`tail` retain W1's brief read-only lease probe and never route. Endpoint-only targets cannot fall back to RPC until a transcript exists.
+
+### Controls (W3b, AC-351–369)
+`abort` (visible alias `stop`), `model`, `thinking`, and `compact` route endpoint → lock-holding RPC job → unowned short-lived RPC. They follow W4's sandbox order: refuse_unreachable, live endpoint, then refuse_rpc. A responding endpoint plus a held glen lock, an unhealthy endpoint, or an owner lease held/unknown without an endpoint refuses exit 6 before a control file or process is created. Old extensions get details.reason extension_outdated, ext_version, and install/restart guidance. A free, unowned idle abort returns route none and creates nothing.
+
+The RPC client acquires and marks the glen lock, re-follows continuations, checks endpoint and lease immediately before spawn, and reroutes once if an endpoint appeared. It starts `omp --mode rpc --no-ui [--profile P] --resume FILE`, GLEN_MANAGED=1, in the session cwd when it exists. Glen owns the child before starting the RPC handshake; startup cancellation or failure terminates its process group with TERM then KILL, reaps the leader and confirms the group is empty before releasing the lock. A baseline id mismatch is control_failed/session_moved before any operation. Re-read state after the op, report forked exit 11, close omp, then release the lock. Child stderr is piped and drained; successful controls include up to 16 omp_stderr warnings, each capturing at most 1024 bytes of a line, without writing to glen's stderr. glen never appends the transcript. Persistence error notices produce persistence_error warnings. The extension-less TUI race remains: before its first write it may hold no lease, retain an old in-memory model, and later write beside a control entry; equipped TUIs close this window.
+
+`models` never resumes a session: use live list_models or its owning job; otherwise start a throwaway `--no-session` client and obtain current selection from the active disk branch. Unreachable sessions warn session_unreachable; outdated extensions warn extension_outdated. Endpoint-only fallback has null selection/current_source and not_yet_persisted. Without a target current is null and default_model names the in-memory default. Lists are sorted, provider-filtered before total, and create no GLEN_HOME except output spill. Sandbox refusals still follow W4.
+
+Every command has a positive --timeout DUR, default 90s. Hello ≤2s, live abort ≤4s (extension settle ≤3s), other live ops use remaining time. RPC ready ≤min(60s, remaining); list/model calls ≤30s, thinking/state ≤10s, compact bounded by the command. Deadline/SIGINT stops an RPC process group with TERM/KILL, never an abort queued behind compact, and exits within 5s. Live stops close the socket with a may-still-finish hint; job stops report unknown outcome and the job handle. Re-route once after job_ended.
 
 ## §A5 Reply channel (`glen_reply`)
 - **Consumption identity, omp 18.14.0:** `CA` below means `packages/coding-agent/src` in the read-only reference clone. `CA/extensibility/extensions/types.ts:2062` declares `sendUserMessage(...): void`; `loader.ts:349-350` and `runner.ts:1597-1598` forward that void call, so no returned message/entry id or promise is available. `CA/modes/controllers/extension-ui-controller.ts:1494-1499` catches the asynchronous session submission error and only reports it to the TUI; the extension receives no submission-error event, so glen uses the delivery timeout. `CA/extensibility/extensions/types.ts:1211-1218` exposes a detached `message_end.message`, mirrored by `lifecycle-mirror.ts:142-152`. The user message type (`packages/ai/src/types.ts:1188-1205`) has content/timestamp but no entry id. Therefore glen uses exact user text plus pending-injection order and the observed event sequence; identical texts consume one pending request at a time. This cannot distinguish an independently typed identical message, a limit of omp's exposed identity, but unrelated runs and substring matches cannot consume a request. Input boundaries arrive as start/end pairs (`packages/agent/src/agent-loop.ts:1154-1158`); queued user content preserves its text (`CA/session/agent-session.ts:9480-9484`), and explicit send delivery queues before returning (`10299-10304`).
@@ -178,6 +208,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - Only terminal jobs (including lost) whose parsed status `updated_at` is more than 7 days old are pruned when a new job is created. Active or unreadable jobs are kept; pruning is best effort.
   - Inbox files are kept.
 
+Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `{v:1,kind:"job"|"control",job_id:null|string,pid,start:null|string}`. Trust only a held lock plus a matching live pid/start; job holders must belong to that session and remain non-terminal. Poll up to 1s, then use a single active, non-waiting, live job as the older-worker fallback. Unknown/control holders make other controls wait with 200ms polls; abort returns busy. Lock files are never unlinked.
+
 ## §A7 Jobs
 - **Id:** glen uuidv7; **handle:** `j` + last 7 hex. `wait` accepts a full uuid or `j` plus at least 7 hex suffix digits, case-insensitively. Multiple matches return `ambiguous` with candidates; bad shapes return usage with a `glen jobs` hint.
 - **`job.json`:** `{v,id,handle,created_at,route,session_id?,session_file?,session_handle?,deliver_as,text,cwd,omp_bin?,live_socket?,live_pid?,profile_flag?,owners_dir,job_timeout_ms,deadline_at}`. Routes are `rpc|new|live`. `omp_bin` is present only for RPC/new; live jobs freeze `live_socket` and `live_pid`. `owners_dir` and the applicable paths are frozen at send. Optional disk fields are omitted when absent; readers tolerate unknown fields.
@@ -193,13 +225,11 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - *Never-ready omp vs the job deadline.* Whichever bound fires decides the code: the job deadline (`GLEN_JOB_TIMEOUT`) → `failed` `timeout`; the 60 s ready bound with deadline time left → `failed` `omp_unavailable`.
   - *Job handle shape first.* `glen wait <arg>` validates the handle shape before any lookup: a malformed argument is exit 2 `usage` even when `GLEN_HOME` does not exist; a well-formed handle with no `GLEN_HOME` or no match is exit 3 `not_found`.
   - *Lost detection age.* "older than 10 s" is measured on `status.json`'s `updated_at` field (the authoritative clock), not the file mtime.
-  - *Abort bound.* The worker writes the terminal `aborted` status within 1 s of the abort request or signal; tests allow 0.5 s of scheduling slack (1.5 s).
+  - *Abort bound.* With no control on omp, the worker publishes aborted within 1 s (tests allow 0.5 s scheduling slack). An in-flight control occupies omp's serial loop; abort queues behind it and W2 escalation bounds completion at 13 s (10s ABORT_GRACE, then 1s KILL_GRACE). No new control is dispatched after stop.
   - *Worker cwd.* omp runs in the session header's `cwd` when it is an existing directory; otherwise in the `--cwd` directory when one was given; otherwise in glen's process cwd.
 - **Exit mapping:** completed → 0 (11 when forked); failed `no_route` → 6; other failed/aborted/lost → 7 `job_failed` with `{status,job,error,forked}` details. A bound expiring while queued/accepted → 10 with `ok:true` and a running document. Foreground SIGINT prints that document with `interrupted:true` and exits 130; worker/omp continue. Worker SIGTERM/SIGINT/SIGHUP abort with `cancelled`.
-- **Control seam:** atomically drop `jobs/<id>/control/<name>.json` with `{"v":1,"op":"abort"}`. The worker polls every 200 ms, including while queued or starting, and acknowledges `<name>.done.json` with `{"v":1,"ok":true}`, then removes the request. Unsupported/malformed operations return `{"v":1,"ok":false,"error":{"code":"unsupported_op","message":"…"}}` and continue the job. Dotfiles and `.done.json` are ignored. Startup cancellation publishes terminal status/ack before joining the bounded startup thread; no prompt follows abandonment.
-- **Live job semantics:** no glen session lock and no omp child. The existing detached worker and wait/jobs lifecycle apply. Ack publishes accepted and delivered_as; reply events append jobs/replies and result in order. Every failure after send writes result before status. Settled completed/aborted/error maps completed/aborted/failed omp_error; shutdown or EOF fails omp_exited; ack mismatch fails session_moved with from/to details. Unknown events are ignored. Ack has a 10s bound (protocol/delivery_unknown), and the earlier absolute deadline is timeout. A post-ack deadline does not interrupt omp; the hint distinguishes consumed from still queued. Worker signals abort observation with cancelled and live_turn_continues. Live control abort returns unsupported_op within the 200ms tick and continues the job. Send-frame writes have ≤200ms cancellation checks and a 2s total budget.
-- **Reserved W3b operations** live in `src/ops.rs`: `abort {}`, `list_models {}`, `set_model {provider,model_id}`, `set_thinking_level {level}`, `compact {instructions?}`. RPC additionally reserves `steer {text}`, `follow_up {text}`.
-- **RPC control extensions (not implemented):** `set_model {provider,model_id}`, `set_thinking_level {level}`, `steer {text}`, `follow_up {text}`. Dispatch them on the same held client; never start a separate omp process for controls.
+- **Control seam (W3b):** atomically drop `jobs/<id>/control/<name>.json` = `{v:1,op,args,deadline_ms}` (Unix ms). Replies are `{v:1,ok:true,data?}` or `{v:1,ok:false,error:{code,message,details?}}` at `<name>.done.json`, then remove the request. Dotfiles/results are ignored. The polling loop is 50ms during a run; startup/lock wait defers non-abort ops until a client exists. The worker runs list_models, set_model, and set_thinking_level one at a time off that loop on its held client, with 30s list/model and 10s other budgets bounded by the job deadline. Expired requests answer timeout unrun. Compact answers busy. Pending ops at job end answer job_ended; an in-flight request is skipped until its actual result arrives after scope join, preventing duplicate application. Abort acknowledgement carries data.job_status and session_id/queued. Startup cancellation publishes terminal status/ack before joining the bounded startup thread.
+- **Live job semantics:** no glen session lock and no omp child. The existing detached worker and wait/jobs lifecycle apply. Ack publishes accepted and delivered_as; reply events append jobs/replies and result in order. Every failure after send writes result before status. Settled completed/aborted/error maps completed/aborted/failed omp_error; shutdown or EOF fails omp_exited; ack mismatch fails session_moved with from/to details. Unknown events are ignored. Ack has a 10s bound (protocol/delivery_unknown), and the earlier absolute deadline is timeout. A post-ack deadline does not interrupt omp; the hint distinguishes consumed from still queued. Worker signals abort observation with cancelled and live_turn_continues. Live control abort returns unsupported_op with “stop the run with `glen abort <session>`”; other control files explain the socket route, and the job continues. Send-frame writes have ≤200ms cancellation checks and a 2s total budget.
 
 ## §A8 Handles
 - **Session handle** = the **last 7 hex digits** of the dash-free session id.
@@ -228,8 +258,13 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | `glen send <session\|@latest\|@new> <message\|-> [--as auto\|steer\|follow-up] [--steer\|--follow-up] [--wait DUR\|--no-wait] [--cwd DIR]` | Send through the live route or RPC, then wait up to the bound (default 90s) | W2 (RPC), W3 (live) | W2 |
 | `glen wait <job> [--timeout DUR]` | Keep waiting for a job (default 90s) | W2 | W2 |
 | `glen jobs [--session S] [--active] [-n N]` | List glen's jobs | W2 | W2 |
+| `glen abort <session> [--timeout DUR]` (alias `stop`) | Stop the active turn; report queued glen jobs | W3b | visible |
+| `glen models [session] [--provider P] [--timeout DUR]` | List exact provider/model pairs and session selection | W3b | visible |
+| `glen model <session> <spec> [--timeout DUR]` | Switch model/provider, session scope | W3b | visible |
+| `glen thinking <session> <level> [--timeout DUR]` | Set supported thinking level, session scope | W3b | visible |
+| `glen compact <session> [--instructions TEXT] [--timeout DUR]` | Compact an idle session | W3b | visible |
 | `glen inbox [--session S] [--peek] [--all] [-f]` | Messages omp sent back with `glen_reply` | W3 | W3 |
-| `glen watch [<session>]` | Full-screen live view (ratatui) | W5 | hidden |
+| `glen watch [<session>] [--all] [--cwd DIR]` | Full-screen sessions, transcript, replies and prompt; Tab changes focus, arrows navigate, Enter sends from the prompt, Ctrl-T cycles delivery, G follows, q quits from a pane | W5 | visible |
 | `glen install-extension [--dry-run] [--force] [--uninstall]` | Install the bundled omp extension for the effective agent dir/profile | W3 | W3 |
 | `glen install-skill [--claude] [--codex] [--project] [--dry-run] [--force] [--uninstall]` | Write SKILL.md for Claude Code and/or Codex; defaults to both, --project means cwd | W4 | visible |
 | `glen doctor` | omp binary/version, paths, glen home, extension and endpoints, .env, skills, sandbox | W0 (extended W3/W4) | visible |
@@ -246,6 +281,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   - a separate `glen steer` verb: folded into `send --as`;
   - a `--new` flag: an optional first positional is ambiguous, so it became `@new`;
   - an MCP server: not needed for v0.1.0.
+
+**Excluded controls:** auto-compaction, steering/follow-up/interrupt queue modes and auto-retry are session-only RPC overrides with persist=false and have no equivalent extension setter. Cycle model/thinking duplicates explicit selection. Service tier/fast mode is provider-specific and deferred. Clearing queued messages has no extension equivalent. Thinking auto/inherit is a documented v0.1.0 gap. Cancelling queued glen jobs remains outside this wave. W4's already-visible install-skill remains available; watch is unchanged.
 
 ## §A10 Output contract
 `docs/json.md` is the normative per-command contract; this section keeps the rules.
@@ -302,9 +339,10 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
   3. `CLICOLOR_FORCE` with any non-empty literal value other than `"0"` (including whitespace) → on
   4. `CLICOLOR=0` → off
   5. TTY and (`TERM` set and not `dumb`, or `CLICOLOR` set and not `0`, or `CI` set)
-  - Every write goes through `anstream::AutoStream`.
+  - Line-oriented command output goes through `anstream::AutoStream`.
 - **Depth:** `COLORTERM` truecolor/24bit → 24-bit; `TERM` containing `256color` → 256; otherwise 16.
 - **Theme:** `GLEN_THEME=dark|light`, then the last semicolon-separated integer in `COLORFGBG` (0–6 or 8 → dark; 7 or 9–15 → light), then dark.
+- **Full-screen mode.** `watch` requires interactive stdin and stdout, refuses JSON mode and `TERM=dumb`, and returns `usage` (exit 2) before touching the terminal when the gate fails. Ratatui cells use foreground colours only, with no background fills. The same colour precedence applies: when colour is disabled (including by `NO_COLOR`), modifiers such as bold and dim are dropped too. `GLEN_THEME=light|dark` selects the full-screen palette.
 - **Palette.** Foreground only; body text keeps the terminal's default colour. Sourced from the Nodex redesign content tone (research `93cec9de` rev 2). The values live in `src/render/palette.json`. `palette_contract` (tests only) checks them against `style()`, and the site reads the dark values at build. This table mirrors that file:
 
 | Token | Light hex | Dark hex | xterm L/D | ANSI-16 |
@@ -329,6 +367,13 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **Write failures.** A failed or closed stdout ends the command with exit 1 and no further stdout output. glen never panics on EPIPE and never writes a second envelope.
 - **Lazy state.** `--help`, `--version`, `doctor` and path resolution never create `GLEN_HOME`. Directories are created on first write (spill in W0; jobs, inbox and live endpoints later).
 
+### W3b control documents
+`docs/json.md` defines the full five documents. Each carries session `{id,handle,path}` (path null before persistence) and route. Model returns model/previous/changed/thinking_level/thinking_levels/busy/scope/forked; thinking returns requested/previous/changed/model/available/busy/scope/forked; compact returns compacted/tokens_before/tokens_after/forked; abort returns was/aborted/idle_after/queued/queued_jobs (job route adds job/job_status). Forked is null or `{from,to,to_handle}`. Endpoint-only changes warn not_yet_persisted. ls still reports the last answering model, which may differ from models current until the next turn.
+
+Human forms name the session and route: “nothing to abort”, “stopped the running turn”, provider/id with thinking level, or compacted token counts. Models renders a COLUMNS-bounded MODEL / NAME / CONTEXT / THINKING table, truncating NAME first and marking current. omp-sourced strings are sanitized only for presentation.
+
+control_failed exits 7: no_auth (log into provider), busy (abort first or wait), omp_error (omp's message), timeout, session_moved, job_ended, protocol. invalid_level is usage/2; model_not_found is not_found/3; model ambiguity is 4. Exact provider/id wins over case-insensitive pair/bare-id resolution. The extension supplies all available models; RPC may apply its enabled-model filter. Same-version installed extensions with an intact digest, matching baked GLEN_HOME and older body are outdated (“older build”), upgraded by install-extension and warned by doctor; a different home remains reinstalled.
+
 ### W3 conformance clarifications
 - `state_source` is `"extension"` for endpoint-only and extension-backed sessions everywhere, including `ls`, `show` and `tail`. This supersedes O3's `"endpoint"` wording. An unwritten session has `path:null`.
 - `install-extension.data.profile` is null for the default profile and the profile name otherwise, matching `doctor.paths.profile`. `doctor.data.extension.current` is always a boolean.
@@ -349,11 +394,14 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | 4 | `ambiguous` | handle matches several; candidates in `details` |
 | 5 | `omp_unavailable` | omp missing, unrunnable or version unparseable |
 | 6 | `no_route` (foreground or worker-side refusal) | live owner without a glen endpoint, probe unknown, or a sandbox that cannot reach omp (`details.reason:"sandboxed"`); refusing to fork |
-| 7 | `job_failed` | omp reported aborted/error, or the worker was lost (`details.status`) |
+| 7 | `job_failed`, `control_failed` | failed/aborted/lost job, or a control failure with details.reason |
 | 8 | `not_implemented` | subcommand declared but not in this build |
 | 10 | (ok) `running` | wait bound elapsed; job continues; use `glen wait <job>` |
 | 11 | (ok) `forked` | omp moved the session to a continuation; use the new handle |
-| 130 | — | interrupted (SIGINT); send/wait print a running document with `interrupted:true`; a detached job keeps running |
+| 101 | — | watch panic; terminal teardown runs before the panic report |
+| 129 | — | watch received SIGHUP |
+| 130 | — | interrupted (SIGINT), including watch; send/wait print a running document with `interrupted:true`; a detached job keeps running |
+| 143 | — | watch received SIGTERM |
 
 ## §A12 omp path resolution (port of `packages/utils/src/dirs.ts` @ v18.14.0)
 1. **home** = `$HOME` if non-empty, else the passwd entry. If neither exists → `invalid_env`.
@@ -399,6 +447,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - **W4 cycle 2 clarification:** AC-410 takes precedence over shorthand routing descriptions: argument/target validation → sandbox refusal → omp executable lookup, endpoint connect, lock and lease checks. CODEX_SANDBOX_NETWORK_DISABLED=1 without CODEX_SANDBOX still proceeds optimistically, with unknown sandbox kind. Actual EPERM/EACCES/EROFS on socket connect/bind, lease probes or GLEN_HOME writes map to exit 6 `sandboxed` with either marker; worker omp spawn/network failures (connection refused, DNS resolution failure, permission denied on connect) also use that mapping with the network-disabled marker.
 - **W4 cycle 2 residual limitation:** a Linux Codex sandbox with network enabled and neither CODEX_SANDBOX nor CODEX_SANDBOX_NETWORK_DISABLED is undetectable from glen. Failures surface as ordinary `io`/`omp_error`, not `sandboxed`; this is an accepted gap.
 
+Controls in the agent loop: `glen models <h>` → `glen model <h> <provider/id>` or `glen thinking <h> high`. Only apply user-authorized changes. On extension_outdated install the current extension and restart that omp session; never bypass a refusal with another omp. Compact needs an idle session; abort first or wait. Abort leaves queued omp messages, and queued_jobs warns about glen jobs that start next.
+
 ## §A14 Security and privacy
 - Local only; no network.
 - GLEN_HOME is 0700. The socket's only protection is filesystem permissions (a same-user boundary).
@@ -410,6 +460,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - W4 acceptance harness: `tests/acceptance/` (not CI), evidence `.claude/evidence/w4-acceptance/<UTC>/`. The recording wrapper guards every mutating target against its manifest and records argv, exit, duration and stdout. Person mode uses the real binary on a pty. Step 11 is deferred until W3; c2 requires owner consent and byte-identical config restoration.
 - Final O1: acceptance uses a fresh cwd under $TMPDIR with normal omp credentials, never copies credentials. Only new session files in its own scratch bucket(s) may differ in the owner sessions snapshot (names/mtimes/sizes); evidence lists those buckets. Missing credentials/model access blocks setup. Extension installation alone uses a scratch agent dir; TUIs explicitly load that copy. GLEN_HOME is under $TMPDIR for sandbox writes. Evidence is gitleaks-scanned; no secrets or env values are recorded.
 - Fixtures live under `tests/fixtures/` (see its README).
+- W5 uses ratatui's `TestBackend` plus insta for deterministic size/theme/depth and state snapshots. Create them with `INSTA_UPDATE=always cargo test --lib tui::view::snapshots`, review every snapshot, commit it, then rerun without `INSTA_UPDATE` to check the pinned result.
+- W5 real-binary tests in `tests/watch.rs` use rustix pty/termios and the `fake_omp`/`fake_ext` peers. Restoration checks require raw mode observed while watch is alive and cooked mode after exit on the same slave fd. On macOS, controlling-tty escape-teardown smokes are paired with non-controlling pty termios checks because session-leader exit revokes the controlling slave; Linux checks both on the controlling tty.
 - `GLEN_OMP_BIN` points to the `fake_omp` cargo example (`tests/support/fake_omp.rs`). It supports version, RPC and `hold-lease` modes. `cargo test` builds examples; `tests/common::fake_omp_bin` rebuilds it once per integration-test process so filtered runs use the current source. It is not installed by cargo install.
 - `FAKE_OMP_SCENARIO`: ok, local, progress, bad_reply, unsettled, never_settles, error, aborted, crash, hang, wedge, fork, fork_silent, moved, reject_tools, reject_filter, no_ready, delayed_state, fork_reply, local_result_unsettled, unsettled_exit, local_exit, stale_state. Timing/shape knobs: `FAKE_OMP_DELAY_MS`, `FAKE_OMP_READY_DELAY_MS`, `FAKE_OMP_SETTLE_DELAY_MS`, `FAKE_OMP_REPLY_BYTES`, `FAKE_OMP_OWNERS_DIR`, `FAKE_OMP_V2=1|partial`. `FAKE_OMP_LOG` records start, inbound/outbound frames and exits as NDJSON. `FAKE_OMP_STARTUP_RECOVERY=1` makes the fake claim its lease and append a recovery record to the copied fixture before ready. `FAKE_OMP_STATE_DELAY_MS` delays running state replies without blocking abort. `FAKE_OMP_RUN_RELEASE` holds prompt work until a test-owned file exists. `FAKE_OMP_READY_RELEASE` holds ready until a test-owned file exists (20 s bound). `FAKE_OMP_PROMPT_SUBMIT_DELAY_MS` delays the debug worker’s submission thread to exercise the cancellation gate; `FAKE_OMP_ACK_FORWARD_DELAY_MS` delays acknowledgement forwarding. Release workers ignore both. `FAKE_OMP_LEASE_PROBE_GATE` gates the debug send after the glen-lock check until a test-owned file exists (5 s bound, `<path>.ready` signals entry). `FAKE_OMP_NEVER_SETTLE=1` keeps fork scenarios unsettled; `FAKE_OMP_RESULT_RELEASE` holds the fake before its result. `FAKE_OMP_OLD_STATE_DELAY_MS` controls the stale_state scenario’s old identity response.
 - Process tests wait for terminal status, worker exit and the omp group to disappear before dropping scratch directories. The startup-abort regression delays ready by 5 s and checks terminal status/ack within 1.5 s with no prompt.
@@ -421,13 +473,18 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 - Integration tests use `CARGO_BIN_EXE_glen` with `env_clear()`.
 - Conformance tests live in `tests/conformance.rs` (the `/implement` tail).
 
+W3b fakes share `tests/support/fake_models.json` (six complete SDK ModelInfo records). fake_omp accepts --no-session, tracks selection on resumed copies, appends model/thinking/compaction entries with sync_all, and supports fork_control and compact_error. FAKE_OMP_SERIAL=1 processes ordinary commands in arrival order, including abort; FAKE_OMP_COMPACT_DELAY_MS delays compaction without writing after a stop. W2 concurrent delayed-state behaviour remains the default.
+
+fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical set. FAKE_EXT_NO_AUTH, FAKE_EXT_COMPACT_DELAY_MS, FAKE_EXT_ABORT_STUCK and FAKE_EXT_POST_ID cover auth, cancellation, settle bounds and post-op forks. The TS host covers every op's happy/error path, expected identity, subagents, UI notifications, concurrent compaction and abort. tests/controls.rs covers RPC/live/job routing and output. Real-omp Step 12 remains an orchestrator-only smoke, explicitly skipped here; no runtime acceptance is inferred from fake-based results.
+
 ## §A16 Wave map
 - **W0** foundation: this plan.
 - **W1** disk reader: ls, show, tail and `-f`, handles, continuations, leaf rule, read-only lease probe.
 - **W2** RPC driver: send/wait/jobs for sessions with no live owner, `@new`, the per-job worker, the per-session lock, the `glen_reply` host tool, fork detection, the fake RPC peer, the `omp-rpc` git dependency.
 - **W3** live route: the bundled extension, install-extension, endpoint-first routing, inbox, talk-back from the TUI.
+- **W3b** session controls: abort/stop, models, model/provider, thinking and idle compaction; one router/executor over live, owning job and unowned RPC.
 - **W4** agent surface: SKILL.md (two variants), install-skill, extended doctor, completions polish, acceptance runs with Claude Code and Codex.
-- **W5** `glen watch` TUI.
+- **W5** visible `glen watch` TUI: sessions, persisted-entry transcripts, a send prompt, job activity and peek-only replies; shared follower/submit cores, worker threads, TestBackend snapshots and real-binary pty tests. Session controls (`m` model, `T` thinking, `C` compact, `^x` abort) dispatch through W3b's `src/ctl` routing. Picking the current model or level again changes nothing. A second SIGINT, SIGTERM or SIGHUP during quit restores the terminal and exits at once. Two identical signals that the kernel merges before glen's handler runs count as one, because standard POSIX signals are not queued, so press Ctrl-C again to force an exit.
 - **W6** site: `site/`, static Astro in the Nodex-redesign look; a CSS-compiled terminal demo; morphin islands; palette from `src/render/palette.json`; CI job `site`.
 - **W7** deploy + release workflow: §A18.
 - **W8** audits + release v0.1.0.
@@ -455,6 +512,8 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 
 - [ ] W4 tech debt: verify Linux network-on CODEX_SANDBOX live delivery and EROFS behaviour under bubblewrap.
 
+- [ ] W3b upgrade checks: re-check all six RPC controls and their wire payloads; Model not found / No API key prefixes; unchanged set_model append, thinking append-on-effective-change, configured thinking and resume defaults; compaction abort/resume and abort keeping queues; TUI setModel/setThinkingLevel/compact/abort wiring; ctx.models.list versus RPC filtering; serial queue including abort. Re-run the Step 12 scratch smoke outside the sandbox, verify persisted model/thinking on resume and unchanged global config, record evidence, and leave/list scratch sessions for the owner.
+
 ### §A18 Distribution
 <!-- Level 3 for now: tests/conformance/repo_contracts.rs (AC-024) pins exactly 17 level-2 sections. Promote to ## when that test learns §A18. -->
 - **Targets** (W7 plan D1, D2). Four, each built on a native GitHub runner with `cargo build --release --locked`:
@@ -466,7 +525,7 @@ $GLEN_HOME            default ~/.glen; must be absolute; leading ~ expanded; rel
 | `x86_64-unknown-linux-musl` | `ubuntu-24.04` | runs; `file` reports a static binary |
 | `aarch64-unknown-linux-musl` | `ubuntu-24.04-arm` | runs; `file` reports a static binary |
 
-  - Linux binaries are static musl, so they run on any glibc (Debian 12, Ubuntu 22.04, RHEL 9). This holds while the lockfile has no C dependency; reassess musl before adding one.
+  - Linux binaries are static musl, so they run on any glibc (Debian 12, Ubuntu 22.04, RHEL 9). This holds while the built graph has no C dependency; reassess musl before adding one. Verify with `cargo tree -e build -i cc --target all` producing no dependency tree: ratatui's unbuilt optional backends can put `cc` in `Cargo.lock` without building it for any target.
 - **Assets** (D3). Versionless names, so "latest" needs no GitHub API: `glen-<target>.tar.gz`, `glen-<target>.tar.gz.sha256` (`<64 hex>  glen-<target>.tar.gz`) and `SHA256SUMS`. Each archive holds exactly `glen-<target>/glen` (0755) and `glen-<target>/LICENSE`. `scripts/package-release.sh <target> <binary> <out-dir>` builds both files. Checksums show integrity, not authenticity; binaries are not signed or notarised.
 - **`install.sh`**, POSIX `sh`, served only from `https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh` (D4):
   - flags `--version X.Y.Z` (an optional leading `v`), `--prefix DIR` (installs `DIR/bin/glen`; default `$HOME/.local/bin`), `--dry-run` (prints target, URLs and install path; no download, no write), `-h`/`--help`;

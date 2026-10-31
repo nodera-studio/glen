@@ -20,8 +20,29 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
-/// The one command still hidden after W3 and W4 (AC-301, AC-401).
-pub const HIDDEN: [&str; 1] = ["watch"];
+/// Shared public-command order, including session controls and watch.
+pub const VISIBLE: [&str; 18] = [
+    "ls",
+    "show",
+    "tail",
+    "send",
+    "wait",
+    "jobs",
+    "abort",
+    "models",
+    "model",
+    "thinking",
+    "compact",
+    "inbox",
+    "watch",
+    "install-extension",
+    "install-skill",
+    "doctor",
+    "completions",
+    "help",
+];
+/// Unimplemented public commands still hidden; the internal worker is checked separately.
+pub const HIDDEN: [&str; 0] = [];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
 pub const DOCTOR_CHECKS: [&str; 12] = [

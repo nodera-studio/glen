@@ -646,7 +646,7 @@ fn ac218_control_inbox() {
     let done = b.job_dir(&id).join("control/unsupported.done.json");
     poll(Duration::from_secs(2), || done.exists().then_some(()));
     let d: Value = serde_json::from_slice(&fs::read(done).unwrap()).unwrap();
-    assert_eq!(d["error"]["code"], "unsupported_op");
+    assert_eq!(d["error"]["code"], "bad_request");
     assert_eq!(b.job(&id).1["status"], "accepted");
     let start = Instant::now();
     control(&b, &id, "a", json!({"v":1,"op":"abort"}));
@@ -657,7 +657,10 @@ fn ac218_control_inbox() {
     let d: Value =
         serde_json::from_slice(&fs::read(b.job_dir(&id).join("control/a.done.json")).unwrap())
             .unwrap();
-    assert_eq!(d, json!({"v":1,"ok":true}));
+    assert_eq!(
+        d,
+        json!({"v":1,"ok":true,"data":{"job_status":"aborted","session_id":A_ID,"queued":false}})
+    );
 }
 #[test]
 fn ac218_abort_while_queued() {
@@ -892,7 +895,10 @@ fn ac218_abort_while_starting() {
     let done: Value =
         serde_json::from_slice(&fs::read(b.job_dir(&id).join("control/a.done.json")).unwrap())
             .unwrap();
-    assert_eq!(done, json!({"v":1,"ok":true}));
+    assert_eq!(
+        done,
+        json!({"v":1,"ok":true,"data":{"job_status":"aborted","session_id":A_ID,"queued":false}})
+    );
     b.wait_worker_gone(&id);
     assert!(b.frames_in("prompt").is_empty());
     assert!(b.frames_in("set_host_tools").is_empty());
@@ -1011,7 +1017,10 @@ fn review1_abort_in_prompt_submission_gap_never_sends_prompt() {
     let done: Value =
         serde_json::from_slice(&fs::read(b.job_dir(&id).join("control/gap.done.json")).unwrap())
             .unwrap();
-    assert_eq!(done, json!({"v":1,"ok":true}));
+    assert_eq!(
+        done,
+        json!({"v":1,"ok":true,"data":{"job_status":"aborted","session_id":A_ID,"queued":false}})
+    );
 }
 #[test]
 fn review4_output_immediately_before_ack_is_preserved() {

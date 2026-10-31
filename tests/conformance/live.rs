@@ -868,7 +868,12 @@ fn ac317_ac307_control_ops_on_a_live_job_are_unsupported_and_the_job_continues()
             &lb,
             &id,
             &format!("{op}.json"),
-            &format!(r#"{{"v":1,"op":"{op}"}}"#),
+            &json!({"v":1,"op":op,"args":match op {
+                "set_model" => json!({"provider":"fake","model_id":"fake-1"}),
+                "set_thinking_level" => json!({"level":"high"}),
+                _ => json!({}),
+            }})
+            .to_string(),
         );
     }
     for op in RESERVED_OPS {

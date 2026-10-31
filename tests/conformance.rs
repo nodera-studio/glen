@@ -12,6 +12,8 @@
 //!   peer and in-test unix-socket endpoints.
 //! - W4 (`.claude/plans/v010-wave-4-agent.md`, AC-401…AC-413 and AC-419; O3, O5–O7; §A9–§A13 and
 //!   `docs/json.md`): agent. The acceptance modes (AC-414…AC-418, AC-420, AC-421) need real omp.
+//! - W5 (`.claude/plans/v010-wave-5-watch.md`, AC-501…AC-526 and the reference-study amendments;
+//!   §A3, §A9–§A11, §A15): watch, on a pseudo-terminal with a VT emulator.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!
@@ -35,6 +37,8 @@ mod agent;
 mod cli_surface;
 #[path = "conformance/color.rs"]
 mod color;
+#[path = "conformance/controls.rs"]
+mod controls;
 #[path = "conformance/doctor.rs"]
 mod doctor;
 #[path = "conformance/ext_node.rs"]
@@ -71,6 +75,8 @@ mod state;
 mod tail;
 #[path = "conformance/w3_surface.rs"]
 mod w3_surface;
+#[path = "conformance/watch.rs"]
+mod watch;
 #[path = "conformance/width.rs"]
 mod width;
 #[path = "conformance/write_failure.rs"]

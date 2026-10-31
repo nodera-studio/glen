@@ -41,7 +41,7 @@ pub const SUN_LIMIT: usize = 104;
 #[cfg(not(target_os = "macos"))]
 pub const SUN_LIMIT: usize = 108;
 
-/// The reserved W3b ops (AC-307, §A3).
+/// W3b controls (formerly reserved by W3); live-job control files remain unsupported.
 pub const RESERVED_OPS: [&str; 5] = [
     "abort",
     "list_models",
@@ -50,8 +50,17 @@ pub const RESERVED_OPS: [&str; 5] = [
     "compact",
 ];
 
-/// The W3 socket ops (AC-307/308).
-pub const OPS: [&str; 3] = ["hello", "state", "send"];
+/// The current socket capabilities (AC-353, superseding AC-307/308).
+pub const OPS: [&str; 8] = [
+    "hello",
+    "state",
+    "send",
+    "abort",
+    "list_models",
+    "set_model",
+    "set_thinking_level",
+    "compact",
+];
 
 /// `id` with its last four hex digits replaced by `f0f0` (the fake's moved identity).
 pub fn moved_id(id: &str) -> String {

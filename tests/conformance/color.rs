@@ -61,10 +61,10 @@ fn ac008_clicolor_force_colours_human_output_on_a_pipe() {
 fn a10_colour_is_decided_per_stream() {
     let sb = Sandbox::new();
     let out = sb
-        .glen(["watch", "--human"])
+        .glen(["--human", "watch"])
         .env("CLICOLOR_FORCE", "1")
         .run();
-    out.assert_exit(8);
+    out.assert_exit(2);
     assert!(
         has_esc_seq(&out.stderr),
         "forced colour applies to stderr diagnostics too\n{}",

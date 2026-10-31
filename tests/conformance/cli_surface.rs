@@ -1,5 +1,5 @@
 //! The command surface: visible vs hidden subcommands, help/version, the §A9 argument
-//! surface of the hidden commands, and completions (AC-001, AC-002, AC-017; §A9, §A10).
+//! surface of the commands, and completions (AC-001, AC-002, AC-017; §A9, §A10).
 
 use crate::support::*;
 use serde_json::Value;
@@ -49,20 +49,11 @@ fn ac001_help_lists_exactly_the_visible_commands() {
         out.assert_exit(0);
         assert_eq!(
             listed_commands(&out.out()),
-            [
-                "completions",
-                "doctor",
-                "help",
-                "inbox",
-                "install-extension",
-                "install-skill",
-                "jobs",
-                "ls",
-                "send",
-                "show",
-                "tail",
-                "wait"
-            ],
+            {
+                let mut names = VISIBLE;
+                names.sort();
+                names
+            },
             "{}",
             out.ctx()
         );
@@ -107,7 +98,13 @@ fn a9_every_command_accepts_help_and_version() {
         "send",
         "wait",
         "jobs",
+        "abort",
+        "models",
+        "model",
+        "thinking",
+        "compact",
         "inbox",
+        "watch",
         "install-extension",
         "install-skill",
         "doctor",
@@ -141,12 +138,12 @@ fn hidden_commands_still_have_help_pages() {
 }
 
 #[test]
-fn ac002_hidden_commands_exit_8_not_implemented() {
+fn ac002_watch_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let invocations: [&[&str]; 1] = [&["watch"]];
     for args in invocations {
         let out = sb.glen(args).run();
-        let err = out.error_envelope("not_implemented");
+        let err = out.error_envelope("usage");
         out.assert_stderr_empty();
         assert!(
             err["message"].as_str().unwrap().contains(args[0]),
@@ -157,22 +154,27 @@ fn ac002_hidden_commands_exit_8_not_implemented() {
 }
 
 #[test]
-fn ac002_hidden_command_in_human_mode_reports_on_stderr() {
+fn ac002_watch_in_human_mode_reports_on_stderr() {
     let sb = Sandbox::new();
     let out = sb.glen(["watch", "--human"]).run();
-    out.assert_exit(8).assert_no_ansi();
+    out.assert_exit(2).assert_no_ansi();
     assert!(out.stdout.is_empty(), "stdout must be empty\n{}", out.ctx());
     assert!(out.err().starts_with("error:"), "{}", out.ctx());
 }
 
-/// Every flag §A9 declares for the hidden commands parses; the command then reports
-/// `not_implemented` (exit 8), never a usage error.
+/// Watch's declared arguments parse; its non-TTY gate runs before session lookup.
 #[test]
-fn a9_declared_arguments_of_hidden_commands_parse() {
+fn a9_watch_arguments_parse_before_the_terminal_gate() {
     let sb = Sandbox::new();
-    let valid: &[&[&str]] = &[&["watch", "abc1234"]];
+    let valid: &[&[&str]] = &[&["watch", "abc1234", "--all"]];
     for args in valid {
-        sb.glen(*args).run().error_envelope("not_implemented");
+        let err = sb.glen(*args).run().error_envelope("usage");
+        assert!(
+            err["message"]
+                .as_str()
+                .unwrap()
+                .contains("interactive terminal")
+        );
     }
 }
 
@@ -194,6 +196,12 @@ fn a9_rpc_arguments_parse() {
         &["wait", "j1234567", "--timeout", "30s"],
         &["jobs", "--session", "abc1234", "--active", "-n", "3"],
         &["jobs", "--limit", "3"],
+        &["abort", "abc1234", "--timeout", "1s"],
+        &["stop", "abc1234"],
+        &["models", "abc1234", "--provider", "fake"],
+        &["model", "abc1234", "fake/fake-1"],
+        &["thinking", "abc1234", "xhigh"],
+        &["compact", "abc1234", "--instructions", "keep facts"],
     ];
     for args in valid {
         let out = sb.glen(*args).run();
@@ -235,6 +243,9 @@ fn a9_invalid_arguments_are_usage_errors() {
         &["--json", "completions"],
         &["--json", "completions", "notashell"],
         &["doctor", "unexpected-positional"],
+        &["thinking", "abc1234", "banana"],
+        &["models", "--timeout", "0"],
+        &["abort", "abc1234", "--timeout", "0"],
     ];
     for args in invalid {
         sb.glen(*args).run().error_envelope("usage");
@@ -279,11 +290,21 @@ fn ac017_completions_are_raw_scripts_without_hidden_commands() {
             "send",
             "wait",
             "jobs",
+            "abort",
+            "models",
+            "model",
+            "thinking",
+            "compact",
             "inbox",
+            "watch",
             "install-extension",
             "install-skill",
         ] {
             assert!(contains_command_word(&script, name), "{shell} lacks {name}");
+        }
+        assert!(contains_command_word(&script, "stop"), "{shell} lacks stop");
+        for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            assert!(script.contains(level), "{shell} lacks {level}");
         }
         assert_no_hidden_commands(&script, shell);
     }
@@ -324,16 +345,39 @@ fn a10_explicit_json_completions_carry_shell_and_script() {
         (vec!["--json", "completions", "bash"], "bash"),
     ] {
         let out = sb.glen(&args).run();
-        let data = out.ok_data();
         out.assert_stderr_empty();
-        assert_eq!(data["shell"], Value::from(shell), "{}", out.ctx());
+        let context = out.ctx();
+        let data = out.ok_data();
+        assert_eq!(data["shell"], Value::from(shell), "{}", context.clone());
         let script = data["script"].as_str().expect("data.script is a string");
-        assert!(!script.trim().is_empty(), "{}", out.ctx());
-        assert!(contains_command_word(script, "doctor"), "{}", out.ctx());
+        assert!(!script.trim().is_empty(), "{}", context.clone());
+        assert!(
+            contains_command_word(script, "doctor"),
+            "{}",
+            context.clone()
+        );
         assert_no_hidden_commands(script, shell);
         if shell == "zsh" {
-            assert!(script.starts_with("#compdef glen"), "{}", out.ctx());
+            assert!(script.starts_with("#compdef glen"), "{}", context.clone());
         }
+    }
+}
+
+#[test]
+fn json_bash_completions_exceed_budget_inline_without_creating_home() {
+    let sb = Sandbox::new();
+    for budget in ["24000", "1"] {
+        let out = sb
+            .glen(["completions", "bash", "--json"])
+            .env("GLEN_MAX_OUTPUT", budget)
+            .run();
+        out.assert_stderr_empty();
+        assert!(out.stdout.len() > budget.parse::<usize>().unwrap());
+        assert!(out.ok_envelope().get("spilled").is_none());
+        let data = out.ok_data();
+        assert_eq!(data["shell"], "bash");
+        assert!(!data["script"].as_str().unwrap().trim().is_empty());
+        assert!(!sb.glen_home.exists(), "completions create nothing");
     }
 }
 

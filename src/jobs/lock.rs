@@ -3,12 +3,64 @@ use rustix::{
     fs::{FlockOperation, Mode, OFlags, flock, open},
     io::Errno,
 };
+use serde::{Deserialize, Serialize};
 use std::{
     io,
     os::fd::OwnedFd,
     path::PathBuf,
     time::{Duration, Instant},
 };
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum HolderKind {
+    Job,
+    Control,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Holder {
+    pub v: u32,
+    pub kind: HolderKind,
+    pub job_id: Option<String>,
+    pub pid: u32,
+    pub start: Option<String>,
+}
+/// Record ownership without replacing the inode protected by flock.
+pub fn mark(lock: &SessionLock, h: &Holder) -> io::Result<()> {
+    let bytes = serde_json::to_vec(h)?;
+    let contextual = |e: rustix::io::Errno| {
+        io::Error::new(
+            io::Error::from(e).kind(),
+            format!("cannot mark holder in {}: {e}", lock.path.display()),
+        )
+    };
+    rustix::fs::ftruncate(&lock.fd, 0).map_err(contextual)?;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let n =
+            rustix::io::pwrite(&lock.fd, &bytes[offset..], offset as u64).map_err(contextual)?;
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                format!("cannot write holder to {}", lock.path.display()),
+            ));
+        }
+        offset += n;
+    }
+    Ok(())
+}
+/// Read only. The caller must separately verify that the lock and identity are live.
+pub fn holder(home: &GlenHome, id: &str) -> Option<Holder> {
+    use std::io::Read;
+    let file = std::fs::File::open(lock_path(home, id)).ok()?;
+    let mut bytes = Vec::new();
+    file.take(16_385).read_to_end(&mut bytes).ok()?;
+    if bytes.len() > 16_384 {
+        return None;
+    }
+    let h: Holder = serde_json::from_slice(&bytes).ok()?;
+    (h.v == 1 && h.pid > 0).then_some(h)
+}
 pub fn lock_key(id: &str) -> String {
     lease::lease_name(id)
         .map(str::to_owned)
@@ -230,5 +282,45 @@ mod tests {
         assert!(!is_held(&h, "abc"));
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod holder_tests {
+    use super::*;
+    #[test]
+    fn holder_is_lazy_and_mark_keeps_the_locked_inode() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("glen"),
+        };
+        assert_eq!(holder(&home, "s"), None);
+        assert!(!home.root.exists());
+        let lock = try_acquire(&home, "s").unwrap().unwrap();
+        let identity = crate::jobs::liveness::current().unwrap();
+        for (kind, job_id) in [
+            (HolderKind::Job, Some("job".into())),
+            (HolderKind::Control, None),
+        ] {
+            let h = Holder {
+                v: 1,
+                kind,
+                job_id,
+                pid: identity.pid,
+                start: Some(identity.start.clone()),
+            };
+            mark(&lock, &h).unwrap();
+            assert_eq!(holder(&home, "s"), Some(h));
+            assert!(is_held(&home, "s"));
+            assert!(try_acquire(&home, "s").unwrap().is_none());
+        }
+        drop(lock);
+        assert!(!is_held(&home, "s"));
+        // A stale holder is deliberately retained; it is not evidence of ownership.
+        assert!(holder(&home, "s").is_some());
+        for bytes in ["bad", r#"{"v":2,"kind":"control","pid":1}"#] {
+            std::fs::write(lock_path(&home, "s"), bytes).unwrap();
+            assert_eq!(holder(&home, "s"), None);
+        }
     }
 }
