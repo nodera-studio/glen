@@ -252,13 +252,17 @@ pub fn emit_to(
     if let Some(commit) = after_output
         && let Err(e) = commit()
     {
+        // The deferred write (e.g. inbox::mark) failed after stdout already succeeded.
+        // Surface its own classification (e.g. exit 6 sandboxed for a denied GLEN_HOME
+        // write), never a flat exit 1 that discards it.
+        let code = ExitCode::from(e.code.exit_code());
         if writeln!(err, "glen: {}", sanitize(&e.to_string()))
             .and_then(|()| err.flush())
             .is_err()
         {
             return ExitCode::from(1);
         }
-        return ExitCode::from(1);
+        return code;
     }
     ExitCode::from(outcome.exit.exit_code())
 }
@@ -675,6 +679,32 @@ mod tests {
                 ExitCode::SUCCESS
             );
             assert_eq!(committed.get(), 1);
+        }
+    }
+    /// A deferred `after_output` failure (e.g. `inbox::mark`'s GLEN_HOME write) keeps its own
+    /// classification instead of a flat exit 1, so a sandboxed GLEN_HOME write still reports
+    /// exit 6 even though the success envelope already reached stdout.
+    #[test]
+    fn a_failed_after_output_commit_keeps_its_own_exit_code() {
+        let tree = tempfile::tempdir().unwrap();
+        let c = ctx(tree.path(), Mode::Json, false);
+        for (error, expected) in [
+            (
+                GlenError::no_route(crate::error::NoRouteReason::Sandboxed, "denied"),
+                6,
+            ),
+            (GlenError::new(ErrorCode::Io, "denied"), 1),
+        ] {
+            let mut outcome = Outcome::new(json!({"marked_read": true}), "ok");
+            outcome.after_output = Some(Box::new(move || Err(error)));
+            let mut out = Vec::new();
+            let mut err = Vec::new();
+            let code = emit_to(&c, outcome, "test", &mut out, &mut err);
+            assert_eq!(code, ExitCode::from(expected));
+            // The envelope was already committed to stdout before the deferred failure.
+            let v: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(v["ok"], true, "{v}");
+            assert_eq!(v["data"]["marked_read"], true, "{v}");
         }
     }
     #[test]
