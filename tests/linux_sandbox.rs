@@ -29,8 +29,9 @@ fn bwrap(cmd: &Command, net: bool, writable: &[&std::path::Path]) -> Output {
         .arg("/dev")
         .arg("--proc")
         .arg("/proc")
-        // /sys is its own mount, same as /proc; `--ro-bind / /` does not recurse into it, and
-        // sandbox::is_loopback_only() reads /sys/class/net to decide the lease-hidden fallback.
+        // A host-bound /sys lists the host's interfaces even under --unshare-net (sysfs shows
+        // its mounter's namespace), the shape sandbox::is_loopback_only() must not be fooled
+        // by: it reads /proc/self/net/dev instead.
         .arg("--ro-bind")
         .arg("/sys")
         .arg("/sys")
@@ -324,9 +325,9 @@ fn s7_lease_across_netns() {
                 .starts_with("e27c0de")
         })
         .unwrap_or_else(|| panic!("row missing: {iv}"));
-    assert_ne!(
-        irow["state"], "live",
-        "a host-namespace lease must not be visible inside --unshare-net: {iv}"
+    assert_eq!(
+        irow["state"], "unknown",
+        "a host-namespace lease hidden by --unshare-net must read as unknown: {iv}"
     );
     let _ = held.kill();
     let _ = held.wait();
@@ -344,7 +345,7 @@ fn s8_hidden_lease_refuses_rpc() {
     // namespace comparison itself disagreed with this scenario inside the very same sandbox.
     let mut diag = Command::new("bash");
     diag.arg("-c")
-        .arg("echo self=$(stat -L -c '%d:%i' /proc/self/ns/net) init=$(stat -L -c '%d:%i' /proc/1/ns/net 2>&1)");
+        .arg("echo self=$(stat -L -c '%d:%i' /proc/self/ns/net) init=$(stat -L -c '%d:%i' /proc/1/ns/net 2>&1) sys=$(ls /sys/class/net | tr '\\n' ' ') proc=$(tail -n +3 /proc/self/net/dev | cut -d: -f1 | tr -d ' ' | tr '\\n' ' ')");
     let diag_out = bwrap_raw(diag, false, &[]);
     eprintln!(
         "s8 namespace diagnostic: {}{}",

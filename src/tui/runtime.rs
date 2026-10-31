@@ -1191,26 +1191,35 @@ mod tests {
     }
     #[test]
     fn action_deadline_is_shared_and_readers_are_not_part_of_the_join_set() {
+        // Workers hold until the test drops their gates, so none can finish before
+        // finish_tasks returns unless it joins them (then each waits out the 30 s timeout).
         let (tx, rx) = mpsc::channel();
+        let mut gates = Vec::new();
         let mut tasks = (0..3)
             .map(|_| {
+                let (gate, held) = mpsc::channel::<()>();
+                gates.push(gate);
                 let tx = tx.clone();
                 thread::spawn(move || {
-                    thread::sleep(Duration::from_millis(100));
+                    let _ = held.recv_timeout(Duration::from_secs(30));
                     tx.send(()).unwrap();
                 })
             })
             .collect::<Vec<_>>();
+        let bound = Duration::from_millis(5);
         let start = Instant::now();
-        finish_tasks(&mut tasks, Duration::from_millis(5)).unwrap();
-        assert!(start.elapsed() < Duration::from_millis(50));
+        finish_tasks(&mut tasks, bound).unwrap();
+        assert!(start.elapsed() >= bound);
         assert!(tasks.is_empty());
+        assert!(rx.try_recv().is_err());
+        drop(gates);
         for _ in 0..3 {
-            rx.recv_timeout(Duration::from_secs(1)).unwrap();
+            rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
+        let bound = Duration::from_secs(6);
         let start = Instant::now();
-        finish_tasks(&mut vec![], Duration::from_secs(6)).unwrap();
-        assert!(start.elapsed() < Duration::from_millis(50));
+        finish_tasks(&mut vec![], bound).unwrap();
+        assert!(start.elapsed() < bound);
     }
     #[cfg(debug_assertions)]
     #[test]

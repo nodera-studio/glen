@@ -165,19 +165,26 @@ fn ns_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
     // return the per-process link's own, always-distinct procfs inode.
     std::fs::metadata(path).map(|m| (m.dev(), m.ino()))
 }
+/// Reads this process's own network namespace's interfaces from `/proc/self/net/dev`, never
+/// `/sys/class/net`: sysfs shows the namespace of whoever mounted it, and a bind-mounted host
+/// `/sys` (bwrap's recursive `--ro-bind / /`, or an explicit `/sys` bind) lists the host's
+/// interfaces inside a fresh `--unshare-net`, while procfs net entries follow the reader.
 #[cfg(target_os = "linux")]
 fn is_loopback_only() -> bool {
-    match std::fs::read_dir("/sys/class/net") {
-        Ok(entries) => {
-            let mut names: Vec<_> = entries
-                .filter_map(|e| e.ok().map(|e| e.file_name()))
-                .collect();
-            names.sort();
-            names == ["lo"]
-        }
-        // Can't tell: do not assume isolation from an unrelated read failure.
-        Err(_) => false,
-    }
+    // Can't tell: do not assume isolation from an unrelated read failure.
+    std::fs::read_to_string("/proc/self/net/dev").is_ok_and(|dev| net_dev_loopback_only(&dev))
+}
+/// True when a `/proc/<pid>/net/dev` table names exactly one interface, `lo`. The table has
+/// two header lines, then one `<name>: <counters>` line per interface.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only called by the Linux probe; kept visible for the cross-platform unit test
+fn net_dev_loopback_only(dev: &str) -> bool {
+    let mut names: Vec<&str> = dev
+        .lines()
+        .filter_map(|line| line.split_once(':').map(|(name, _)| name.trim()))
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_unstable();
+    names == ["lo"]
 }
 #[cfg(target_os = "linux")]
 fn net_namespace_hidden() -> bool {
@@ -504,6 +511,20 @@ mod tests {
         ));
         // Our own /proc/self/ns/net unreadable -> fail closed, hidden.
         assert!(net_namespace_hidden_with(eacces, || ok((5, 100)), || false));
+    }
+    #[test]
+    fn net_dev_loopback_only_reads_interface_names() {
+        let header = "Inter-|   Receive                            |  Transmit\n face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
+        let lo = "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n";
+        let eth = "  eth0: 1234567    8901    0    0    0     0          0         0   765432    1098    0    0    0     0       0          0\n";
+        // A fresh --unshare-net namespace: loopback only, whatever a host-bound /sys lists.
+        assert!(net_dev_loopback_only(&format!("{header}{lo}")));
+        // The host namespace (or an escalated command in it): a real interface.
+        assert!(!net_dev_loopback_only(&format!("{header}{lo}{eth}")));
+        assert!(!net_dev_loopback_only(&format!("{header}{eth}")));
+        // Empty or header-only: cannot tell, so not loopback-only.
+        assert!(!net_dev_loopback_only(""));
+        assert!(!net_dev_loopback_only(header));
     }
     #[test]
     fn lease_hidden_truth_table() {
