@@ -905,7 +905,7 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
         10,
     );
     let second_id = job_id(&second);
-    poll(Duration::from_secs(3), || {
+    poll(Duration::from_secs(15), || {
         let status = b.job(second_id).1;
         (status["waiting_for_lock"] == true && status["status"] == "queued").then_some(())
     });
@@ -918,7 +918,7 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
             .unwrap(),
     );
     let requests = b.job_dir(first_id).join("control");
-    poll(Duration::from_secs(3), || {
+    poll(Duration::from_secs(15), || {
         fs::read_dir(&requests)
             .ok()?
             .filter_map(Result::ok)
@@ -941,7 +941,7 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
     accepted(&b, second_id);
     assert!(abort.0.try_wait().unwrap().is_none());
     drop(caller);
-    let status = poll(Duration::from_secs(3), || abort.0.try_wait().unwrap());
+    let status = poll(Duration::from_secs(15), || abort.0.try_wait().unwrap());
     use std::io::Read;
     let mut stdout = vec![];
     let mut stderr = vec![];

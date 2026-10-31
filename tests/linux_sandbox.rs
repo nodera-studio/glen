@@ -29,6 +29,11 @@ fn bwrap(cmd: &Command, net: bool, writable: &[&std::path::Path]) -> Output {
         .arg("/dev")
         .arg("--proc")
         .arg("/proc")
+        // /sys is its own mount, same as /proc; `--ro-bind / /` does not recurse into it, and
+        // sandbox::is_loopback_only() reads /sys/class/net to decide the lease-hidden fallback.
+        .arg("--ro-bind")
+        .arg("/sys")
+        .arg("/sys")
         .arg("--die-with-parent");
     if !net {
         c.arg("--unshare-net");
@@ -63,6 +68,9 @@ fn bwrap_raw(c: Command, net: bool, writable: &[&std::path::Path]) -> Output {
         .arg("/dev")
         .arg("--proc")
         .arg("/proc")
+        .arg("--ro-bind")
+        .arg("/sys")
+        .arg("/sys")
         .arg("--die-with-parent");
     if !net {
         wrapped.arg("--unshare-net");
@@ -269,6 +277,21 @@ fn s6_reads_and_inbox() {
     c.env("CODEX_SANDBOX", "linux-ci")
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
     let out = bwrap(&c, true, &[]);
+    // Diagnostic only (not asserted): if this ever fails again, the log shows whether the
+    // sandbox's own view of GLEN_HOME is genuinely read-only from inside the same sandbox.
+    let home = rb2.omp.glen_home.clone();
+    let mut diag = Command::new("bash");
+    diag.arg("-c").arg(format!(
+        "touch '{}/.diag-probe' 2>&1; ls -la '{}'",
+        home.display(),
+        home.display()
+    ));
+    let diag_out = bwrap_raw(diag, true, &[]);
+    eprintln!(
+        "s6 glen_home diagnostic: {}{}",
+        String::from_utf8_lossy(&diag_out.stdout),
+        String::from_utf8_lossy(&diag_out.stderr)
+    );
     let v = json(&out);
     assert_eq!(exit_code(&out), 6, "{v}");
     assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
