@@ -164,27 +164,67 @@ fn unary_io(error: io::Error) -> ClientError {
         ClientError::Protocol(error.to_string())
     }
 }
+/// The read the drain still makes once its deadline has passed (NEW-LOW-002).
+const DRAIN_FLOOR: Duration = Duration::from_millis(1);
 /// Reads with an absolute deadline: the remaining time is recomputed before every read, so
-/// the total wait never exceeds `until` however the peer paces its bytes.
+/// a peer trickling bytes cannot stretch the drain. Once `until` has passed, one read still
+/// waits `DRAIN_FLOOR` and every later read takes only bytes already buffered, so an answer
+/// the peer wrote before closing is used even when the write deadline ran out at the EPIPE.
 struct DrainReader<'a> {
     stream: &'a UnixStream,
     until: Instant,
+    expired: bool,
 }
-impl Read for DrainReader<'_> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        let left = self.until.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(io::ErrorKind::TimedOut.into());
-        }
+impl DrainReader<'_> {
+    fn read_for(&mut self, buf: &mut [u8], timeout: Duration) -> io::Result<usize> {
         // macOS can reject a timeout change once the peer has already closed; reads on such a
         // socket return what is buffered, then EOF, without blocking.
-        if let Err(e) = self.stream.set_read_timeout(Some(left))
+        if let Err(e) = self.stream.set_read_timeout(Some(timeout))
             && e.raw_os_error() != Some(libc::EINVAL)
         {
             return Err(e);
         }
         self.stream.read(buf)
     }
+}
+impl Read for DrainReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if !left.is_zero() {
+            return self.read_for(buf, left);
+        }
+        if !self.expired {
+            self.expired = true;
+            return self.read_for(buf, DRAIN_FLOOR);
+        }
+        use std::os::fd::AsRawFd;
+        // SAFETY: `buf` is a live, writable slice of `buf.len()` bytes, and the borrowed stream
+        // keeps the descriptor open for the call. MSG_DONTWAIT leaves the socket's flags alone.
+        let n = unsafe {
+            libc::recv(
+                self.stream.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if n < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(n as usize)
+    }
+}
+/// Reads one line for the EPIPE drain without reading ahead: open_send's reader still needs
+/// the frames after it.
+fn drain_line(stream: &UnixStream, until: Instant) -> io::Result<Vec<u8>> {
+    read_line(&mut BufReader::with_capacity(
+        1,
+        DrainReader {
+            stream,
+            until,
+            expired: false,
+        },
+    ))
 }
 fn write_request(
     stream: &mut UnixStream,
@@ -219,13 +259,7 @@ fn write_request(
                 // `DrainReader` recomputes what is left of it before every read, so a peer
                 // trickling bytes cannot stretch the drain past it.
                 let until = end.min(Instant::now() + Duration::from_secs(1));
-                // Do not read ahead: open_send's reader still needs subsequent frames.
-                return read_line(&mut BufReader::with_capacity(
-                    1,
-                    DrainReader { stream, until },
-                ))
-                .map(Some)
-                .map_err(|_| {
+                return drain_line(stream, until).map(Some).map_err(|_| {
                     ClientError::Protocol(
                         "endpoint closed the connection before reading the request".into(),
                     )
@@ -622,6 +656,45 @@ mod unary_tests {
             matches!(read_frame(&mut BufReader::new(&client)).unwrap(), Frame::Event { kind, .. } if kind == "error")
         );
         worker.join().unwrap();
+    }
+
+    /// NEW-LOW-002 (W10 fix cycle 3): a drain whose deadline has already passed still reads,
+    /// so an answer the peer wrote before closing is used, whole, rather than lost; with nothing
+    /// buffered it gives up at once instead of waiting.
+    #[test]
+    fn an_expired_drain_still_returns_a_buffered_answer() {
+        let answer = br#"{"v":1,"type":"response","id":"x","ok":false,"error":{"code":"busy","message":"no"}}"#;
+        for closed in [true, false] {
+            let (client, mut peer) = UnixStream::pair().unwrap();
+            peer.write_all(answer).unwrap();
+            peer.write_all(b"\n").unwrap();
+            peer.write_all(b"next frame\n").unwrap();
+            let peer = (!closed).then_some(peer);
+            let until = Instant::now();
+            std::thread::sleep(Duration::from_millis(5));
+            let line =
+                drain_line(&client, until).unwrap_or_else(|e| panic!("closed={closed}: {e}"));
+            assert_eq!(
+                line.strip_suffix(b"\n").unwrap(),
+                &answer[..],
+                "closed={closed}"
+            );
+            // The drain did not read ahead into the next frame.
+            assert_eq!(
+                read_line(&mut BufReader::new(&client)).unwrap(),
+                b"next frame\n",
+                "closed={closed}"
+            );
+            drop(peer);
+        }
+        let (client, _peer) = UnixStream::pair().unwrap();
+        let start = Instant::now();
+        assert!(drain_line(&client, Instant::now()).is_err());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "an expired drain with nothing buffered waited {:?}",
+            start.elapsed()
+        );
     }
 
     /// AC-1014 / LOW-004 (fixes2 decision 5): the drain has one absolute deadline. The peer

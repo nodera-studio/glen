@@ -153,6 +153,16 @@ pub fn refuse_hidden_lease(env: &Env) -> Result<(), GlenError> {
     .with_detail("network", network)
     .with_detail("lease", json!("unknown")))
 }
+/// Adds `details.lease:"unknown"` to a sandbox refusal of an existing session's RPC resume
+/// while the lease is hidden, so the refusal names it even when `refuse_rpc` or
+/// `refuse_unreachable` fires before `refuse_hidden_lease` (design.md §A13, W10 fix cycle 3).
+pub fn with_hidden_lease(env: &Env, error: GlenError) -> GlenError {
+    if lease_hidden(env, cfg!(target_os = "linux")) {
+        error.with_detail("lease", json!("unknown"))
+    } else {
+        error
+    }
+}
 /// Every lease value is refused when `lease_hidden` (`refuse_hidden_lease`); otherwise only a
 /// real probe error (`Lease::Unknown` with an errno) is mapped.
 pub fn map_probe_failure(

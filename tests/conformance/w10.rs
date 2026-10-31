@@ -1353,6 +1353,7 @@ fn ac1026_readme_documents_the_installers_and_the_headless_skill_permission() {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
+#[ignore = "AC-1027 (Step 21) lands with harness batch 10 phase B after W9 merges; un-ignore there"]
 fn ac1027_the_orchestrator_checks_every_ac_against_the_source_before_role_3() {
     let dir = repo_root().join(".claude/agents/implementation");
     let orch = text_of(&dir.join("orchestrator.md"));

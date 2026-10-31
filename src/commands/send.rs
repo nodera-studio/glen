@@ -143,7 +143,10 @@ pub(crate) fn submit(
             "message is larger than 512 KiB",
         ));
     }
-    crate::sandbox::refuse_unreachable(env, "send")?;
+    crate::sandbox::refuse_unreachable(env, "send").map_err(|e| match opened {
+        Some(_) => crate::sandbox::with_hidden_lease(env, e),
+        None => e,
+    })?;
     // Inside a sandbox, only the live route can work: @new is always RPC, and an
     // existing session is refused below once no live endpoint answers.
     if opened.is_none() {
@@ -192,7 +195,8 @@ pub(crate) fn submit(
             _ => (),
         }
         if live.is_none() {
-            crate::sandbox::refuse_rpc(env, "send")?;
+            crate::sandbox::refuse_rpc(env, "send")
+                .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
         }
         if live.is_none() && o.not_yet_persisted {
             return Err(GlenError::no_route(
@@ -447,6 +451,66 @@ mod tests {
             lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "held={held}"));
             assert!(!home.root.join("jobs").exists(), "held={held}: no job");
             drop(lock);
+        }
+        crate::sandbox::force_lease_hidden_for_test(None);
+    }
+    /// W10 fix cycle 3 (Codex P2): `refuse_rpc` (non-empty `CODEX_SANDBOX`) and the
+    /// network-disabled early return (both markers) fire before `refuse_hidden_lease`, and still
+    /// name the hidden lease for an existing session; `@new` resumes nothing and never does.
+    #[test]
+    fn every_sandbox_refusal_of_an_existing_session_names_a_hidden_lease() {
+        let tree = crate::omp::fixtures::tree();
+        let target = crate::omp::fixtures::path(&tree, 'A');
+        let glen = tempfile::tempdir().unwrap();
+        let agent = tree.path().join("unused-agent");
+        let home = glen.path().join("glen");
+        for network in [None, Some("1")] {
+            let mut vars = vec![
+                ("GLEN_HOME", home.to_str().unwrap()),
+                ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+                ("GLEN_OMP_BIN", "/nonexistent/omp"),
+                ("CODEX_SANDBOX", "seatbelt"),
+            ];
+            vars.extend(network.map(|v| ("CODEX_SANDBOX_NETWORK_DISABLED", v)));
+            let env = Env::for_test(Some(tree.path()), tree.path(), &vars);
+            for hidden in [true, false] {
+                crate::sandbox::force_lease_hidden_for_test(Some(hidden));
+                for (to, existing) in [(target.to_str().unwrap(), true), ("@new", false)] {
+                    let cli = Cli::try_parse_from(["glen", "send", to, "hi"]).unwrap();
+                    let crate::cli::Command::Send(args) = &cli.command else {
+                        panic!("send")
+                    };
+                    let ctx = OutputCtx::new(
+                        &cli.global,
+                        OutputKind::Document,
+                        &env,
+                        &Terminal {
+                            stdout_tty: false,
+                            stderr_tty: false,
+                            stdout_cols: None,
+                        },
+                    )
+                    .unwrap();
+                    lease::PROBE_CALLS.with(|calls| calls.set(0));
+                    let case = format!("network={network:?} hidden={hidden} to={to}");
+                    let err = match run(&cli, args, &env, &ctx) {
+                        Err(e) => e,
+                        Ok(_) => panic!("{case}: unexpected success"),
+                    };
+                    assert_eq!(err.code, ErrorCode::NoRoute, "{case}: {}", err.message);
+                    let details = err.details.unwrap();
+                    assert_eq!(details["reason"], "sandboxed", "{case}");
+                    assert_eq!(details["sandbox"], "seatbelt", "{case}");
+                    assert_eq!(details["network"], network.is_none(), "{case}");
+                    assert_eq!(
+                        details.get("lease"),
+                        (hidden && existing).then_some(&serde_json::json!("unknown")),
+                        "{case}: {details}"
+                    );
+                    lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "{case}"));
+                    assert!(!home.join("jobs").exists(), "{case}: no job");
+                }
+            }
         }
         crate::sandbox::force_lease_hidden_for_test(None);
     }

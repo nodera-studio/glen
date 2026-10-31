@@ -663,7 +663,7 @@ in the project.
 | Field | Meaning |
 |---|---|
 | `total` | messages returned |
-| `marked_read` | true when this call moved the read cursor of at least one returned session; false with `--peek` and when nothing new was returned |
+| `marked_read` | true when this call moved at least one read cursor, including past malformed lines only (then `total` can be 0); false with `--peek` and when no cursor moved |
 | `skipped_lines` | malformed inbox lines skipped |
 | `messages` | reply records plus session_handle and job_handle (null without a job) |
 
@@ -1142,6 +1142,8 @@ and the absolute scope directory. File paths bypass project filtering and remain
 | `extension_newer`, `extension_modified`, `extension_foreign` | install-extension | file skipped unless --force |
 | `extension_dir_not_empty` | install-extension | removed file, retained nonempty glen directory |
 | `changed_during_install` | install-extension | extension file or directory changed during install; skipped |
+| `replace_not_atomic` | install-extension, install-skill | the filesystem has no atomic exchange; the file was replaced with a plain rename, so a concurrent change in that window may have been overwritten |
+| `outside_cwd` | inbox | with --cwd and --session, every matching inbox session is outside that project; nothing returned (not -f) |
 
 New visible commands and visible aliases must add a section and contract runner in their own wave.
 

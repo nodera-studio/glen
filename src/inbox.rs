@@ -96,6 +96,7 @@ pub fn probe_writable(home: &GlenHome) -> io::Result<()> {
     let probe = dir.join(format!(".probe.{}.tmp", std::process::id()));
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);

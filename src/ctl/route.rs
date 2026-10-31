@@ -329,7 +329,8 @@ pub(crate) fn route(
     deadline: Instant,
     stop: Arc<AtomicBool>,
 ) -> Result<(Target, Vec<Warning>), GlenError> {
-    crate::sandbox::refuse_unreachable(env, cli.command.name())?;
+    crate::sandbox::refuse_unreachable(env, cli.command.name())
+        .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
     let home = glen_home::resolve(env)?;
     let store = JobStore::new(home.clone());
     let id = &opened.session.header.id;
@@ -395,10 +396,18 @@ pub(crate) fn route(
             }
             _ => (),
         }
-        crate::sandbox::refuse_rpc(env, cli.command.name())?;
-        if lock::is_held(&home, id) {
+        crate::sandbox::refuse_rpc(env, cli.command.name())
+            .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
+        // A hidden lease refuses before any lock wait or lease probe; only a control for a
+        // running glen job still reaches that job (design.md §A13, W10 clarification).
+        if !lock::is_held(&home, id) {
+            crate::sandbox::refuse_hidden_lease(env)?;
+        } else {
             let holder = owner(&store, id, deadline, &stop);
             stopped(deadline, &stop, opened)?;
+            if !matches!(holder, Owner::Job(_)) {
+                crate::sandbox::refuse_hidden_lease(env)?;
+            }
             match holder {
                 Owner::Job(job) => return Ok((job_target(store, job, id, deadline, stop), vec![])),
                 Owner::Free => continue,

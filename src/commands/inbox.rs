@@ -165,17 +165,6 @@ fn collect(
         skipped: 0,
         outside_cwd: false,
     };
-    let start = |stem: &str| {
-        cursors
-            .and_then(|c| c.get(stem).copied())
-            .unwrap_or_else(|| {
-                if all {
-                    Cursor::default()
-                } else {
-                    inbox::cursor(home, stem)
-                }
-            })
-    };
     let mut sessions = inbox::sessions(home, filter);
     if let Some(scope) = scope {
         let all = filter.map(|_| inbox::sessions(home, None));
@@ -205,7 +194,16 @@ fn collect(
         read.outside_cwd = filter.is_some() && had_matches && sessions.is_empty();
     }
     for (stem, path) in sessions {
-        let batch = inbox::read_new(&path, start(&stem)).map_err(|e| GlenError::read(&path, e))?;
+        let start = cursors
+            .and_then(|c| c.get(&stem).copied())
+            .unwrap_or_else(|| {
+                if all {
+                    Cursor::default()
+                } else {
+                    inbox::cursor(home, &stem)
+                }
+            });
+        let batch = inbox::read_new(&path, start).map_err(|e| GlenError::read(&path, e))?;
         read.skipped += batch.skipped;
         read.ends.push((
             stem.clone(),
@@ -288,7 +286,13 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
             if total == 1 { "message" } else { "messages" },
             sessions,
             if sessions == 1 { "session" } else { "sessions" },
-            if a.peek { "peek" } else { "marked read" }
+            if a.peek {
+                "peek"
+            } else if moves.is_empty() {
+                "already read"
+            } else {
+                "marked read"
+            }
         )
     };
     let mut outcome = Outcome::new(

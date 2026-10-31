@@ -347,7 +347,7 @@ Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `
 | muted | #505050 | #B4B5BD | 239 / 250 | default + dim |
 | border | #DADADA | #45474D | 253 / 238 | bright black |
 | accent (user role) | #5E6AD2 | #7170FF | 62 / 63 | blue |
-| accent_2 (assistant role) | #12A594 | #12A594 | 36 / 36 | cyan |
+| accent_2 (assistant role) | #0E7C70 | #12A594 | 23 / 36 | cyan |
 | success | #007F3D | #00CA50 | 29 / 41 | green |
 | warning | #A66300 | #FF9300 | 130 / 208 | yellow |
 | danger | #DC2626 | #FF565F | 160 / 203 | red |
@@ -473,6 +473,16 @@ Controls in the agent loop: `glen models <h>` → `glen model <h> <provider/id>`
 - An `Env` snapshot means code and tests never mutate the process environment.
 - Integration tests use `CARGO_BIN_EXE_glen` with `env_clear()`.
 - Conformance tests live in `tests/conformance.rs` (the `/implement` tail).
+- **Flake ledger.** Each flake is fixed at its root cause, with a deterministic regression test, never by widening a timeout. The label-triggered `flake-proof` workflow reruns the suite 20 times per OS.
+  - F1: `fake_ext`'s accepted socket inherited O_NONBLOCK on macOS (BSD `accept`), so `serve` dropped a request that had not arrived yet and the client saw EPIPE; it now serves in blocking mode (W10, 53fed35).
+  - F2: the live client never read after a write error, losing an answer the endpoint sent before closing; it drains one frame under an absolute deadline (W10, 53fed35; cycle 3 keeps one read after that deadline).
+  - F3: tests wrote `control/*.json` with a plain write, so the worker could parse a torn request; test writes are atomic like the product's (W10, 53fed35).
+  - F4: `jobs::lock` checked its deadline before the first acquire, so scheduling delay could time out an uncontended lock; it tries first (W10, 53fed35).
+  - F5: macOS rejects `setsockopt(SO_RCVTIMEO)` once the peer has closed, turning a good answer into EINVAL; the timeout is set before writing and EINVAL is tolerated in the drain (W10, 53fed35).
+  - F6: the abort answer raced the queue snapshot in `glen abort` (W5, PR #21).
+  - F7: `fake_ext` log and inbox lines tore under concurrent appends, and `records()` dropped unparseable lines; each line is one write and `records()` fails on a bad complete line (W5, PR #21).
+  - F8: the abort-queue test in `tests/controls.rs` froze the caller on `write_atomic`'s temp file, before the rename, hiding the request from `control::poll`; it now waits for a published request (W10, 24bee32).
+  - F9: `jobs::lock` holder tests saw a released lock still held: a child forked on another thread shared the lock's open file description until exec, and closing our fd did not release the flock; `SessionLock` and the `is_held` probe release with `LOCK_UN` (W10, fcddede).
 
 W3b fakes share `tests/support/fake_models.json` (six complete SDK ModelInfo records). fake_omp accepts --no-session, tracks selection on resumed copies, appends model/thinking/compaction entries with sync_all, and supports fork_control and compact_error. FAKE_OMP_SERIAL=1 processes ordinary commands in arrival order, including abort; FAKE_OMP_COMPACT_DELAY_MS delays compaction without writing after a stop. W2 concurrent delayed-state behaviour remains the default.
 
