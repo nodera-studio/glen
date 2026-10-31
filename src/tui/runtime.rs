@@ -1206,20 +1206,33 @@ mod tests {
                 })
             })
             .collect::<Vec<_>>();
+        // Scheduling allowance: the most a loaded CI runner may add in wake-up latency to
+        // finish_tasks' own wait. Far below the 30 s a joined, gated worker would take and
+        // below the 6 s production bound, so either regression still fails.
+        const SCHEDULING_ALLOWANCE: Duration = Duration::from_secs(1);
         let bound = Duration::from_millis(5);
         let start = Instant::now();
         finish_tasks(&mut tasks, bound).unwrap();
-        assert!(start.elapsed() >= bound);
+        let elapsed = start.elapsed();
+        assert!(elapsed >= bound);
+        assert!(
+            elapsed < bound + SCHEDULING_ALLOWANCE,
+            "finish_tasks overran its {bound:?} bound: {elapsed:?}"
+        );
         assert!(tasks.is_empty());
         assert!(rx.try_recv().is_err());
         drop(gates);
         for _ in 0..3 {
             rx.recv_timeout(Duration::from_secs(5)).unwrap();
         }
-        let bound = Duration::from_secs(6);
+        // An empty set returns at once, whatever the bound: only scheduling latency counts.
         let start = Instant::now();
-        finish_tasks(&mut vec![], bound).unwrap();
-        assert!(start.elapsed() < bound);
+        finish_tasks(&mut vec![], Duration::from_secs(6)).unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < SCHEDULING_ALLOWANCE,
+            "an empty set waited {elapsed:?}"
+        );
     }
     #[cfg(debug_assertions)]
     #[test]
