@@ -29,7 +29,7 @@ use ratatui::{
 use std::{
     io, panic,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -38,6 +38,7 @@ use std::{
 };
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+static RESTORING: Mutex<()> = Mutex::new(());
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TerminalStep {
     Raw,
@@ -75,8 +76,12 @@ fn terminal_step(step: TerminalStep) -> io::Result<()> {
 }
 fn restore_with(
     active: &AtomicBool,
+    restoring: &Mutex<()>,
     mut step: impl FnMut(TerminalStep) -> io::Result<()>,
 ) -> io::Result<()> {
+    // A caller preparing to exit must wait for an already-started restore to finish,
+    // even though that restore has cleared active to prevent duplicate teardown.
+    let _restoring = restoring.lock().unwrap_or_else(|error| error.into_inner());
     if !active.swap(false, Ordering::AcqRel) {
         return Ok(());
     }
@@ -90,6 +95,7 @@ fn restore_with(
 }
 fn enter_with(
     active: &AtomicBool,
+    restoring: &Mutex<()>,
     mut step: impl FnMut(TerminalStep) -> io::Result<()>,
 ) -> io::Result<()> {
     // Set before raw mode: failures at any stage still run every teardown step.
@@ -103,7 +109,7 @@ fn enter_with(
         })?;
     for action in ENTER {
         if let Err(first) = step(action) {
-            return match restore_with(active, &mut step) {
+            return match restore_with(active, restoring, &mut step) {
                 Ok(()) | Err(_) => Err(first),
             };
         }
@@ -111,12 +117,12 @@ fn enter_with(
     Ok(())
 }
 fn restore_terminal() -> io::Result<()> {
-    restore_with(&ACTIVE, terminal_step)
+    restore_with(&ACTIVE, &RESTORING, terminal_step)
 }
 struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        enter_with(&ACTIVE, terminal_step)?;
+        enter_with(&ACTIVE, &RESTORING, terminal_step)?;
         Ok(Self)
     }
     fn restore(&self) -> io::Result<()> {
@@ -176,11 +182,14 @@ impl Signals {
         let thread = thread::Builder::new()
             .name("watch-signals".into())
             .spawn(move || {
+                let mut seen = false;
                 for signal in signals.forever() {
-                    if quitting.load(Ordering::Acquire) {
+                    if seen || quitting.load(Ordering::Acquire) {
                         if let Err(_error) = restore_terminal() {}
                         std::process::exit(128 + signal);
                     }
+                    // Count delivery here, before the UI can observe the first signal.
+                    seen = true;
                     if signal == SIGHUP {
                         hup.store(true, Ordering::Release);
                     }
@@ -708,7 +717,8 @@ mod tests {
         for failed in ENTER {
             let active = AtomicBool::new(false);
             let mut seen = vec![];
-            let result = enter_with(&active, |step| {
+            let restoring = Mutex::new(());
+            let result = enter_with(&active, &restoring, |step| {
                 if step == TerminalStep::Raw {
                     assert!(active.load(Ordering::Acquire));
                 }
@@ -730,23 +740,86 @@ mod tests {
     fn restore_is_idempotent_attempts_all_actions_and_returns_only_the_first_error() {
         let active = AtomicBool::new(true);
         let mut seen = vec![];
-        let error = restore_with(&active, |step| {
+        let restoring = Mutex::new(());
+        let error = restore_with(&active, &restoring, |step| {
             seen.push(step);
             Err(io::Error::other(format!("{step:?}")))
         })
         .unwrap_err();
         assert_eq!(seen, LEAVE);
         assert_eq!(error.to_string(), "NoPaste");
-        restore_with(&active, |_| panic!("restored twice")).unwrap();
+        restore_with(&active, &restoring, |_| panic!("restored twice")).unwrap();
         assert!(!active.load(Ordering::Acquire));
         active.store(true, Ordering::Release);
         assert_eq!(
-            enter_with(&active, |_| panic!("already entered"))
+            enter_with(&active, &restoring, |_| panic!("already entered"))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::AlreadyExists
         );
         assert!(active.load(Ordering::Acquire));
+    }
+    #[test]
+    fn racing_restore_waits_for_complete_teardown_before_the_exit_path_returns() {
+        let active = Arc::new(AtomicBool::new(true));
+        let restoring = Arc::new(Mutex::new(()));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        let raw = Arc::new(AtomicBool::new(true));
+        let (started, in_restore) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let first = {
+            let (active, restoring, output, raw) = (
+                active.clone(),
+                restoring.clone(),
+                output.clone(),
+                raw.clone(),
+            );
+            thread::spawn(move || {
+                restore_with(&active, &restoring, |step| {
+                    let bytes: &[u8] = match step {
+                        TerminalStep::NoPaste => {
+                            output.lock().unwrap().extend_from_slice(b"\x1b[?20");
+                            started.send(()).unwrap();
+                            paused.recv_timeout(Duration::from_secs(2)).unwrap();
+                            b"04l"
+                        }
+                        TerminalStep::Leave => b"\x1b[?1049l",
+                        TerminalStep::Show => b"\x1b[?25h",
+                        TerminalStep::NoRaw => {
+                            raw.store(false, Ordering::Release);
+                            b""
+                        }
+                        _ => panic!("unexpected enter step"),
+                    };
+                    output.lock().unwrap().extend_from_slice(bytes);
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        in_restore.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(!active.load(Ordering::Acquire));
+        let (attempting, attempted) = mpsc::channel();
+        let (done, completed) = mpsc::channel();
+        let second = thread::spawn(move || {
+            attempting.send(()).unwrap();
+            restore_with(&active, &restoring, |_| panic!("teardown ran twice")).unwrap();
+            // This is the point where the second-signal path could exit the process.
+            done.send((output.lock().unwrap().clone(), raw.load(Ordering::Acquire)))
+                .unwrap();
+        });
+        attempted.recv_timeout(Duration::from_secs(2)).unwrap();
+        let early = completed.recv_timeout(Duration::from_millis(50));
+        resume.send(()).unwrap();
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            matches!(early, Err(RecvTimeoutError::Timeout)),
+            "exit raced the partial restore: {early:?}"
+        );
+        let (bytes, raw) = completed.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(bytes, b"\x1b[?2004l\x1b[?1049l\x1b[?25h");
+        assert!(!raw, "exit preceded disabling raw mode");
     }
     #[test]
     fn input_adapter_forwards_only_keys_paste_and_resize() {

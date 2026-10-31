@@ -1122,6 +1122,48 @@ fn second_signal_interrupts_the_wait_for_an_in_flight_submit() {
     b.omp.clean();
 }
 
+#[cfg(debug_assertions)]
+#[test]
+fn back_to_back_signals_exit_within_one_second_and_finish_teardown() {
+    for controlling in terminal_modes() {
+        // Exercise the scheduling race repeatedly without pausing between the two sends.
+        for _ in 0..4 {
+            let b = RpcBox::new();
+            let gate = b.omp.tmp.path().join("rapid-probe");
+            let ready = gate.with_file_name("rapid-probe.ready");
+            let mut cmd = b.glen(&["watch", "e27c0de"]);
+            cmd.env("TERM", "xterm-256color")
+                .env("FAKE_OMP_LEASE_PROBE_GATE", &gate);
+            let mut pty = Pty::open(120, 40);
+            pty.controlling = controlling;
+            pty.spawn(cmd);
+            pty.ready();
+            pty.send(b"\tin flight\r");
+            poll(START, || ready.exists().then_some(()));
+            let signalled = Instant::now();
+            pty.signal_process(Signal::TERM);
+            pty.signal_process(Signal::INT);
+            let code = pty.wait_exit(EXIT);
+            assert!(signalled.elapsed() < EXIT, "rapid signals took at least 1s");
+            // Distinct pending signals can be yielded in either order by the OS/iterator.
+            assert!([130, 143].contains(&code), "unexpected signal exit: {code}");
+            pty.assert_teardown();
+            let bytes = pty.bytes();
+            let leave = b"\x1b[?2004l\x1b[?1049l\x1b[?25h";
+            assert_eq!(
+                bytes
+                    .windows(leave.len())
+                    .filter(|bytes| *bytes == leave)
+                    .count(),
+                1,
+                "teardown must be one complete, uninterrupted escape sequence: {bytes:?}"
+            );
+            assert!(!gate.exists());
+            b.omp.clean();
+        }
+    }
+}
+
 #[test]
 fn hung_endpoint_keeps_focus_responsive_refuses_and_bounds_quit() {
     let mut b = LiveBox::new();
