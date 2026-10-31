@@ -384,6 +384,14 @@ fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
         assert_eq!(details["error"]["details"]["reason"], "live_owner");
         assert!(details.get("forked").is_some());
         assert!(details["forked"].is_null());
+        // W8-DEBT-1: the worker uses the shared lease hint (no glen extension installed here),
+        // not a claim that the extension needs "a later glen version".
+        let hint = if b.omp.agent.join("extensions/glen/index.ts").is_file() {
+            "restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)"
+        } else {
+            "run `glen install-extension`, then restart that omp session"
+        };
+        assert_eq!(value["error"]["hint"], hint, "{value}");
     }
     b.wait_worker_gone(&id);
     assert!(

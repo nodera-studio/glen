@@ -967,19 +967,24 @@ fn ac209_cwd_scopes_existing_targets_and_new_requires_a_directory() {
     );
     assert_eq!(outside["details"]["reason"], "outside_cwd");
     assert_eq!(outside["details"]["cwd"], "/tmp");
+    // W8-ERR-8: a --cwd that is not a directory is a usage error (exit 2) with reason
+    // missing_cwd and a fix-the-path hint, no longer not_found (exit 3).
     let missing = rb.bx.root.join("nope");
-    failed(
+    let e = failed(
         &rb.glen(["send", "@new", "hi", "--cwd", &s(&missing), "--json"])
             .run(),
-        "not_found",
+        "usage",
     );
+    assert_eq!(e["details"]["reason"], "missing_cwd");
+    assert_eq!(e["hint"], "check the --cwd path");
     let file = rb.bx.root.join("a-file");
     fs::write(&file, "x").unwrap();
-    failed(
+    let e = failed(
         &rb.glen(["send", "@new", "hi", "--cwd", &s(&file), "--json"])
             .run(),
-        "not_found",
+        "usage",
     );
+    assert_eq!(e["details"]["reason"], "missing_cwd");
     assert!(!rb.bx.glen_home.exists(), "no job for a refused --cwd");
     assert!(rb.starts().is_empty());
 
@@ -1793,11 +1798,8 @@ fn ac222_send_failures_before_the_job_leave_no_glen_home() {
             None,
             "not_found",
         ),
-        (
-            vec!["send", "@new", "hi", "--cwd", &missing],
-            None,
-            "not_found",
-        ),
+        // W8-ERR-8: a missing --cwd is a usage error.
+        (vec!["send", "@new", "hi", "--cwd", &missing], None, "usage"),
         (
             vec!["--profile", "Bad Name", "send", "@new", "hi"],
             None,
