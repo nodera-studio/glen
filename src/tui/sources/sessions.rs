@@ -184,6 +184,7 @@ impl Reader {
             sessions_dir: paths.sessions_dir.clone(),
             sessions: summaries,
             handles: HashMap::new(),
+            unreadable: vec![],
         };
         registry::union(&mut catalog, &ctx.home, &ctx.env, &registries);
         catalog.assign_handles(None);

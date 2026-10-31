@@ -7,7 +7,8 @@ impl Spinner {
             if let Ok(style) = ProgressStyle::with_template("{spinner} {msg}") {
                 bar.set_style(style);
             }
-            bar.set_message(msg.to_string());
+            // Messages can carry session handles or model names from transcripts.
+            bar.set_message(super::sanitize(msg).into_owned());
             bar.enable_steady_tick(std::time::Duration::from_millis(80));
             Some(bar)
         } else {
@@ -16,7 +17,7 @@ impl Spinner {
     }
     pub fn set_message(&self, msg: &str) {
         if let Some(bar) = &self.0 {
-            bar.set_message(msg.to_owned());
+            bar.set_message(super::sanitize(msg).into_owned());
         }
     }
     pub fn finish(self) {
@@ -48,6 +49,16 @@ mod tests {
         let error = failing(bar);
         assert!(error.is_err());
         assert!(observer.is_finished());
+    }
+    #[test]
+    fn messages_escape_terminal_controls() {
+        let spinner = Spinner::start(true, "stopping \x1bc\x1b[31mzz");
+        let bar = spinner.0.as_ref().unwrap();
+        assert!(!bar.message().contains('\x1b'));
+        assert!(bar.message().contains("\\x1b"));
+        spinner.set_message("next \u{9b}2J");
+        assert!(!bar.message().contains('\u{9b}'));
+        spinner.finish();
     }
 }
 

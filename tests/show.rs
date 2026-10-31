@@ -277,3 +277,149 @@ fn cwd_makes_a_globally_ambiguous_suffix_unique_and_limits_candidates() {
     );
     sb.clean();
 }
+fn write_session(sb: &OmpBox, name: &str, lines: &[&str]) -> std::path::PathBuf {
+    let path = sb
+        .agent
+        .join("sessions/-work-alpha")
+        .join(format!("2026-10-20T00-00-00-000Z_{name}.jsonl"));
+    std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    path
+}
+#[test]
+fn w8_sec1_lone_surrogate_keeps_the_line_and_its_ancestors() {
+    let sb = OmpBox::new();
+    let path = write_session(
+        &sb,
+        "01a0dddd-0000-7000-8000-000000000001",
+        &[
+            r#"{"type":"session","version":3,"id":"01a0dddd-0000-7000-8000-000000000001","cwd":"/w"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","message":{"role":"assistant","content":[{"type":"text","text":"reply \ud83d"}],"stopReason":"stop"}}"#,
+            r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"user","content":"third"}}"#,
+        ],
+    );
+    let out = sb.glen(&["show", path.to_str().unwrap(), "--json"], &sb.alpha());
+    let v = json(&out);
+    assert!(v.get("warnings").is_none(), "{v}");
+    let d = data(&out);
+    assert_eq!(d["skipped_lines"], 0);
+    let items = d["items"].as_array().unwrap();
+    assert_eq!(
+        items
+            .iter()
+            .map(|i| i["id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["m1", "m2", "m3"]
+    );
+    assert!(items[1].to_string().contains('\u{fffd}'), "{}", items[1]);
+    sb.clean();
+}
+#[test]
+fn w8_sec1_a_malformed_ancestor_reports_branch_truncated() {
+    let sb = OmpBox::new();
+    let path = write_session(
+        &sb,
+        "01a0dddd-0000-7000-8000-000000000002",
+        &[
+            r#"{"type":"session","version":3,"id":"01a0dddd-0000-7000-8000-000000000002","cwd":"/w"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","message":{"role":"assistant","content":"broken"#,
+            r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"user","content":"third"}}"#,
+        ],
+    );
+    for command in ["show", "tail"] {
+        let v = json(&sb.glen(&[command, path.to_str().unwrap(), "--json"], &sb.alpha()));
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["data"]["skipped_lines"], 1);
+        // The walk stops at the missing parent instead of guessing ancestors.
+        assert_eq!(v["data"]["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["warnings"][0]["code"], "branch_truncated", "{v}");
+        assert_eq!(
+            v["warnings"][0]["message"],
+            "1 earlier entries may be hidden by a malformed line"
+        );
+    }
+    // A malformed line that is not an ancestor does not warn.
+    let v = json(&sb.glen(&["show", "0a3f417", "--json"], &sb.alpha()));
+    assert!(v.get("warnings").is_none(), "{v}");
+    sb.clean();
+}
+#[cfg(unix)]
+#[test]
+fn w8_err5_unreadable_sessions_warn_and_turn_misses_into_io_errors() {
+    use std::os::unix::fs::PermissionsExt;
+    let sb = OmpBox::new();
+    let file = sb.session('A');
+    let beta = sb.agent.join("sessions/-work-beta");
+    let set = |path: &std::path::Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    set(&file, 0o000);
+    if std::fs::File::open(&file).is_ok() {
+        // Running as root: permissions are not enforced.
+        set(&file, 0o644);
+        return;
+    }
+    let out = sb.glen(&["show", "e27c0de", "--json"], &sb.alpha());
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let e = json(&out);
+    assert_eq!(e["error"]["code"], "io");
+    assert!(
+        e["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(file.to_str().unwrap()),
+        "{e}"
+    );
+    // A session elsewhere still resolves, with the unreadable file as a warning.
+    let v = json(&sb.glen(&["show", "b8e4a07", "--json"], &sb.alpha()));
+    assert_eq!(v["ok"], true);
+    assert_eq!(v["warnings"][0]["code"], "unreadable_session");
+    assert!(
+        v["warnings"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains(file.to_str().unwrap())
+    );
+    let v = json(&sb.glen(&["tail", "b8e4a07", "--json"], &sb.alpha()));
+    assert_eq!(v["warnings"][0]["code"], "unreadable_session", "{v}");
+    set(&beta, 0o000);
+    let v = json(&sb.glen(&["ls", "--all", "--json"], &sb.alpha()));
+    // @latest in a bucket that cannot be read is an io error, not "no sessions".
+    let latest = json(&sb.glen(&["show", "@latest", "--json"], &sb.beta()));
+    // @latest in a readable bucket is unaffected.
+    let alpha_latest = json(&sb.glen(&["show", "@latest", "--json"], &sb.alpha()));
+    set(&beta, 0o755);
+    set(&file, 0o644);
+    assert_eq!(v["ok"], true);
+    let mut unreadable = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|w| w["code"] == "unreadable_session")
+        .map(|w| w["message"].as_str().unwrap().to_owned())
+        .collect::<Vec<_>>();
+    unreadable.sort();
+    assert_eq!(unreadable.len(), 2, "{v}");
+    assert!(
+        unreadable
+            .iter()
+            .any(|m| m.ends_with(beta.to_str().unwrap()))
+    );
+    assert!(
+        unreadable
+            .iter()
+            .any(|m| m.ends_with(file.to_str().unwrap()))
+    );
+    assert_eq!(latest["error"]["code"], "io", "{latest}");
+    assert!(
+        latest["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(beta.to_str().unwrap())
+    );
+    assert_eq!(alpha_latest["ok"], true, "{alpha_latest}");
+    let v = json(&sb.glen(&["ls", "--all", "--json"], &sb.alpha()));
+    assert!(v.get("warnings").is_none(), "{v}");
+    sb.clean();
+}

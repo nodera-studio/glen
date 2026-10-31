@@ -80,6 +80,8 @@ pub fn run(cli: &Cli, args: &ShowArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
     }
     spinner.finish();
     let mut outcome = Outcome::new(data, human);
+    outcome.warnings.extend(o.catalog.unreadable_warnings());
+    outcome.warnings.extend(o.session.branch_warning());
     if o.not_yet_persisted {
         outcome.warnings.push(crate::error::Warning {
             code: "not_yet_persisted".into(),
