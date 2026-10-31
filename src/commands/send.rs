@@ -73,7 +73,15 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         store,
         mut child,
         created,
-    } = submit(cli, env, opened.as_ref(), cwd, text, args.deliver(), args.thinking.as_deref())?;
+    } = submit(
+        cli,
+        env,
+        opened.as_ref(),
+        cwd,
+        text,
+        args.deliver(),
+        args.thinking.as_deref(),
+    )?;
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
         ctx.mode == Mode::Human && ctx.stderr_tty,
@@ -420,7 +428,8 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "-"]).unwrap();
         let cwd = send_cwd(None, None, &env).unwrap();
-        let mut submitted = submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp, None).unwrap();
+        let mut submitted =
+            submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp, None).unwrap();
         // The worker child is this unit-test binary, not a live omp process.
         if submitted.child.try_wait().unwrap().is_none() {
             submitted.child.kill().unwrap();
@@ -441,9 +450,17 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "text"]).unwrap();
         for text in [" \n".to_string(), "x".repeat(rpc::MAX_MESSAGE_BYTES + 1)] {
-            let e = submit(&cli, &env, None, tree.path().into(), text, DeliverAs::Auto, None)
-                .err()
-                .unwrap();
+            let e = submit(
+                &cli,
+                &env,
+                None,
+                tree.path().into(),
+                text,
+                DeliverAs::Auto,
+                None,
+            )
+            .err()
+            .unwrap();
             assert_eq!(e.code, ErrorCode::Usage);
             assert!(!home.exists());
         }
