@@ -783,6 +783,72 @@ fn same_inode_rewrite_is_noticed_and_fresh_content_is_visible() {
 }
 
 #[test]
+fn equal_size_early_prefix_rewrite_reaches_watch_with_an_unchanged_tail_window() {
+    let b = OmpBox::new();
+    let path = b.session('A');
+    let original = fs::read_to_string(&path).unwrap()
+        + &format!(
+            "{}\n",
+            j!({"type":"future", "id":"padding", "parentId":"10000009", "data":"x".repeat(9000)})
+        );
+    fs::write(&path, &original).unwrap();
+    let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 40);
+    pty.ready();
+    let before = fs::metadata(&path).unwrap();
+    let rewritten = original
+        .replace("10000003", "90000003")
+        .replace("Why does parser_test flake?", "prefix rewrite detected    ");
+    assert_eq!(original.len(), rewritten.len());
+    assert_eq!(
+        &original.as_bytes()[original.len() - 4096..],
+        &rewritten.as_bytes()[rewritten.len() - 4096..]
+    );
+    fs::write(&path, rewritten).unwrap();
+    File::open(&path)
+        .unwrap()
+        .set_modified(before.modified().unwrap() + Duration::from_secs(1))
+        .unwrap();
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(before.ino(), fs::metadata(&path).unwrap().ino());
+    pty.wait_for("── session file rewritten ──", DATA);
+    pty.wait_for("prefix rewrite detected", DATA);
+    append(&path, format!("{}\n", j!({"type":"message", "id":"after-prefix", "parentId":"padding", "message":{"role":"user", "content":"normal append after prefix rewrite"}})).as_bytes());
+    pty.wait_for("normal append after prefix rewrite", DATA);
+    pty.quit();
+    b.clean();
+}
+#[test]
+fn v1_rewrite_rebases_watch_occurrences_so_the_next_duplicate_is_visible() {
+    let b = OmpBox::new();
+    let path = b.session('A');
+    let header = include_str!("fixtures/v1-session.jsonl")
+        .lines()
+        .next()
+        .unwrap()
+        .replace("legacy-v1", A_ID);
+    let a = format!(
+        "{}\n",
+        j!({"type":"message", "message":{"role":"user", "content":"old prompt"}})
+    );
+    let other = a.replace("old prompt", "another prompt");
+    fs::write(&path, format!("{header}\n{a}{a}{other}")).unwrap();
+    let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 40);
+    pty.wait_for("another prompt", START);
+    pty.assert_raw_while_running();
+    assert_eq!(pty.text_from(0).matches("old prompt").count(), 2);
+    fs::write(&path, format!("{header}\n{a}{other}")).unwrap();
+    pty.wait_for("── session file rewritten ──", DATA);
+    assert_eq!(pty.text_from(0).matches("old prompt").count(), 2);
+    append(&path, a.as_bytes());
+    poll(DATA, || {
+        (pty.text_from(0).matches("old prompt").count() == 3).then_some(())
+    });
+    assert_eq!(pty.text_from(0).matches("another prompt").count(), 1);
+    pty.quit();
+    b.clean();
+}
+
+#[test]
 fn v1_rewrite_does_not_duplicate_messages_when_ordinals_shift() {
     let b = OmpBox::new();
     let path = b.session('A');

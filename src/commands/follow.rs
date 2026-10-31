@@ -13,8 +13,17 @@ use std::{
     fs::{File, Metadata},
     io::{Read, Seek, SeekFrom},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
+
+use xxhash_rust::xxh3::Xxh3;
+
+#[cfg(test)]
+thread_local! {
+    static FULL_RECONCILIATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static LEGACY_KEYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PREFIX_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 #[derive(Debug)]
 pub(crate) enum FollowEvent {
@@ -49,31 +58,37 @@ enum Emitted {
     Id(String),
     Legacy { content: String, occurrence: usize },
 }
-fn branch_keys(session: &Session) -> Vec<(&Entry, Emitted)> {
+fn entry_key(entry: &Entry, legacy: bool, occurrences: &mut HashMap<String, usize>) -> Emitted {
+    if !legacy {
+        return Emitted::Id(entry.id.clone());
+    }
+    #[cfg(test)]
+    LEGACY_KEYS.with(|count| count.set(count.get() + 1));
+    let mut content = entry.raw.clone();
+    if let Some(fields) = content.as_object_mut() {
+        fields.remove("id");
+        fields.remove("parentId");
+    }
+    let content = content.to_string();
+    let occurrence = occurrences.entry(content.clone()).or_insert(0);
+    *occurrence += 1;
+    Emitted::Legacy {
+        content,
+        occurrence: *occurrence,
+    }
+}
+fn branch_keys<'a>(
+    session: &'a Session,
+    occurrences: &mut HashMap<String, usize>,
+) -> Vec<(&'a Entry, Emitted)> {
+    #[cfg(test)]
+    FULL_RECONCILIATIONS.with(|count| count.set(count.get() + 1));
     let legacy = session.header.raw["version"].as_u64().unwrap_or(1) < 2;
-    let mut occurrences = HashMap::new();
+    occurrences.clear();
     session
         .active_branch()
         .into_iter()
-        .map(|entry| {
-            let key = if legacy {
-                let mut content = entry.raw.clone();
-                if let Some(fields) = content.as_object_mut() {
-                    fields.remove("id");
-                    fields.remove("parentId");
-                }
-                let content = content.to_string();
-                let occurrence = occurrences.entry(content.clone()).or_insert(0);
-                *occurrence += 1;
-                Emitted::Legacy {
-                    content,
-                    occurrence: *occurrence,
-                }
-            } else {
-                Emitted::Id(entry.id.clone())
-            };
-            (entry, key)
-        })
+        .map(|entry| (entry, entry_key(entry, legacy, occurrences)))
         .collect()
 }
 pub(crate) struct Follower {
@@ -81,7 +96,10 @@ pub(crate) struct Follower {
     summary: Summary,
     offset: u64,
     identity: (u64, u64),
+    observed: Option<(u64, SystemTime)>,
     emitted: HashSet<Emitted>,
+    occurrences: HashMap<String, usize>,
+    known_ids: HashSet<String>,
     last_on_branch: Option<String>,
     opts: ItemOpts,
     ticks: u8,
@@ -91,12 +109,25 @@ pub(crate) struct Follower {
 }
 impl Follower {
     pub(crate) fn new(o: Opened, opts: ItemOpts) -> Self {
+        let mut occurrences = HashMap::new();
+        let emitted = branch_keys(&o.session, &mut occurrences)
+            .into_iter()
+            .map(|(_, key)| key)
+            .collect();
         Self {
             offset: o.session.consumed,
             identity: o.metadata.as_ref().map(identity).unwrap_or((0, 0)),
-            emitted: branch_keys(&o.session)
-                .into_iter()
-                .map(|(_, key)| key)
+            observed: o
+                .metadata
+                .as_ref()
+                .and_then(|m| m.modified().ok().map(|time| (m.len(), time))),
+            emitted,
+            occurrences,
+            known_ids: o
+                .session
+                .entries
+                .iter()
+                .map(|entry| entry.id.clone())
                 .collect(),
             last_on_branch: o.session.leaf_id().map(str::to_owned),
             session: o.session,
@@ -117,7 +148,7 @@ impl Follower {
     pub(crate) fn rebuild(&mut self, opts: ItemOpts) -> Vec<Item> {
         self.opts = opts;
         self.emitted.clear();
-        self.unseen()
+        self.unseen(true)
     }
     #[allow(dead_code)] // Shared with the watch view in the next slice.
     pub(crate) fn session(&self) -> &Session {
@@ -167,14 +198,18 @@ impl Follower {
         Ok(events)
     }
 
-    fn unseen(&mut self) -> Vec<Item> {
-        let branch = branch_keys(&self.session);
+    fn unseen(&mut self, reset: bool) -> Vec<Item> {
+        let branch = branch_keys(&self.session, &mut self.occurrences);
         let new = branch
             .iter()
             .filter(|(_, key)| !self.emitted.contains(key))
             .map(|(entry, _)| *entry)
             .collect::<Vec<_>>();
         let items = items::build(&new, &self.opts);
+        if reset {
+            // Compare against the old keys first, then rebase occurrences onto this snapshot.
+            self.emitted.clear();
+        }
         self.emitted.extend(branch.into_iter().map(|(_, key)| key));
         self.last_on_branch = self.session.leaf_id().map(str::to_owned);
         items
@@ -203,11 +238,17 @@ impl Follower {
             handle,
         });
         self.identity = identity(&metadata);
+        self.observed = metadata.modified().ok().map(|time| (metadata.len(), time));
+        self.known_ids = session
+            .entries
+            .iter()
+            .map(|entry| entry.id.clone())
+            .collect();
         self.offset = session.consumed;
         self.session = session;
         self.summary = summary;
         self.reload_pending = false;
-        events.push(FollowEvent::Items(self.unseen()));
+        events.push(FollowEvent::Items(self.unseen(false)));
         Ok(true)
     }
     fn consumed_tail_matches(&self, file: &mut File) -> Result<bool, GlenError> {
@@ -221,16 +262,41 @@ impl Follower {
             Err(e) => Err(GlenError::read(&self.session.path, e)),
         }
     }
+    fn consumed_prefix_matches(&self, file: &mut File) -> Result<bool, GlenError> {
+        #[cfg(test)]
+        PREFIX_CHECKS.with(|count| count.set(count.get() + 1));
+        file.seek(SeekFrom::Start(0))
+            .map_err(|e| GlenError::read(&self.session.path, e))?;
+        let mut hash = Xxh3::new();
+        let mut remaining = self.offset;
+        let mut buffer = [0; 8192];
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            match file.read_exact(&mut buffer[..count]) {
+                Ok(()) => hash.update(&buffer[..count]),
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+                Err(e) => return Err(GlenError::read(&self.session.path, e)),
+            }
+            remaining -= count as u64;
+        }
+        Ok(hash.digest() == self.session.consumed_hash())
+    }
     pub(crate) fn tick(
         &mut self,
         file: &mut File,
         m: &Metadata,
     ) -> Result<(bool, Vec<FollowEvent>), GlenError> {
         let mut events = vec![];
+        let observed = (
+            m.len(),
+            m.modified()
+                .map_err(|e| GlenError::read(&self.session.path, e))?,
+        );
         if self.reload_pending
             || m.len() < self.offset
             || identity(m) != self.identity
             || !self.consumed_tail_matches(file)?
+            || (self.observed != Some(observed) && !self.consumed_prefix_matches(file)?)
         {
             let session = match open::snapshot(&self.session.path, file, m, true) {
                 Ok(session) if session.header.id == self.session.header.id => session,
@@ -240,6 +306,11 @@ impl Follower {
                 }
                 Err(e) => return Err(open::load_error(&self.session.path, e)),
             };
+            self.known_ids = session
+                .entries
+                .iter()
+                .map(|entry| entry.id.clone())
+                .collect();
             self.session = session;
             self.reload_pending = false;
             self.identity = identity(m);
@@ -247,7 +318,7 @@ impl Follower {
             events.push(FollowEvent::Rewritten {
                 path: self.session.path.clone(),
             });
-            events.push(FollowEvent::Items(self.unseen()));
+            events.push(FollowEvent::Items(self.unseen(true)));
         } else if m.len() > self.offset {
             file.seek(SeekFrom::Start(self.offset))
                 .map_err(|e| GlenError::read(&self.session.path, e))?;
@@ -256,24 +327,52 @@ impl Follower {
                 .read_to_end(&mut bytes)
                 .map_err(|e| GlenError::read(&self.session.path, e))?;
             if let Some(end) = bytes.iter().rposition(|b| *b == b'\n') {
-                self.session.append(&bytes[..=end]);
+                let added = self.session.append(&bytes[..=end]);
                 self.offset += (end + 1) as u64;
-                let branch = self.session.active_branch();
-                let switched = self
-                    .last_on_branch
-                    .as_deref()
-                    .is_some_and(|id| !branch.iter().any(|e| e.id == id));
-                if switched {
-                    events.push(FollowEvent::BranchSwitch {
-                        leaf_id: self.session.leaf_id().map(str::to_owned),
-                    });
+                let mut parent = self.last_on_branch.as_deref();
+                let mut linear = true;
+                for entry in &self.session.entries[added.clone()] {
+                    let unique = self.known_ids.insert(entry.id.clone());
+                    linear &= unique
+                        && entry.parent_id.as_deref() == parent
+                        && entry
+                            .active_leaf_id
+                            .as_ref()
+                            .is_none_or(|leaf| leaf.as_deref() == Some(entry.id.as_str()));
+                    parent = Some(&entry.id);
                 }
-                let unseen = self.unseen();
+                let mut switched = false;
+                let unseen = if linear {
+                    let legacy = self.session.header.raw["version"].as_u64().unwrap_or(1) < 2;
+                    let new = self.session.entries[added]
+                        .iter()
+                        .filter(|entry| {
+                            let key = entry_key(entry, legacy, &mut self.occurrences);
+                            self.emitted.insert(key)
+                        })
+                        .collect::<Vec<_>>();
+                    let items = items::build(&new, &self.opts);
+                    self.last_on_branch = self.session.leaf_id().map(str::to_owned);
+                    items
+                } else {
+                    let branch = self.session.active_branch();
+                    switched = self
+                        .last_on_branch
+                        .as_deref()
+                        .is_some_and(|id| !branch.iter().any(|e| e.id == id));
+                    if switched {
+                        events.push(FollowEvent::BranchSwitch {
+                            leaf_id: self.session.leaf_id().map(str::to_owned),
+                        });
+                    }
+                    self.unseen(false)
+                };
                 if switched || !unseen.is_empty() {
                     events.push(FollowEvent::Items(unseen));
                 }
             }
         }
+        self.observed = Some(observed);
         Ok((true, events))
     }
 }
@@ -471,6 +570,116 @@ mod poll_tests {
         let events = f.poll().unwrap();
         assert!(matches!(events.as_slice(), [FollowEvent::Items(items)]
             if matches!(items.as_slice(), [Item::User { text, .. }] if text == "old prompt")));
+    }
+    #[test]
+    fn equal_size_early_prefix_rewrite_is_hashed_only_after_metadata_changes() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let original = String::from_utf8(fixtures::bytes('A').to_vec()).unwrap()
+            + &format!(
+                "{}\n",
+                json!({"type":"future", "id":"padding", "parentId":"10000009", "data":"x".repeat(9000)})
+            );
+        fs::write(&path, &original).unwrap();
+        let mut f = follower(&tree, &path);
+        PREFIX_CHECKS.with(|count| count.set(0));
+        for _ in 0..3 {
+            assert!(f.poll().unwrap().is_empty());
+        }
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 0);
+        let old = fs::metadata(&path).unwrap();
+        let rewritten = original
+            .replace("10000003", "90000003")
+            .replace("Why does parser_test flake?", "prefix rewrite detected    ");
+        assert_eq!(original.len(), rewritten.len());
+        assert_eq!(
+            &original.as_bytes()[original.len() - 4096..],
+            &rewritten.as_bytes()[rewritten.len() - 4096..]
+        );
+        fs::write(&path, &rewritten).unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(old.modified().unwrap() + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(identity(&old), identity(&fs::metadata(&path).unwrap()));
+        let events = f.poll().unwrap();
+        assert!(matches!(&events[0], FollowEvent::Rewritten { .. }));
+        assert!(matches!(&events[1], FollowEvent::Items(items)
+            if matches!(items.as_slice(), [Item::User { id, text, .. }] if id == "90000003" && text.starts_with("prefix rewrite detected"))));
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 1);
+        assert!(f.poll().unwrap().is_empty());
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 1);
+        // A true append also changes metadata, but must not be mistaken for another rewrite.
+        append(&path, &message("after-prefix", "padding"));
+        one(&f.poll().unwrap(), "after-prefix");
+    }
+    fn legacy_message(text: &str) -> String {
+        format!(
+            "{}\n",
+            json!({"type":"message", "message":{"role":"user", "content":text}})
+        )
+    }
+    #[test]
+    fn v1_rewrite_rebases_occurrences_before_the_next_append() {
+        let tree = fixtures::tree();
+        let path = tree.path().join("legacy.jsonl");
+        let header = include_str!("../../tests/fixtures/v1-session.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+        let a = legacy_message("old prompt");
+        let b = legacy_message("another prompt");
+        fs::write(&path, format!("{header}\n{a}{a}{b}")).unwrap();
+        let mut f = follower(&tree, &path);
+        assert_eq!(f.emitted.len(), 3);
+        fs::write(&path, format!("{header}\n{a}{b}")).unwrap();
+        let events = f.poll().unwrap();
+        assert!(
+            matches!(events.as_slice(), [FollowEvent::Rewritten { .. }, FollowEvent::Items(items)] if items.is_empty())
+        );
+        assert_eq!(f.emitted.len(), 2);
+        append(&path, &a);
+        let events = f.poll().unwrap();
+        assert!(matches!(events.as_slice(), [FollowEvent::Items(items)]
+            if matches!(items.as_slice(), [Item::User { text, .. }] if text == "old prompt")));
+        assert!(f.poll().unwrap().is_empty());
+    }
+    #[test]
+    fn large_v1_appends_key_only_new_entries_and_rewrites_reconcile_once() {
+        let tree = fixtures::tree();
+        let path = tree.path().join("legacy.jsonl");
+        let header = include_str!("../../tests/fixtures/v1-session.jsonl")
+            .lines()
+            .next()
+            .unwrap();
+        let mut original = format!("{header}\n{}", legacy_message("old prompt").repeat(500));
+        fs::write(&path, &original).unwrap();
+        let mut f = follower(&tree, &path);
+        FULL_RECONCILIATIONS.with(|count| count.set(0));
+        LEGACY_KEYS.with(|count| count.set(0));
+        for i in 0..5 {
+            let text = format!("new {i}");
+            let line = legacy_message(&text);
+            original.push_str(&line);
+            append(&path, &line);
+            let events = f.poll().unwrap();
+            assert!(matches!(events.as_slice(), [FollowEvent::Items(items)]
+                if matches!(items.as_slice(), [Item::User { text: actual, .. }] if actual == &text)));
+        }
+        assert_eq!(FULL_RECONCILIATIONS.with(|count| count.get()), 0);
+        assert_eq!(LEGACY_KEYS.with(|count| count.get()), 5);
+        let (header, entries) = original.split_once('\n').unwrap();
+        fs::write(
+            &path,
+            format!("{header}\n{{\"type\":\"future_metadata\"}}\n{entries}"),
+        )
+        .unwrap();
+        let events = f.poll().unwrap();
+        assert!(
+            matches!(events.as_slice(), [FollowEvent::Rewritten { .. }, FollowEvent::Items(items)] if items.is_empty())
+        );
+        assert_eq!(FULL_RECONCILIATIONS.with(|count| count.get()), 1);
+        assert_eq!(LEGACY_KEYS.with(|count| count.get()), 5 + 506);
     }
     #[test]
     fn deleted_parent_follows_new_continuation_immediately() {

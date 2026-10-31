@@ -187,6 +187,79 @@ fn same_inode_rewrites_at_or_above_the_old_length_emit_rewritten_then_items() {
     }
 }
 #[test]
+fn equal_size_early_prefix_rewrite_is_not_hidden_by_the_unchanged_tail_window() {
+    let sb = OmpBox::new();
+    let path = sb.session('A');
+    let original = fs::read_to_string(&path).unwrap()
+        + &format!(
+            "{}\n",
+            j!({"type":"future", "id":"padding", "parentId":"10000009", "data":"x".repeat(9000)})
+        );
+    fs::write(&path, &original).unwrap();
+    let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    f.backlog();
+    let before = fs::metadata(&path).unwrap();
+    let rewritten = original
+        .replace("10000003", "90000003")
+        .replace("Why does parser_test flake?", "prefix rewrite detected    ");
+    assert_eq!(original.len(), rewritten.len());
+    assert_eq!(
+        &original.as_bytes()[original.len() - 4096..],
+        &rewritten.as_bytes()[rewritten.len() - 4096..]
+    );
+    fs::write(&path, rewritten).unwrap();
+    fs::File::open(&path)
+        .unwrap()
+        .set_modified(before.modified().unwrap() + Duration::from_secs(1))
+        .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(before.ino(), fs::metadata(&path).unwrap().ino());
+    }
+    assert_eq!(f.event()["event"], "rewritten");
+    let item = f.event();
+    assert_eq!(item["item"]["id"], "90000003");
+    assert_eq!(item["item"]["text"], "prefix rewrite detected    ");
+    append(
+        &path,
+        &message("after-prefix", "padding", "normal append after rewrite"),
+    );
+    assert_eq!(f.event()["item"]["id"], "after-prefix");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    drop(f);
+    sb.clean();
+}
+#[test]
+fn v1_rewrite_removes_stale_occurrences_before_a_genuinely_new_duplicate() {
+    let sb = OmpBox::new();
+    let path = sb.alpha().join("legacy.jsonl");
+    let header = include_str!("fixtures/v1-session.jsonl")
+        .lines()
+        .next()
+        .unwrap();
+    let a = format!(
+        "{}\n",
+        j!({"type":"message", "message":{"role":"user", "content":"old prompt"}})
+    );
+    let b = a.replace("old prompt", "another prompt");
+    fs::write(&path, format!("{header}\n{a}{a}{b}")).unwrap();
+    let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    assert_eq!(f.event()["event"], "session");
+    for text in ["old prompt", "old prompt", "another prompt"] {
+        assert_eq!(f.event()["item"]["text"], text);
+    }
+    fs::write(&path, format!("{header}\n{a}{b}")).unwrap();
+    assert_eq!(f.event()["event"], "rewritten");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    append(&path, &a);
+    assert_eq!(f.event()["item"]["text"], "old prompt");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    drop(f);
+    sb.clean();
+}
+
+#[test]
 fn v1_rewrite_with_shifted_ordinals_emits_only_new_content() {
     let sb = OmpBox::new();
     let path = sb.alpha().join("legacy.jsonl");
