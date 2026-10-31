@@ -9,22 +9,12 @@ exec 3>&1
 MODE="${1:-}"
 [ "$#" -eq 0 ] || shift
 PROFILE=glen-harness
-# Mirrors omp-profile-setup.sh's ladder: each model's own thinking level, kept
-# in sync there. The engine never writes config; it only maps the resolved
-# modelRoles.default back to the level setup chose when it selected that id.
-MODEL_LADDER=(cursor/gemini-4-argon cursor/gemini-3.8-flash cursor/grok-4.7)
-THINKING_LADDER=(medium medium high)
-thinking_level_for() {
-  local model="$1" i=0
-  while [ "$i" -lt "${#MODEL_LADDER[@]}" ]; do
-    if [ "${MODEL_LADDER[$i]}" = "$model" ]; then
-      printf '%s\n' "${THINKING_LADDER[$i]}"
-      return 0
-    fi
-    i=$((i + 1))
-  done
-  printf '%s\n' "${THINKING_LADDER[0]}"
-}
+# The engine never writes config; it only maps the resolved modelRoles.default
+# back to the level setup chose when it selected that id. $0, not
+# BASH_SOURCE[0]: consistent with omp-profile-setup.sh's sibling line, robust
+# to a test running this script's text through `bash -c "$text" ...`.
+# shellcheck source=.claude/omp/model-ladder.sh
+. "$(cd "$(dirname "$0")/../omp" && pwd -P)/model-ladder.sh"
 START="$(date +%s)"
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
 MODEL='' THINKING_LEVEL='' PROVIDER='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
@@ -52,10 +42,20 @@ usage() {
 profile_agent_dir() {
   printf '%s/%s/profiles/%s/agent\n' "$(cd "$HOME" && pwd -P)" "${PI_CONFIG_DIR:-.omp}" "$PROFILE"
 }
+# A fixed, per-TMPDIR cache outside any per-dispatch run directory. The sandbox
+# profile grants file-write* only on OMP_SANDBOX_RUN_ROOT (the per-dispatch run
+# directory) and specific profile paths; the launcher must never live there,
+# or the sandboxed child could overwrite its own policy enforcement.
+launcher_dir_for() {
+  local dir
+  dir="${TMPDIR:-/tmp}"
+  dir="$(cd "$dir" && pwd -P)" || return 1
+  printf '%s/glen-omp-engine-launcher\n' "$dir"
+}
 dispatch_env() {
   local engine_root agent_dir real_omp
   engine_root="${ENGINE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
-  resolve_launcher "$engine_root" "$RUN_DIR" || { log "$REASON"; stop failed "$REASON" 4; }
+  resolve_launcher "$engine_root" "$(launcher_dir_for)" || { log "$REASON"; stop failed "$REASON" 4; }
   agent_dir="$(profile_agent_dir)"
   real_omp="$(command -v omp)" || stop failed 'omp not on PATH' 4
   case "$real_omp" in /*) ;; *) real_omp="$PWD/$real_omp" ;; esac
@@ -68,22 +68,63 @@ dispatch_env() {
     GLEN_JOB_TIMEOUT="${JOB_TIMEOUT_SECONDS}s" "$@" 3>&-
 }
 
+# Refuses if $1's permission bits allow group or other write, or if it is not
+# owned by the current user. Used for the launcher cache directory and file.
+check_no_group_other_write() {
+  local path="$1" owner permissions
+  if [ "$(uname -s)" = Darwin ]; then
+    owner="$(stat -f '%u' "$path")" && permissions="$(stat -f '%Lp' "$path")" || return 1
+  else
+    owner="$(stat -c '%u' "$path")" && permissions="$(stat -c '%a' "$path")" || return 1
+  fi
+  [ "$owner" = "$(id -u)" ] || return 1
+  (( (8#$permissions & 0022) == 0 ))
+}
 # The one platform/source decision, shared by dispatch, probes, and setup's
-# internal `launcher SRC DIR` helper. DIR belongs to the caller's run lifetime.
+# internal `launcher SRC DIR` helper. DEST must never be a directory the
+# sandboxed child can write to: refuse any destination that is, or sits
+# inside, a per-dispatch run directory (the "run-*" naming resolve_root uses),
+# and re-verify owner/mode on every dispatch, not just at creation.
 resolve_launcher() {
   local src="$1" dest="$2" launcher tool platform
   platform="$(uname -s)"
-  if [ "$platform" = Darwin ]; then launcher=omp-sandboxed.sh; tool=sandbox-exec
-  else launcher=omp-sandboxed-linux.sh; tool=bwrap
-  fi
+  # The omp engine is unavailable on Linux (probe_checks gates this earlier);
+  # this is a second, independent refusal so resolve_launcher never selects
+  # the bwrap launcher even if called directly.
+  [ "$platform" = Darwin ] || { REASON='unavailable: linux abstract-socket isolation not supported'; return 1; }
+  launcher=omp-sandboxed.sh; tool=sandbox-exec
   if ! command -v "$tool" >/dev/null 2>&1; then
-    if [ "$platform" = Darwin ]; then platform=macOS; else platform=Linux; fi
-    REASON="$tool not on PATH; the omp sandbox requires it on $platform"
+    REASON="$tool not on PATH; the omp sandbox requires it on macOS"
     return 1
   fi
-  # Reuse the captured executable within this run, but recheck tool availability
-  # on every dispatch. Never select an inherited GLEN_OMP_BIN/OMP_REAL_BIN.
-  case "$LAUNCHER_BIN" in "$dest"/*) [ ! -x "$LAUNCHER_BIN" ] || return 0 ;; esac
+  case "$dest" in
+    */glen-omp-engine/run-*)
+      REASON='sandbox launcher must not be placed inside a per-dispatch run directory'
+      return 1
+      ;;
+  esac
+  if [ -n "${RUN_DIR:-}" ]; then
+    case "$dest/" in
+      "$RUN_DIR"/*) REASON='sandbox launcher must not be placed inside the active run directory'; return 1 ;;
+    esac
+    [ "$dest" != "$RUN_DIR" ] || { REASON='sandbox launcher must not be placed inside the active run directory'; return 1; }
+  fi
+  mkdir -p "$dest" || { REASON='could not create sandbox launcher directory'; return 1; }
+  chmod 0700 "$dest" || { REASON='could not secure sandbox launcher directory'; return 1; }
+  check_no_group_other_write "$dest" || {
+    REASON="unsafe sandbox launcher directory: $dest is not exclusively owned and writable by the current user"
+    return 1
+  }
+  # Reuse the captured executable within this run, but recheck ownership/mode
+  # and tool availability on every dispatch. Never select an inherited
+  # GLEN_OMP_BIN/OMP_REAL_BIN.
+  case "$LAUNCHER_BIN" in
+    "$dest"/*)
+      if [ -x "$LAUNCHER_BIN" ] && check_no_group_other_write "$LAUNCHER_BIN"; then
+        return 0
+      fi
+      ;;
+  esac
   LAUNCHER_BIN="$(mktemp "$dest/$launcher.XXXXXX")" || { REASON='could not create sandbox launcher'; return 1; }
   if git -C "$src" show "main:.claude/omp/$launcher" > "$LAUNCHER_BIN" 2>/dev/null; then
     LAUNCHER_SOURCE=main
@@ -93,6 +134,10 @@ resolve_launcher() {
     log 'warning: main launcher unavailable; using the worktree launcher'
   fi
   chmod 0700 "$LAUNCHER_BIN" || { REASON='could not make sandbox launcher executable'; return 1; }
+  check_no_group_other_write "$LAUNCHER_BIN" || {
+    REASON='unsafe sandbox launcher file permissions after creation'
+    return 1
+  }
 }
 
 # SRC is an engine checkout, not the tree being reviewed.
@@ -285,14 +330,21 @@ prepare_root() {
 # for these git-free snapshots). Inspect the physical chain all the way to /,
 # including ROOT's parent; shared sticky directories get no permission exception.
 validate_snapshot_ancestors() {
-  local ancestor context permissions
+  local ancestor context permissions matches
   ancestor="$(cd "$(dirname "$1")" && pwd -P)" || stop skipped 'unsafe snapshot ancestor: could not resolve parent' 3
   while :; do
-    if ! context="$(find "$ancestor" -mindepth 1 -maxdepth 1 \
-      \( -iname AGENTS.md -o -iname CLAUDE.md \) \( -type f -o -type l \) -print -quit)"; then
-      stop skipped "unsafe snapshot ancestor: could not inspect $ancestor" 3
-    fi
-    [ -z "$context" ] || stop skipped "unsafe snapshot ancestor: context file $context" 3
+    # Glob only this directory's own entry names, case-insensitively, instead
+    # of a find traversal: a sibling vanishing mid-scan must never turn into
+    # a false "could not inspect" failure (Claude MED-002). nullglob makes a
+    # non-match expand to nothing rather than the literal pattern; nocaseglob
+    # covers every AGENTS.md/CLAUDE.md case variant without -iname.
+    shopt -s nocaseglob nullglob
+    matches=("$ancestor"/AGENTS.md "$ancestor"/CLAUDE.md)
+    shopt -u nocaseglob nullglob
+    for context in "${matches[@]}"; do
+      [ -f "$context" ] || [ -L "$context" ] || continue
+      stop skipped "unsafe snapshot ancestor: context file $context" 3
+    done
     if [ "$(uname -s)" = Darwin ]; then
       permissions="$(stat -f '%Lp' "$ancestor")" || stop skipped "unsafe snapshot ancestor: could not stat $ancestor" 3
     else
@@ -324,7 +376,7 @@ bounded_omp() {
   local seconds="$1" cwd real_omp agent_dir
   shift
   cwd="$(mktemp -d "$PROBE_DIR/call.XXXXXX")" || return 1
-  resolve_launcher "$ENGINE_ROOT" "$PROBE_DIR" || { log "$REASON"; return 1; }
+  resolve_launcher "$ENGINE_ROOT" "$(launcher_dir_for)" || { log "$REASON"; return 1; }
   real_omp="$(command -v omp)" || return 1
   case "$real_omp" in /*) ;; *) real_omp="$PWD/$real_omp" ;; esac
   agent_dir="$(profile_agent_dir)"
@@ -346,14 +398,19 @@ bounded_omp() {
 probe_checks() {
   local models value rc
   [ "${GLEN_OMP_ENGINE:-}" != off ] || stop skipped 'disabled by GLEN_OMP_ENGINE=off' 3
+  # Orchestrator decision (fix cycle 4): the omp engine is unavailable on
+  # Linux in v0.1.0. bwrap cannot isolate abstract Unix sockets while still
+  # letting the sandboxed process reach Cursor over the network, so there is
+  # no safe bwrap policy today. omp-sandboxed-linux.sh stays in the repo for
+  # a later Landlock-based version, but dispatch never calls it; this check
+  # runs before resolve_launcher, regardless of whether bwrap happens to be
+  # on PATH.
+  if [ "$(uname -s)" != Darwin ]; then
+    stop skipped 'unavailable: linux abstract-socket isolation not supported' 3
+  fi
   resolve_glen || stop skipped 'no glen binary; run .claude/scripts/omp-profile-setup.sh' 3
   command -v omp >/dev/null 2>&1 || stop skipped 'omp not on PATH' 3
-  if [ "$(uname -s)" = Darwin ] && ! command -v sandbox-exec >/dev/null 2>&1; then
-    stop skipped 'sandbox-exec not on PATH; the omp sandbox requires it on macOS' 3
-  fi
-  if [ "$(uname -s)" != Darwin ] && ! command -v bwrap >/dev/null 2>&1; then
-    stop skipped 'bwrap not on PATH; the omp sandbox requires it on Linux' 3
-  fi
+  command -v sandbox-exec >/dev/null 2>&1 || stop skipped 'sandbox-exec not on PATH; the omp sandbox requires it on macOS' 3
   [ -f "$(profile_agent_dir)/config.yml" ] || \
     stop skipped 'glen-harness profile is not set up; run .claude/scripts/omp-profile-setup.sh' 3
   prepare_root || stop skipped "$REASON" 3
@@ -376,6 +433,9 @@ probe_checks() {
   [ "$rc" -eq 0 ] || stop skipped 'modelRoles.default config check failed' 3
   MODEL="$(printf '%s' "$value" | jq -er '.value.default | select(type == "string" and length > 0)')" || \
     stop skipped 'modelRoles.default config check failed' 3
+  # Item 10 (fix cycle 4): setup persists "<id>:<level>" (omp honours this
+  # suffix itself); strip it before matching the ladder or reporting MODEL.
+  MODEL="${MODEL%%:*}"
   THINKING_LEVEL="$(thinking_level_for "$MODEL")"
   STATUS=ready REASON='' EXIT_CODE=0
 }

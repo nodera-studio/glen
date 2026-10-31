@@ -41,11 +41,34 @@ sbpl_path() {
   value="${value//\\/\\\\}"
   printf '%s' "${value//\"/\\\"}"
 }
+# Escape a path for use inside an SBPL (regex #"...") literal: backslash-escape
+# regex metacharacters first, then SBPL-quote the result like sbpl_path.
+sbpl_regex_literal() {
+  local value="$1" out="" ch i len
+  case "$value" in *$'\n'* | *$'\r'*) die 'newline in sandbox path' ;; esac
+  len=${#value}
+  for ((i = 0; i < len; i++)); do
+    ch="${value:i:1}"
+    case "$ch" in
+      $'\\' | '.' | '^' | '$' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|')
+        out="$out\\$ch"
+        ;;
+      '"')
+        out="$out\\\""
+        ;;
+      *)
+        out="$out$ch"
+        ;;
+    esac
+  done
+  printf '%s' "$out"
+}
 home_sb="$(sbpl_path "$REAL_HOME")"
 run_sb="$(sbpl_path "$RUN_ROOT_REAL")"
 bin_sb="$(sbpl_path "$OMP_REAL_BIN_RESOLVED")"
 agent_sb="$(sbpl_path "$PROFILE_AGENT_DIR")"
 profile_sb="$(sbpl_path "$PROFILE_ROOT")"
+agent_regex="$(sbpl_regex_literal "$PROFILE_AGENT_DIR")"
 # Preserve read-only treatment for other entries already present in the agent
 # directory. SQLite database families and sessions need directory operations;
 # new transient filenames are intentionally covered by the broad write grant.
@@ -69,7 +92,10 @@ cat > "$profile" <<EOF
 ;; Without Apple's fragment, dyld can abort before emitting any sandbox deny log.
 (import "dyld-support.sb")
 ;; omp execs itself; tool approval independently denies bash/eval/task.
-(allow process-exec*)
+;; S5 fix-cycle-4 (host-verified via a real send, 2026-10-31): execution is
+;; limited to the physical omp binary itself; omp execs itself, and tool
+;; approval independently denies bash/eval/task.
+(allow process-exec* (literal "$bin_sb"))
 (allow process-fork)
 (allow file-read*
   ;; Snapshot/run tree; also Bun's startup cwd accessibility probe.
@@ -77,20 +103,24 @@ cat > "$profile" <<EOF
   ;; Dylib dependencies and system frameworks.
   (subpath "/usr")
   (subpath "/System")
-  (subpath "/Library")
   ;; TLS root certificates for the Cursor API.
   (subpath "/private/etc/ssl")
   ;; Runtime device nodes and timezone database.
   (subpath "/dev")
   (subpath "/private/var/db/timezone")
+  ;; S5 fix-cycle-4 (host-verified, 2026-10-31): the only /Library path a real
+  ;; send actually touched was Bun's own JIT/module cache; a clean run with no
+  ;; /Library grant at all still completed (denials there are non-fatal), so
+  ;; the full subpath grant this replaced was unnecessarily broad.
+  (subpath "/Library/Caches/bun")
   ;; DNS config files Bun's getaddrinfo (and dscacheutil) consult.
   (literal "/private/etc/hosts")
   (literal "/private/etc/resolv.conf")
   (literal "/private/etc/services")
   ;; The physical, self-contained omp executable.
   (literal "$bin_sb")
-  ;; Agent contents are readable; the later write-deny stanza protects config,
-  ;; extensions, skills, and other non-runtime entries present at launch.
+  ;; Agent contents are readable; the write allowlist below (not a broad
+  ;; subpath grant) governs what omp may write there.
   (subpath "$agent_sb")
   ;; Profile-scoped runtime siblings observed in the host's S3 write-map.
   (subpath "$profile_sb/logs")
@@ -99,12 +129,15 @@ cat > "$profile" <<EOF
   ;; Shared native cache: populated unsandboxed by setup, then read-only here.
   (subpath "$home_sb/.omp/natives")
 )
+;; S4 fix-cycle-4 allowlist (host-verified via a real send, 2026-10-31): omp's
+;; own state databases and their WAL/SHM/journal siblings, plus sessions/ and
+;; logs/, are the only agent-directory writes a real dispatch needs. Nothing
+;; else in the agent or profile directory is writable; the agent and profile
+;; directories themselves cannot be renamed, unlinked or replaced (below).
 (allow file-write*
   ;; Job artifacts and harness runtime state.
   (subpath "$run_sb")
-  ;; Host SQLite CREATE/INSERT/SELECT probes require a genuine directory grant
-  ;; for journals/locks/renames; literal DB grants (even + directory literal) fail.
-  (subpath "$agent_sb")
+  (regex #"^$agent_regex/(agent|models|skill-descriptions)\.db(-wal|-shm|-journal)?\$")
   (subpath "$agent_sb/sessions")
   (subpath "$profile_sb/logs")
   (subpath "$profile_sb/cache")
@@ -116,9 +149,12 @@ cat > "$profile" <<EOF
   (literal "/dev/null")
   (literal "/dev/tty")
 )
-;; Host-verified S3 shape: these later denies override the agent-directory allow.
-;; Keep fixed configuration protected even when a file/directory is absent.
+;; The agent and profile directories themselves must never be renamed,
+;; unlinked or replaced; this is why the allow above is a named-entry
+;; allowlist, never a (subpath "$agent_sb") write grant.
 (deny file-write*
+  (literal "$agent_sb")
+  (literal "$profile_sb")
   (literal "$agent_sb/config.yml")
   (literal "$agent_sb/config.yml.lock")
   (literal "$agent_sb/mcp.json")
@@ -126,16 +162,24 @@ cat > "$profile" <<EOF
   (subpath "$agent_sb/skills")
 $readonly_filters
 )
-;; Isolated S4 host-validation candidate (2026-10-31): Apple parsecd uses bare
-;; (remote ip), never the nonmatching (remote ip "*:*") form. The host's earlier
-;; deny-default trials failed DNS; sandbox_apply EPERM blocks Codex verification.
-;; DNS/chat completion is pending the owner's isolated host check, not proven by
-;; cached models output. Other Unix socket paths receive no outbound grant.
-(allow network-outbound (remote ip))
+;; Fix cycle 4, item 6 (accepted exfiltration residual, documented in
+;; SKILL.md under Risks): outbound is restricted to TCP 443 (any host, not
+;; just Cursor's) plus the mDNSResponder DNS socket below. omp still needs
+;; name resolution and Cursor's API is plain HTTPS/443, so this is the
+;; narrowest grant that keeps a real dispatch working; it does not confine
+;; traffic to Cursor specifically.
+(allow network-outbound (remote tcp "*:443"))
 ;; Apple com.apple.security.XPCTimeStampingService.sb:79: DNS Unix socket.
 (allow network-outbound (literal "/private/var/run/mDNSResponder"))
-;; Keep XPC lookup broad while the coupled S4 DNS investigation is unresolved.
-(allow mach-lookup)
+;; S5 fix-cycle-4 (host-verified via a real send and models cursor --json,
+;; 2026-10-31): no mach-lookup allow at all. A real dispatch with this removed
+;; still completed; the denied lookups seen in the log (opendirectoryd,
+;; diagnosticd, FSEvents, PowerManagement, securityd.xpc, SecurityServer) are
+;; all non-fatal telemetry/identity probes omp tolerates failing. Explicitly
+;; never allowed: com.apple.coreservices.launchservicesd and the
+;; com.apple.pasteboard.* family (SBPL global-name has no wildcard, so there
+;; is no single deny clause for the family; neither was requested in any
+;; trial, and (deny default) already covers both).
 ;; Bun JavaScript engine CPU/host feature detection.
 (allow sysctl-read)
 ;; Host-verified (log stream, 2026-10-31): dscacheutil/Bun's getaddrinfo denied

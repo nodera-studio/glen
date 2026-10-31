@@ -134,10 +134,24 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   assert 'sandbox profile contains no unresolved fixture alias' test "$(grep -Fc sandbox-alias "$generated_profile" || true)" -eq 0
   # An opening quote followed by /var/ must never survive physical resolution.
   assert 'sandbox profile contains no logical /var literal' test "$(grep -Fc '\"/var/' "$generated_profile" || true)" -eq 0
-  # SQLite requires directory writes; later denies keep configuration read-only.
+  # Fix cycle 4, item 2: a named-entry write allowlist, never a broad subpath
+  # grant over the agent directory. SQLite's directory-level needs (WAL/journal/
+  # lock) are met by the state-database regex below, not a subpath grant.
   sed -n '/^(allow file-write\*/,/^)/p' "$generated_profile" > "$WORK/sandbox-writes"
   sed -n '/^(deny file-write\*/,/^)/p' "$generated_profile" > "$WORK/sandbox-write-denies"
-  assert_contains 'sandbox grants directory operations needed by SQLite' "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/agent\")" "$WORK/sandbox-writes"
+  assert 'sandbox agent directory has no broad write subpath grant' test \
+    "$(grep -Fc "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/agent\")" "$WORK/sandbox-writes" || true)" -eq 0
+  # Escape the full fixture path the same way sbpl_regex_literal does (every
+  # dot, not just the one before "omp"): $WORK itself contains a literal dot
+  # (mktemp's "glen-omp-smoke.XXXXXX"), which the real regex also escapes.
+  expected_agent_regex="$(printf '%s' "$sandbox_base/home/.omp/profiles/glen-harness/agent" | sed 's/\./\\./g')"
+  assert_contains 'sandbox grants only the named state-database family for SQLite' \
+    "(regex #\"^$expected_agent_regex/(agent|models|skill-descriptions)\\.db(-wal|-shm|-journal)?\$\")" \
+    "$WORK/sandbox-writes"
+  assert_contains 'sandbox denies renaming or unlinking the agent directory itself' \
+    "(literal \"$sandbox_base/home/.omp/profiles/glen-harness/agent\")" "$WORK/sandbox-write-denies"
+  assert_contains 'sandbox denies renaming or unlinking the profile root itself' \
+    "(literal \"$sandbox_base/home/.omp/profiles/glen-harness\")" "$WORK/sandbox-write-denies"
   assert 'sandbox configuration denies follow directory write allow' awk \
     '/^\(allow file-write\*/ { allow=NR } /^\(deny file-write\*/ { deny=NR } END { exit !(allow>0 && deny>allow) }' "$generated_profile"
   assert 'sandbox native cache has no write grant' test "$(grep -Fc '/.omp/natives' "$WORK/sandbox-writes" || true)" -eq 0
@@ -153,16 +167,22 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
     assert_contains "sandbox permits runtime subtree $path" \
       "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/$path\")" "$WORK/sandbox-writes"
   done
-  assert_contains 'sandbox outbound IP uses bare Apple filter' '(allow network-outbound (remote ip))' "$generated_profile"
+  assert_contains 'sandbox outbound restricted to TCP 443' '(allow network-outbound (remote tcp "*:443"))' "$generated_profile"
+  assert 'sandbox outbound grants no bare IP filter' test "$(grep -Fc '(allow network-outbound (remote ip))' "$generated_profile" || true)" -eq 0
   assert_contains 'sandbox explicitly permits DNS Unix socket' '(allow network-outbound (literal "/private/var/run/mDNSResponder"))' "$generated_profile"
   assert 'sandbox has no blanket outbound grant' test "$(grep -Fxc '(allow network-outbound)' "$generated_profile" || true)" -eq 0
-  assert_contains 'sandbox retains broad mach lookup for isolated host check' '(allow mach-lookup)' "$generated_profile"
+  assert 'sandbox grants no mach-lookup at all (S5)' test "$(grep -Fc '(allow mach-lookup)' "$generated_profile" || true)" -eq 0
+  assert 'sandbox restricts process-exec to the resolved binary (S5)' test \
+    "$(grep -Fc '(allow process-exec* (literal "'"$(cd /bin && pwd -P)"'/cat"))' "$generated_profile" || true)" -eq 1
+  assert 'sandbox grants no blanket process-exec*' test "$(grep -Fxc '(allow process-exec*)' "$generated_profile" || true)" -eq 0
 
   mkdir -p "$sandbox_base/home/custom-omp/profiles/glen-harness/agent"
   sandbox_agent="$sandbox_alias/home/custom-omp/profiles/glen-harness/agent"
   run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
   custom_profile="$(grep -Fl -- "$sandbox_base/home/custom-omp/profiles/glen-harness/agent" "$sandbox_base/run"/omp-sandbox.*)"
-  assert 'sandbox explicit profile path is canonical for reads and SQLite writes' test "$(grep -Fc "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent\")" "$custom_profile")" -eq 2
+  # Appears twice: the file-read* grant, and the explanatory comment above
+  # the deny stanza that names the directory it protects from being renamed.
+  assert 'sandbox explicit profile path is canonical for reads' test "$(grep -Fc "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent\")" "$custom_profile")" -eq 2
   assert_contains 'sandbox custom profile denies configuration writes' "(literal \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent/config.yml\")" "$custom_profile"
   assert_contains 'sandbox custom profile includes sibling logs' "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/logs\")" "$custom_profile"
   assert 'sandbox explicit profile does not admit old profile root' test "$(grep -Fc '.omp/profiles/glen-harness' "$custom_profile" || true)" -eq 0
@@ -217,8 +237,10 @@ PY
   fi
 
   if [ "$sandbox_runtime" -eq 1 ]; then
-    # shellcheck disable=SC2016 # The sandboxed child must expand its own HOME.
-    run_sandbox sandbox_call /bin/sh -c 'printf "%s\n" "$HOME"'
+    # process-exec* is restricted to the literal resolved binary (S5), so this
+    # probe uses printenv directly instead of /bin/sh -c (sh re-execs /bin/bash
+    # internally on this platform, which the narrowed grant would deny).
+    run_sandbox sandbox_call /usr/bin/printenv HOME
     assert_eq 'sandbox child inherits canonical HOME' "$(cat "$STDOUT")" "$sandbox_base/home"
     for denied in home/.ssh/known_hosts home/glen-canary.txt home/.omp/agent/config.yml AGENTS.md; do
       run_sandbox sandbox_call /bin/cat "$sandbox_base/$denied"
@@ -264,17 +286,35 @@ PY
     done
 
     if [ -n "$socket_python" ]; then
-      # The same executable reports connect()'s OSError in both runs. BSD nc -U
-      # emits no diagnostic on failure, so it cannot distinguish ENOENT/EPERM.
-      # Capture output through pipes; the listener stays unconfined.
-      run fixture_omp_env "$socket_python" -I - "$SANDBOX" "$sandbox_base" "$socket_probe" "$WORK/foreign.sock" <<'PY'
+      # S5 (fix cycle 4) restricts process-exec* to the literal resolved
+      # binary and read access no longer covers /Library beyond Bun's own
+      # cache, so the sandboxed leg of this probe cannot use python3 (it
+      # dlopens its own CommandLineTools framework, a separate file-read
+      # outside any grant). Perl has no such dependency and is already
+      # covered by the existing subpath "/usr" read grant. The unconfined
+      # control leg is unaffected and still uses the existing Python probe.
+      sandbox_probe_pl="$sandbox_base/run/sockconnect.pl"
+      cat > "$sandbox_probe_pl" <<'PL'
+use strict;
+use warnings;
+use Socket qw(PF_UNIX SOCK_STREAM sockaddr_un);
+my ($path) = @ARGV;
+socket(my $sock, PF_UNIX, SOCK_STREAM, 0) or die "socket: $!\n";
+if (connect($sock, sockaddr_un($path))) {
+  print "glen-unix-connected\n";
+} else {
+  print STDERR "$!\n";
+  exit 1;
+}
+PL
+      run fixture_omp_env "$socket_python" -I - "$SANDBOX" "$sandbox_base" "$socket_probe" "$sandbox_probe_pl" "$WORK/foreign.sock" <<'PY'
 import json
 import os
 import socket
 import subprocess
 import sys
 
-launcher, base, probe, foreign = sys.argv[1:]
+launcher, base, probe, probe_pl, foreign = sys.argv[1:]
 with socket.socket(socket.AF_UNIX) as server:
     server.bind(foreign)
     server.listen(2)
@@ -287,10 +327,10 @@ with socket.socket(socket.AF_UNIX) as server:
             accepted, _ = server.accept()
             accepted.close()
             connected = True
-        env = dict(os.environ, HOME=base + "/home", OMP_REAL_BIN=probe,
+        env = dict(os.environ, HOME=base + "/home", OMP_REAL_BIN="/usr/bin/perl",
                    OMP_SANDBOX_RUN_ROOT=base + "/run",
                    OMP_PROFILE_AGENT_DIR=base + "/home/.omp/profiles/glen-harness/agent")
-        child = subprocess.run(["/bin/bash", launcher, foreign], env=env, cwd=base + "/run",
+        child = subprocess.run(["/bin/bash", launcher, probe_pl, foreign], env=env, cwd=base + "/run",
                                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                stderr=subprocess.PIPE, timeout=5)
         print(json.dumps({"control_connected": connected, "control_code": control.returncode,
@@ -305,7 +345,7 @@ PY
       assert_exit 'foreign Unix socket fixture completes' 0
       assert 'foreign Unix socket accepts unconfined control' jq -e '.control_connected == true' "$STDOUT"
       assert 'foreign Unix socket accepts identical unconfined Python probe' jq -e '.control_code == 0 and .control_output == "glen-unix-connected\n" and .control_stderr == ""' "$STDOUT"
-      assert 'sandbox refuses foreign Unix socket connection' jq -e '.code == 1 and .stdout == "" and (.stderr == "[Errno 1] Operation not permitted\n" or .stderr == "[Errno 13] Permission denied\n")' "$STDOUT"
+      assert 'sandbox refuses foreign Unix socket connection' jq -e '.code == 1 and .stdout == "" and (.stderr | test("Operation not permitted|Permission denied"))' "$STDOUT"
     fi
   fi
 
@@ -603,7 +643,14 @@ for name in AGENTS.md cLaUdE.mD; do
   run /bin/bash "$ENGINE" snapshot "$SRC" "$ancestor/glen-omp-engine/run/tree"
   assert_exit "snapshot refuses ancestor context $name" 3
   assert "ancestor context $name is a skip" jq -e '.status == "skipped"' "$STDOUT"
-  assert_contains "ancestor context $name reason names file" "$ancestor/$name" "$STDOUT"
+  # MED-002's nocaseglob match returns the on-disk entry name for its own
+  # case variant; on a case-insensitive filesystem the directory lookup can
+  # also report the pattern's own casing for an exact-string match, so check
+  # the ancestor directory and basename case-insensitively, not full exact text.
+  assert_contains "ancestor context $name reason names directory" "$ancestor" "$STDOUT"
+  # shellcheck disable=SC2016 # $1/$2 expand inside the inner bash -c, not here.
+  assert "ancestor context $name reason names the file case-insensitively" bash -c \
+    'printf "%s" "$1" | grep -qi "$2"' _ "$(jq -r .reason "$STDOUT")" "$name"
   assert_contains "ancestor context $name reason names problem" 'context file' "$STDOUT"
 done
 ancestor="$WORK/ancestor-permissions"
@@ -772,7 +819,8 @@ assert_contains 'dispatch overwrites inherited real binary' "OMP_REAL_BIN=$WORK/
 # Successful production paths use offline stubs, never the owner's omp/profile.
 export SMOKE_OMP_CALLS="$WORK/omp-calls" SMOKE_DISPATCH_CALLS="$WORK/dispatch-calls"
 export SMOKE_OMP_FDS="$WORK/omp-fds" SMOKE_DISPATCH_FDS="$WORK/dispatch-fds"
-export SMOKE_SESSION="$WORK/session.jsonl"
+export SMOKE_SESSION="$WORK/session.jsonl" SMOKE_SEND_ARGV="$WORK/send-argv"
+: > "$SMOKE_SEND_ARGV"
 printf '%s\n' '{"type":"message","message":{"role":"assistant","model":"fixture","provider":"cursor","usage":{"input":1,"output":1}}}' > "$SMOKE_SESSION"
 cat > "$WORK/bin/omp" <<'EOF'
 #!/bin/sh
@@ -803,12 +851,17 @@ fd3=closed
 printf '%s %s\n' "$command" "$fd3" >> "$SMOKE_DISPATCH_FDS"
 [ "$fd3" = closed ] || exit 99
 [ -f "${GLEN_OMP_BIN:-}" ] && [ -x "$GLEN_OMP_BIN" ] || exit 99
-case "$GLEN_OMP_BIN" in "$OMP_SANDBOX_RUN_ROOT"/omp-sandboxed*.sh.*) ;; *) exit 99 ;; esac
+# Fix cycle 4, item 1: the launcher must never sit inside the per-dispatch run
+# root (OMP_SANDBOX_RUN_ROOT), which the sandboxed child can write to. It now
+# lives in a fixed, per-TMPDIR cache dir outside any such root.
+case "$GLEN_OMP_BIN" in "$TMPDIR"/glen-omp-engine-launcher/omp-sandboxed*.sh.*) ;; *) exit 99 ;; esac
+case "$GLEN_OMP_BIN" in "$OMP_SANDBOX_RUN_ROOT"/*) exit 99 ;; esac
 [ "$OMP_PROFILE_AGENT_DIR" = "$HOME/.omp/profiles/glen-harness/agent" ] || exit 99
 [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
 printf '%s scrubbed\n' "$command" >> "$SMOKE_DISPATCH_CALLS"
 case "$command" in
   send)
+    printf '%s\n' "$*" >> "${SMOKE_SEND_ARGV:-/dev/null}"
     while [ "$#" -gt 0 ]; do
       if [ "$1" = --cwd ]; then cwd="$2"; break; fi
       shift
@@ -1074,6 +1127,11 @@ for terminal in ok failed; do
   if [ "$terminal" = ok ]; then
     assert_eq 'dispatch captures exact final answer' "$(cat "$CASE_OUT")" "$ANSWER"
     assert 'dispatch sums session usage and replies' jq -e '.replies==1 and .usage=={input:9,output:14,cacheRead:17,cacheWrite:22,totalTokens:62,cost_total:3}' "$STDOUT"
+    # Item 11 (fix cycle 4): the ladder entry's thinking level reaches the send
+    # argv. The fixture model (cursor/fixture) is off-ladder, so
+    # thinking_level_for falls back to the first entry's level (medium), via
+    # the shared ladder file both scripts source.
+    assert_contains 'probe fixture model resolves the ladder fallback thinking level' '--thinking medium' "$SMOKE_SEND_ARGV"
   fi
 done
 
