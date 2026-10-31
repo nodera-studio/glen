@@ -117,6 +117,21 @@ you are uncertain — with its confidence tier; never silently drop a finding. W
 library pattern looks wrong but you are not sure, verify with
 `npx ctx7@latest library <name> "<q>"` then `npx ctx7@latest docs <id> "<q>"`
 rather than guessing from training data.
+
+Two claims never count as verification:
+
+- **Stress is not correctness.** A stress or repeat-run green (`scripts/flake-check.sh`, N
+  passing runs) shows only that a test is not flaky; it is never evidence that a fix is
+  correct. For each fix, ask for the red → green test: one that fails on the code before the
+  fix and passes after it. A fix whose only evidence is a stress run is a finding (Category:
+  Tests).
+- **Linux-only code needs CI.** When the diff adds or changes `cfg(target_os = "linux")`,
+  `bwrap`, `unshare`, `netns`, `renameat2`, `omp-sandboxed-linux.sh`, or a Linux job in
+  `.github/workflows/`, a macOS trace and the host's Linux clippy are not enough. It is
+  verified only by a CI run on the reviewed head that passed `check (ubuntu-latest)` and any
+  Linux sandbox job (`linux-sandbox`). If the brief gives no such run id, report a HIGH
+  finding "Linux-only code unverified: CI run required" (Category: Tests, the Linux-only
+  `file:line`), with **Recommendation: BLOCK**: it holds the gate until the run passes.
 </reasoning>
 
 ## Categories (cover ALL in this single pass)
