@@ -164,6 +164,28 @@ fn unary_io(error: io::Error) -> ClientError {
         ClientError::Protocol(error.to_string())
     }
 }
+/// Reads with an absolute deadline: the remaining time is recomputed before every read, so
+/// the total wait never exceeds `until` however the peer paces its bytes.
+struct DrainReader<'a> {
+    stream: &'a UnixStream,
+    until: Instant,
+}
+impl Read for DrainReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::ErrorKind::TimedOut.into());
+        }
+        // macOS can reject a timeout change once the peer has already closed; reads on such a
+        // socket return what is buffered, then EOF, without blocking.
+        if let Err(e) = self.stream.set_read_timeout(Some(left))
+            && e.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(e);
+        }
+        self.stream.read(buf)
+    }
+}
 fn write_request(
     stream: &mut UnixStream,
     bytes: &[u8],
@@ -192,29 +214,22 @@ fn write_request(
                 if cancelled() {
                     return Err(ClientError::Cancelled);
                 }
-                // AC-1014: bound the drain itself at min(1s, what's left of the write
-                // deadline), an absolute instant, never the caller's own (possibly longer)
-                // read timeout. unary_inner/unary_for set theirs to the full remaining
-                // deadline for the real response wait; open_send already caps its own read
-                // timeout the same way before calling this, so this is a no-op there.
-                let drain = end
-                    .saturating_duration_since(Instant::now())
-                    .min(Duration::from_secs(1))
-                    .max(Duration::from_millis(1));
-                // macOS can reject a timeout change once the peer has already closed.
-                if let Err(e) = stream.set_read_timeout(Some(drain))
-                    && e.raw_os_error() != Some(libc::EINVAL)
-                {
-                    return Err(ClientError::Protocol(e.to_string()));
-                }
+                // AC-1014: the drain has one absolute deadline, min(1s, what's left of the
+                // write deadline), never the caller's own (possibly longer) read timeout.
+                // `DrainReader` recomputes what is left of it before every read, so a peer
+                // trickling bytes cannot stretch the drain past it.
+                let until = end.min(Instant::now() + Duration::from_secs(1));
                 // Do not read ahead: open_send's reader still needs subsequent frames.
-                return read_line(&mut BufReader::with_capacity(1, stream))
-                    .map(Some)
-                    .map_err(|_| {
-                        ClientError::Protocol(
-                            "endpoint closed the connection before reading the request".into(),
-                        )
-                    });
+                return read_line(&mut BufReader::with_capacity(
+                    1,
+                    DrainReader { stream, until },
+                ))
+                .map(Some)
+                .map_err(|_| {
+                    ClientError::Protocol(
+                        "endpoint closed the connection before reading the request".into(),
+                    )
+                });
             }
             Err(e)
                 if matches!(
@@ -609,21 +624,34 @@ mod unary_tests {
         worker.join().unwrap();
     }
 
-    /// AC-1014 / LOW-004: once the write fails and the drain starts, a peer that never
-    /// answers must not make the drain wait the whole remaining write deadline; it is bounded
-    /// at ~1s, not the 10s deadline below. The peer is gone before the write even starts (the
-    /// deterministic way to force EPIPE on this platform); what this test actually pins is
-    /// the *read* bound once that drain begins, which `end` alone would not have capped.
+    /// AC-1014 / LOW-004 (fixes2 decision 5): the drain has one absolute deadline. The peer
+    /// stays connected on a half-closed socket (the write fails with EPIPE) and trickles a frame one byte every 200 ms, each gap well under any single read timeout,
+    /// for ~3 s before its newline. A per-read timeout would keep the drain alive until that
+    /// line completes; the absolute deadline ends it at ~1 s with no frame.
     #[test]
-    fn a_peer_that_never_answers_bounds_the_drain_at_about_one_second_not_the_full_deadline() {
-        let (mut client, peer) = UnixStream::pair().unwrap();
+    fn a_trickling_half_closed_peer_cannot_stretch_the_drain_past_its_deadline() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         client
             .set_write_timeout(Some(Duration::from_millis(200)))
             .unwrap();
-        drop(peer);
+        // Half-close the connection: our write side is shut, so the write fails with EPIPE
+        // on Linux and macOS alike, while the peer can still send. (A peer `SHUT_RD` gives
+        // EPIPE on Linux only.)
+        client.shutdown(Shutdown::Write).unwrap();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let trickle = std::thread::spawn(move || {
+            for _ in 0..15 {
+                if peer.write_all(b"x").is_err()
+                    || done_rx.recv_timeout(Duration::from_millis(200)).is_ok()
+                {
+                    return;
+                }
+            }
+            let _ = peer.write_all(b"\n");
+        });
         let bytes = crate::ops::request_bytes(
             &Op::Send(SendArgs {
                 text: "x".repeat(1024 * 1024),
@@ -642,13 +670,16 @@ mod unary_tests {
             &|| false,
         );
         let elapsed = start.elapsed();
+        let _ = done_tx.send(());
+        trickle.join().unwrap();
         assert!(
-            result.is_err(),
-            "a peer that is gone before it ever answers must not return a frame"
+            matches!(result, Err(ClientError::Protocol(ref m)) if m == "endpoint closed the connection before reading the request"),
+            "the drain must give up before the trickled line completes: {result:?}"
         );
+        // 1 s drain bound, plus a scheduling allowance well under the ~3 s trickle.
         assert!(
-            elapsed < Duration::from_secs(5),
-            "drain took {elapsed:?}, the full 10s deadline was not meant to be reachable"
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(2500),
+            "drain took {elapsed:?}; its absolute deadline is 1 s"
         );
     }
 

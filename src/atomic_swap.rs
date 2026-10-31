@@ -2,7 +2,7 @@
 //! `extension::write` and `skill::write`. Both callers pin a directory fd and keep
 //! their own private `Identity`, so this takes plain (dev, ino, digest) tuples.
 #[cfg(unix)]
-use std::{ffi::OsStr, fs, io};
+use std::{ffi::OsStr, fs, io, path::Path};
 use xxhash_rust::xxh64::xxh64;
 
 /// The outcome of publishing over an existing file.
@@ -85,18 +85,62 @@ fn identity_at(
 #[derive(Debug)]
 pub(crate) enum PublishError {
     BeforeExchange(io::Error),
-    AfterExchange(io::Error),
+    /// `kept` is the name, in the pinned directory, that still holds the displaced file.
+    AfterExchange {
+        error: io::Error,
+        kept: String,
+    },
 }
 #[cfg(unix)]
 impl PublishError {
     pub(crate) fn temp_is_safe_to_clean(&self) -> bool {
         matches!(self, Self::BeforeExchange(_))
     }
-    pub(crate) fn into_io(self) -> io::Error {
+    /// `dir` is the path of the directory `publish_over` worked in. Every after-exchange
+    /// error names the preserved displaced file by its full path (fixes2 decision 6).
+    pub(crate) fn into_io(self, dir: &Path) -> io::Error {
         match self {
-            Self::BeforeExchange(e) | Self::AfterExchange(e) => e,
+            Self::BeforeExchange(e) => e,
+            Self::AfterExchange { error, kept } => io::Error::new(
+                error.kind(),
+                format!(
+                    "{error}; displaced copy kept at {}",
+                    dir.join(kept).display()
+                ),
+            ),
         }
     }
+}
+/// Test-only fault and race injection at the exchange's stages: "exchange" (just before the
+/// syscall), "exchanged" (it completed) and "swapped_back" (the swap-back completed). An
+/// `Err` from the hook is returned as that stage's error.
+#[cfg(all(unix, test))]
+type Hook = Box<dyn FnMut(&str) -> io::Result<()>>;
+#[cfg(all(unix, test))]
+thread_local! {
+    static HOOK: std::cell::RefCell<Option<Hook>> = const { std::cell::RefCell::new(None) };
+}
+/// Installs `hook` on this thread until the returned guard drops.
+#[cfg(all(unix, test))]
+pub(crate) fn set_test_hook(hook: impl FnMut(&str) -> io::Result<()> + 'static) -> HookGuard {
+    HOOK.with(|h| *h.borrow_mut() = Some(Box::new(hook)));
+    HookGuard
+}
+#[cfg(all(unix, test))]
+pub(crate) struct HookGuard;
+#[cfg(all(unix, test))]
+impl Drop for HookGuard {
+    fn drop(&mut self) {
+        HOOK.with(|h| *h.borrow_mut() = None);
+    }
+}
+#[cfg(all(unix, test))]
+fn hook(stage: &str) -> io::Result<()> {
+    HOOK.with(|h| h.borrow_mut().as_mut().map_or(Ok(()), |f| f(stage)))
+}
+#[cfg(all(unix, not(test)))]
+fn hook(_: &str) -> io::Result<()> {
+    Ok(())
 }
 /// Publish `temp` over `name` in `dir`. `expected` is the identity of the file the caller
 /// inspected before writing `temp`; `ours` is the identity `temp` itself has right now (used to
@@ -122,9 +166,14 @@ pub(crate) fn publish_over(
     if force_fallback {
         return fallback(dir, temp, name).map_err(PublishError::BeforeExchange);
     }
+    hook("exchange").map_err(PublishError::BeforeExchange)?;
     match at::renameat_with(dir, temp, dir, name, RenameFlags::EXCHANGE) {
-        Ok(()) => finish_exchange(dir, temp, name, expected, ours, noun)
-            .map_err(PublishError::AfterExchange),
+        Ok(()) => finish_exchange(dir, temp, name, expected, ours, noun).map_err(|error| {
+            PublishError::AfterExchange {
+                error,
+                kept: temp.to_owned(),
+            }
+        }),
         Err(e) if exchange_unsupported(e) => {
             fallback(dir, temp, name).map_err(PublishError::BeforeExchange)
         }
@@ -139,7 +188,7 @@ fn fallback(dir: &rustix::fd::OwnedFd, temp: &str, name: &OsStr) -> io::Result<A
 }
 /// Runs only after the exchange itself has completed: `temp` now holds whatever was displaced
 /// from `name`. Every path either verifies an identity before unlinking `temp`, or leaves it
-/// untouched and says so in the error.
+/// untouched; `publish_over` adds `temp`'s path to every error from here.
 #[cfg(unix)]
 fn finish_exchange(
     dir: &rustix::fd::OwnedFd,
@@ -150,6 +199,7 @@ fn finish_exchange(
     noun: &str,
 ) -> io::Result<Applied> {
     use rustix::fs::{self as at, AtFlags, RenameFlags};
+    hook("exchanged")?;
     let displaced = identity_at(dir, OsStr::new(temp))?;
     if displaced.as_ref().map(|(d, i, g)| (*d, *i, *g)) == Some(expected) {
         at::unlinkat(dir, temp, AtFlags::empty())?;
@@ -158,13 +208,14 @@ fn finish_exchange(
         // Not our expected file: someone else replaced it between our check and the swap.
         // Swap back so `name` keeps publishing the third party's file.
         at::renameat_with(dir, temp, dir, name, RenameFlags::EXCHANGE)?;
+        hook("swapped_back")?;
         let back = identity_at(dir, OsStr::new(temp))?;
         if back.as_ref().map(|(d, i, _)| (*d, *i)) == Some(ours) {
             at::unlinkat(dir, temp, AtFlags::empty())?;
             Ok(Applied::Lost)
         } else {
             Err(io::Error::other(format!(
-                "{noun} changed twice during install; displaced copy kept at {temp}"
+                "{noun} changed twice during install"
             )))
         }
     }
@@ -317,7 +368,7 @@ mod tests {
         std::fs::set_permissions(t.path(), original).unwrap();
         let err = result.expect_err("a read-only directory must fail the exchange");
         assert!(err.temp_is_safe_to_clean(), "the exchange never started");
-        assert_eq!(err.into_io().raw_os_error(), Some(libc::EACCES));
+        assert_eq!(err.into_io(t.path()).raw_os_error(), Some(libc::EACCES));
         assert_eq!(
             std::fs::read(&path).unwrap(),
             b"before",
@@ -329,8 +380,9 @@ mod tests {
         );
     }
     /// HIGH-002: once the exchange has completed, an error must never delete the displaced
-    /// file, even when it cannot re-verify it (the "changed twice" case): a second competing
-    /// writer replaces `temp` again, between our swap-back attempt's own two steps.
+    /// file, even when it cannot re-verify it (the "changed twice" case): a competitor
+    /// replaced the file before our swap, and a third writer replaces `temp` right after our
+    /// swap-back, so `temp` no longer holds our copy.
     #[test]
     fn changed_twice_keeps_the_displaced_copy_and_reports_after_exchange() {
         let t = tempfile::tempdir().unwrap();
@@ -341,18 +393,23 @@ mod tests {
         std::fs::write(&path, b"first-competitor").unwrap();
         let temp = format!(".{name}.tmp");
         let temp_path = t.path().join(&temp);
-        let _ours = write_identity(&temp_path, b"after");
+        let ours = write_identity(&temp_path, b"after");
         let dir = open_dir(t.path());
-        // Force the swap-back to find a THIRD file at `temp`, not ours: simulate by handing a
-        // `ours` identity that can never match what is actually there after the swap-back
-        // (a dev/ino pair no real file on this filesystem has).
-        let impossible_ours = (u64::MAX, u64::MAX);
+        let third = t.path().join("third");
+        std::fs::write(&third, b"third-writer").unwrap();
+        let (third_at, temp_at) = (third.clone(), temp_path.clone());
+        let _hook = set_test_hook(move |stage| {
+            if stage == "swapped_back" {
+                std::fs::rename(&third_at, &temp_at)?;
+            }
+            Ok(())
+        });
         let result = publish_over(
             &dir,
             &temp,
             std::ffi::OsStr::new(name),
             expected,
-            impossible_ours,
+            (ours.0, ours.1),
             false,
             "skill",
         );
@@ -361,11 +418,54 @@ mod tests {
             !err.temp_is_safe_to_clean(),
             "the exchange completed; temp may hold someone else's file"
         );
-        let message = err.into_io().to_string();
+        let message = err.into_io(t.path()).to_string();
         assert!(message.contains("skill changed twice"), "{message}");
-        assert!(message.contains(&temp), "{message}");
-        // The displaced copy is still there, verified or not, exactly where the error says.
-        assert!(temp_path.exists());
+        assert!(
+            message.contains(&format!("displaced copy kept at {}", temp_path.display())),
+            "{message}"
+        );
+        // The third writer's file is still there, exactly where the error says.
+        assert_eq!(std::fs::read(&temp_path).unwrap(), b"third-writer");
         assert_eq!(std::fs::read(&path).unwrap(), b"first-competitor");
+    }
+    /// Fixes2 decision 6: an ordinary failure after the exchange (here the re-verify itself)
+    /// also names the preserved displaced file, and leaves it in place.
+    #[test]
+    fn an_error_after_the_exchange_names_and_keeps_the_displaced_file() {
+        let t = tempfile::tempdir().unwrap();
+        let name = "index.ts";
+        let path = t.path().join(name);
+        let expected = write_identity(&path, b"before");
+        let temp = format!(".{name}.tmp");
+        let temp_path = t.path().join(&temp);
+        let ours = write_identity(&temp_path, b"after");
+        let dir = open_dir(t.path());
+        let _hook = set_test_hook(|stage| {
+            if stage == "exchanged" {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        });
+        let err = publish_over(
+            &dir,
+            &temp,
+            std::ffi::OsStr::new(name),
+            expected,
+            (ours.0, ours.1),
+            false,
+            "extension",
+        )
+        .expect_err("the injected EIO must surface");
+        assert!(!err.temp_is_safe_to_clean());
+        let error = err.into_io(t.path());
+        assert_eq!(error.kind(), io::Error::from_raw_os_error(libc::EIO).kind());
+        let message = error.to_string();
+        assert!(
+            message.contains(&format!("displaced copy kept at {}", temp_path.display())),
+            "{message}"
+        );
+        assert_eq!(std::fs::read(&temp_path).unwrap(), b"before");
+        assert_eq!(std::fs::read(&path).unwrap(), b"after");
     }
 }
