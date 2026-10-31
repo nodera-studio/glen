@@ -67,7 +67,7 @@ Score every candidate on this **fixed weighted rubric** — never a free-form "w
 | **Migration safety** | Reversible / gap-less / no destructive schema step. |
 
 **Plan-step checks (when the candidates are step plans).** Before scoring, check each candidate
-for two failure modes that slipped past earlier plans, and list every hit in the cross-model
+for the failure modes that slipped past earlier plans, and list every hit in the cross-model
 summary:
 - **Timing contradictions.** For every timing AC (deadline, timeout, "within N s", abort
   latency), add up the blocking calls its own steps make on that path (readiness waits,
@@ -85,6 +85,11 @@ summary:
   plan you return. One that cannot be resolved yet stays, labelled `CONDITIONAL — decided by:
   <the check>`. W5's unresolved "If W4 is merged" bullets cost the Implementer five Codex
   round trips.
+- **omp homes.** Every omp-running step names an allowed omp home (planner rule):
+  `HOME="$(mktemp -d)"` or `--profile glen-harness`. A step that creates another profile, uses
+  `~/.omp` itself, or isolates with a temp `PI_CONFIG_DIR` scores against correctness; rewrite
+  it to an allowed home in the plan you return. The W9 plan's "second throwaway profile" was
+  this failure.
 
 **Bias controls (apply every time):**
 - **Judge blind** — score content only; authorship is withheld and stays irrelevant. If a

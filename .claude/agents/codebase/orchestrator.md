@@ -146,9 +146,22 @@ Flag docs older than the newest `src/` change that describe behaviour that chang
 
 ## Step 3 -- Collect and Synthesize
 
-Wait for all dispatched agents to complete. Produce a unified audit summary with:
+Wait for all dispatched agents to complete.
 
-- Summary table (scan name, status, key metrics)
+**Verify every finding with two lenses.** Every finding of every severity, LOW included, gets two
+independent verifiers (separate agents, neither sees the other's verdict):
+
+- **REPRODUCE:** run the command that shows it, or cite the exact `path:line` that proves it.
+- **REFUTE:** look for the guard, test or convention that makes it a non-issue.
+
+Keep a finding only when REPRODUCE confirms it **and** REFUTE fails to refute it. Record the kill
+rate per lens in the report (findings in, killed by REPRODUCE, killed by REFUTE, kept). A single
+REPRODUCE lens is too lenient: W8 kept 54 of 56 findings that way, and LOW findings may have passed
+too easily. To run the verifiers as a workflow, see `.claude/docs/Workflow-Fanout.md`.
+
+Then produce a unified audit summary with:
+
+- Summary table (scan name, status, key metrics, kill rate per lens)
 - Critical/high findings listed individually with source, severity, and recommended fix
 - Action items prioritized by severity
 - For quick mode: recommendation on whether a deep audit is warranted
@@ -168,6 +181,8 @@ across machines. Skip this step for quick mode.
 - Dispatch tier 1 agents in parallel -- they are fully independent.
 - Dispatch tier 2 audits sequentially -- each is heavy and context-intensive.
 - Always produce the synthesis summary. Raw agent outputs are too verbose.
+- Every finding passes both verifier lenses (REPRODUCE confirms, REFUTE fails) before it is
+  reported, whatever its severity.
 - Write critical/high findings to the tech-debt registry (deep mode only).
 - This is an audit -- report only. Do not fix issues or commit changes.
 - If a tier 2 audit directory does not exist yet, report it and skip that audit.

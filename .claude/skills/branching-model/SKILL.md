@@ -41,6 +41,11 @@ nothing promotes between branches and nothing can drift. A release is a tag on `
   (`memory_store`, project `glen`), referencing `PR #<n>` in the title, content or tags. The
   `capture-before-merge` hook blocks `gh pr merge` until such a call exists in the session. A
   one-line episodic note is fine for a trivial PR.
+- **Owner waiver:** the owner can waive that memory for one PR by saying so in chat, e.g. "no
+  memory for PR #42" (it must name the PR). The hook honours it only in the main session, never
+  in a subagent, and only from the owner's own message, not from tool output, notifications or
+  a compaction summary. On a waiver the hook asks the owner to confirm the merge (a prompt even
+  under `bypassPermissions`); record the waiver in the state file's decision log.
 - **Merge:** `gh pr merge <n> --squash`. `gh pr merge` is a mutator and stays prompt-gated.
   Delete the branch yourself afterwards (`git push origin --delete <branch>`), once the capture
   and the board update are done.
