@@ -21,6 +21,6 @@ export default function AgentTabs({commands,skillPaths}:{commands:Pick<Site['com
     <p className="panel-note">Writes <code>{tab.id==='claude' ? skillPaths.claude : skillPaths.codex}</code>.{tab.id==='claude' ? ' Claude Code picks it up in its next session.' : ' Give glen commands a timeout of at least 100 seconds, or use '}{tab.id==='codex' && <><code>glen send --wait 5s</code> and repeat <code>glen wait &lt;job&gt; --timeout 5s</code>.</>}</p>
    </div>;
   })}
-  <p className="tabs-foot">Add <code>--project</code> to install into this repository instead.</p>
+  <p className="tabs-foot">Add <code>--project</code> to install into the current directory instead (run it from the repository root).</p>
  </div></IslandRoot>;
 }

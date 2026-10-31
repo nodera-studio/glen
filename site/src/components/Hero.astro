@@ -1,14 +1,18 @@
 ---
 import Terminal from './terminal/Terminal.astro';
 import Actions from './Actions.astro';
-import {site} from '../data/site';
+import {site, versionLabel} from '../data/site';
 ---
 <section aria-labelledby="hero-h" class="hero hero-glow">
  <div class="wrap">
-  <p class="release-chip"><span aria-hidden="true"></span>v0.1.0 · works with omp {site.testedOmp}</p>
+  <p class="release-chip" data-release={site.releaseAvailable ? 'out' : 'soon'}><span aria-hidden="true"></span>{versionLabel(site)} · works with omp {site.testedOmp}</p>
   <h1 id="hero-h"><strong>Let Claude Code and Codex</strong> talk to your omp sessions.</h1>
   <div class="hero-lead-row"><p class="body-lg">glen is a small CLI. It finds omp sessions, reads their transcripts, sends a message into one, and brings the reply back to the agent that asked.</p><Actions /></div>
   <ul class="trust-row">{['macOS and Linux','Single binary','MIT licence'].map(text=><li><svg aria-hidden="true" viewBox="0 0 16 16"><path d="m3.5 8.5 3 3 6-7"/></svg>{text}</li>)}</ul>
  </div>
  <div class="hero-product"><div class="hero-wall" aria-hidden="true"></div><Terminal /></div>
 </section>
+<style>
+ /* Not out yet: the pulsing green dot becomes a still, hollow ring, the planned-state mark. */
+ .release-chip[data-release=soon] > span { background: none; box-shadow: inset 0 0 0 1.5px currentColor; animation: none }
+</style>

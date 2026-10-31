@@ -476,6 +476,24 @@ test('FAQ: five rows; Enter opens one and the others close', async ({ page }) =>
  await expect(rows.nth(3)).toHaveAttribute('open', ''); await expect(rows.nth(1)).not.toHaveAttribute('open', '');
  await expect(rows.nth(3).locator('.faq-body')).toContainText('glen wait');
 });
+// W8-DOC-15: no chip may read as released before the first release; the hero dot stops pulsing.
+test('before the first release the header, hero and footer chips say coming soon, and the hero dot is still', async ({ page }) => {
+ await page.goto('/');
+ for (const chip of [page.locator('.header-bar .version-chip'), page.locator('.hero .release-chip'), page.locator('.footer-bottom span').last()]) await expect(chip).toContainText('v0.1.0 · coming soon');
+ const dot = page.locator('.release-chip > span');
+ await expect(dot).toHaveCSS('animation-name', 'none');
+ await expect(dot).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+});
+// W8-DOC-16, DOC-18, DOC-17 and DOC-6: the copy says what glen does.
+test('copy: exit 6 is a refusal, --project uses the current directory, the Linux limit is conditional, omp is tested not required', async ({ page }) => {
+ await page.goto('/');
+ const six = page.locator('.exit-row').filter({ has: page.locator('[role=rowheader]', { hasText: /^6$/ }) });
+ await expect(six.locator('.exit-badge')).toHaveText('refused');
+ await expect(six.locator('.exit-meaning')).toHaveText('Read error.hint and details.reason; often: install the extension and restart omp.');
+ await expect(page.locator('#agents .tabs-foot')).toHaveText('Add --project to install into the current directory instead (run it from the repository root).');
+ await expect(page.locator('#faq details').nth(3).locator('.faq-body')).toContainText('(on Linux, when the command runs in its own network namespace, existing sessions only through the live route)');
+ await expect(page.locator('#install .section-lead')).toHaveText('macOS and Linux. Tested with omp 18.14.0.');
+});
 test('closing band and footer', async ({ page }) => {
  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
  await expect(page.locator('.cta-ground > div').first()).toHaveCSS('background-size', '40px 40px, 40px 40px');
