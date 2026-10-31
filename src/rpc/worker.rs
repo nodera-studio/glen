@@ -1,5 +1,7 @@
-use super::{
-    self as rpc, control,
+// `crate::rpc::{self, …}`, not `super::{self as rpc, …}`: the MSRV, Rust 1.89, rejects
+// importing `super` through `self` ("no `super` in the root").
+use crate::rpc::{
+    self, control,
     reply::{self, ReplySink},
 };
 use crate::{

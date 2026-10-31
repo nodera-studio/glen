@@ -491,7 +491,8 @@ test('copy: exit 6 is a refusal, --project uses the current directory, the Linux
  await expect(six.locator('.exit-badge')).toHaveText('refused');
  await expect(six.locator('.exit-meaning')).toHaveText('Read error.hint and details.reason; often: install the extension and restart omp.');
  await expect(page.locator('#agents .tabs-foot')).toHaveText('Add --project to install into the current directory instead (run it from the repository root).');
- await expect(page.locator('#faq details').nth(3).locator('.faq-body')).toContainText('(on Linux, when the command runs in its own network namespace, existing sessions only through the live route)');
+ // W10 fix cycle 2 decision 1 replaced DOC-17's namespace condition: on Linux any Codex marker hides the lease.
+ await expect(page.locator('#faq details').nth(3).locator('.faq-body')).toContainText("On Linux, a Codex sandbox hides omp's session locks, so under either variable glen refuses to resume a session over RPC (exit 6); the live route through the extension still works.");
  await expect(page.locator('#install .section-lead')).toHaveText('macOS and Linux. Tested with omp 18.14.0.');
 });
 test('closing band and footer', async ({ page }) => {
