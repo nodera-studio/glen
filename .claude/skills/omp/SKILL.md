@@ -58,6 +58,17 @@ The engine sees a snapshot outside HOME, without Git metadata. Root agent config
 is relocated to `_agent-config/` (for example `.claude/` becomes `_agent-config/claude/`).
 Policy comes from `main` when available, with a warned worktree fallback.
 
+## Best-effort Claude Code deny rules
+
+`.claude/settings.json` denies literal command prefixes such as `omp login` in Claude's
+own typed Bash calls. These are courtesy guardrails, not a security boundary or a sound
+shell parser: do not rely on them to catch `bash -c "omp login"`, heredocs, variable
+indirection, or other alternate invocation forms. They do not govern calls inside scripts.
+[Claude Code also checks separated subcommands and unwraps some wrappers](https://code.claude.com/docs/en/permissions#compound-commands);
+prefix matching is not limited to position zero of the entire Bash call.
+The real default-profile protections are explicit `--profile glen-harness` on every
+harness invocation, setup's default-profile fingerprint, and the OS sandbox.
+
 ## Risks
 
 The macOS `sandbox-exec` and Linux `bwrap` launchers contain reads of other processes'

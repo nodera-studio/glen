@@ -136,7 +136,9 @@ choice is configured outside the harness (see `AGENTS.md`).
 The third review/debug engine uses profile `glen-harness` on Cursor.
 Sessions are read-only under omp's approval policy plus read containment (`.claude/omp/glen-harness.yml`).
 Configure it with `.claude/scripts/omp-profile-setup.sh`; see `.claude/skills/omp/SKILL.md`.
-The `guard-omp-profile.sh` hook blocks accidental writes to the owner's default profile.
+Claude Code's `permissions.deny` rules are best-effort typing guardrails, not a security boundary.
+Default-profile protection relies on explicit `--profile glen-harness` in harness scripts,
+setup's fingerprint check, and the OS sandbox.
 Set `GLEN_OMP_ENGINE=off` to skip the engine.
 
 ## Tool routing

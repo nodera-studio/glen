@@ -86,18 +86,22 @@ SKILL_MARKER='<!-- Managed by omp-profile-setup.sh: mnemosyne-glen -->'
 # XDG_STATE_HOME/omp/run) are runtime state, intentionally not fingerprinted.
 COMPONENTS=(config.yml mcp.json agent.db extensions sessions)
 fingerprint() {
-  local component="$1" path="$DEFAULT_AGENT_DIR/$1"
+  local component="$1" path="$DEFAULT_AGENT_DIR/$1" database
   case "$component" in
     config.yml | mcp.json)
       if [ -f "$path" ]; then shasum -a 256 < "$path"; else say absent; fi
       ;;
     agent.db)
       # omp utils/src/dirs.ts:getAgentDbPath puts settings/auth SQLite state
-      # directly under agent/. Compare existence and bytes only, never content/mtime.
-      if [ ! -f "$path" ]; then say absent
-      elif [ "$(uname -s)" = Darwin ]; then stat -f '%z' "$path"
-      else stat -c '%s' "$path"
-      fi
+      # directly under agent/. Include SQLite WAL/SHM sidecars, since pending
+      # writes need not change the main DB. Compare existence/bytes, not content/mtime.
+      for database in "$path" "$path-wal" "$path-shm"; do
+        printf '%s ' "${database##*/}"
+        if [ ! -f "$database" ]; then say absent
+        elif [ "$(uname -s)" = Darwin ]; then stat -f '%z' "$database" || return 1
+        else stat -c '%s' "$database" || return 1
+        fi
+      done
       ;;
     extensions)
       if [ -d "$path" ]; then

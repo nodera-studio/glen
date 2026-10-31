@@ -63,7 +63,22 @@
       "mcp__plugin_mnemosyne_secrets__secret_delete",
       "Bash(rm -rf:*)",
       "Bash(sudo:*)",
-      "Bash(chmod 777:*)"
+      "Bash(chmod 777:*)",
+      "Bash(omp login:*)",
+      "Bash(omp logout:*)",
+      "Bash(omp config:*)",
+      "Bash(omp auth:*)",
+      "Bash(omp setup:*)",
+      "Bash(omp plugin:*)",
+      "Bash(omp extensions:*)",
+      "Bash(omp agents:*)",
+      "Bash(omp gc:*)",
+      "Bash(omp settings:*)",
+      "Bash(omp session:*)",
+      "Bash(omp ssh:*)",
+      "Bash(omp tiny-models:*)",
+      "Bash(omp worktree:*)",
+      "Bash(glen install-extension:*)"
     ]
   },
   "autoMode": {
@@ -92,10 +107,6 @@
           {
             "type": "command",
             "command": ".claude/hooks/block-old-codex.sh"
-          },
-          {
-            "type": "command",
-            "command": ".claude/hooks/guard-omp-profile.sh"
           },
           {
             "type": "command",

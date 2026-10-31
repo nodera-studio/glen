@@ -105,4 +105,6 @@ The third reviewer and optional debug investigator use profile `glen-harness` on
 Configure it with `.claude/scripts/omp-profile-setup.sh`.
 Engine sessions are read-only under omp's approval policy and read containment
 (`.claude/omp/glen-harness.yml`). Agents never write the owner's default `~/.omp/agent`
-config; the `.claude/hooks/guard-omp-profile.sh` hook guards accidental Bash writes there.
+config. Claude Code's `permissions.deny` rules are best-effort typing guardrails;
+default-profile protection relies on explicit `--profile glen-harness` in harness scripts,
+setup's fingerprint check, and the OS sandbox (see `.claude/skills/omp/SKILL.md`).

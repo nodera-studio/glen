@@ -77,6 +77,7 @@ new_fixture() {
   export FAKE_OMP_STATE="$CASE_DIR/state" FAKE_OMP_LOG="$CASE_DIR/omp.jsonl"
   export FAKE_OMP_WRITES="$CASE_DIR/writes" FAKE_TOOL_CALLS="$CASE_DIR/tool-calls"
   unset FAKE_OMP_VERSION FAKE_OMP_REPORTED_DIR FAKE_OMP_REJECT_KEY FAKE_OMP_ERROR_KEY FAKE_OMP_MUTATE FAKE_GLEN_CURRENT
+  unset FAKE_OMP_DB_FILE
   : > "$FAKE_OMP_LOG"
   : > "$FAKE_OMP_WRITES"
   : > "$FAKE_TOOL_CALLS"
@@ -325,7 +326,7 @@ cat > "$WORK/db-bin/omp" <<'EOF'
 #!/bin/bash
 set -euo pipefail
 if [ "$*" = '--profile glen-harness models cursor --json' ]; then
-  database="$FAKE_OMP_TEST_HOME/${PI_CONFIG_DIR:-.omp}/agent/agent.db"
+  database="$FAKE_OMP_TEST_HOME/${PI_CONFIG_DIR:-.omp}/agent/${FAKE_OMP_DB_FILE:-agent.db}"
   case "$FAKE_OMP_DB_CHANGE" in
     size | appear) printf 'database grew\n' >> "$database" ;;
     disappear) rm "$database" ;;
@@ -373,6 +374,33 @@ for change in size appear disappear mtime content; do
       ;;
   esac
   assert 'database fingerprint test keeps every omp call scoped' all_scoped
+done
+
+# A sidecar alone can hold new SQLite state while agent.db stays byte-for-byte
+# unchanged. Reuse the same mutation helper and the existing component diagnostic.
+for sidecar in agent.db-wal agent.db-shm; do
+  for change in size appear disappear; do
+    new_fixture
+    ready_assets
+    database="$TEST_ROOT/agent/agent.db"
+    printf 'unchanged database\n' > "$database"
+    cp "$database" "$CASE_DIR/database-before"
+    if [ "$change" != appear ]; then
+      printf 'database fixture\n' > "$TEST_ROOT/agent/$sidecar"
+    fi
+    export FAKE_OMP_DB_FILE="$sidecar" FAKE_OMP_DB_CHANGE="$change"
+    PATH="$WORK/db-bin:$PATH" setup_run "$SETUP" --check
+    assert_exit "default fingerprint $sidecar $change change fails" 1
+    assert_contains "default fingerprint detects $sidecar $change" 'default-profile fingerprint changed: agent.db' "$STDERR"
+    assert "$sidecar $change leaves main database unchanged" cmp -s "$database" "$CASE_DIR/database-before"
+    assert "$sidecar $change mismatch reports no unchanged claim" test "$(grep -c 'fingerprint-unchanged.*yes' "$STDOUT" || true)" -eq 0
+    case "$change" in
+      size) assert_eq "$sidecar really grew" "$(wc -c < "$TEST_ROOT/agent/$sidecar" | tr -d ' ')" 31 ;;
+      appear) assert_contains "$sidecar really appeared" 'database grew' "$TEST_ROOT/agent/$sidecar" ;;
+      disappear) assert "$sidecar really disappeared" test ! -e "$TEST_ROOT/agent/$sidecar" ;;
+    esac
+    assert "$sidecar $change test keeps every omp call scoped" all_scoped
+  done
 done
 
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
