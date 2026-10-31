@@ -1,5 +1,6 @@
 use std::time::SystemTime;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 pub fn width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
@@ -16,16 +17,36 @@ pub fn truncate(s: &str, max: usize) -> String {
     }
     let mut out = String::new();
     let mut used = 0;
-    for c in s.chars() {
-        let w = c.width().unwrap_or(0);
+    for grapheme in s.graphemes(true) {
+        let w = width(grapheme);
         if used + w > max - 1 {
             break;
         }
-        out.push(c);
+        out.push_str(grapheme);
         used += w
     }
     out.push('…');
     out
+}
+/// Keep a path's identifying tail when it does not fit its column budget.
+pub fn truncate_left(s: &str, max: usize) -> String {
+    if width(s) <= max {
+        return s.into();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut suffix = vec![];
+    let mut used = 0;
+    for grapheme in s.graphemes(true).rev() {
+        let cells = width(grapheme);
+        if used + cells > max - 1 {
+            break;
+        }
+        suffix.push(grapheme);
+        used += cells;
+    }
+    format!("…{}", suffix.into_iter().rev().collect::<String>())
 }
 pub fn clean_lines(text: &str) -> Vec<String> {
     text.split('\n')
@@ -58,13 +79,13 @@ pub fn wrap(line: &str, max: Option<usize>) -> Vec<String> {
             out.push(current);
             current = indent.clone()
         }
-        for c in word.chars() {
-            let w = c.width().unwrap_or(0);
+        for grapheme in word.graphemes(true) {
+            let w = width(grapheme);
             if width(&current) + w > max {
                 out.push(current);
                 current = indent.clone()
             }
-            current.push(c)
+            current.push_str(grapheme)
         }
     }
     if !current.is_empty() {
@@ -76,6 +97,9 @@ pub fn wrap(line: &str, max: Option<usize>) -> Vec<String> {
     out
 }
 pub fn age(now: SystemTime, then: SystemTime) -> String {
+    age_in(now, then, &jiff::tz::TimeZone::system())
+}
+pub fn age_in(now: SystemTime, then: SystemTime, timezone: &jiff::tz::TimeZone) -> String {
     let s = now.duration_since(then).unwrap_or_default().as_secs();
     match s {
         0..60 => "just now".into(),
@@ -84,7 +108,7 @@ pub fn age(now: SystemTime, then: SystemTime) -> String {
         86400..604800 => format!("{}d ago", s / 86400),
         _ => jiff::Timestamp::try_from(then)
             .map(|t| {
-                t.to_zoned(jiff::tz::TimeZone::system())
+                t.to_zoned(timezone.clone())
                     .strftime("%Y-%m-%d")
                     .to_string()
             })
@@ -92,9 +116,10 @@ pub fn age(now: SystemTime, then: SystemTime) -> String {
     }
 }
 pub fn local_hm(ts: &jiff::Timestamp) -> String {
-    ts.to_zoned(jiff::tz::TimeZone::system())
-        .strftime("%H:%M")
-        .to_string()
+    local_hm_in(ts, &jiff::tz::TimeZone::system())
+}
+pub fn local_hm_in(ts: &jiff::Timestamp, timezone: &jiff::tz::TimeZone) -> String {
+    ts.to_zoned(timezone.clone()).strftime("%H:%M").to_string()
 }
 #[cfg(test)]
 mod tests {
@@ -113,5 +138,31 @@ mod tests {
             assert!(line.starts_with("  "));
         }
         assert_eq!(age(SystemTime::UNIX_EPOCH, SystemTime::now()), "just now");
+    }
+    #[test]
+    fn grapheme_truncation_and_wrapping_keep_clusters_whole() {
+        assert_eq!(width("👩‍💻"), 2);
+        assert_eq!(width("🇷🇴"), 2);
+        assert_eq!(truncate("👩‍💻ab", 3), "👩‍💻…");
+        assert_eq!(truncate("e\u{301}xy", 2), "e\u{301}…");
+        assert_eq!(truncate("你好世界", 5), "你好…");
+        assert_eq!(truncate_left("root/你好世界", 5), "…世界");
+        assert_eq!(truncate_left("long/👩‍💻x", 4), "…👩‍💻x");
+        assert_eq!(truncate_left("abcdef", 0), "");
+        assert_eq!(truncate_left("abcdef", 1), "…");
+        assert_eq!(truncate_left("abc", 3), "abc");
+        assert_eq!(wrap("👩‍💻你好世界", Some(4)), ["👩‍💻你", "好世", "界"]);
+    }
+    #[test]
+    fn explicit_timezone_formatters_do_not_depend_on_the_host_zone() {
+        let timezone = jiff::tz::TimeZone::fixed(jiff::tz::Offset::from_hours(9).unwrap());
+        let timestamp: jiff::Timestamp = "2026-10-30T23:30:00Z".parse().unwrap();
+        let now: jiff::Timestamp = "2026-11-10T00:00:00Z".parse().unwrap();
+        assert_eq!(local_hm_in(&timestamp, &timezone), "08:30");
+        assert_eq!(
+            age_in(now.into(), timestamp.into(), &timezone),
+            "2026-10-31"
+        );
+        assert_eq!(local_hm_in(&timestamp, &jiff::tz::TimeZone::UTC), "23:30");
     }
 }

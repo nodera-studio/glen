@@ -5,6 +5,29 @@ use glen::{
     skill::{self, Agent},
 };
 use std::collections::{BTreeMap, BTreeSet};
+#[test]
+fn watch_warning_is_one_guarded_line_and_survives_both_agent_renders() {
+    let template = include_str!("../skill/glen/SKILL.md");
+    let line = template
+        .split("<!-- glen:if watch -->\n")
+        .nth(1)
+        .unwrap()
+        .split("\n<!-- glen:end -->")
+        .next()
+        .unwrap();
+    assert_eq!(line.lines().count(), 1);
+    for phrase in [
+        "exits 2 without a terminal",
+        "agents should not run it",
+        "glen tail <handle> -f",
+        "glen inbox -f",
+    ] {
+        assert!(line.contains(phrase), "{line}");
+    }
+    for agent in [Agent::Claude, Agent::Codex] {
+        assert!(skill::render_current(agent).unwrap().contains(line));
+    }
+}
 #[derive(Debug)]
 struct Word {
     text: String,

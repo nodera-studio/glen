@@ -589,19 +589,21 @@ fn help_commands(text: &str) -> Vec<String> {
 // ---------------------------------------------------------------------------------------------
 
 #[test]
-fn ac351_help_lists_exactly_the_visible_commands_and_watch_stays_hidden() {
+// W5 Step 8 made watch visible (spec change to earlier waves); migrated at the W3b→W5 merge
+fn ac351_help_lists_exactly_the_visible_commands_and_watch_is_visible_but_usage_gated() {
     let sb = Sandbox::new();
     let out = sb.glen(["--help"]).run();
     out.assert_exit(0);
     let mut got = help_commands(&out.out());
     let mut want: Vec<String> = VISIBLE_W3B.iter().map(|s| (*s).to_owned()).collect();
+    want.push("watch".to_owned());
     got.sort();
     want.sort();
     assert_eq!(got, want, "AC-351 (R1, R2)\n{}", out.out());
 
     let out = sb.glen(["watch", "--json"]).run();
-    out.error_envelope("not_implemented");
-    out.assert_exit(8).assert_stderr_empty();
+    out.error_envelope("usage");
+    out.assert_exit(2).assert_stderr_empty();
     for cmd in ["abort", "stop", "models", "model", "thinking", "compact"] {
         sb.glen([cmd, "--help"]).run().assert_exit(0);
     }

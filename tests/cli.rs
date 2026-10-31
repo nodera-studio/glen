@@ -37,6 +37,7 @@ fn public_help() {
             "thinking",
             "compact",
             "inbox",
+            "watch",
             "install-extension",
             "install-skill",
             "doctor",
@@ -46,15 +47,20 @@ fn public_help() {
     );
 }
 #[test]
-fn hidden_commands() {
-    // `watch` is the only command still hidden after W3 and W4.
+fn watch_requires_an_interactive_terminal() {
     let o = glen(&["watch"], &[]);
-    assert_eq!(o.status.code(), Some(8));
-    assert_eq!(json(&o)["error"]["code"], "not_implemented");
+    assert_eq!(o.status.code(), Some(2));
+    assert_eq!(json(&o)["error"]["code"], "usage");
+    assert!(
+        json(&o)["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("interactive terminal")
+    );
     assert_eq!(json(&o)["v"], 1);
     assert!(o.stderr.is_empty());
     let o = glen(&["watch", "--human"], &[]);
-    assert_eq!(o.status.code(), Some(8));
+    assert_eq!(o.status.code(), Some(2));
     assert!(o.stdout.is_empty());
     assert!(o.stderr.starts_with(b"error:"));
     assert!(!o.stderr.contains(&27));
@@ -251,6 +257,7 @@ fn completions() {
             "thinking",
             "compact",
             "inbox",
+            "watch",
             "install-extension",
             "install-skill",
         ] {
@@ -260,9 +267,7 @@ fn completions() {
         for level in ["off", "minimal", "low", "medium", "high", "xhigh", "max"] {
             assert!(s.contains(level), "{shell} lacks {level}");
         }
-        for hidden in ["__worker", "watch"] {
-            assert!(!s.contains(hidden), "{shell}: {hidden}");
-        }
+        assert!(!s.contains("__worker"), "{shell}: __worker");
     }
     let o = glen(&["completions", "zsh", "--json"], &[]);
     assert!(o.status.success());

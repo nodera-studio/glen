@@ -11,6 +11,7 @@ pub mod render;
 pub mod rpc;
 pub mod sandbox;
 pub mod skill;
+pub mod tui;
 use clap::Parser;
 use std::{ffi::OsString, process::ExitCode};
 pub fn run() -> ExitCode {
@@ -47,6 +48,9 @@ pub fn run() -> ExitCode {
         && a.follow
     {
         return commands::inbox::follow(&cli, a, &env, &ctx);
+    }
+    if matches!(cli.command, cli::Command::Watch(_)) {
+        return commands::watch::run(cli, &env, &ctx, &term);
     }
     match commands::dispatch(&cli, &env, &ctx) {
         Ok(o) => output::emit(&ctx, o, cli.command.name()),

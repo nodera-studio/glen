@@ -1129,12 +1129,13 @@ fn ac401_help_lists_install_skill_with_every_earlier_visible_command() {
     }
 }
 
-/// AC-401 + the W4 spec change: `watch` stays hidden (exit 8); `inbox` and
-/// `install-extension` became visible with W3.
+/// Watch is visible; on a pipe its interactive-terminal gate returns usage.
+/// `inbox` and `install-extension` became visible with W3.
 #[test]
-fn ac401_watch_stays_hidden_and_exits_8() {
+fn ac401_watch_is_visible_and_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let listed = command_names(&sb.glen(["--help"]).run().out());
+    assert!(listed.iter().any(|name| name == "watch"), "{listed:?}");
     for name in HIDDEN {
         assert!(
             !listed.iter().any(|c| c == name),
@@ -1144,9 +1145,7 @@ fn ac401_watch_stays_hidden_and_exits_8() {
         out.error_envelope("not_implemented");
         out.assert_exit(8).assert_stderr_empty();
     }
-    sb.glen(["watch", "abc1234"])
-        .run()
-        .error_envelope("not_implemented");
+    sb.glen(["watch", "abc1234"]).run().error_envelope("usage");
     assert!(!sb.glen_home.exists());
 }
 
@@ -1437,7 +1436,11 @@ fn ac404_the_conformance_skill_checker_catches_each_mutation() {
             format!("{base}\n`glen show <handle> --tools everything`\n"),
             "everything",
         ),
-        ("hidden command", format!("{base}\n`glen watch`\n"), "watch"),
+        (
+            "hidden command",
+            format!("{base}\n`glen __worker`\n"),
+            "__worker",
+        ),
         (
             "removed visible-command reference",
             base.replace("glen doctor", "glen ls"),

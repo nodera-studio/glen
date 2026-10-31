@@ -250,7 +250,7 @@ fn ac018_error_envelopes_and_raw_output_are_never_spilled() {
     sb.glen(["watch"])
         .env("GLEN_MAX_OUTPUT", "10")
         .run()
-        .error_envelope("not_implemented");
+        .error_envelope("usage");
 
     let out = sb.glen(["doctor"]).env("GLEN_MAX_OUTPUT", "10").run();
     let err = out.error_envelope("omp_unavailable");

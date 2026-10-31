@@ -6,6 +6,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
 };
+use xxhash_rust::xxh3::Xxh3;
 #[derive(Debug, Clone)]
 pub struct Header {
     pub id: String,
@@ -33,6 +34,18 @@ pub struct Session {
     pub entries: Vec<Entry>,
     pub skipped_lines: usize,
     pub consumed: u64,
+    consumed_tail: Vec<u8>,
+    consumed_hash: ConsumedHash,
+}
+const CONSUMED_WINDOW: usize = 4096;
+// The streaming hasher has no Debug implementation; expose only its digest in Session's debug view.
+struct ConsumedHash(Xxh3);
+impl std::fmt::Debug for ConsumedHash {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("ConsumedHash")
+            .field(&self.0.digest())
+            .finish()
+    }
 }
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
@@ -107,16 +120,18 @@ impl Session {
             continuation_of: string(&raw, "continuationOf"),
             raw,
         };
+        let consumed = bytes.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+        let mut consumed_hash = Xxh3::new();
+        consumed_hash.update(&bytes[..consumed]);
         let mut s = Self {
             path: path.into(),
             slot_title,
             header,
             entries: vec![],
             skipped_lines: 0,
-            consumed: bytes
-                .iter()
-                .rposition(|b| *b == b'\n')
-                .map_or(0, |i| i as u64 + 1),
+            consumed: consumed as u64,
+            consumed_tail: bytes[consumed.saturating_sub(CONSUMED_WINDOW)..consumed].to_vec(),
+            consumed_hash: ConsumedHash(consumed_hash),
         };
         for l in lines {
             s.parse_entry(l);
@@ -151,7 +166,21 @@ impl Session {
             self.parse_entry(l);
         }
         self.consumed += complete_lines.len() as u64;
+        self.consumed_hash.0.update(complete_lines);
+        let keep = CONSUMED_WINDOW.saturating_sub(complete_lines.len());
+        self.consumed_tail
+            .drain(..self.consumed_tail.len().saturating_sub(keep));
+        self.consumed_tail.extend_from_slice(
+            &complete_lines[complete_lines.len().saturating_sub(CONSUMED_WINDOW)..],
+        );
         start..self.entries.len()
+    }
+    /// Exact snapshot bytes let followers validate an apparent append without reopening the path.
+    pub(crate) fn consumed_tail(&self) -> &[u8] {
+        &self.consumed_tail
+    }
+    pub(crate) fn consumed_hash(&self) -> u64 {
+        self.consumed_hash.0.digest()
     }
     pub fn leaf_id(&self) -> Option<&str> {
         let last = self.entries.last()?;
@@ -377,6 +406,40 @@ mod tests {
             1..3
         );
         assert_eq!(s.skipped_lines, 3);
+    }
+    #[test]
+    fn consumed_tail_is_bounded_exact_and_excludes_the_unfinished_line() {
+        let mut bytes = b"{\"type\":\"session\",\"version\":3,\"id\":\"window\"}\n".to_vec();
+        bytes.extend(
+            format!(
+                "{}\n",
+                json!({"type":"future", "id":"one", "data":"x".repeat(9000)})
+            )
+            .bytes(),
+        );
+        let mut unfinished = bytes.clone();
+        unfinished.extend_from_slice(b"unfinished");
+        let mut session = parse(&unfinished);
+        assert_eq!(session.consumed, bytes.len() as u64);
+        assert_eq!(session.consumed_hash(), xxhash_rust::xxh3::xxh3_64(&bytes));
+        assert_eq!(
+            session.consumed_tail(),
+            &bytes[bytes.len() - CONSUMED_WINDOW..]
+        );
+        for size in [1, 8000, 2] {
+            let line = format!(
+                "{}\n",
+                json!({"type":"future", "id":size.to_string(), "data":"y".repeat(size)})
+            );
+            session.append(line.as_bytes());
+            bytes.extend_from_slice(line.as_bytes());
+            assert_eq!(session.consumed_tail().len(), CONSUMED_WINDOW);
+            assert_eq!(session.consumed_hash(), xxhash_rust::xxh3::xxh3_64(&bytes));
+            assert_eq!(
+                session.consumed_tail(),
+                &bytes[bytes.len() - CONSUMED_WINDOW..]
+            );
+        }
     }
     #[test]
     fn leaves() {

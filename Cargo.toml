@@ -13,20 +13,23 @@ dirs = "7.0.0"
 indicatif = "0.18.6"
 jiff = "0.2.38"
 omp-rpc = { git = "https://github.com/can1357/oh-my-pi", tag = "v18.14.0", version = "0.1.0" }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm", "underline-color", "layout-cache"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 terminal_size = "0.4.4"
 thiserror = "2.0.21"
+unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 uuid = { version = "1.29.0", features = ["v7"] }
-xxhash-rust = { version = "0.8.18", features = ["xxh64"] }
+xxhash-rust = { version = "0.8.18", features = ["xxh3", "xxh64"] }
 
 [dev-dependencies]
+insta = "1.49.0"
 tempfile = "3.27.0"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.191"
-rustix = { version = "1.1.6", features = ["fs", "net", "process"] }
+rustix = { version = "1.1.6", features = ["fs", "net", "process", "pty", "termios"] }
 signal-hook = "0.3.18"
 
 [[example]]

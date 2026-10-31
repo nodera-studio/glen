@@ -1,6 +1,7 @@
 pub mod completions;
 pub mod ctl;
 pub mod doctor;
+pub(crate) mod follow;
 pub mod inbox;
 pub mod install_extension;
 pub mod install_skill;
@@ -11,6 +12,7 @@ pub mod send;
 pub mod show;
 pub mod tail;
 pub mod wait;
+pub mod watch;
 use crate::{
     cli::{Cli, Command},
     env::Env,
@@ -44,12 +46,9 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
             outcome.data["script"] = serde_json::json!(outcome.human);
             Ok(outcome)
         }
-        cmd => Err(GlenError::new(
-            ErrorCode::NotImplemented,
-            format!("`glen {}` is not available in this build yet", cmd.name()),
-        )
-        .with_hint(
-            "it is planned for glen v0.1.0; run `glen --help` for the commands in this build",
+        Command::Watch(_) => Err(GlenError::new(
+            ErrorCode::Internal,
+            "watch is dispatched before commands",
         )),
     }
 }

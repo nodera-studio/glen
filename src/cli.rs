@@ -111,7 +111,10 @@ pub enum Command {
     Inbox(InboxArgs),
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
     Worker(WorkerArgs),
-    #[command(hide = true, about = "Watch a session live")]
+    #[command(
+        about = "Watch sessions live: transcripts, replies and a prompt (full screen)",
+        after_help = "Examples:\n  glen watch\n  glen watch e27c0de\n  glen watch --all"
+    )]
     Watch(WatchArgs),
     #[command(
         about = "Install the bundled omp extension (live sessions, glen_reply)",
@@ -278,7 +281,12 @@ pub struct InboxArgs {
 }
 #[derive(Debug, Args)]
 pub struct WatchArgs {
+    #[arg(help = "session handle or @latest; otherwise select from the session list")]
     pub session: Option<String>,
+    #[arg(long, conflicts_with = "cwd", help = "watch every project")]
+    pub all: bool,
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "watch this project directory; scope @latest to it")]
+    pub cwd: Option<PathBuf>,
 }
 #[derive(Debug, Args)]
 pub struct InstallExtensionArgs {

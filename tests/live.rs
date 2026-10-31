@@ -1,4 +1,6 @@
 mod common;
+#[path = "support/fake_ext.rs"]
+mod fake_ext_peer;
 use common::{A_ID, LiveBox, data, json, poll};
 use glen::{
     glen_home::GlenHome,

@@ -857,6 +857,13 @@ Install for both agents unless selected; --project means cwd. Dry runs make no c
 }
 ```
 
+## `glen watch`
+
+Full-screen interface for people in an interactive terminal. It requires TTY stdin and stdout,
+and `TERM` must not be `dumb`. `--json` or non-TTY use returns a `usage` error envelope with exit 2
+(human diagnostics with `--human`); there is no JSON success document for the TUI.
+Agents should use `glen tail -f <session>` and `glen inbox -f` instead.
+
 ## `glen help`
 
 Help and version are text in every output mode, with no JSON envelope.

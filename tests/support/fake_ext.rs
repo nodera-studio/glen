@@ -62,12 +62,15 @@ impl Peer {
         if let Some(p) = &self.log {
             let mut o = fs::OpenOptions::new();
             o.create(true).append(true);
+            // One write(2) per line: `writeln!` on a File emits a syscall per serializer fragment,
+            // and concurrent serve threads then interleave lines.
+            let mut line =
+                json!({"t":jiff::Timestamp::now().as_millisecond(),"dir":dir,"frame":frame})
+                    .to_string()
+                    .into_bytes();
+            line.push(b'\n');
             if let Ok(mut f) = o.open(p) {
-                let _ = writeln!(
-                    f,
-                    "{}",
-                    json!({"t":jiff::Timestamp::now().as_millisecond(),"dir":dir,"frame":frame})
-                );
+                let _ = f.write_all(&line);
             }
         }
     }
@@ -258,7 +261,9 @@ impl Peer {
                 dir.join(format!("{}.ndjson", self.id)),
                 fs::Permissions::from_mode(0o600),
             )?;
-            writeln!(f, "{}", json!(reply))?;
+            let mut line = serde_json::to_vec(&reply)?;
+            line.push(b'\n');
+            f.write_all(&line)?;
             self.write(&mut s, json!({"v":1,"id":id,"event":"reply","reply":reply}))?;
         }
         if self.scenario == "crash" {
@@ -389,6 +394,7 @@ fn moved(id: &str) -> String {
     s.push_str("f0f0");
     s
 }
+#[cfg_attr(test, allow(dead_code))] // The integration tests exercise Peer directly.
 fn main() -> io::Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     let get = |name: &str| args.windows(2).find(|p| p[0] == name).map(|p| p[1].clone());
@@ -478,4 +484,131 @@ fn main() -> io::Result<()> {
         fs::remove_file(&peer.socket)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{collections::HashSet, sync::Barrier};
+
+    fn peer(temp: &std::path::Path) -> Peer {
+        let models: Vec<omp_rpc::ModelInfo> =
+            serde_json::from_str(include_str!("fake_models.json")).unwrap();
+        Peer {
+            home: GlenHome {
+                root: temp.join("glen"),
+            },
+            id: "fixture-session".into(),
+            file: None,
+            socket: temp.join("unused.sock"),
+            scenario: "ok".into(),
+            log: Some(temp.join("frames.ndjson")),
+            version: env!("CARGO_PKG_VERSION").into(),
+            delay: 0,
+            mode: "tui".into(),
+            old_ops: false,
+            selection: Arc::new(Mutex::new(Selection {
+                model: models[0].clone(),
+                thinking: "medium".into(),
+            })),
+            models: Arc::new(models),
+            active: Arc::new(AtomicUsize::new(0)),
+            abort_generation: Arc::new(AtomicU64::new(0)),
+            compacting: Arc::new(AtomicBool::new(false)),
+        }
+    }
+    fn complete_records(path: &std::path::Path, expected: usize) -> Vec<Value> {
+        let bytes = fs::read(path).unwrap();
+        assert!(
+            bytes.ends_with(b"\n"),
+            "unfinished record in {}",
+            path.display()
+        );
+        let records: Vec<Value> = bytes[..bytes.len() - 1]
+            .split(|b| *b == b'\n')
+            .map(|line| {
+                serde_json::from_slice(line).unwrap_or_else(|error| {
+                    panic!(
+                        "torn record in {}: {error}; {:?}",
+                        path.display(),
+                        String::from_utf8_lossy(line)
+                    )
+                })
+            })
+            .collect();
+        assert_eq!(records.len(), expected);
+        records
+    }
+    #[test]
+    fn concurrent_log_writers_leave_complete_distinct_json_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let peer = peer(temp.path());
+        let barrier = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let (peer, barrier) = (&peer, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for sequence in 0..128 {
+                        peer.log(
+                            "in",
+                            &json!({"writer":writer, "sequence":sequence, "text":"x".repeat(1024)}),
+                        );
+                    }
+                });
+            }
+        });
+        let records = complete_records(peer.log.as_ref().unwrap(), 8 * 128);
+        let ids: HashSet<_> = records
+            .iter()
+            .map(|r| {
+                (
+                    r["frame"]["writer"].as_u64().unwrap(),
+                    r["frame"]["sequence"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(ids.len(), 8 * 128);
+    }
+    #[test]
+    fn concurrent_send_replies_leave_complete_distinct_inbox_lines() {
+        let temp = tempfile::tempdir().unwrap();
+        let peer = peer(temp.path());
+        peer.home.ensure_dir("inbox").unwrap();
+        let barrier = Barrier::new(8);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let (peer, barrier) = (&peer, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    for sequence in 0..32 {
+                        let id = format!("{writer}-{sequence}");
+                        let (mut client, server) = UnixStream::pair().unwrap();
+                        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                        let mut request = json!({"v":1,"id":id,"op":"send","args":{"text":"x".repeat(1024),"deliver_as":"auto"}}).to_string().into_bytes();
+                        request.push(b'\n');
+                        client.write_all(&request).unwrap();
+                        peer.serve(server).unwrap();
+                        let mut frames = String::new();
+                        client.read_to_string(&mut frames).unwrap();
+                        let frames: Vec<Value> = frames.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+                        assert!(frames.iter().any(|f| f["event"] == "settled" && f["status"] == "completed"));
+                    }
+                });
+            }
+        });
+        let records =
+            complete_records(&peer.home.root.join("inbox/fixture-session.ndjson"), 8 * 32);
+        let ids: HashSet<_> = records
+            .iter()
+            .map(|r| r["request_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids.len(), 8 * 32);
+        assert!(
+            records
+                .iter()
+                .all(|r| r["text"] == format!("reply: {}", "x".repeat(1024)))
+        );
+        complete_records(peer.log.as_ref().unwrap(), 8 * 32 * 5);
+    }
 }
