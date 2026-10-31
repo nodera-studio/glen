@@ -1,16 +1,18 @@
 use crate::{
     cli::{Cli, InboxArgs},
     env::Env,
-    error::{ErrorCode, GlenError},
+    error::{ErrorCode, GlenError, Warning},
     glen_home::{self, GlenHome},
     inbox::{self, Cursor},
     jobs::Reply,
+    omp::{bucket::bucket_for, handle, listing::Catalog, paths},
     output::{Outcome, OutputCtx, stream::EventStream},
     render::{self, palette::Token, text},
 };
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
+    path::{Path, PathBuf},
     process::ExitCode,
     time::Duration,
 };
@@ -61,6 +63,67 @@ struct Read {
     records: Vec<(String, Reply, u64, u64)>,
     ends: Vec<(String, Cursor)>,
     skipped: usize,
+    outside_cwd: bool,
+}
+struct Scope {
+    cwd: PathBuf,
+    bucket: String,
+    sessions_dir: PathBuf,
+    included: HashSet<String>,
+    classified: HashSet<String>,
+    selector: Option<String>,
+    matched: Option<HashSet<String>>,
+}
+impl Scope {
+    fn new(
+        cli: &Cli,
+        env: &Env,
+        home: &GlenHome,
+        dir: &Path,
+        selector: Option<&str>,
+    ) -> Result<Self, GlenError> {
+        let cwd = paths::absolute(env, &dir.to_string_lossy());
+        let mut scope = Self {
+            bucket: bucket_for(&cwd, env),
+            cwd,
+            sessions_dir: paths::resolve(env, cli.global.profile.as_deref())?.sessions_dir,
+            included: HashSet::new(),
+            classified: HashSet::new(),
+            selector: selector.map(str::to_owned),
+            matched: None,
+        };
+        scope.refresh(home, env)?;
+        Ok(scope)
+    }
+    fn refresh(&mut self, home: &GlenHome, env: &Env) -> Result<(), GlenError> {
+        let mut catalog = Catalog::read(&self.sessions_dir)?;
+        // An unwritten registry without a cwd cannot place a session in a project.
+        // Persisted sessions still get their classification from their bucket.
+        let registries = crate::live::registry::index(home)
+            .into_iter()
+            .filter(|registry| registry.cwd.as_deref().is_some_and(|cwd| !cwd.is_empty()))
+            .collect::<Vec<_>>();
+        crate::live::registry::union(&mut catalog, home, env, &registries);
+        self.matched = self.selector.as_deref().map(|selector| {
+            catalog.assign_handles(None);
+            handle::matching_ids(selector, &catalog)
+                .into_iter()
+                .map(str::to_lowercase)
+                .collect()
+        });
+        self.classified = catalog
+            .sessions
+            .iter()
+            .map(|session| session.id.to_lowercase())
+            .collect();
+        self.included = catalog
+            .sessions
+            .iter()
+            .filter(|session| session.file.bucket == self.bucket)
+            .map(|session| session.id.to_lowercase())
+            .collect();
+        Ok(())
+    }
 }
 fn validate_filter(filter: Option<&str>) -> Result<(), GlenError> {
     if let Some(filter) = filter
@@ -79,14 +142,43 @@ fn collect(
     filter: Option<&str>,
     all: bool,
     cursors: Option<&HashMap<String, Cursor>>,
+    env: &Env,
+    scope: Option<&mut Scope>,
 ) -> Result<Read, GlenError> {
     validate_filter(filter)?;
     let mut read = Read {
         records: vec![],
         ends: vec![],
         skipped: 0,
+        outside_cwd: false,
     };
-    for (stem, path) in inbox::sessions(home, filter) {
+    let mut sessions = inbox::sessions(home, filter);
+    if let Some(scope) = scope {
+        let all = filter.map(|_| inbox::sessions(home, None));
+        // Rescan at most once per poll, retaining classifications for known ids.
+        // Unknown ids remain eligible for a later scan if their transcript arrives.
+        if all
+            .as_deref()
+            .unwrap_or(&sessions)
+            .iter()
+            .any(|(stem, _)| !scope.classified.contains(&stem.to_lowercase()))
+        {
+            scope.refresh(home, env)?;
+        }
+        if let (Some(all), Some(matched)) = (all, &scope.matched) {
+            let mut seen = sessions
+                .iter()
+                .map(|(stem, _)| stem.clone())
+                .collect::<HashSet<_>>();
+            sessions.extend(all.into_iter().filter(|(stem, _)| {
+                matched.contains(&stem.to_lowercase()) && seen.insert(stem.clone())
+            }));
+        }
+        let had_matches = !sessions.is_empty();
+        sessions.retain(|(stem, _)| scope.included.contains(&stem.to_lowercase()));
+        read.outside_cwd = filter.is_some() && had_matches && sessions.is_empty();
+    }
+    for (stem, path) in sessions {
         let from = cursors
             .and_then(|c| c.get(&stem).copied())
             .unwrap_or_else(|| {
@@ -125,9 +217,21 @@ fn collect(
     });
     Ok(read)
 }
-pub fn run(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
+pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let home = glen_home::resolve(env)?;
-    let read = collect(&home, a.session.as_deref(), a.all, None)?;
+    let mut scope = a
+        .cwd
+        .as_deref()
+        .map(|dir| Scope::new(cli, env, &home, dir, a.session.as_deref()))
+        .transpose()?;
+    let read = collect(
+        &home,
+        a.session.as_deref(),
+        a.all,
+        None,
+        env,
+        scope.as_mut(),
+    )?;
     let total = read.records.len();
     let sessions = read
         .records
@@ -156,6 +260,17 @@ pub fn run(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
         json!({"total":total,"marked_read":!a.peek&&total>0,"skipped_lines":read.skipped,"messages":read.records.iter().map(|(_,r,_,_)|message(r)).collect::<Vec<_>>()}),
         human,
     );
+    if read.outside_cwd
+        && let Some(scope) = &scope
+    {
+        outcome.warnings.push(Warning {
+            code: "outside_cwd".into(),
+            message: format!(
+                "matching inbox sessions are outside {}; drop --cwd to include them",
+                scope.cwd.display()
+            ),
+        });
+    }
     if !a.peek {
         let ends = read
             .ends
@@ -195,16 +310,19 @@ impl PrintedPrefix {
         Some(safe)
     }
 }
-pub fn follow(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode {
+pub fn follow(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode {
     // Follow is always NDJSON, even when explicitly invoked with --human.
     let mut stream = EventStream::ndjson(ctx);
     let result = (|| -> Result<_, GlenError> {
-        Ok((
-            glen_home::resolve(env)?,
-            crate::jobs::wait::install_interrupt()?,
-        ))
+        let home = glen_home::resolve(env)?;
+        let scope = a
+            .cwd
+            .as_deref()
+            .map(|dir| Scope::new(cli, env, &home, dir, a.session.as_deref()))
+            .transpose()?;
+        Ok((home, crate::jobs::wait::install_interrupt()?, scope))
     })();
-    let (home, stop) = match result {
+    let (home, stop, mut scope) = match result {
         Ok(r) => r,
         Err(e) => return stream.fail(e),
     };
@@ -213,7 +331,14 @@ pub fn follow(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode
         if stop.load(std::sync::atomic::Ordering::Relaxed) {
             return stream.end(130);
         }
-        let read = match collect(&home, a.session.as_deref(), a.all, Some(&cursors)) {
+        let read = match collect(
+            &home,
+            a.session.as_deref(),
+            a.all,
+            Some(&cursors),
+            env,
+            scope.as_mut(),
+        ) {
             Ok(r) => r,
             Err(e) => return stream.fail(e),
         };

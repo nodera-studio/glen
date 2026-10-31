@@ -64,16 +64,49 @@ pub(crate) fn load_snapshot(
     Ok((session, metadata))
 }
 pub(crate) fn open(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, false, true)
+    open_mode(cli, env, arg, false, true, None)
 }
 pub(crate) fn open_follow(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, true, true)
+    open_mode(cli, env, arg, true, true, None)
 }
 pub(crate) fn open_unprobed(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, false, false)
+    open_mode(cli, env, arg, false, false, None)
+}
+pub(crate) fn open_in(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    scope: Option<&Path>,
+) -> Result<Opened, GlenError> {
+    match scope {
+        None => open(cli, env, arg),
+        Some(_) => open_mode(cli, env, arg, false, true, scope),
+    }
+}
+pub(crate) fn open_follow_in(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    scope: Option<&Path>,
+) -> Result<Opened, GlenError> {
+    match scope {
+        None => open_follow(cli, env, arg),
+        Some(_) => open_mode(cli, env, arg, true, true, scope),
+    }
+}
+pub(crate) fn open_unprobed_in(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    scope: Option<&Path>,
+) -> Result<Opened, GlenError> {
+    match scope {
+        None => open_unprobed(cli, env, arg),
+        Some(_) => open_mode(cli, env, arg, false, false, scope),
+    }
 }
 pub(crate) fn open_watch(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, true, false)
+    open_mode(cli, env, arg, true, false, None)
 }
 fn open_mode(
     cli: &Cli,
@@ -81,6 +114,7 @@ fn open_mode(
     arg: &str,
     complete_only: bool,
     probe: bool,
+    scope: Option<&Path>,
 ) -> Result<Opened, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     // Paths need no assigned handles during resolution. Include an external
@@ -93,7 +127,7 @@ fn open_mode(
     if !explicit_path {
         catalog.assign_handles(None);
     }
-    let path = handle::resolve(arg, &catalog, env)?;
+    let path = handle::resolve_in(arg, &catalog, env, scope)?;
     if !path.exists()
         && let Some(summary) = catalog
             .sessions

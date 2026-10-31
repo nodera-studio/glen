@@ -308,3 +308,186 @@ fn inbox_rejects_hex_suffixes_shorter_than_four_digits() {
     assert_eq!(data(&inbox(&b, &["--session", "abcd"]))["total"], 0);
     assert!(!b.glen_home.exists());
 }
+
+fn fixture_session_id(b: &OmpBox, key: char) -> String {
+    glen::omp::session::Session::load(&b.session(key))
+        .unwrap()
+        .header
+        .id
+}
+
+#[test]
+fn cwd_inbox_intersects_session_filters_and_leaves_foreign_and_orphan_replies_unread() {
+    let b = OmpBox::new();
+    let beta = fixture_session_id(&b, 'E');
+    let registry_alpha = "registry-alpha";
+    let registry_unknown = "registry-unknown";
+    for (id, text) in [
+        (A, "alpha"),
+        (beta.as_str(), "beta"),
+        (B, "orphan"),
+        (registry_alpha, "live alpha"),
+        (registry_unknown, "unknown project"),
+    ] {
+        append(&b, id, &record(id, text, "2026-10-30T00:00:00Z"));
+    }
+    let home = glen::glen_home::GlenHome {
+        root: b.glen_home.clone(),
+    };
+    fs::create_dir_all(glen::live::run_dir(&home)).unwrap();
+    for (id, cwd) in [(registry_alpha, Some(b.alpha())), (registry_unknown, None)] {
+        fs::write(glen::live::registry::path(&home, id), j!({"v":1,"pid":std::process::id(),"session_id":id,"socket":glen::live::run_dir(&home).join(format!("{id}.sock")),"cwd":cwd}).to_string()).unwrap();
+    }
+    let alpha = b.alpha();
+    let flags = ["--cwd", alpha.to_str().unwrap()];
+    let prefix = inbox(
+        &b,
+        &[
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--session",
+            "01a0f6b1",
+            "--peek",
+        ],
+    );
+    assert_eq!(data(&prefix)["total"], 1);
+    assert_eq!(data(&prefix)["messages"][0]["session_id"], A);
+    let legacy = inbox(
+        &b,
+        &[
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--session",
+            "registr",
+            "--peek",
+        ],
+    );
+    assert_eq!(data(&legacy)["total"], 1);
+    assert_eq!(data(&legacy)["messages"][0]["session_id"], registry_alpha);
+    let selected = data(&inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--peek"]));
+    assert_eq!(selected["total"], 2);
+    assert!(
+        selected["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|message| message["session_id"] == A || message["session_id"] == registry_alpha)
+    );
+    assert_eq!(data(&inbox(&b, &flags))["total"], 2);
+    for id in [&beta, B, registry_unknown] {
+        assert!(!b.glen_home.join("inbox/.read").join(id).exists());
+    }
+    let remaining = data(&inbox(&b, &["--peek"]));
+    assert_eq!(remaining["total"], 3);
+    let outside = inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--session", &beta]);
+    assert_eq!(data(&outside)["total"], 0);
+    assert_eq!(common::json(&outside)["warnings"][0]["code"], "outside_cwd");
+    let included = inbox(
+        &b,
+        &[
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--session",
+            A,
+            "--all",
+            "--peek",
+        ],
+    );
+    assert_eq!(data(&included)["total"], 1);
+    assert!(common::json(&included).get("warnings").is_none());
+}
+
+struct ScopedInboxChild(std::process::Child);
+impl Drop for ScopedInboxChild {
+    fn drop(&mut self) {
+        if self.0.try_wait().unwrap().is_none() {
+            self.0.kill().unwrap();
+            self.0.wait().unwrap();
+        }
+    }
+}
+
+#[test]
+fn cwd_inbox_follow_discovers_new_sessions_and_reclassifies_an_orphan_within_ten_seconds() {
+    let b = OmpBox::new();
+    let beta = fixture_session_id(&b, 'E');
+    for (id, text) in [(A, "alpha"), (beta.as_str(), "beta"), (B, "orphan")] {
+        append(&b, id, &record(id, text, "2026-10-30T00:00:00Z"));
+    }
+    let mut child = ScopedInboxChild(
+        b.command(
+            &[
+                "inbox",
+                "-f",
+                "--cwd",
+                b.alpha().to_str().unwrap(),
+                "--json",
+            ],
+            &b.alpha(),
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap(),
+    );
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let event: Value = serde_json::from_str(&line.unwrap()).unwrap();
+            if tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["message"]["text"],
+        "alpha"
+    );
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_millis(300)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    let new = "00000000-0000-7000-8000-000009876abc";
+    append(&b, new, &record(new, "new alpha", "2026-10-30T00:00:01Z"));
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_millis(300)),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(!b.glen_home.join("inbox/.read").join(new).exists());
+    fs::write(
+        b.agent
+            .join("sessions/-work-alpha")
+            .join(format!("{new}.jsonl")),
+        format!(
+            "{}\n",
+            j!({"type":"session","version":3,"id":new,"cwd":b.alpha()})
+        ),
+    )
+    .unwrap();
+    let message = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(message["event"], "message");
+    assert_eq!(message["message"]["session_id"], new);
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(child.0.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
+        "end"
+    );
+    assert_eq!(
+        poll(Duration::from_secs(10), || child.0.try_wait().unwrap()).code(),
+        Some(130)
+    );
+    reader.join().unwrap();
+    let mut err = String::new();
+    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut err).unwrap();
+    assert!(err.is_empty(), "{err}");
+    assert!(b.glen_home.join("inbox/.read").join(A).exists());
+    assert!(b.glen_home.join("inbox/.read").join(new).exists());
+    assert!(!b.glen_home.join("inbox/.read").join(&beta).exists());
+    assert!(!b.glen_home.join("inbox/.read").join(B).exists());
+    assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 2);
+}

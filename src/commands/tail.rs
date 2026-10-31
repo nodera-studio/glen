@@ -25,7 +25,7 @@ use std::{
 };
 const POLL: Duration = Duration::from_millis(250);
 pub fn run(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
-    let o = open::open(cli, env, &args.session)?;
+    let o = open::open_in(cli, env, &args.session, args.cwd.as_deref())?;
     let mut items = items::build(
         &o.session.active_branch(),
         &ItemOpts {
@@ -94,7 +94,7 @@ impl Drop for Signals {
     }
 }
 pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCode {
-    let mut o = match open::open_follow(cli, env, &args.session) {
+    let mut o = match open::open_follow_in(cli, env, &args.session, args.cwd.as_deref()) {
         Ok(o) => o,
         Err(e) => return output::emit_error(ctx, e),
     };

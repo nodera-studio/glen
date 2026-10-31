@@ -20,25 +20,19 @@ use std::{
     time::{Duration, Instant},
 };
 pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
-    if args.cwd.is_some() && !matches!(args.session.as_str(), "@new" | "@latest") {
-        return Err(GlenError::new(
-            ErrorCode::Usage,
-            "--cwd only applies to @new and @latest",
-        ));
-    }
     paths::resolve(env, cli.global.profile.as_deref())?;
     let scope = args
         .cwd
         .as_deref()
         .map(|p| paths::absolute(env, &p.to_string_lossy()));
-    let scoped = scope.as_ref().map(|p| env.with_cwd(p));
     let opened = if args.session == "@new" {
         None
     } else {
-        Some(super::open::open_unprobed(
+        Some(super::open::open_unprobed_in(
             cli,
-            scoped.as_ref().unwrap_or(env),
+            env,
             &args.session,
+            scope.as_deref(),
         )?)
     };
     let cwd = send_cwd(opened.as_ref(), scope.as_deref(), env)?;

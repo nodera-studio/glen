@@ -906,6 +906,24 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 }
 ```
 
+With `--cwd`, session handles, ids and prefixes are resolved within that directory's project bucket.
+A match found only in another project is `not_found` (exit 3) with `details.reason:"outside_cwd"`
+and the absolute scope directory. File paths bypass project filtering and remain relative to the process cwd.
+
+<!-- contract: error.not_found.outside_cwd -->
+```json
+{
+  "error": {
+    "code": "not_found",
+    "details": {"reason": "outside_cwd", "cwd": "/home/fixture/work/beta"},
+    "hint": "it is in /home/fixture/work/alpha; drop --cwd or run `glen ls --all`",
+    "message": "`e27c0de` is not a session in /home/fixture/work/beta"
+  },
+  "ok": false,
+  "v": 1
+}
+```
+
 <!-- contract: error.ambiguous -->
 ```json
 {

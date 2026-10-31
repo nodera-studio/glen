@@ -208,6 +208,16 @@ use crate::{
 };
 use std::path::PathBuf;
 pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenError> {
+    resolve_in(arg, catalog, env, None)
+}
+pub fn resolve_in(
+    arg: &str,
+    catalog: &Catalog,
+    env: &Env,
+    scope: Option<&Path>,
+) -> Result<PathBuf, GlenError> {
+    let scope = scope.map(|dir| super::paths::absolute(env, &dir.to_string_lossy()));
+    let bucket = scope.as_deref().map(|dir| bucket_for(dir, env));
     let missing = || {
         GlenError::new(
             ErrorCode::NotFound,
@@ -216,7 +226,8 @@ pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenE
         .with_hint("run `glen ls --all`")
     };
     if arg == "@latest" {
-        let bucket = bucket_for(env.cwd(), env);
+        let dir = scope.as_deref().unwrap_or(env.cwd());
+        let bucket = bucket_for(dir, env);
         return catalog
             .sessions
             .iter()
@@ -225,7 +236,7 @@ pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenE
             .ok_or_else(|| {
                 GlenError::new(
                     ErrorCode::NotFound,
-                    format!("no omp sessions for {}", env.cwd().display()),
+                    format!("no omp sessions for {}", dir.display()),
                 )
                 .with_hint("run `glen ls --all`")
             });
@@ -264,24 +275,41 @@ pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenE
             }
         };
     }
-    let mut index = Matches::new(
-        catalog
-            .sessions
-            .iter()
-            .map(|s| (s.id.as_str(), Some(s.file.path.as_path()))),
-    );
-    for (id, handle) in &catalog.handles {
-        index.add_handle(id, handle);
-    }
-    let matching_ids = index.find(&a, usize::MAX);
+    let matching_ids = matching_ids(&a, catalog);
     let mut seen = HashSet::new();
     let matches = catalog
         .sessions
         .iter()
-        .filter(|s| matching_ids.contains(s.id.as_str()) && seen.insert(&s.file.path))
+        .filter(|s| {
+            matching_ids.contains(s.id.as_str())
+                && bucket
+                    .as_ref()
+                    .is_none_or(|bucket| s.file.bucket == *bucket)
+                && seen.insert(&s.file.path)
+        })
         .collect::<Vec<_>>();
     match matches.as_slice() {
-        [] => Err(missing()),
+        [] => {
+            if let Some(dir) = scope.as_deref()
+                && let Some(elsewhere) = catalog
+                    .sessions
+                    .iter()
+                    .find(|s| matching_ids.contains(s.id.as_str()))
+            {
+                return Err(GlenError::new(
+                    ErrorCode::NotFound,
+                    format!("`{arg}` is not a session in {}", dir.display()),
+                )
+                .with_details(
+                    serde_json::json!({"reason":"outside_cwd","cwd":dir.to_string_lossy()}),
+                )
+                .with_hint(format!(
+                    "it is in {}; drop --cwd or run `glen ls --all`",
+                    elsewhere.cwd.as_deref().unwrap_or(&elsewhere.file.bucket)
+                )));
+            }
+            Err(missing())
+        }
         [s] => Ok(s.file.path.clone()),
         _ => {
             let candidates=matches.iter().map(|s|serde_json::json!({"handle":catalog.handle(&s.id),"id":s.id,"path":s.file.path,"title":s.title,"cwd":s.cwd,"updated_at":jiff::Timestamp::try_from(s.file.mtime).ok().map(|t|t.to_string())})).collect::<Vec<_>>();
@@ -311,10 +339,89 @@ pub fn resolve(arg: &str, catalog: &Catalog, env: &Env) -> Result<PathBuf, GlenE
         }
     }
 }
+pub(crate) fn matching_ids<'a>(arg: &str, catalog: &'a Catalog) -> HashSet<&'a str> {
+    let mut index = Matches::new(
+        catalog
+            .sessions
+            .iter()
+            .map(|session| (session.id.as_str(), Some(session.file.path.as_path()))),
+    );
+    for (id, handle) in &catalog.handles {
+        index.add_handle(id, handle);
+    }
+    index.find(arg, usize::MAX)
+}
+
 #[cfg(test)]
 mod resolution_tests {
     use super::*;
     use crate::omp::fixtures;
+    #[test]
+    fn scoped_matches_disambiguate_and_keep_paths_process_relative() {
+        use std::fs;
+        let tree = tempfile::tempdir().unwrap();
+        let alpha = tree.path().join("-work-alpha");
+        let beta = tree.path().join("-work-beta");
+        fs::create_dir(&alpha).unwrap();
+        fs::create_dir(&beta).unwrap();
+        let a = "11111111-1111-7111-8111-111111234567";
+        let b = "22222222-2222-7222-8222-222221234567";
+        for (dir, id, cwd) in [
+            (&alpha, a, "/home/fixture/work/alpha"),
+            (&beta, b, "/home/fixture/work/beta"),
+        ] {
+            fs::write(
+                dir.join("one.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({"type":"session","version":3,"id":id,"cwd":cwd})
+                ),
+            )
+            .unwrap();
+        }
+        let catalog = Catalog::scan(tree.path()).unwrap();
+        let env = Env::for_test(
+            Some(Path::new("/home/fixture")),
+            &alpha,
+            &[("TMPDIR", "/unrelated-temp")],
+        );
+        let scope = Path::new("/home/fixture/work/alpha");
+        assert_eq!(
+            resolve("1234567", &catalog, &env).unwrap_err().code,
+            ErrorCode::Ambiguous
+        );
+        assert_eq!(
+            resolve_in("1234567", &catalog, &env, Some(scope)).unwrap(),
+            alpha.join("one.jsonl")
+        );
+        assert_eq!(
+            resolve_in("@latest", &catalog, &env, Some(scope)).unwrap(),
+            alpha.join("one.jsonl")
+        );
+        for arg in [b, "22222222"] {
+            let error = resolve_in(arg, &catalog, &env, Some(scope)).unwrap_err();
+            assert_eq!(error.code, ErrorCode::NotFound);
+            assert_eq!(error.details.as_ref().unwrap()["reason"], "outside_cwd");
+            assert_eq!(
+                error.details.as_ref().unwrap()["cwd"],
+                "/home/fixture/work/alpha"
+            );
+            assert!(error.hint.unwrap().contains("/home/fixture/work/beta"));
+        }
+        assert_eq!(
+            resolve_in(
+                "one.jsonl",
+                &catalog,
+                &env,
+                Some(Path::new("/home/fixture/work/beta"))
+            )
+            .unwrap(),
+            alpha.join("one.jsonl")
+        );
+        let error = resolve_in("ffffffff", &catalog, &env, Some(scope)).unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert!(error.details.is_none());
+    }
     #[test]
     fn selectors() {
         let t = fixtures::tree();

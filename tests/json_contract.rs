@@ -505,6 +505,20 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         .unwrap();
     assert_eq!(out.status.code(), Some(6));
     all.insert("error.no_route.sandboxed".into(), vec![json(&out)]);
+    let scoped = OmpBox::new();
+    let out = scoped.glen(
+        &[
+            "show",
+            "e27c0de",
+            "--cwd",
+            scoped.beta().to_str().unwrap(),
+            "--json",
+        ],
+        &scoped.alpha(),
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(json(&out)["error"]["details"]["reason"], "outside_cwd");
+    all.insert("error.not_found.outside_cwd".into(), vec![json(&out)]);
     all
 }
 #[test]

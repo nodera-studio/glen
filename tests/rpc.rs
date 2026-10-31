@@ -476,12 +476,13 @@ fn ac209_new_session_and_profile() {
         }
     }
     let b = RpcBox::new();
-    envelope(
+    let outside = envelope(
         &b.glen(&["send", "e27c0de", "hi", "--cwd", "/tmp", "--json"])
             .output()
             .unwrap(),
-        2,
+        3,
     );
+    assert_eq!(outside["error"]["details"]["reason"], "outside_cwd");
     envelope(
         &b.glen(&["send", "@new", "hi", "--cwd", "/missing-glen-dir", "--json"])
             .output()
@@ -1507,4 +1508,49 @@ fn cycle3_stale_state_responses_cannot_revert_reply_identity() {
                 .exists()
         );
     }
+}
+
+#[test]
+fn cwd_resolves_a_handle_in_its_bucket_but_recorded_cwd_still_wins() {
+    let b = RpcBox::new();
+    // These distinct directories encode to the same project bucket (-work-alpha).
+    let scope = b.omp.home.join("work-alpha");
+    fs::create_dir(&scope).unwrap();
+    let file = b.omp.session('A');
+    let original = fs::read_to_string(&file).unwrap();
+    let mut changed = false;
+    let lines = original
+        .lines()
+        .map(|line| {
+            let Ok(mut record) = serde_json::from_str::<Value>(line) else {
+                return line.to_owned();
+            };
+            if record["type"] == "session" {
+                record["cwd"] = json!(b.omp.alpha());
+                changed = true;
+                record.to_string()
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>();
+    assert!(changed, "fixture must contain a session header");
+    fs::write(&file, format!("{}\n", lines.join("\n"))).unwrap();
+    let out = b
+        .glen(&[
+            "send",
+            "e27c0de",
+            "hi",
+            "--cwd",
+            scope.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    let value = envelope(&out, 0);
+    let log = b.fake_log();
+    let started = log.iter().find(|event| event["event"] == "start").unwrap();
+    assert_eq!(started["cwd"], b.omp.alpha().to_str().unwrap());
+    assert_ne!(started["cwd"], scope.to_str().unwrap());
+    b.wait_worker_gone(&job_id(&value));
 }

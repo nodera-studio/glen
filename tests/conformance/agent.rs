@@ -2848,7 +2848,7 @@ fn ac410_the_offline_refusal_follows_argument_target_and_message_validation() {
         ),
         (
             &["send", A.handle, "hi", "--cwd", "/tmp", "--json"],
-            "usage",
+            "not_found",
         ),
         (&["send", A.handle, "--json"], "usage"),
         (&["send", "j1234567", "hi", "--json"], "usage"),
@@ -2857,7 +2857,11 @@ fn ac410_the_offline_refusal_follows_argument_target_and_message_validation() {
     ];
     for (args, code) in cases {
         let out = envs(rb.glen(args), &OFFLINE).run();
-        failed(&out, code);
+        let error = failed(&out, code);
+        if args.contains(&"--cwd") {
+            assert_eq!(error["details"]["reason"], "outside_cwd");
+            assert_eq!(error["details"]["cwd"], "/tmp");
+        }
     }
     let out = rb.glen_stdin(&["send", A.handle, "-", "--json"], &OFFLINE, b"");
     failed(&out, "usage");
@@ -3184,7 +3188,7 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 32] = [
+const CONTRACT_IDS: [&str; 33] = [
     "ls",
     "show",
     "show.raw",
@@ -3210,6 +3214,7 @@ const CONTRACT_IDS: [&str; 32] = [
     "compact",
     "error.usage",
     "error.not_found",
+    "error.not_found.outside_cwd",
     "error.ambiguous",
     "error.job_failed",
     "error.control_failed",
@@ -3578,6 +3583,18 @@ fn ac412_contract_reader_errors() {
     let out = bx.glen(["ls", "--bogus", "--json"]).run();
     failed(&out, "usage");
     assert_contract("error.usage", &out.json());
+}
+
+#[test]
+fn ac412_contract_not_found_outside_cwd() {
+    let bx = OmpBox::new();
+    let out = bx
+        .glen(["show", A.handle, "--cwd", &s(&bx.beta), "--json"])
+        .run();
+    let error = failed(&out, "not_found");
+    assert_eq!(error["details"]["reason"], "outside_cwd");
+    assert_eq!(error["details"]["cwd"], s(&bx.beta));
+    assert_contract("error.not_found.outside_cwd", &out.json());
 }
 
 #[test]

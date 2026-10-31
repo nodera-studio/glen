@@ -629,3 +629,82 @@ fn rejected_in_place_reload_stays_rejected_after_regrowth() {
     assert_eq!(f.event()["item"]["id"], "original-restored");
     assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
 }
+
+#[test]
+fn cwd_scopes_latest_and_follow_but_never_rebases_explicit_paths() {
+    let sb = OmpBox::new();
+    let alpha = sb.alpha();
+    let beta = sb.beta();
+    let foreign = beta.join("nested");
+    fs::create_dir(&foreign).unwrap();
+    let a = sb.session('A');
+    let relative = format!(
+        "../../../agent/sessions/-work-alpha/{}",
+        a.file_name().unwrap().to_str().unwrap()
+    );
+    for command in ["show", "tail"] {
+        let latest = sb.glen(
+            &[
+                command,
+                "@latest",
+                "--cwd",
+                beta.to_str().unwrap(),
+                "--json",
+            ],
+            &alpha,
+        );
+        assert_eq!(
+            data(&latest)["session"]["path"],
+            sb.session('E').to_str().unwrap()
+        );
+        for arg in [a.to_str().unwrap(), &relative] {
+            let out = sb.glen(
+                &[command, arg, "--cwd", foreign.to_str().unwrap(), "--json"],
+                &alpha,
+            );
+            assert_eq!(data(&out)["session"]["id"], common::A_ID);
+        }
+    }
+    let outside = sb.glen(
+        &[
+            "tail",
+            "0a3f417",
+            "-f",
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--json",
+        ],
+        &beta,
+    );
+    assert_eq!(outside.status.code(), Some(3));
+    assert_eq!(json(&outside)["error"]["details"]["reason"], "outside_cwd");
+    let mut following = Following::start(
+        &sb,
+        &[
+            "tail",
+            "@latest",
+            "-f",
+            "--cwd",
+            beta.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        following.event()["session"]["path"],
+        sb.session('E').to_str().unwrap()
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(following.child.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    assert_eq!(
+        common::poll(Duration::from_secs(10), || following
+            .child
+            .try_wait()
+            .unwrap())
+        .code(),
+        Some(130)
+    );
+    sb.clean();
+}
