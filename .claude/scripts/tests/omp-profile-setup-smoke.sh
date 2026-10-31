@@ -5,10 +5,22 @@ umask 077
 
 TEST_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd -P)"
-SETUP="$REPO_ROOT/.claude/scripts/omp-profile-setup.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/glen-omp-setup-smoke.XXXXXX")"
 WORK="$(cd "$WORK" && pwd -P)"
 trap 'rm -rf "$WORK"' EXIT
+# A private engine checkout supplies a known main launcher. This both isolates
+# source selection from the host's main branch and exercises the shared resolver.
+ENGINE_FIXTURE="$WORK/engine-source"
+mkdir -p "$ENGINE_FIXTURE/.claude/scripts" "$ENGINE_FIXTURE/.claude/omp/skills/mnemosyne-glen"
+cp "$REPO_ROOT/.claude/scripts/omp-profile-setup.sh" "$REPO_ROOT/.claude/scripts/omp-engine.sh" "$ENGINE_FIXTURE/.claude/scripts/"
+cp "$REPO_ROOT/.claude/omp/omp-sandboxed.sh" "$REPO_ROOT/.claude/omp/omp-sandboxed-linux.sh" \
+  "$REPO_ROOT/.claude/omp/glen-harness.yml" "$REPO_ROOT/.claude/omp/mcp.json" "$ENGINE_FIXTURE/.claude/omp/"
+cp "$REPO_ROOT/.claude/omp/skills/mnemosyne-glen/SKILL.md" "$ENGINE_FIXTURE/.claude/omp/skills/mnemosyne-glen/"
+git -C "$ENGINE_FIXTURE" init -q --initial-branch=main
+git -C "$ENGINE_FIXTURE" add .
+git -C "$ENGINE_FIXTURE" -c user.name='Glen smoke' -c user.email='smoke@example.invalid' \
+  -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --no-gpg-sign -qm fixture
+SETUP="$ENGINE_FIXTURE/.claude/scripts/omp-profile-setup.sh"
 mkdir "$WORK/bin"
 cp "$TEST_DIR/support/omp" "$WORK/bin/omp"
 export PATH="$WORK/bin:$PATH"
@@ -61,6 +73,30 @@ esac
 EOF
 chmod +x "$WORK/bin/omp" "$WORK/bin/cargo" "$WORK/bin/glen"
 
+# Run the actual launcher, replacing only the OS sandbox program in this offline
+# routing suite. Local config invocations must not pass through either stub.
+cat > "$WORK/bin/sandbox-exec" <<'EOF'
+#!/bin/bash
+set -eu
+[ "$1" = -f ] && [ -f "$2" ] || exit 99
+shift 2
+jq -cn --arg agent "$OMP_PROFILE_AGENT_DIR" --arg root "$OMP_SANDBOX_RUN_ROOT" \
+  --arg cwd "$(pwd -P)" --args \
+  '{agent:$agent,root:$root,cwd:$cwd,argv:$ARGS.positional}' -- "${@:2}" >> "$FAKE_OMP_LAUNCH_LOG"
+exec "$@"
+EOF
+cat > "$WORK/bin/bwrap" <<'EOF'
+#!/bin/bash
+set -eu
+while [ "$1" != -- ]; do shift; done
+shift
+jq -cn --arg agent "$OMP_PROFILE_AGENT_DIR" --arg root "$OMP_SANDBOX_RUN_ROOT" \
+  --arg cwd "$(pwd -P)" --args \
+  '{agent:$agent,root:$root,cwd:$cwd,argv:$ARGS.positional}' -- "${@:2}" >> "$FAKE_OMP_LAUNCH_LOG"
+exec "$@"
+EOF
+chmod +x "$WORK/bin/sandbox-exec" "$WORK/bin/bwrap"
+
 new_fixture() {
   CASE_DIR="$(mktemp -d "$WORK/case.XXXXXX")"
   TEST_HOME="$CASE_DIR/home" TEST_CONFIG_DIR="${1:-.omp}"
@@ -76,9 +112,11 @@ new_fixture() {
   export FAKE_OMP_TEST_HOME="$TEST_HOME" FAKE_OMP_AGENT_DIR="$TEST_AGENT"
   export FAKE_OMP_STATE="$CASE_DIR/state" FAKE_OMP_LOG="$CASE_DIR/omp.jsonl"
   export FAKE_OMP_WRITES="$CASE_DIR/writes" FAKE_TOOL_CALLS="$CASE_DIR/tool-calls"
+  export FAKE_OMP_LAUNCH_LOG="$CASE_DIR/launcher-calls.jsonl"
   unset FAKE_OMP_VERSION FAKE_OMP_REPORTED_DIR FAKE_OMP_REJECT_KEY FAKE_OMP_ERROR_KEY FAKE_OMP_MUTATE FAKE_GLEN_CURRENT
   unset FAKE_OMP_DB_FILE
   : > "$FAKE_OMP_LOG"
+  : > "$FAKE_OMP_LAUNCH_LOG"
   : > "$FAKE_OMP_WRITES"
   : > "$FAKE_TOOL_CALLS"
   # Canned config responses keyed by the exact registered setting ID.
@@ -121,6 +159,16 @@ assert_contains 'both preferred models present chooses Argon visibly' 'chose cur
 assert 'full setup fetches models before setting config' jq -es '
   map(.argv[2:4] | join(" ")) as $calls |
   ($calls | index("models cursor")) < ($calls | index("config set"))' "$FAKE_OMP_LOG"
+# shellcheck disable=SC2016 # jq receives $agent through --arg.
+assert 'setup launches only the model query with explicit profile and cwd' jq -es --arg agent "$TEST_AGENT" \
+  'length==1 and all(.[]; .argv==["--profile","glen-harness","models","cursor","--json"] and .agent==$agent and .root==.cwd)' "$FAKE_OMP_LAUNCH_LOG"
+assert 'setup removes model query scratch root after the call' test ! -e "$(jq -r .root "$FAKE_OMP_LAUNCH_LOG")"
+# A modified worktree launcher cannot replace the captured main version.
+if [ "$(uname -s)" = Darwin ]; then launcher_name=omp-sandboxed.sh; else launcher_name=omp-sandboxed-linux.sh; fi
+printf '#!/bin/bash\nexit 99\n' > "$ENGINE_FIXTURE/.claude/omp/$launcher_name"
+setup_run "$SETUP" --check
+assert_exit 'setup model fetch prefers main over modified worktree launcher' 0
+assert 'setup using main launcher has no fallback warning' test ! -s "$STDERR"
 
 new_fixture
 printf '%s\n' '{"models":[{"provider":"cursor","id":"gemini-3.8-flash"},{"selector":"cursor/other"}]}' > "$FAKE_OMP_STATE/models.json"
@@ -203,6 +251,24 @@ new_fixture /custom-omp
 setup_run "$SETUP" --dry-run
 assert_exit 'leading-slash PI_CONFIG_DIR stays under scratch HOME' 0
 assert 'custom config directory still scopes every call' all_scoped
+# shellcheck disable=SC2016 # jq receives $agent through --arg.
+assert 'setup passes resolved custom profile directory into launcher' jq -es --arg agent "$TEST_AGENT" \
+  'length==1 and all(.[]; .agent==$agent)' "$FAKE_OMP_LAUNCH_LOG"
+
+# Setup may configure local files directly, but it cannot query models without
+# an OS sandbox. The allowlisted PATH contains no sandbox-exec or bwrap.
+mkdir "$WORK/no-sandbox-bin"
+for tool in date dirname git jq shasum uname mktemp rm find stat awk sort env omp mkdir cmp grep basename; do
+  ln -s "$(command -v "$tool")" "$WORK/no-sandbox-bin/$tool"
+done
+new_fixture
+PATH="$WORK/no-sandbox-bin" setup_run "$SETUP" --dry-run
+assert_exit 'setup model fetch without sandbox fails closed' 1
+if [ "$(uname -s)" = Darwin ]; then missing_tool=sandbox-exec; else missing_tool=bwrap; fi
+assert_contains 'setup missing sandbox reason names tool' "$missing_tool not on PATH" "$STDERR"
+assert 'setup without sandbox never queries models or sets config' jq -es \
+  'all(.[]; .argv[2]!="models" and .argv[2:4]!=["config","set"])' "$FAKE_OMP_LOG"
+assert 'setup without sandbox never executes launcher payload' test ! -s "$FAKE_OMP_LAUNCH_LOG"
 
 # HOME aliases are allowed; only symlinks below its physical location are unsafe.
 # Cover both the nearest-existing-ancestor fallback and an existing agent dir.

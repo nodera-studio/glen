@@ -11,6 +11,12 @@ REAL_HOME="$(cd "$HOME" && pwd -P)" || die 'could not resolve HOME directory'
 export HOME="$REAL_HOME"
 [ -n "${OMP_SANDBOX_RUN_ROOT:-}" ] || die 'OMP_SANDBOX_RUN_ROOT is required'
 RUN_ROOT_REAL="$(cd "$OMP_SANDBOX_RUN_ROOT" && pwd -P)" || die 'could not resolve run root'
+# Legacy callers retain the old profile-root scope. Repository callers pass the
+# resolved agent directory explicitly, including custom PI_CONFIG_DIR layouts.
+PROFILE_STATE_DIR="$REAL_HOME/.omp/profiles/glen-harness"
+if [ -n "${OMP_PROFILE_AGENT_DIR:-}" ]; then
+  PROFILE_STATE_DIR="$(cd "$OMP_PROFILE_AGENT_DIR" && pwd -P)" || die 'could not resolve profile agent directory'
+fi
 
 # Resolve both ancestor aliases (/var -> /private/var) and the executable's own
 # symlink chain. omp is a self-contained Bun-compiled Mach-O; no runtime/package
@@ -41,6 +47,7 @@ sbpl_path() {
 home_sb="$(sbpl_path "$REAL_HOME")"
 run_sb="$(sbpl_path "$RUN_ROOT_REAL")"
 bin_sb="$(sbpl_path "$OMP_REAL_BIN_RESOLVED")"
+agent_sb="$(sbpl_path "$PROFILE_STATE_DIR")"
 profile="$(mktemp "$RUN_ROOT_REAL/omp-sandbox.XXXXXX")"
 cat > "$profile" <<EOF
 (version 1)
@@ -66,14 +73,14 @@ cat > "$profile" <<EOF
   ;; The physical, self-contained omp executable.
   (literal "$bin_sb")
   ;; Harness config, mcp.json, skill, sessions and extensions.
-  (subpath "$home_sb/.omp/profiles/glen-harness")
+  (subpath "$agent_sb")
   ;; Shared native-binary cache populated by any omp profile.
   (subpath "$home_sb/.omp/natives")
 )
 (allow file-write*
   ;; Job artifacts and the harness profile's own state.
   (subpath "$run_sb")
-  (subpath "$home_sb/.omp/profiles/glen-harness")
+  (subpath "$agent_sb")
   ;; Cross-profile owner leases/daemon state and native-binary cache.
   (subpath "$home_sb/.omp/run")
   (subpath "$home_sb/.omp/natives")

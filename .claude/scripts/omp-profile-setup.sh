@@ -153,11 +153,20 @@ trap finish EXIT
 # Each call gets a new project-free cwd. Never inherit the caller's overlay or
 # active profile; every omp invocation must explicitly select glen-harness.
 omp_run() {
-  local layer="$1"
+  local layer="$1" cwd launcher real_omp
   shift
   (
-    cd "$(mktemp -d "$TMPROOT/omp.XXXXXX")" || exit 1
-    if [ "$layer" = overlay ]; then
+    cwd="$(mktemp -d "$TMPROOT/omp.XXXXXX")" || exit 1
+    cd "$cwd" || exit 1
+    cwd="$(pwd -P)"
+    if [ "$layer" = sandbox ]; then
+      launcher="$(/bin/bash "$ENGINE_ROOT/.claude/scripts/omp-engine.sh" launcher "$ENGINE_ROOT" "$cwd")" || exit 1
+      real_omp="$(command -v omp)" || exit 1
+      env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
+        -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+        HOME="$PROFILE_HOME" OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" \
+        OMP_PROFILE_AGENT_DIR="$AGENT_DIR" "$launcher" "$@" 3>&-
+    elif [ "$layer" = overlay ]; then
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" PI_CONFIG_FILES="$OVERLAY" omp "$@"
     else
@@ -190,8 +199,9 @@ asset_guard "$MCP_SOURCE" "$MCP_TARGET" '"mnemosyne"'
 asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"
 
 # Resolve the default before syncing settings or installing assets. Primary login
-# signal, pending a live owner login; usage accounts --json is an alternate.
-MODELS="$(profile_omp profile models cursor --json)"
+# signal, pending a live owner login (a cached catalog is not a network test).
+# models-cli.ts uses online-if-uncached; no usage fallback is actually invoked.
+MODELS="$(profile_omp sandbox models cursor --json)"
 MODEL_COUNT="$(printf '%s' "$MODELS" | jq -er '.models | length')"
 LOGIN=1
 [ "$MODEL_COUNT" -gt 0 ] || LOGIN=0

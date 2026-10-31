@@ -11,7 +11,7 @@ MODE="${1:-}"
 PROFILE=glen-harness
 START="$(date +%s)"
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
-MODEL='' PROVIDER='' POLICY_SOURCE='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
+MODEL='' PROVIDER='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
 RUN_DIR='' RUN_GLEN_HOME='' POLICY_PATH='' JOB='' SESSION_HANDLE='' SESSION_PATH=''
 OUT='' PROBE_DIR='' ENVELOPE='' TREE='' ROOT='' MOVED='[]' REPLIES=0 KEEP=0
 OUTPUT_READY=0 JOB_ACTIVE=0 JOB_TIMEOUT_SECONDS=0
@@ -33,24 +33,50 @@ usage() {
 
 # The single environment boundary for send, wait, and the envcheck smoke helper.
 # Mnemosyne credentials pass through untouched; never log environment values.
+profile_agent_dir() {
+  printf '%s/%s/profiles/%s/agent\n' "$(cd "$HOME" && pwd -P)" "${PI_CONFIG_DIR:-.omp}" "$PROFILE"
+}
 dispatch_env() {
-  local engine_root launcher=''
-  if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
-    launcher=omp-sandboxed.sh
-  elif [ "$(uname -s)" != Darwin ] && command -v bwrap >/dev/null 2>&1; then
-    launcher=omp-sandboxed-linux.sh
-  fi
-  if [ -n "$launcher" ]; then
-    # envcheck runs before normal repository discovery; resolve only when needed.
-    engine_root="${ENGINE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
-    set -- GLEN_OMP_BIN="$engine_root/.claude/omp/$launcher" \
-      OMP_SANDBOX_RUN_ROOT="$RUN_DIR" "$@"
-  fi
+  local engine_root agent_dir real_omp
+  engine_root="${ENGINE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
+  resolve_launcher "$engine_root" "$RUN_DIR" || { log "$REASON"; stop failed "$REASON" 4; }
+  agent_dir="$(profile_agent_dir)"
+  real_omp="$(command -v omp)" || stop failed 'omp not on PATH' 4
+  case "$real_omp" in /*) ;; *) real_omp="$PWD/$real_omp" ;; esac
   env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CODING_AGENT_DIR \
     -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
-    -u GLEN_OMP_BIN -u OMP_SANDBOX_RUN_ROOT \
+    -u GLEN_OMP_BIN -u OMP_SANDBOX_RUN_ROOT -u OMP_REAL_BIN -u OMP_PROFILE_AGENT_DIR \
+    GLEN_OMP_BIN="$LAUNCHER_BIN" OMP_REAL_BIN="$real_omp" \
+    OMP_SANDBOX_RUN_ROOT="$RUN_DIR" OMP_PROFILE_AGENT_DIR="$agent_dir" \
     GLEN_HOME="$RUN_GLEN_HOME" PI_CONFIG_FILES="$POLICY_PATH" \
     GLEN_JOB_TIMEOUT="${JOB_TIMEOUT_SECONDS}s" "$@" 3>&-
+}
+
+# The one platform/source decision, shared by dispatch, probes, and setup's
+# internal `launcher SRC DIR` helper. DIR belongs to the caller's run lifetime.
+resolve_launcher() {
+  local src="$1" dest="$2" launcher tool platform
+  platform="$(uname -s)"
+  if [ "$platform" = Darwin ]; then launcher=omp-sandboxed.sh; tool=sandbox-exec
+  else launcher=omp-sandboxed-linux.sh; tool=bwrap
+  fi
+  if ! command -v "$tool" >/dev/null 2>&1; then
+    if [ "$platform" = Darwin ]; then platform=macOS; else platform=Linux; fi
+    REASON="$tool not on PATH; the omp sandbox requires it on $platform"
+    return 1
+  fi
+  # Reuse the captured executable within this run, but recheck tool availability
+  # on every dispatch. Never select an inherited GLEN_OMP_BIN/OMP_REAL_BIN.
+  case "$LAUNCHER_BIN" in "$dest"/*) [ ! -x "$LAUNCHER_BIN" ] || return 0 ;; esac
+  LAUNCHER_BIN="$(mktemp "$dest/$launcher.XXXXXX")" || { REASON='could not create sandbox launcher'; return 1; }
+  if git -C "$src" show "main:.claude/omp/$launcher" > "$LAUNCHER_BIN" 2>/dev/null; then
+    LAUNCHER_SOURCE=main
+  else
+    cp "$src/.claude/omp/$launcher" "$LAUNCHER_BIN" || { REASON='sandbox launcher unavailable on main and in worktree'; return 1; }
+    LAUNCHER_SOURCE=worktree
+    log 'warning: main launcher unavailable; using the worktree launcher'
+  fi
+  chmod 0700 "$LAUNCHER_BIN" || { REASON='could not make sandbox launcher executable'; return 1; }
 }
 
 # SRC is an engine checkout, not the tree being reviewed.
@@ -65,14 +91,22 @@ policy() {
   fi
 }
 
-# These two internal helpers deliberately expose the requested command/YAML output.
+# Internal helpers deliberately expose only their requested command/path/YAML.
 case "$MODE" in
+  launcher)
+    [ "$#" -eq 2 ] || { log 'usage: launcher SRC DIR'; exit 2; }
+    resolve_launcher "$1" "$2" || { log "$REASON"; exit 4; }
+    printf '%s\n' "$LAUNCHER_BIN"
+    exit 0
+    ;;
   envcheck)
     if [ "${1:-}" != -- ] || [ "$#" -lt 2 ]; then
       printf '%s\n' '{"v":1,"engine":"omp","mode":"envcheck","status":"failed","reason":"usage error"}'
       exit 2
     fi
     shift
+    RUN_DIR="$(mktemp -d)"
+    trap 'rm -rf "$RUN_DIR"' EXIT
     dispatch_env "$@"
     exit "$?"
     ;;
@@ -99,6 +133,7 @@ result_json() {
   elapsed=$(( ($(date +%s) - START) * 1000 ))
   jq -cn --arg mode "$MODE" --arg status "$STATUS" --arg reason "$REASON" \
     --arg model "$MODEL" --arg provider "$PROVIDER" --arg policy_source "$POLICY_SOURCE" \
+    --arg launcher_source "$LAUNCHER_SOURCE" \
     --arg head "$HEAD" --arg merge_base "$MERGE_BASE" --arg snapshot_sha256 "$SNAPSHOT_SHA256" \
     --arg glen_home "$RUN_GLEN_HOME" --arg job "$JOB" --arg handle "$SESSION_HANDLE" \
     --arg path "$SESSION_PATH" --arg out "$OUT" --arg run_dir "$RUN_DIR" \
@@ -111,6 +146,7 @@ result_json() {
     else
       {v:1,engine:"omp",mode:$mode,status:$status,reason:($reason|nullable),profile:"glen-harness",
        model:($model|nullable),provider:($provider|nullable),policy_source:($policy_source|nullable),
+       launcher_source:($launcher_source|nullable),
        head:($head|nullable),merge_base:($merge_base|nullable),snapshot_sha256:($snapshot_sha256|nullable),
        glen_home:($glen_home|nullable),job:($job|nullable),session:{handle:($handle|nullable),path:($path|nullable)},
        elapsed_ms:$elapsed_ms,usage:$usage,replies:$replies,out:($out|nullable),run_dir:($run_dir|nullable)}
@@ -269,19 +305,25 @@ resolve_glen() {
   case "$GLEN_BIN" in /*) ;; *) GLEN_BIN="$PWD/$GLEN_BIN" ;; esac
 }
 bounded_omp() {
-  local seconds="$1" cwd
+  local seconds="$1" cwd real_omp agent_dir
   shift
   cwd="$(mktemp -d "$PROBE_DIR/call.XXXXXX")" || return 1
+  resolve_launcher "$ENGINE_ROOT" "$PROBE_DIR" || { log "$REASON"; return 1; }
+  real_omp="$(command -v omp)" || return 1
+  case "$real_omp" in /*) ;; *) real_omp="$PWD/$real_omp" ;; esac
+  agent_dir="$(profile_agent_dir)"
   (
     cd "$cwd" || exit 1
     if command -v timeout >/dev/null 2>&1; then
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
-        timeout "$seconds" omp --profile "$PROFILE" "$@" 3>&-
+        OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" OMP_PROFILE_AGENT_DIR="$agent_dir" \
+        timeout "$seconds" "$LAUNCHER_BIN" --profile "$PROFILE" "$@" 3>&-
     else
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
-        perl -e 'alarm shift @ARGV; exec @ARGV' "$seconds" omp --profile "$PROFILE" "$@" 3>&-
+        OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" OMP_PROFILE_AGENT_DIR="$agent_dir" \
+        perl -e 'alarm shift @ARGV; exec @ARGV' "$seconds" "$LAUNCHER_BIN" --profile "$PROFILE" "$@" 3>&-
     fi
   )
 }
@@ -290,15 +332,19 @@ probe_checks() {
   [ "${GLEN_OMP_ENGINE:-}" != off ] || stop skipped 'disabled by GLEN_OMP_ENGINE=off' 3
   resolve_glen || stop skipped 'no glen binary; run .claude/scripts/omp-profile-setup.sh' 3
   command -v omp >/dev/null 2>&1 || stop skipped 'omp not on PATH' 3
+  if [ "$(uname -s)" = Darwin ] && ! command -v sandbox-exec >/dev/null 2>&1; then
+    stop skipped 'sandbox-exec not on PATH; the omp sandbox requires it on macOS' 3
+  fi
   if [ "$(uname -s)" != Darwin ] && ! command -v bwrap >/dev/null 2>&1; then
     stop skipped 'bwrap not on PATH; the omp sandbox requires it on Linux' 3
   fi
-  [ -f "$HOME/${PI_CONFIG_DIR:-.omp}/profiles/$PROFILE/agent/config.yml" ] || \
+  [ -f "$(profile_agent_dir)/config.yml" ] || \
     stop skipped 'glen-harness profile is not set up; run .claude/scripts/omp-profile-setup.sh' 3
   prepare_root || stop skipped "$REASON" 3
   # Probe cwd is also below ROOT; reject unsafe discovery ancestry before omp.
   validate_snapshot_ancestors "$ROOT/.probe"
   PROBE_DIR="$(mktemp -d "$ROOT/probe.XXXXXX")"
+  resolve_launcher "$ENGINE_ROOT" "$PROBE_DIR" || stop skipped "$REASON" 3
   # Provisional login signal; Step 3 must confirm this after the owner's login.
   if models="$(bounded_omp 9 models cursor --json)"; then rc=0; else rc="$?"; fi
   case "$rc" in

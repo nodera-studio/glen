@@ -12,6 +12,10 @@ export HOME="$REAL_HOME"
 [ -n "${OMP_SANDBOX_RUN_ROOT:-}" ] || die 'OMP_SANDBOX_RUN_ROOT is required'
 RUN_ROOT_REAL="$(cd "$OMP_SANDBOX_RUN_ROOT" && pwd -P)" || die 'could not resolve run root'
 RUN_CWD="$(pwd -P)" || die 'could not resolve working directory'
+PROFILE_STATE_DIR="$REAL_HOME/.omp/profiles/glen-harness"
+if [ -n "${OMP_PROFILE_AGENT_DIR:-}" ]; then
+  PROFILE_STATE_DIR="$(cd "$OMP_PROFILE_AGENT_DIR" && pwd -P)" || die 'could not resolve profile agent directory'
+fi
 
 # Resolve ancestor aliases and the executable's own symlink chain, as on macOS.
 # omp is self-contained; only its executable and system linking dependencies bind.
@@ -53,9 +57,9 @@ binds+=(--ro-bind "$OMP_REAL_BIN_RESOLVED" "$OMP_REAL_BIN_RESOLVED")
 # shared native-binary cache, and cross-profile owner leases/daemon runtime state.
 # Create only these state directories; refuse aliases that could import another
 # profile or arbitrary host data through a bind's source resolution.
-for path in "$REAL_HOME/.omp/profiles/glen-harness" "$REAL_HOME/.omp/natives" "$REAL_HOME/.omp/run"; do
+for path in "$PROFILE_STATE_DIR" "$REAL_HOME/.omp/natives" "$REAL_HOME/.omp/run"; do
   ancestor="$path"
-  while [ "$ancestor" != "$REAL_HOME" ]; do
+  while [ "$ancestor" != "$REAL_HOME" ] && [ "$ancestor" != / ]; do
     [ ! -L "$ancestor" ] || die "symlink in sandbox state path: $ancestor"
     ancestor="$(dirname "$ancestor")"
   done

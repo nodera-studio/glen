@@ -101,7 +101,9 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
       -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
       -u XDG_STATE_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_DATA_HOME \
       LC_ALL=C HOME="$sandbox_home" PI_CONFIG_DIR=.omp OMP_REAL_BIN="$binary" \
-      OMP_SANDBOX_RUN_ROOT="$sandbox_run" /bin/bash "$SANDBOX" "$@"
+      OMP_SANDBOX_RUN_ROOT="$sandbox_run" \
+      OMP_PROFILE_AGENT_DIR="${sandbox_agent:-$sandbox_home/.omp/profiles/glen-harness/agent}" \
+      /bin/bash "$SANDBOX" "$@"
   )
   run_sandbox sandbox_call "$sandbox_alias/bin/omp" "$sandbox_base/run/readable"
   if [ "$sandbox_runtime" -eq 1 ]; then
@@ -112,11 +114,19 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   generated_profile="${profiles[0]}"
   assert_contains 'sandbox imports dyld bootstrap support' '(import "dyld-support.sb")' "$generated_profile"
   assert_contains 'sandbox canonicalizes run root' "(subpath \"$sandbox_base/run\")" "$generated_profile"
-  assert_contains 'sandbox canonicalizes HOME' "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness\")" "$generated_profile"
+  assert_contains 'sandbox canonicalizes HOME' "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/agent\")" "$generated_profile"
   assert_contains 'sandbox resolves executable symlink chain' "(literal \"$(cd /bin && pwd -P)/cat\")" "$generated_profile"
   assert 'sandbox profile contains no unresolved fixture alias' test "$(grep -Fc sandbox-alias "$generated_profile" || true)" -eq 0
   # An opening quote followed by /var/ must never survive physical resolution.
   assert 'sandbox profile contains no logical /var literal' test "$(grep -Fc '\"/var/' "$generated_profile" || true)" -eq 0
+
+  mkdir -p "$sandbox_base/home/custom-omp/profiles/glen-harness/agent"
+  sandbox_agent="$sandbox_alias/home/custom-omp/profiles/glen-harness/agent"
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  custom_profile="$(grep -Fl -- "$sandbox_base/home/custom-omp/profiles/glen-harness/agent" "$sandbox_base/run"/omp-sandbox.*)"
+  assert 'sandbox explicit profile path is canonical and used for reads/writes' test "$(grep -Fc "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent\")" "$custom_profile")" -eq 2
+  assert 'sandbox explicit profile does not admit old profile root' test "$(grep -Fc '.omp/profiles/glen-harness' "$custom_profile" || true)" -eq 0
+  unset sandbox_agent
 
   if [ "$sandbox_runtime" -eq 1 ]; then
     # shellcheck disable=SC2016 # The sandboxed child must expand its own HOME.
@@ -195,6 +205,51 @@ if [ "$(uname -s)" != Darwin ]; then
 else
   printf 'NOTE Linux bwrap probe checks skipped: non-Darwin required\n'
 fi
+
+# Hide the sandbox tool with an allowlisted PATH: prepending an empty directory
+# cannot hide a later executable. Both the probe and bypassed-probe dispatch fail.
+mkdir "$WORK/no-sandbox-bin"
+for tool in date uname git dirname jq omp mktemp rm; do
+  ln -s "$(command -v "$tool")" "$WORK/no-sandbox-bin/$tool"
+done
+if [ "$(uname -s)" = Darwin ]; then missing_tool=sandbox-exec; else missing_tool=bwrap; fi
+run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+  PATH="$WORK/no-sandbox-bin" /bin/bash "$ENGINE" probe
+assert_exit 'probe without sandbox skips' 3
+assert 'probe without sandbox has skipped status' jq -e '.status == "skipped"' "$STDOUT"
+assert_contains 'probe without sandbox names missing tool' "$missing_tool not on PATH" "$STDOUT"
+assert 'probe without sandbox creates no run root or jobs' test ! -e "$WORK/tmp/glen-omp-engine"
+run env HOME="$WORK/home" PATH="$WORK/no-sandbox-bin" /bin/bash "$ENGINE" envcheck -- "$GLEN_BIN"
+assert_exit 'dispatch without sandbox fails closed' 4
+assert_contains 'dispatch without sandbox names missing tool' "$missing_tool not on PATH" "$STDERR"
+assert 'missing sandbox never executes omp or glen' test ! -e "$SMOKE_UNEXPECTED_CALL"
+
+# Offline routing checks exercise the REAL launcher with a fake OS sandbox tool,
+# independently of whether nested sandbox_apply is permitted by the test host.
+export SMOKE_SANDBOX_CALLS="$WORK/sandbox-calls.jsonl"
+cat > "$WORK/bin/sandbox-exec" <<'EOF'
+#!/bin/bash
+set -eu
+[ "$1" = -f ] && [ -f "$2" ] || exit 99
+shift 2
+export SMOKE_SANDBOX_ACTIVE=1
+jq -cn --arg root "$OMP_SANDBOX_RUN_ROOT" --arg cwd "$(pwd -P)" \
+  --arg agent "$OMP_PROFILE_AGENT_DIR" --arg binary "$OMP_REAL_BIN" \
+  '{root:$root,cwd:$cwd,agent:$agent,binary:$binary}' >> "$SMOKE_SANDBOX_CALLS"
+exec "$@"
+EOF
+cat > "$WORK/bin/bwrap" <<'EOF'
+#!/bin/bash
+set -eu
+while [ "$1" != -- ]; do shift; done
+shift
+export SMOKE_SANDBOX_ACTIVE=1
+jq -cn --arg root "$OMP_SANDBOX_RUN_ROOT" --arg cwd "$(pwd -P)" \
+  --arg agent "$OMP_PROFILE_AGENT_DIR" --arg binary "$OMP_REAL_BIN" \
+  '{root:$root,cwd:$cwd,agent:$agent,binary:$binary}' >> "$SMOKE_SANDBOX_CALLS"
+exec "$@"
+EOF
+chmod +x "$WORK/bin/sandbox-exec" "$WORK/bin/bwrap"
 
 started="$(now_ms)"
 run env GLEN_OMP_ENGINE=off /bin/bash "$ENGINE" probe
@@ -414,6 +469,7 @@ assert 'standalone snapshot honors explicit mutation hook' test -f "$WORK/direct
 POLICY_REPO="$WORK/policy-source"
 mkdir -p "$POLICY_REPO/.claude/omp"
 git -C "$POLICY_REPO" init -q --initial-branch=main
+cp "$SANDBOX" "$LINUX_SANDBOX" "$POLICY_REPO/.claude/omp/"
 printf '# main policy\ntools:\n  approvalMode: always-ask\n' > "$POLICY_REPO/.claude/omp/glen-harness.yml"
 git -C "$POLICY_REPO" add .
 commit_fixture "$POLICY_REPO"
@@ -424,29 +480,47 @@ assert_eq 'policy source label' "$(sed -n '1p' "$STDOUT")" main
 assert_eq 'policy content comes from main' "$(sed '1d' "$STDOUT")" \
   "$(git -C "$POLICY_REPO" show main:.claude/omp/glen-harness.yml)"
 
+if [ "$(uname -s)" = Darwin ]; then launcher_name=omp-sandboxed.sh; else launcher_name=omp-sandboxed-linux.sh; fi
+printf '#!/bin/bash\nexit 99\n' > "$POLICY_REPO/.claude/omp/$launcher_name"
+mkdir "$WORK/launcher-main" "$WORK/launcher-fallback"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-main"
+assert_exit 'launcher resolution succeeds from main' 0
+captured_launcher="$(cat "$STDOUT")"
+git -C "$POLICY_REPO" show "main:.claude/omp/$launcher_name" > "$WORK/main-launcher"
+assert 'launcher uses main despite modified worktree launcher' cmp -s "$WORK/main-launcher" "$captured_launcher"
+assert 'captured launcher is a regular executable file' test -f "$captured_launcher" -a -x "$captured_launcher"
+assert 'main launcher resolution needs no warning' test ! -s "$STDERR"
+FALLBACK_REPO="$WORK/launcher-source-without-main"
+mkdir -p "$FALLBACK_REPO/.claude/omp"
+git -C "$FALLBACK_REPO" init -q --initial-branch=fixture
+cp "$SANDBOX" "$LINUX_SANDBOX" "$FALLBACK_REPO/.claude/omp/"
+run /bin/bash "$ENGINE" launcher "$FALLBACK_REPO" "$WORK/launcher-fallback"
+assert_exit 'launcher without main uses worktree fallback' 0
+assert 'launcher fallback captures worktree contents' cmp -s "$FALLBACK_REPO/.claude/omp/$launcher_name" "$(cat "$STDOUT")"
+assert_contains 'launcher fallback warns about source' 'warning: main launcher unavailable; using the worktree launcher' "$STDERR"
+mkdir "$WORK/launcher-missing" "$WORK/no-launcher-source"
+run /bin/bash "$ENGINE" launcher "$WORK/no-launcher-source" "$WORK/launcher-missing"
+assert_exit 'launcher missing from both sources fails closed' 4
+assert 'missing launcher never returns an executable path' test ! -s "$STDOUT"
+
 # Use a synthetic token. Never print envcheck output or any variable values.
 (
   export CLAUDE_CONFIG_DIR=smoke PI_PY=smoke PI_JS=smoke PI_CODING_AGENT_DIR=smoke
   export COPILOT_CUSTOM_INSTRUCTIONS_DIRS=smoke
   export OMP_CODING_AGENT_DIR=smoke OMP_PROFILE=smoke PI_PROFILE=smoke
   export GLEN_OMP_BIN=hostile-inherited OMP_SANDBOX_RUN_ROOT=hostile-inherited
+  export OMP_PROFILE_AGENT_DIR=hostile-inherited OMP_REAL_BIN=hostile-inherited
   export MNEMOSYNE_TOKEN=smoke-placeholder
-  /bin/bash "$ENGINE" envcheck -- env
+  HOME="$WORK/home" /bin/bash "$ENGINE" envcheck -- /bin/sh -c 'test -f "$GLEN_OMP_BIN" && test -x "$GLEN_OMP_BIN" && env'
 ) > "$WORK/env.out" 2> "$STDERR"
 for name in CLAUDE_CONFIG_DIR COPILOT_CUSTOM_INSTRUCTIONS_DIRS PI_PY PI_JS PI_CODING_AGENT_DIR OMP_CODING_AGENT_DIR OMP_PROFILE PI_PROFILE; do
   if grep -q "^${name}=" "$WORK/env.out"; then present=yes; else present=no; fi
   assert_eq "dispatch scrubs $name" "$present" no
 done
 assert 'dispatch retains token variable name' grep -q '^MNEMOSYNE_TOKEN=' "$WORK/env.out"
-if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
-  assert_contains 'dispatch selects executable sandbox launcher' "GLEN_OMP_BIN=$SANDBOX" "$WORK/env.out"
-  assert 'sandbox launcher is a regular executable file' test -f "$SANDBOX" -a -x "$SANDBOX"
-elif [ "$(uname -s)" != Darwin ] && command -v bwrap >/dev/null 2>&1; then
-  assert_contains 'dispatch selects executable Linux sandbox launcher' "GLEN_OMP_BIN=$LINUX_SANDBOX" "$WORK/env.out"
-  assert 'Linux sandbox launcher is a regular executable file' test -f "$LINUX_SANDBOX" -a -x "$LINUX_SANDBOX"
-else
-  assert 'dispatch without sandbox tool leaves GLEN_OMP_BIN unset' test "$(grep -c '^GLEN_OMP_BIN=' "$WORK/env.out" || true)" -eq 0
-fi
+assert 'dispatch selects captured platform launcher' grep -Eq "^GLEN_OMP_BIN=.*/$launcher_name\.[^/]+$" "$WORK/env.out"
+assert_contains 'dispatch passes explicit profile agent path' "OMP_PROFILE_AGENT_DIR=$WORK/home/.omp/profiles/glen-harness/agent" "$WORK/env.out"
+assert_contains 'dispatch overwrites inherited real binary' "OMP_REAL_BIN=$WORK/bin/omp" "$WORK/env.out"
 
 # Successful production paths use offline stubs, never the owner's omp/profile.
 export SMOKE_OMP_CALLS="$WORK/omp-calls" SMOKE_DISPATCH_CALLS="$WORK/dispatch-calls"
@@ -455,6 +529,7 @@ export SMOKE_SESSION="$WORK/session.jsonl"
 printf '%s\n' '{"type":"message","message":{"role":"assistant","model":"fixture","provider":"cursor","usage":{"input":1,"output":1}}}' > "$SMOKE_SESSION"
 cat > "$WORK/bin/omp" <<'EOF'
 #!/bin/sh
+[ "${SMOKE_SANDBOX_ACTIVE:-}" = 1 ] || exit 98
 if [ -e /dev/fd/3 ]; then printf 'open\n' >> "$SMOKE_OMP_FDS"; exit 99; fi
 printf 'closed\n' >> "$SMOKE_OMP_FDS"
 printf '%s\n' "$*" >> "$SMOKE_OMP_CALLS"
@@ -480,13 +555,10 @@ fd3=closed
 [ ! -e /dev/fd/3 ] || fd3=open
 printf '%s %s\n' "$command" "$fd3" >> "$SMOKE_DISPATCH_FDS"
 [ "$fd3" = closed ] || exit 99
-if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
-  [ "${GLEN_OMP_BIN:-}" = "$SMOKE_SANDBOX" ] || exit 99
-  [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
-elif [ "$(uname -s)" != Darwin ] && command -v bwrap >/dev/null 2>&1; then
-  [ "${GLEN_OMP_BIN:-}" = "$SMOKE_LINUX_SANDBOX" ] || exit 99
-  [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
-fi
+[ -f "${GLEN_OMP_BIN:-}" ] && [ -x "$GLEN_OMP_BIN" ] || exit 99
+case "$GLEN_OMP_BIN" in "$OMP_SANDBOX_RUN_ROOT"/omp-sandboxed*.sh.*) ;; *) exit 99 ;; esac
+[ "$OMP_PROFILE_AGENT_DIR" = "$HOME/.omp/profiles/glen-harness/agent" ] || exit 99
+[ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
 printf '%s scrubbed\n' "$command" >> "$SMOKE_DISPATCH_CALLS"
 case "$command" in
   send)
@@ -509,8 +581,6 @@ jq -cn --arg answer "$answer" --arg session "$SMOKE_SESSION" \
   '{data:{assistant_text:$answer,job:{handle:"j-fixture"},session:{handle:"s-fixture",path:$session},replies:[]}}'
 exit "$code"
 EOF
-export SMOKE_SANDBOX="$SANDBOX"
-export SMOKE_LINUX_SANDBOX="$LINUX_SANDBOX"
 printf 'Debug fixture\n' > "$WORK/brief.md"
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
 assert_exit 'probe safe private run root exit' 0
@@ -520,12 +590,17 @@ assert 'fd3 fixture detects an intentionally open descriptor' /bin/bash -c 'test
 assert_eq 'probe omp children start with fd3 closed' "$(cat "$SMOKE_OMP_FDS")" $'closed\nclosed'
 assert_contains 'probe queries registered modelRoles record key' 'config get modelRoles --json' "$SMOKE_OMP_CALLS"
 assert_eq 'probe never queries invalid modelRoles.default key' "$(grep -c 'config get modelRoles.default' "$SMOKE_OMP_CALLS" || true)" 0
+# shellcheck disable=SC2016 # jq receives these variables through --arg.
+assert 'probe routes both calls through launcher with private cwd and explicit paths' jq -es \
+  --arg agent "$WORK/home/.omp/profiles/glen-harness/agent" --arg binary "$WORK/bin/omp" \
+  'length==2 and all(.[]; .root==.cwd and .agent==$agent and .binary==$binary)' "$SMOKE_SANDBOX_CALLS"
+assert 'probe reports launcher source' jq -e '.launcher_source == "main" or .launcher_source == "worktree"' "$STDOUT"
 
 # Exercise both bounded_omp branches, independent of which timeout tools the
 # host installed. The private PATH still points at the same fd-aware fake omp.
 mkdir "$WORK/no-timeout-bin" "$WORK/with-timeout-bin"
-for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp; do
-  ln -s "$(command -v "$tool")" "$WORK/no-timeout-bin/$tool"
+for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp cp chmod cat readlink sandbox-exec; do
+  if command -v "$tool" >/dev/null 2>&1; then ln -s "$(command -v "$tool")" "$WORK/no-timeout-bin/$tool"; fi
 done
 if [ "$(uname -s)" != Darwin ]; then ln -s "$WORK/bin/bwrap" "$WORK/no-timeout-bin/bwrap"; fi
 cat > "$WORK/with-timeout-bin/timeout" <<'EOF'
