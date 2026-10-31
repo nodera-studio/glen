@@ -332,14 +332,9 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
         let rendered = e.render().to_string();
         let plain = anstream::adapter::strip_str(&rendered).to_string();
         let message = if e.kind() == ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand {
-            "a subcommand is required"
+            "a subcommand is required".to_owned()
         } else {
-            plain
-                .lines()
-                .next()
-                .unwrap_or("invalid arguments")
-                .strip_prefix("error: ")
-                .unwrap_or_else(|| plain.lines().next().unwrap_or("invalid arguments"))
+            usage_message(&plain)
         };
         let value = serde_json::json!({"v":1,"ok":false,"error":{"code":"usage","message":message,"details":{"text":plain}}});
         let mut out = anstream::AutoStream::new(stdout_writer(), anstream::ColorChoice::Never);
@@ -357,10 +352,52 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
         }
     }
 }
+/// clap's first error line, without `error: `. A first line ending in `:` introduces an
+/// indented list (the missing arguments, say), so that list up to the first blank line is
+/// joined onto it: `error.message` must name what to fix (W8-ERR-7).
+fn usage_message(plain: &str) -> String {
+    let mut lines = plain.lines();
+    let first = lines.next().unwrap_or("invalid arguments");
+    let first = first.strip_prefix("error: ").unwrap_or(first);
+    if !first.ends_with(':') {
+        return first.to_owned();
+    }
+    let items = lines
+        .take_while(|line| !line.trim().is_empty())
+        .filter(|line| line.starts_with([' ', '\t']))
+        .map(str::trim)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        first.to_owned()
+    } else {
+        format!("{first} {}", items.join(", "))
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::Path;
+    #[test]
+    fn usage_message_names_the_listed_arguments() {
+        assert_eq!(
+            usage_message(
+                "error: the following required arguments were not provided:\n  <MESSAGE>\n\nUsage: glen send <SESSION> <MESSAGE>\n"
+            ),
+            "the following required arguments were not provided: <MESSAGE>"
+        );
+        assert_eq!(
+            usage_message(
+                "error: the following required arguments were not provided:\n  <SESSION>\n  <MESSAGE>\n\nUsage: x\n"
+            ),
+            "the following required arguments were not provided: <SESSION>, <MESSAGE>"
+        );
+        assert_eq!(
+            usage_message("error: unexpected argument 'x' found\n\n  tip: y\n"),
+            "unexpected argument 'x' found"
+        );
+        assert_eq!(usage_message("error: trailing:\n\nUsage: x\n"), "trailing:");
+        assert_eq!(usage_message(""), "invalid arguments");
+    }
     fn env(vars: &[(&str, &str)]) -> Env {
         Env::for_test(Some(Path::new("/h")), Path::new("/w"), vars)
     }
