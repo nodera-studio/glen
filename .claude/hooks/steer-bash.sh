@@ -9,6 +9,8 @@
 #   - shell reads of `.env`/secret files (not `.env.example`)     -> Mnemosyne secrets MCP
 #   - `curl`/`wget` to an EXTERNAL url -> Exa MCP (web) / a service SDK-CLI (APIs).
 #     Loopback stays allowed (local API, MCP servers, health checks).
+#   - `omp` with a profile other than glen-harness (`--profile`, OMP_PROFILE, PI_PROFILE), and
+#     `mkdir`/`cp`/`mv`/`rsync`/`ln` into another ~/.omp/profiles/<name> -> HOME="$(mktemp -d)"
 # Does NOT touch grep/rg (agentic search is good in-loop — routed via CLAUDE.md)
 # or codex (block-old-codex.sh). Fails open on any error. Project-specific
 # steering (e.g. a dev-tool wrapper hook) can be layered in separately — see
@@ -24,11 +26,19 @@ deny() {
   exit 0
 }
 
+# omp probes (s175): omp joins PI_CONFIG_DIR onto $HOME, and a named profile ignores
+# PI_CODING_AGENT_DIR, so the only isolation is a throwaway HOME or the approved profile.
+OMP_OK_PROFILE='glen-harness'
+# shellcheck disable=SC2016 # the $(mktemp -d) and $HOME are literal advice text
+OMP_PROFILE_REASON='omp probes use a throwaway home: HOME="$(mktemp -d)" omp … (omp joins PI_CONFIG_DIR onto $HOME, so an absolute PI_CONFIG_DIR still writes under ~), or the approved glen-harness profile. Never create another ~/.omp/profiles/<name> (owner rule).'
+# a profile name with surrounding quotes removed
+unquote() { printf '%s' "$1" | tr -d "\"'"; }
+
 # split on pipes and ; & && || so each segment is inspected on its own
 # (|| [ -n "$seg" ] handles the final newline-less segment; tr is BSD/GNU-portable)
 while IFS= read -r seg || [ -n "$seg" ]; do
   [ -z "$seg" ] && continue
-  base=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*//; s/^[A-Za-z_][A-Za-z0-9_]*=[^ ]* //' | awk '{print $1}')
+  base=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*//; s/^([A-Za-z_][A-Za-z0-9_]*=[^ ]* +)+//' | awk '{print $1}')
   base=$(basename "$base" 2>/dev/null)
 
   # shell reads of real secret files (not .env.example) -> secrets MCP
@@ -82,6 +92,27 @@ while IFS= read -r seg || [ -n "$seg" ]; do
          && ! printf '%s' "$seg" | grep -qE '(^|[[:space:]])-(exec(dir)?|delete|[mc]time|newer|size|empty)([[:space:]]|$)'; then
         deny "Don't search for files with 'find'. Use 'rg --files | rg <pattern>' (fast, respects .gitignore) for literal file lookups, or the codebase MCP for conceptual 'where does X live'. Operational find (-exec / -delete / -mtime …) is fine."
       fi
+      ;;
+    omp)
+      # --profile in this segment; OMP_PROFILE= / PI_PROFILE= anywhere in the command (an
+      # `export` earlier in the chain counts). An empty value is the default profile.
+      names=$( { printf '%s' "$seg" | grep -oE -- '--profile[= ]+[^[:space:]]+' | sed -E 's/^--profile[= ]+//'
+                 printf '%s' "$CMD" | grep -oE '(^|[^A-Za-z0-9_])(OMP|PI)_PROFILE=[^[:space:];&|]*' | sed -E 's/^.*_PROFILE=//'; } 2>/dev/null)
+      while IFS= read -r name; do
+        name=$(unquote "$name")
+        if [ -n "$name" ] && [ "$name" != "$OMP_OK_PROFILE" ]; then
+          deny "$OMP_PROFILE_REASON"
+        fi
+      done <<< "$names"
+      ;;
+    mkdir|cp|mv|rsync|ln)
+      names=$(printf '%s' "$seg" | grep -oE '\.omp/profiles/[^/[:space:]]+' | sed -E 's#^\.omp/profiles/##' 2>/dev/null)
+      while IFS= read -r name; do
+        name=$(unquote "$name")
+        if [ -n "$name" ] && [ "$name" != "$OMP_OK_PROFILE" ]; then
+          deny "$OMP_PROFILE_REASON"
+        fi
+      done <<< "$names"
       ;;
   esac
 done < <(printf '%s\n' "$CMD" | tr '|;&' '\n')
