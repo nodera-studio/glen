@@ -7,6 +7,7 @@ TEST_DIR="$(cd "$(dirname "$0")" && pwd -P)"
 REPO_ROOT="$(cd "$TEST_DIR/../../.." && pwd -P)"
 ENGINE="$REPO_ROOT/.claude/scripts/omp-engine.sh"
 SANDBOX="$REPO_ROOT/.claude/omp/omp-sandboxed.sh"
+LINUX_SANDBOX="$REPO_ROOT/.claude/omp/omp-sandboxed-linux.sh"
 GUARD="$REPO_ROOT/.claude/hooks/guard-omp-profile.sh"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/glen-omp-smoke.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -163,6 +164,33 @@ cp "$WORK/bin/glen" "$WORK/bin/omp"
 chmod +x "$WORK/bin/glen" "$WORK/bin/omp"
 export PATH="$WORK/bin:$PATH"
 export GLEN_BIN="$WORK/bin/glen" SMOKE_UNEXPECTED_CALL="$WORK/unexpected-call"
+
+# Linux coverage is limited to local probe gates; no live omp or real bwrap run.
+if [ "$(uname -s)" != Darwin ]; then
+  linux_probe_bin="$WORK/linux-probe-bin"
+  mkdir -p "$linux_probe_bin" "$WORK/linux-probe-home"
+  # An allowlisted PATH guarantees bwrap is absent even when CI installed it.
+  for tool in date uname git dirname jq omp; do
+    ln -s "$(command -v "$tool")" "$linux_probe_bin/$tool"
+  done
+  run env HOME="$WORK/linux-probe-home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+    PATH="$linux_probe_bin" /bin/bash "$ENGINE" probe
+  assert_exit 'Linux probe missing bwrap skips' 3
+  assert 'Linux probe missing bwrap status' jq -e '.status == "skipped"' "$STDOUT"
+  assert_contains 'Linux probe missing bwrap reason' 'bwrap not on PATH; the omp sandbox requires it on Linux' "$STDOUT"
+
+  # Keep the fake tool for the rest of the offline engine fixtures as well.
+  # Any attempt to execute it is unexpected: only command -v should inspect it.
+  cp "$WORK/bin/glen" "$WORK/bin/bwrap"
+  chmod +x "$WORK/bin/bwrap"
+  run env HOME="$WORK/linux-probe-home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
+    PATH="$WORK/bin:$linux_probe_bin" /bin/bash "$ENGINE" probe
+  assert_exit 'Linux probe fake bwrap proceeds to next skip' 3
+  assert_contains 'Linux probe fake bwrap reaches profile check' 'profile is not set up' "$STDOUT"
+  assert 'Linux probe tool checks invoke neither omp nor bwrap' test ! -e "$SMOKE_UNEXPECTED_CALL"
+else
+  printf 'NOTE Linux bwrap probe checks skipped: non-Darwin required\n'
+fi
 
 started="$(now_ms)"
 run env GLEN_OMP_ENGINE=off /bin/bash "$ENGINE" probe
@@ -371,8 +399,11 @@ assert 'dispatch retains token variable name' grep -q '^MNEMOSYNE_TOKEN=' "$WORK
 if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   assert_contains 'dispatch selects executable sandbox launcher' "GLEN_OMP_BIN=$SANDBOX" "$WORK/env.out"
   assert 'sandbox launcher is a regular executable file' test -f "$SANDBOX" -a -x "$SANDBOX"
+elif [ "$(uname -s)" != Darwin ] && command -v bwrap >/dev/null 2>&1; then
+  assert_contains 'dispatch selects executable Linux sandbox launcher' "GLEN_OMP_BIN=$LINUX_SANDBOX" "$WORK/env.out"
+  assert 'Linux sandbox launcher is a regular executable file' test -f "$LINUX_SANDBOX" -a -x "$LINUX_SANDBOX"
 else
-  assert 'non-macOS dispatch leaves GLEN_OMP_BIN unset' test "$(grep -c '^GLEN_OMP_BIN=' "$WORK/env.out" || true)" -eq 0
+  assert 'dispatch without sandbox tool leaves GLEN_OMP_BIN unset' test "$(grep -c '^GLEN_OMP_BIN=' "$WORK/env.out" || true)" -eq 0
 fi
 
 # Successful production paths use offline stubs, never the owner's omp/profile.
@@ -402,6 +433,9 @@ shift
 if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   [ "${GLEN_OMP_BIN:-}" = "$SMOKE_SANDBOX" ] || exit 99
   [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
+elif [ "$(uname -s)" != Darwin ] && command -v bwrap >/dev/null 2>&1; then
+  [ "${GLEN_OMP_BIN:-}" = "$SMOKE_LINUX_SANDBOX" ] || exit 99
+  [ -d "${OMP_SANDBOX_RUN_ROOT:-}/tree" ] || exit 99
 fi
 printf '%s scrubbed\n' "$command" >> "$SMOKE_DISPATCH_CALLS"
 case "$command" in
@@ -426,6 +460,7 @@ jq -cn --arg answer "$answer" --arg session "$SMOKE_SESSION" \
 exit "$code"
 EOF
 export SMOKE_SANDBOX="$SANDBOX"
+export SMOKE_LINUX_SANDBOX="$LINUX_SANDBOX"
 printf 'Debug fixture\n' > "$WORK/brief.md"
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
 assert_exit 'probe safe private run root exit' 0

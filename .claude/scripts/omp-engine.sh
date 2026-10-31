@@ -34,11 +34,16 @@ usage() {
 # The single environment boundary for send, wait, and the envcheck smoke helper.
 # Mnemosyne credentials pass through untouched; never log environment values.
 dispatch_env() {
-  local engine_root
+  local engine_root launcher=''
   if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
+    launcher=omp-sandboxed.sh
+  elif [ "$(uname -s)" != Darwin ] && command -v bwrap >/dev/null 2>&1; then
+    launcher=omp-sandboxed-linux.sh
+  fi
+  if [ -n "$launcher" ]; then
     # envcheck runs before normal repository discovery; resolve only when needed.
     engine_root="${ENGINE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)}"
-    set -- GLEN_OMP_BIN="$engine_root/.claude/omp/omp-sandboxed.sh" \
+    set -- GLEN_OMP_BIN="$engine_root/.claude/omp/$launcher" \
       OMP_SANDBOX_RUN_ROOT="$RUN_DIR" "$@"
   fi
   env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CODING_AGENT_DIR \
@@ -258,6 +263,9 @@ probe_checks() {
   [ "${GLEN_OMP_ENGINE:-}" != off ] || stop skipped 'disabled by GLEN_OMP_ENGINE=off' 3
   resolve_glen || stop skipped 'no glen binary; run .claude/scripts/omp-profile-setup.sh' 3
   command -v omp >/dev/null 2>&1 || stop skipped 'omp not on PATH' 3
+  if [ "$(uname -s)" != Darwin ] && ! command -v bwrap >/dev/null 2>&1; then
+    stop skipped 'bwrap not on PATH; the omp sandbox requires it on Linux' 3
+  fi
   [ -f "$HOME/${PI_CONFIG_DIR:-.omp}/profiles/$PROFILE/agent/config.yml" ] || \
     stop skipped 'glen-harness profile is not set up; run .claude/scripts/omp-profile-setup.sh' 3
   prepare_root || stop skipped "$REASON" 3
