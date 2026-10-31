@@ -288,6 +288,27 @@ fn marked_read_is_false_when_no_cursor_moves() {
     assert_eq!(data(&inbox(&b, &[]))["total"], 0);
 }
 
+/// W8-ERR-6: follow mode is NDJSON even under `--human`, so DEL in a message survives.
+#[test]
+fn human_follow_keeps_del_bytes_in_ndjson() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "A\u{7f}B\u{85}C", "2026-10-30T00:00:00Z"));
+    let mut c = b
+        .command(&["--human", "inbox", "-f", "--peek", "--all"], &b.alpha())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(c.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    c.kill().unwrap();
+    c.wait().unwrap();
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["message"]["text"], "A\u{7f}B\u{85}C", "{line:?}");
+}
+
 /// NEW-LOW-003 (W10 fix cycle 3): the human footer says "marked read" only when a cursor
 /// moved, like `marked_read`; `--all` of messages already read says so.
 #[test]

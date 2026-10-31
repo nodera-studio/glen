@@ -63,6 +63,11 @@ pub fn restricted(env: &Env, err: &io::Error) -> bool {
     ) && (detect(env).is_some() || env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1"))
 }
 pub fn map_home_write(env: &Env, command: &str, err: io::Error) -> GlenError {
+    // SEC-3: an untrusted existing GLEN_HOME directory keeps its own invalid_env refusal.
+    let err = match glen_home::take_refusal(err) {
+        Ok(refusal) => return refusal,
+        Err(err) => err,
+    };
     if restricted(env, &err) {
         let s = detect(env).unwrap_or(Sandbox {
             kind: None,
@@ -73,10 +78,10 @@ pub fn map_home_write(env: &Env, command: &str, err: io::Error) -> GlenError {
             .unwrap_or_else(|_| "GLEN_HOME".into());
         let hint = if s.kind.is_some() {
             format!(
-                "the sandbox cannot write GLEN_HOME ({path}); set GLEN_HOME under $TMPDIR, add it to `sandbox_workspace_write.writable_roots`, or run glen outside the sandbox"
+                "the sandbox cannot write GLEN_HOME ({path}); set GLEN_HOME to a private directory, for example `$(mktemp -d)/glen` (a new 0700 directory under $TMPDIR), add it to `sandbox_workspace_write.writable_roots`, or run glen outside the sandbox"
             )
         } else {
-            "set GLEN_HOME under $TMPDIR, add it to `sandbox_workspace_write.writable_roots`, or run glen outside the sandbox; Codex disabled the network for this command, so it may be sandboxed".into()
+            "set GLEN_HOME to a private directory, for example `$(mktemp -d)/glen` (a new 0700 directory under $TMPDIR), add it to `sandbox_workspace_write.writable_roots`, or run glen outside the sandbox; Codex disabled the network for this command, so it may be sandboxed".into()
         };
         let mut error = refusal(command, &s).with_hint(hint);
         error.message = if s.kind.is_some() {
@@ -605,6 +610,33 @@ mod cycle1_tests {
             map_home_write(&env, "send", io::ErrorKind::ReadOnlyFilesystem.into()).code,
             ErrorCode::Io
         );
+    }
+    #[test]
+    fn sec3_hint_names_a_private_directory_and_refusals_pass_through() {
+        for vars in [
+            vec![("CODEX_SANDBOX", "seatbelt")],
+            vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        ] {
+            let env = Env::for_test(Some(Path::new("/h")), Path::new("/w"), &vars);
+            let hint = map_home_write(&env, "send", io::ErrorKind::PermissionDenied.into())
+                .hint
+                .unwrap();
+            assert!(
+                hint.contains(
+                    "set GLEN_HOME to a private directory, for example `$(mktemp -d)/glen`"
+                ),
+                "{hint}"
+            );
+            assert!(!hint.contains("under $TMPDIR,"), "{hint}");
+            let refusal = io::Error::other(
+                GlenError::new(ErrorCode::InvalidEnv, "refusing GLEN_HOME directory /x")
+                    .with_hint("point GLEN_HOME at a private directory you own (mkdir -m 700)"),
+            );
+            let e = map_home_write(&env, "send", refusal);
+            assert_eq!(e.code, ErrorCode::InvalidEnv);
+            assert_eq!(e.message, "refusing GLEN_HOME directory /x");
+            assert!(e.hint.unwrap().contains("mkdir -m 700"));
+        }
     }
 }
 

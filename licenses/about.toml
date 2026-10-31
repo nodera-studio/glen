@@ -1,0 +1,36 @@
+# cargo-about config for the THIRD-PARTY-LICENSES file in each release archive
+# (release.yml generates it per target; licenses/about.hbs is the template).
+# Order is priority: an "MIT OR Apache-2.0" crate is listed under MIT.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "Unicode-3.0",
+    "Zlib",
+    "BSL-1.0",
+    "MPL-2.0",
+    "Unlicense",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = true
+ignore-transitive-dependencies = false
+
+# glen itself has no `license` field; its own LICENSE ships beside
+# THIRD-PARTY-LICENSES, and about.hbs leaves glen out of the listing.
+[glen.clarify]
+license = "MIT"
+
+[[glen.clarify.files]]
+path = "LICENSE"
+checksum = "aaa3708bdef379be56a6c5cdf7696ef7b9213ec6e24ac149bcedfcc9e2fd16b4"
+
+# omp-rpc lives in the oh-my-pi monorepo, whose LICENSE is three directories up
+# from the crate (sdk/rust/omp-rpc). Without this, cargo-about falls back to the
+# generic MIT text and drops the copyright lines. A changed checksum after an
+# omp bump fails the release build: re-check the file and update the hash.
+[omp-rpc.clarify]
+license = "MIT"
+
+[[omp-rpc.clarify.files]]
+path = "../../../LICENSE"
+checksum = "16c45f9d667442781f03fa198914cc39abcaa48ec5ed8f644643e554ca2fbf63"

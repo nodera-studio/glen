@@ -233,7 +233,7 @@ fn collect(
     Ok(read)
 }
 pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
-    let home = glen_home::resolve(env)?;
+    let home = glen_home::resolve_trusted(env, &["inbox/.read"])?;
     let mut scope = a
         .cwd
         .as_deref()
@@ -348,7 +348,7 @@ pub fn follow(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode 
     // Follow is always NDJSON, even when explicitly invoked with --human.
     let mut stream = EventStream::ndjson(ctx);
     let result = (|| -> Result<_, GlenError> {
-        let home = glen_home::resolve(env)?;
+        let home = glen_home::resolve_trusted(env, &["inbox/.read"])?;
         let scope = a
             .cwd
             .as_deref()

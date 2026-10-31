@@ -6,7 +6,7 @@ import {installView} from '../data/install.mjs';
 const steps=[[site.commands.doctor,'Checks omp, its version and the paths glen will use.'],[site.commands.extension,'Lets glen reach sessions that are open in omp. Restart omp afterwards.'],['glen install-skill','Teaches Claude Code or Codex the glen commands.']];
 ---
 <section id="install" aria-labelledby="install-h" class="section"><div class="wrap">
- <SectionHead id="install-h" eyebrow="02 / Install" strong="One command." rest="Then check your setup." lead={`macOS and Linux. Needs omp ${site.testedOmp} or newer.`} />
+ <SectionHead id="install-h" eyebrow="02 / Install" strong="One command." rest="Then check your setup." lead={`macOS and Linux. Tested with omp ${site.testedOmp}.`} />
  <div class="install-layout">
   <div class="tabs-card reveal"><InstallTabs client:visible view={installView(site)} /></div>
   <div class="next-steps reveal"><h3>Next steps</h3><ol>{steps.map(([command,body],i)=><li><span class="step-disc" aria-hidden="true">{i+1}</span><div><code>{command}</code><p>{body}</p></div></li>)}</ol></div>

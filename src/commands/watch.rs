@@ -99,7 +99,7 @@ fn prepare(
     }
     Ok(Prepared {
         env: scoped,
-        home: glen_home::resolve(env)?,
+        home: glen_home::resolve_trusted(env, &["run/live", "jobs", "inbox/.read"])?,
         app,
         opened,
     })

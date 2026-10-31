@@ -47,6 +47,9 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 UTC; durations are integer `*_ms`; paths are absolute. Defined nullable data fields remain present as `null`.
 Optional error diagnostics and warnings may be omitted. Error codes, reason values and field names are stable;
 `message`, `hint` and `detail` prose is not. `show --raw` returns omp's own records, outside this schema.
+String values keep their raw content, but the wire never carries a raw control or bidi character: besides
+JSON's own escapes, glen writes U+007F–U+009F, U+061C, U+200E–U+200F, U+202A–U+202E and U+2066–U+2069 as
+`\uXXXX`, in documents and NDJSON alike. A JSON parser decodes them back to the original value.
 
 Session objects have `handle,id,path,bucket,cwd,title,first_message,created_at,updated_at,age_ms,size_bytes,model,
 last_turn,state,state_source,state_detail,continuation_of,parent_session`. State is `idle|live|busy|unknown`.
@@ -55,13 +58,14 @@ Handles are unique catalog suffixes, normally 7 hex characters. Nullable model a
 Transcript items share `kind,id,timestamp`. Kind-specific fields are: user `text,images`; assistant
 `text,model,stop_reason,error,has_thinking,thinking_words` (plus thinking when requested and tool_calls when nonempty);
 tool_result `tool_call_id,tool_name,is_error,text,chars,truncated,images`; bash/python `command|code,exit_code,cancelled,
-output,chars,truncated,images`; developer `text`; custom `custom_type,text`; file_mention `files:[{path,line_count}]`;
+output,chars,truncated`; developer `text`; custom `custom_type,text`; file_mention `files:[{path,line_count}]`;
 compaction `tokens_before,tokens_after,summary`; reset has no extra fields; branch_summary `summary`;
 model_change `model`; thinking_level `level`. Consumers dispatch by kind rather than assuming homogeneous arrays.
 Unknown omp records are skipped by the rendered reader and preserved by raw output.
 
 Job views share `id,handle,status,route,deliver_as,delivered_as,session_id,session_handle,actual_session_id,
-created_at,updated_at,elapsed_ms`. Routes are `rpc|new|live`.
+created_at,updated_at,elapsed_ms`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
+`auto|steer|follow_up`; `delivered_as` is how omp took it, `prompt|steer|follow_up`, or null until then.
 Replies carry `text,final` and context/sequence metadata; read their field names from the examples below.
 
 ## `glen ls`
@@ -122,7 +126,7 @@ Read the active branch. `--tools` and `--thinking` control detail; `--raw` retur
 | Field | Meaning |
 |---|---|
 | `session` | resolved session object |
-| `continued_from` | continuation source or null |
+| `continued_from` | array of session ids glen followed to reach `session`, the requested one first; empty when none |
 | `leaf_id` | active branch leaf or null |
 | `skipped_lines` | malformed lines skipped |
 | `items / entries` | rendered items, or raw omp entries |
@@ -403,6 +407,8 @@ The tail item example is a shape catalogue: one example per item kind (and per a
 ## `glen send`
 
 Send once. Exits 10 and 130 leave the job running; never resend to poll. Use `wait`.
+A `--cwd` that is not an existing directory exits 2 `usage` with `details:{reason:"missing_cwd",cwd}`
+before stdin is read or a job is created.
 `--thinking <LEVEL>` passes omp's startup reasoning effort (off, minimal, low, medium, high,
 xhigh, max, auto) through to the spawned omp process; glen rejects any other value as a usage
 error (exit 2) before it ever reaches omp. It is ignored with an `ignored_flag` warning on the
@@ -421,7 +427,7 @@ passes no `--thinking` when the persisted value has none.
 | `session` | actual id, handle, path (null until known for new jobs) |
 | `assistant_text, replies` | answer and glen_reply records |
 | `command_output, stop_reason` | local command result or model stop reason, nullable |
-| `session_settled, delivered_as` | persistence acknowledged; prompt/steer/follow-up or null |
+| `session_settled, delivered_as` | persistence acknowledged; prompt/steer/follow_up or null |
 | `forked` | null or {from,to,to_handle} |
 | `next, interrupted` | running-only wait command and observer interruption flag |
 
@@ -562,6 +568,9 @@ passes no `--thinking` when the persisted value has none.
 ## `glen wait`
 
 Observe the same job; completed output has the send shape. A bounded wait can return running again.
+A job whose worker died is reported `lost` (exit 7 `job_failed`). If glen cannot write that status to the
+job directory, it still reports `lost` and adds the warning `lost_write_failed`; the stored status is left as it was.
+An unknown job handle is `not_found` (exit 3) with the hint "run `glen jobs`".
 
 | Field | Meaning |
 |---|---|
@@ -623,7 +632,10 @@ List jobs, newest first. Absent glen home gives an empty list without creating i
 | Field | Meaning |
 |---|---|
 | `total` | after filters, before limit |
-| `jobs` | job views plus text_preview, error and forked; -n 0 means all |
+| `jobs` | job views plus text_preview, error and forked (null or {from,to,to_handle}, as in send); -n 0 means all |
+
+Lost detection runs before `--active` filtering. A lost status glen cannot persist adds one `lost_write_failed`
+warning per job, including jobs the filter then drops.
 
 <!-- contract: jobs -->
 ```json
@@ -664,11 +676,12 @@ message unread: inside Codex's sandbox (`CODEX_SANDBOX` or `CODEX_SANDBOX_NETWOR
 `no_route` with `details.reason:"sandboxed"` and `details.glen_home_writable:false`, otherwise exit 1 `io`.
 A write that still fails after the check (the disk fills, a permission changes in between) cannot replace the
 envelope already printed: the call exits with that error's own code (6 or 1) and writes `glen: <message>` to stderr,
-so `ok:true` with a non-zero exit means the cursors did not move and the messages will come back.
+so `ok:true` with a non-zero exit means the cursors did not move and the messages will come back. A run that moves no
+cursor (`--peek`, or nothing new to read) writes nothing.
 
 With `--cwd`, only replies of sessions in that project are returned and marked read. A reply that no session or
 registry places in any project (an orphan) is left out and stays unread; `-f` streams it once its session appears
-in the project.
+in the project. When `--session` matches only sessions outside the project, the document warns `outside_cwd`.
 
 | Field | Meaning |
 |---|---|
@@ -893,12 +906,22 @@ Help and version are text in every output mode, with no JSON envelope.
 
 ## Error details
 
-Usage errors may include clap diagnostics in details. Not-found errors supply a hint. Ambiguous errors include
-`details.candidates`. Job failure has `details:{status,job,error,forked}`. Every exit-6 `no_route` envelope
+Usage errors may include clap diagnostics in details; for a missing required argument the message names it
+after the colon (`… were not provided: <MESSAGE>`). Usage `details.reason` values are `missing_cwd` (send,
+with `cwd`) and `invalid_level` (thinking). Not-found errors supply a hint: `glen ls --all` for sessions,
+`glen jobs` for jobs, `glen models <session>` for models. When a session lookup misses while some session file
+or project directory could not be read, the error is `io` (exit 1) naming that path, with `details.unreadable`
+listing every unreadable path. Ambiguous errors include `details.candidates`: session objects for sessions,
+`{provider,id,name}` for models. Job failure has `details:{status,job,error,forked}`. Every exit-6 `no_route` envelope
 includes a string `details.reason`; worker-side refusals also copy it beside `status`, `job`, `error` and `forked`.
 Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`, `endpoint_gone`, `endpoint_appeared`, `rpc_job_running`, `sandboxed`, `extension_outdated`, `unknown` (a legacy job record persisted before this list existed; wait normalises it, never a missing reason).
 Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permission-denied glen-home write adds
-`glen_home_writable:false` and a hint naming `$TMPDIR` and writable_roots. Doctor failures embed data in
+`glen_home_writable:false` and a hint to set GLEN_HOME to a private directory (for example `$(mktemp -d)/glen`),
+add it to writable_roots, or run glen outside the sandbox. A GLEN_HOME, or a directory glen writes under it, that
+is a symlink, belongs to another user or is group- or world-writable is refused before the write, and before glen
+reads a live registry, job record or inbox reply from it (`invalid_env`, exit 2). Job creation
+reports `invalid_env` (exit 2) with the path in `details.path` and a hint to use a private directory; other
+writes, such as an output spill, report `io` (exit 1) with the same message. Doctor failures embed data in
 `details.report`. Install-skill filesystem failures include `details.done` (targets processed before failure).
 
 <!-- contract: error.usage -->
@@ -1142,8 +1165,21 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
 | `skill_sync_failed` | install-skill | file published successfully, but directory sync failed |
 | `changed_during_install` | install-skill | destination or ancestor changed after inspection; skipped even with --force |
 | `skill_dir_not_empty` | install-skill | removed file, retained nonempty glen directory |
-| `not_yet_persisted` | show, tail | live session has not written a transcript yet |
-| `extension_version_mismatch` | send | live extension version differs from glen |
+| `ignored_flag` | send | `--thinking` has no effect on the live route; the message names the `glen thinking` command to run instead |
+| `not_yet_persisted` | show, tail, models, model, thinking | live session has not written a transcript yet; a model or thinking change is written with its first answer |
+| `extension_version_mismatch` | send, abort, models, model, thinking, compact | live extension version differs from glen |
+| `steer_queued` | send, wait | another glen job held the session, so the steer waited and was sent as a prompt |
+| `lost_write_failed` | send, wait, jobs | the job is reported lost, but its status file could not be written |
+| `unreadable_session` | ls, show, tail | a session file or project directory could not be read and was left out |
+| `branch_truncated` | show, tail | a malformed line cut the active branch; earlier entries may be hidden |
+| `abort_pending` | abort | omp has not become idle yet |
+| `jobs_queued` | abort | waiting glen jobs start next |
+| `thinking_changed` | model | omp changed the effective thinking level for the new model |
+| `thinking_clamped` | thinking | the effective level differs from the requested one |
+| `deadline_passed_after_apply` | model, thinking, compact | the change was applied, but after the command deadline |
+| `session_unreachable` | models | the session's endpoint is unhealthy or another omp holds it; selection comes from disk |
+| `extension_outdated` | models | the live extension is too old to list models; selection comes from disk |
+| `extension_sync_failed` | install-extension | file published successfully, but directory sync failed |
 | `batched` | send, wait | omp answered this request together with other queued requests |
 | `holder_unavailable` | model, thinking, compact | could not mark the session lock with the control holder identity |
 | `teardown_error` | models, model, thinking, compact | RPC process, client or reader cleanup did not finish cleanly |
@@ -1547,7 +1583,7 @@ On Linux, command-line instructions are limited by the OS to 128 KiB (`MAX_ARG_S
 
 All controls use one 90s default command deadline, accept a positive `--timeout DUR`, and route live → owning job → unowned RPC. JSON emits one envelope and empty stderr. Mutations never persist global settings. A changed post-op session id exits 11 with `forked:{from,to,to_handle}`; otherwise forked is null. Model/thinking changes on endpoint-only sessions warn `not_yet_persisted` until omp's first answer writes the file.
 
-`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol. Missing credentials include an omp-login hint. RPC deadlines and SIGINT stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT exits 130 with `{status:"interrupted",session,route,interrupted:true,hint}`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
+`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol|outcome_unknown. Missing credentials include an omp-login hint. `outcome_unknown` means omp went away after glen submitted the change: the change may have been applied, so check `glen models <session>` before retrying. RPC deadlines and SIGINT, SIGTERM or SIGHUP stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT, SIGTERM and SIGHUP exit 130 with `{status:"interrupted",session,route,interrupted:true,hint}`; a second signal exits at once (130, 143 or 129). A model, thinking or compact change that succeeds after the deadline keeps its result and adds the top-level warning `deadline_passed_after_apply`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
 
 <!-- contract: error.control_failed -->
 ```json

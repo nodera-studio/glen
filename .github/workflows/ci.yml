@@ -16,11 +16,16 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '26'
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain comes from rust-toolchain.toml (W8 DEBT-7).
+      - id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: rustfmt, clippy
       # caches ~/.cargo/registry, ~/.cargo/git (the omp-rpc git dep from W2 is a ~1.5 GB clone) and target; saved on failure too
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cache-on-failure: true
       - run: cargo fmt --all -- --check
@@ -43,8 +48,14 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      # The toolchain comes from rust-toolchain.toml (W8 DEBT-7).
+      - id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: linux-sandbox
           cache-on-failure: true
@@ -59,6 +70,27 @@ jobs:
             sh -c 'touch "$HOME/.glen-ro-probe" 2>&1 | grep -q "Read-only file system"'
       - run: cargo build --locked --bins --examples
       - run: cargo test --locked --test linux_sandbox -- --ignored --test-threads=1
+
+  # Keeps Cargo.toml's rust-version honest (W8 DEBT-7).
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - id: msrv
+        shell: bash
+        # RUSTUP_TOOLCHAIN outranks rust-toolchain.toml for every later step.
+        run: |
+          version=$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "RUSTUP_TOOLCHAIN=$version" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.msrv.outputs.version }}
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: msrv
+          cache-on-failure: true
+      - run: cargo check --locked --all-targets
 
   site:
     runs-on: ubuntu-latest
@@ -117,13 +149,15 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version-file: site/.nvmrc
+      # Install the locked wrangler before the token exists in any step (W8 SEC-6).
+      - run: npm ci
       - uses: actions/download-artifact@v8
         with:
           name: site-reports
           path: site
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: node scripts/check-links.mjs --online
-      - run: npx --yes wrangler@4.124.0 deploy --dry-run
+      - run: npx --no wrangler deploy --dry-run
       - id: token
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         env:
@@ -139,6 +173,6 @@ jobs:
             echo '::notice title=Site deploy skipped::newer commit on main; skipping'
             exit 0
           fi
-          npx --yes wrangler@4.124.0 deploy
+          npx --no wrangler deploy
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.token.outputs.present == 'false'
         run: echo "::notice title=Site deploy skipped::CLOUDFLARE_API_TOKEN is not set; the owner deploys with npm --prefix site run deploy"

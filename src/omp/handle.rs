@@ -218,12 +218,40 @@ pub fn resolve_in(
 ) -> Result<PathBuf, GlenError> {
     let scope = scope.map(|dir| super::paths::absolute(env, &dir.to_string_lossy()));
     let bucket = scope.as_deref().map(|dir| bucket_for(dir, env));
+    // A lookup that misses while some session files could not be read may have
+    // missed one of those, so report the read failure instead of not_found.
+    // With a bucket, only unreadable paths in that bucket (the bucket directory
+    // itself, or a file directly inside it) count.
+    let unreadable = |bucket: Option<&str>| {
+        let in_bucket = |path: &&PathBuf| {
+            bucket.is_none_or(|bucket| {
+                path.file_name().is_some_and(|n| n == bucket)
+                    || path
+                        .parent()
+                        .and_then(Path::file_name)
+                        .is_some_and(|n| n == bucket)
+            })
+        };
+        catalog.unreadable.iter().find(in_bucket).map(|path| {
+            GlenError::new(
+                ErrorCode::Io,
+                format!(
+                    "no readable omp session matches `{arg}`; cannot read {}",
+                    path.display()
+                ),
+            )
+            .with_details(serde_json::json!({"unreadable":catalog.unreadable}))
+            .with_hint("check the permissions of that path")
+        })
+    };
     let missing = || {
-        GlenError::new(
-            ErrorCode::NotFound,
-            format!("no omp session matches `{arg}`"),
-        )
-        .with_hint("run `glen ls --all`")
+        unreadable(bucket.as_deref()).unwrap_or_else(|| {
+            GlenError::new(
+                ErrorCode::NotFound,
+                format!("no omp session matches `{arg}`"),
+            )
+            .with_hint("run `glen ls --all`")
+        })
     };
     if arg == "@latest" {
         let dir = scope.as_deref().unwrap_or(env.cwd());
@@ -234,11 +262,13 @@ pub fn resolve_in(
             .find(|s| s.file.bucket == bucket)
             .map(|s| s.file.path.clone())
             .ok_or_else(|| {
-                GlenError::new(
-                    ErrorCode::NotFound,
-                    format!("no omp sessions for {}", dir.display()),
-                )
-                .with_hint("run `glen ls --all`")
+                unreadable(Some(&bucket)).unwrap_or_else(|| {
+                    GlenError::new(
+                        ErrorCode::NotFound,
+                        format!("no omp sessions for {}", dir.display()),
+                    )
+                    .with_hint("run `glen ls --all`")
+                })
             });
     }
     if arg.starts_with('@') {
@@ -579,6 +609,7 @@ mod regression_tests {
                     sessions_dir: "/fixture".into(),
                     sessions: selected.clone(),
                     handles: HashMap::new(),
+                    unreadable: vec![],
                 };
                 if reverse {
                     catalog.sessions.reverse();

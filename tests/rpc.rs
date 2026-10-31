@@ -401,6 +401,14 @@ fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
         assert_eq!(details["error"]["details"]["reason"], "live_owner");
         assert!(details.get("forked").is_some());
         assert!(details["forked"].is_null());
+        // W8-DEBT-1: the worker uses the shared lease hint (no glen extension installed here),
+        // not a claim that the extension needs "a later glen version".
+        let hint = if b.omp.agent.join("extensions/glen/index.ts").is_file() {
+            "restart that omp session so it loads the glen extension (only TUI sessions accept glen messages)"
+        } else {
+            "run `glen install-extension`, then restart that omp session"
+        };
+        assert_eq!(value["error"]["hint"], hint, "{value}");
     }
     b.wait_worker_gone(&id);
     assert!(
@@ -529,12 +537,15 @@ fn ac209_new_session_and_profile() {
         3,
     );
     assert_eq!(outside["error"]["details"]["reason"], "outside_cwd");
-    envelope(
+    // W8-ERR-8: a missing --cwd is a usage error (exit 2, reason missing_cwd), not not_found.
+    let missing = envelope(
         &b.glen(&["send", "@new", "hi", "--cwd", "/missing-glen-dir", "--json"])
             .output()
             .unwrap(),
-        3,
+        2,
     );
+    assert_eq!(missing["error"]["code"], "usage");
+    assert_eq!(missing["error"]["details"]["reason"], "missing_cwd");
     assert!(!b.omp.glen_home.exists());
 }
 #[test]

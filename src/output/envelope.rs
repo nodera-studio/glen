@@ -57,15 +57,130 @@ pub fn emit_error(ctx: &OutputCtx, error: GlenError) -> ExitCode {
     let (mut out, mut err) = writers(ctx);
     emit_error_to(ctx, error, &mut out, &mut err)
 }
-fn json_bytes(value: &Value, pretty: bool) -> io::Result<Vec<u8>> {
-    let mut bytes = if pretty {
-        serde_json::to_vec_pretty(value)
+/// Wraps a serde_json formatter so strings also escape what serde leaves raw but a terminal
+/// may act on: DEL and the C1 controls (U+007F-U+009F, CSI among them) and the bidi controls
+/// (W8-SEC-5). `\uXXXX` decodes to the same string, so this is lossless and always on.
+struct TerminalSafe<F>(F);
+fn terminal_unsafe(c: char) -> bool {
+    matches!(c, '\u{7f}'..='\u{9f}' | '\u{61c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+impl<F: serde_json::ser::Formatter> serde_json::ser::Formatter for TerminalSafe<F> {
+    fn write_string_fragment<W: ?Sized + Write>(
+        &mut self,
+        writer: &mut W,
+        fragment: &str,
+    ) -> io::Result<()> {
+        let mut start = 0;
+        for (i, c) in fragment.char_indices() {
+            if terminal_unsafe(c) {
+                writer.write_all(&fragment.as_bytes()[start..i])?;
+                write!(writer, "\\u{:04x}", u32::from(c))?;
+                start = i + c.len_utf8();
+            }
+        }
+        writer.write_all(&fragment.as_bytes()[start..])
+    }
+    fn begin_array<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.begin_array(w)
+    }
+    fn end_array<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_array(w)
+    }
+    fn begin_array_value<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+        self.0.begin_array_value(w, first)
+    }
+    fn end_array_value<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_array_value(w)
+    }
+    fn begin_object<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.begin_object(w)
+    }
+    fn end_object<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_object(w)
+    }
+    fn begin_object_key<W: ?Sized + Write>(&mut self, w: &mut W, first: bool) -> io::Result<()> {
+        self.0.begin_object_key(w, first)
+    }
+    fn begin_object_value<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.begin_object_value(w)
+    }
+    fn end_object_value<W: ?Sized + Write>(&mut self, w: &mut W) -> io::Result<()> {
+        self.0.end_object_value(w)
+    }
+}
+/// JSON bytes (no trailing newline) with the terminal-safe string escaping.
+pub(crate) fn to_json_vec(value: &Value, pretty: bool) -> io::Result<Vec<u8>> {
+    use serde::Serialize;
+    let mut bytes = Vec::new();
+    if pretty {
+        let formatter = TerminalSafe(serde_json::ser::PrettyFormatter::new());
+        value.serialize(&mut serde_json::Serializer::with_formatter(
+            &mut bytes, formatter,
+        ))
     } else {
-        serde_json::to_vec(value)
+        let formatter = TerminalSafe(serde_json::ser::CompactFormatter);
+        value.serialize(&mut serde_json::Serializer::with_formatter(
+            &mut bytes, formatter,
+        ))
     }
     .map_err(io::Error::other)?;
+    Ok(bytes)
+}
+fn json_bytes(value: &Value, pretty: bool) -> io::Result<Vec<u8>> {
+    let mut bytes = to_json_vec(value, pretty)?;
     bytes.push(b'\n');
     Ok(bytes)
+}
+/// Spill files glen writes are named `{ms}-{command}-{pid}.{json|txt}` (see `spill`); prune
+/// only those, never a user's own file in a reused `out/` (W8-SEC-2).
+fn is_spill_name(name: &str) -> bool {
+    let Some(stem) = name
+        .strip_suffix(".json")
+        .or_else(|| name.strip_suffix(".txt"))
+    else {
+        return false;
+    };
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let Some((ms, rest)) = stem.split_once('-') else {
+        return false;
+    };
+    let Some((command, pid)) = rest.rsplit_once('-') else {
+        return false;
+    };
+    digits(ms)
+        && digits(pid)
+        && command.starts_with(|c: char| c.is_ascii_lowercase())
+        && command.bytes().all(|b| b.is_ascii_lowercase() || b == b'-')
+}
+fn prune_spills(dir: &std::path::Path, keep: &std::path::Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        // DirEntry::metadata does not follow symlinks, so `is_file` is a regular file.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        #[cfg(unix)]
+        let owned = {
+            use std::os::unix::fs::MetadataExt;
+            meta.uid() == rustix::process::geteuid().as_raw()
+        };
+        #[cfg(not(unix))]
+        let owned = true;
+        if entry.path() != keep
+            && entry.file_name().to_str().is_some_and(is_spill_name)
+            && meta.is_file()
+            && owned
+            && meta
+                .modified()
+                .ok()
+                .and_then(|t| SystemTime::now().duration_since(t).ok())
+                .is_some_and(|age| age > Duration::from_secs(7 * 24 * 3600))
+        {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
 }
 fn with_warnings(mut value: Value, warnings: &[Warning]) -> Value {
     if !warnings.is_empty() {
@@ -158,21 +273,7 @@ fn spill(
         .to_string();
     write_private_atomic(&path, plain.as_bytes())
         .map_err(|e| home_write_error(ctx, command, &path, "write", e))?;
-    if let Ok(entries) = fs::read_dir(&dir) {
-        for entry in entries.flatten() {
-            if entry.path() != path
-                && entry.file_type().is_ok_and(|t| t.is_file())
-                && entry
-                    .metadata()
-                    .and_then(|m| m.modified())
-                    .ok()
-                    .and_then(|t| SystemTime::now().duration_since(t).ok())
-                    .is_some_and(|age| age > Duration::from_secs(7 * 24 * 3600))
-            {
-                let _ = fs::remove_file(entry.path());
-            }
-        }
-    }
+    prune_spills(&dir, &path);
     if is_json {
         json_bytes(
             &with_warnings(json!({"v":1,"ok":true,"spilled":{"path":json_path,"bytes":plain.len(),"format":"json"}}), warnings),
@@ -249,6 +350,9 @@ pub fn emit_to(
     if ctx.mode != Mode::Json && human_warnings(ctx, &warnings, err).is_err() {
         return ExitCode::from(1);
     }
+    // The commit runs only after stdout is flushed (design.md: commit-after-flush), so a
+    // failure here cannot replace the envelope already written. Report it on stderr and
+    // exit with the error's own code, e.g. 6 `sandboxed` (W8-ERR-1).
     if let Some(commit) = after_output
         && let Err(e) = commit()
     {
@@ -1005,5 +1109,99 @@ mod tests {
         );
         assert!(err.is_empty());
         assert!(!home.exists());
+    }
+    /// W8-SEC-2: pruning removes only glen's own stale spills.
+    #[test]
+    fn prune_removes_only_stale_spill_names() {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("out");
+        fs::create_dir_all(&dir).unwrap();
+        let stale = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
+        let touch = |name: &str, when: SystemTime| {
+            let path = dir.join(name);
+            fs::write(&path, b"x").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            path
+        };
+        let notes = touch("notes.txt", stale);
+        let other = touch("thesis-draft-2.json", stale);
+        // A distinct number: macOS file systems are usually case-insensitive.
+        let numbered = touch("124-Doctor-45.json", stale);
+        let spill = touch("123-doctor-45.json", stale);
+        let multi = touch("1-install-skill-9.txt", stale);
+        let fresh = touch("456-doctor-78.json", SystemTime::now());
+        let keep = touch("789-ls-1.json", stale);
+        prune_spills(&dir, &keep);
+        for survivor in [&notes, &other, &numbered, &fresh, &keep] {
+            assert!(survivor.exists(), "{}", survivor.display());
+        }
+        assert!(!spill.exists());
+        assert!(!multi.exists());
+        for name in ["123-doctor-45.json", "1-install-skill-9.txt", "0-a-0.txt"] {
+            assert!(is_spill_name(name), "{name}");
+        }
+        for name in [
+            "notes.txt",
+            "123-doctor-45.json.bak",
+            "-doctor-45.json",
+            "123-doctor-.json",
+            "123--45.json",
+            "123-9doctor-45.json",
+            "123-doctor-45.md",
+            "x123-doctor-45.json",
+        ] {
+            assert!(!is_spill_name(name), "{name}");
+        }
+    }
+    /// W8-SEC-5: C1 and bidi controls are escaped in both forms and decode unchanged.
+    #[test]
+    fn json_escapes_c1_and_bidi_controls_losslessly() {
+        let text =
+            "X\u{7f}\u{85}\u{9b}2J\u{61c}\u{200e}\u{200f}\u{202a}\u{202e}\u{2066}\u{2069}Y é ✓";
+        let value = json!({"title": text, text: [text]});
+        for pretty in [false, true] {
+            let bytes = json_bytes(&value, pretty).unwrap();
+            let s = std::str::from_utf8(&bytes).unwrap();
+            assert!(!s.chars().any(terminal_unsafe), "{s}");
+            assert!(s.contains("\\u009b") && s.contains("\\u202e"), "{s}");
+            assert!(s.contains("é ✓"), "{s}");
+            assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), value);
+            assert_eq!(pretty, s.trim_end().contains('\n'));
+        }
+        assert_eq!(
+            json_bytes(&json!({"a":[1,{"b":null}]}), true).unwrap(),
+            [
+                serde_json::to_vec_pretty(&json!({"a":[1,{"b":null}]})).unwrap(),
+                b"\n".to_vec()
+            ]
+            .concat()
+        );
+    }
+    /// W8-ERR-1: a commit that fails after output exits with the error's own code.
+    #[test]
+    fn failed_commit_exits_with_its_own_code() {
+        let t = tempfile::tempdir().unwrap();
+        let c = ctx(t.path(), Mode::Json, false);
+        let mut outcome = Outcome::new(json!({}), "unused");
+        outcome.after_output = Some(Box::new(|| {
+            Err(GlenError::no_route(
+                crate::error::NoRouteReason::Sandboxed,
+                "cannot write GLEN_HOME",
+            ))
+        }));
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        assert_eq!(
+            emit_to(&c, outcome, "inbox", &mut out, &mut err),
+            ExitCode::from(6)
+        );
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "glen: cannot write GLEN_HOME\n"
+        );
     }
 }

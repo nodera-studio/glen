@@ -171,18 +171,9 @@ fn live_target(
     deadline: Instant,
     stop: Arc<AtomicBool>,
 ) -> (Target, Vec<Warning>) {
-    let warnings = if hello.ext_version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
-        vec![Warning {
-            code: "extension_version_mismatch".into(),
-            message: format!(
-                "extension version {} differs from glen {}; run `glen install-extension` and restart omp",
-                hello.ext_version.as_deref().unwrap_or("unknown"),
-                env!("CARGO_PKG_VERSION")
-            ),
-        }]
-    } else {
-        vec![]
-    };
+    let warnings = live::route::extension_version_warning(&hello)
+        .into_iter()
+        .collect();
     (
         Target::Live {
             reg,
@@ -305,22 +296,6 @@ fn job_target(
         stop,
     }
 }
-fn unavailable(opened: &Opened, probe: &Lease, paths: &paths::OmpPaths) -> GlenError {
-    let message = match probe {
-        Lease::Unknown { .. } => format!(
-            "cannot tell whether another omp process owns session {} ({})",
-            opened.handle,
-            lease::state_detail(probe).unwrap_or_default()
-        ),
-        _ => format!("session {} is open in another omp process", opened.handle),
-    };
-    let reason = if matches!(probe, Lease::Unknown { .. }) {
-        NoRouteReason::UnknownLease
-    } else {
-        NoRouteReason::LiveOwner
-    };
-    GlenError::no_route(reason, message).with_hint(live::route::lease_held_hint(paths))
-}
 pub(crate) fn route(
     cli: &Cli,
     env: &Env,
@@ -331,7 +306,7 @@ pub(crate) fn route(
 ) -> Result<(Target, Vec<Warning>), GlenError> {
     crate::sandbox::refuse_unreachable(env, cli.command.name())
         .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
-    let home = glen_home::resolve(env)?;
+    let home = glen_home::resolve_trusted(env, &["run/live", "jobs"])?;
     let store = JobStore::new(home.clone());
     let id = &opened.session.header.id;
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
@@ -347,7 +322,13 @@ pub(crate) fn route(
         match endpoint {
             live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, id) {
-                    return Err(GlenError::no_route(NoRouteReason::RpcJobRunning,format!("session {} is open in a live omp session and a glen RPC job is still running on it",opened.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",opened.handle)));
+                    // The CLI command the user retries; `watch` routes the same ops.
+                    let command = match op_name {
+                        "set_model" => "model",
+                        "set_thinking_level" => "thinking",
+                        other => other,
+                    };
+                    return Err(live::route::rpc_job_running(&opened.handle, command));
                 }
                 if !hello.ops.iter().any(|op| op == op_name) {
                     let ctx = super::ErrCtx {
@@ -365,34 +346,14 @@ pub(crate) fn route(
                 return Ok(live_target(reg, hello, deadline, stop));
             }
             live::route::Endpoint::Unhealthy { reason, kind, io } => {
-                if let Some(error) = io {
-                    let mapped = match kind {
-                        live::route::Unhealthy::Unresponsive => {
-                            crate::sandbox::map_socket_failure(env, "connect omp socket", &error)
-                        }
-                        live::route::Unhealthy::Unreadable
-                            if crate::sandbox::restricted(env, &error) =>
-                        {
-                            Some(crate::sandbox::map_home_write(
-                                env,
-                                cli.command.name(),
-                                error,
-                            ))
-                        }
-                        _ => None,
-                    };
-                    if let Some(error) = mapped {
-                        return Err(error);
-                    }
-                }
-                return Err(GlenError::no_route(
-                    NoRouteReason::UnhealthyEndpoint,
-                    format!(
-                        "session {} has a glen live endpoint that cannot take controls ({reason})",
-                        opened.handle
-                    ),
-                )
-                .with_hint(live::route::hint(kind)));
+                return Err(live::route::unhealthy_refusal(
+                    env,
+                    cli.command.name(),
+                    &opened.handle,
+                    &reason,
+                    kind,
+                    io,
+                ));
             }
             _ => (),
         }
@@ -461,7 +422,7 @@ pub(crate) fn route(
             return Err(error);
         }
         if !matches!(probe, Lease::Free) {
-            return Err(unavailable(opened, &probe, &paths));
+            return Err(live::route::lease_refusal(&probe, &opened.handle, &paths));
         }
         if op_name == "abort" {
             return Ok((Target::Idle, vec![]));
@@ -518,7 +479,7 @@ pub(crate) fn route_models(
     stop: Arc<AtomicBool>,
 ) -> Result<(Target, Vec<Warning>, ModelsSource), GlenError> {
     crate::sandbox::refuse_unreachable(env, "models")?;
-    let home = glen_home::resolve(env)?;
+    let home = glen_home::resolve_trusted(env, &["run/live", "jobs"])?;
     let store = JobStore::new(home.clone());
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     let mut warnings = vec![];

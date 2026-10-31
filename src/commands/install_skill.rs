@@ -57,8 +57,8 @@ fn run_inspected(
                 .and_then(Path::parent)
                 .ok_or_else(|| GlenError::new(ErrorCode::Internal, "skill target has no scope"))?
         };
-        let guard =
-            skill::write::Guard::inspect(&path).map_err(|e| io_error(&path, e, &[], &[]))?;
+        let guard = crate::install_guard::Guard::inspect(&path, skill::GUARD)
+            .map_err(|e| io_error(&path, e, &[], &[]))?;
         let before = skill::inspect_scoped(&path, scope, agent, &rendered)
             .map_err(|e| io_error(&path, e, &[], &[]))?;
         targets.push((agent, path, rendered, before, guard));

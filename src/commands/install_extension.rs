@@ -4,6 +4,7 @@ use crate::{
     error::{ErrorCode, GlenError, Warning},
     extension::{self, State},
     glen_home,
+    install_guard::Guard,
     omp::paths,
     output::{Mode, Outcome, OutputCtx},
     render::{self, palette::Token, text},
@@ -50,23 +51,25 @@ pub fn run(
             format!("cannot update extension {}: {e}", target.display()),
         )
     };
-    let mut guard = extension::write::Guard::inspect(&target).map_err(io)?;
-    let unsafe_path = guard.unsafe_path(&paths.extensions_dir);
-    let (state, previous) = if unsafe_path {
-        (State::Foreign, None)
-    } else {
-        extension::inspect(&target, env!("CARGO_PKG_VERSION"), &home.root).map_err(io)?
-    };
+    let mut guard = Guard::inspect(&target, extension::GUARD).map_err(io)?;
+    let extension::Inspection {
+        state,
+        version: previous,
+        unsafe_path,
+    } = extension::inspect(
+        &target,
+        &paths.extensions_dir,
+        env!("CARGO_PKG_VERSION"),
+        &home.root,
+    )
+    .map_err(io)?;
     let mut warnings = Vec::new();
     let unsafe_state = matches!(state, State::Modified | State::Foreign)
         || (!a.uninstall && matches!(state, State::Newer(_)));
     let mut action = if unsafe_path {
         warnings.push(Warning {
             code: "unsafe_path".into(),
-            message: format!(
-                "refusing symlink in extension path {}; --force cannot override this",
-                target.display()
-            ),
+            message: extension::unsafe_path_message(&target),
         });
         "skipped"
     } else if a.uninstall && state == State::NotInstalled {
@@ -144,6 +147,12 @@ pub fn run(
                 }
             }
         }
+    }
+    if let Some(message) = guard.sync_warning.take() {
+        warnings.push(Warning {
+            code: "extension_sync_failed".into(),
+            message,
+        });
     }
     warnings.extend(extension::socket_path_warning(&home.root));
     let restart = changes && action != "skipped" && !a.dry_run;

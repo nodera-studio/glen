@@ -26,6 +26,22 @@ pub fn install_interrupt() -> Result<Arc<AtomicBool>, GlenError> {
     }
     Ok(f)
 }
+/// [`install_interrupt`] plus SIGTERM and SIGHUP on the same flag, for commands that own a
+/// short-lived omp process group and must tear it down on any polite stop (W8-ERR-3). The first
+/// signal sets the flag and the command returns its interrupted outcome; a repeat of a signal
+/// once the flag is set exits at once with 128 plus that signal's number.
+pub fn install_interrupt_all() -> Result<Arc<AtomicBool>, GlenError> {
+    let f = install_interrupt()?;
+    #[cfg(unix)]
+    for (signal, code) in [
+        (signal_hook::consts::SIGTERM, 143),
+        (signal_hook::consts::SIGHUP, 129),
+    ] {
+        signal_hook::flag::register_conditional_shutdown(signal, code, f.clone())?;
+        signal_hook::flag::register(signal, f.clone())?;
+    }
+    Ok(f)
+}
 pub fn observe(
     store: &JobStore,
     id: &JobId,

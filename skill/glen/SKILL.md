@@ -27,9 +27,9 @@ Every command has `--help`.
 |---|---|---|
 | 0 | — | done; read `data` |
 | 1 | `internal`, `io` | report `error.message` |
-| 2 | `usage`, `invalid_env` | fix the command or variable named in `error.message` |
-| 3 | `not_found` | `glen ls --all` and use a listed handle |
-| 4 | `ambiguous` | use a handle from `error.details.candidates` |
+| 2 | `usage`, `invalid_env` | fix the command or variable named in `error.message`; a missing argument's name follows the colon |
+| 3 | `not_found` | follow `error.hint` (sessions: `glen ls --all`; jobs: `glen jobs`; models: `glen models <handle>`) |
+| 4 | `ambiguous` | pick a candidate from `error.details.candidates` (a session handle or provider/id) |
 | 5 | `omp_unavailable` | tell the user; `glen doctor` shows why |
 | 6 | `no_route` | refused safely; see below |
 | 7 | `job_failed`, `control_failed` | report `error.details` |
@@ -41,7 +41,8 @@ Every command has `--help`.
 Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not retry in a loop or work around it.
 - `sandboxed`: rerun this command outside the sandbox (ask for escalated permissions for `glen`);
   with `lease:"unknown"` (Linux) escalating does not help: follow `error.hint`.
-  With `glen_home_writable:false`, set `GLEN_HOME` under `$TMPDIR` or run outside the sandbox.
+  With `glen_home_writable:false`, set `GLEN_HOME` to a private directory you own, e.g. `"$(mktemp -d)/glen"`,
+  or run outside the sandbox.
 - Otherwise the session is open in omp and glen cannot deliver safely; follow `error.hint`.
 - Usually fix with `glen install-extension` (writes omp config, so ask first), then ask the user to restart omp. <!-- glen:if install-extension -->
 
@@ -69,8 +70,10 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   Codex's classic shell kills after 10 s unless you set a timeout; exec_command yields after 10 s and keeps running.
   Use `glen send <handle> "…" --wait 5s`, then `glen wait <job> --timeout 5s` while exit is 10.
   After a cut-off send, use `glen jobs --active`.
+- Session controls (compact, model, thinking, abort) also default to 90 s: give them a shell timeout of at least 100 s or pass a shorter `--timeout`. SIGTERM and SIGHUP stop the headless omp they started. <!-- glen:if compact model thinking abort -->
 - In Codex's sandbox reads work. Spills need writable `GLEN_HOME`; otherwise exit 6 `sandboxed` with
-  `glen_home_writable:false`: set `GLEN_HOME` under `$TMPDIR`. Prefer `glen tail <handle> -n 20`.
+  `glen_home_writable:false`: set `GLEN_HOME` to a private directory you own, e.g. `"$(mktemp -d)/glen"`.
+  Prefer `glen tail <handle> -n 20`.
   Sending and session controls must reach omp outside the sandbox; exit 6 `sandboxed` explains the restriction.
   Only non-empty `CODEX_SANDBOX` marks a sandbox. `CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends;
   a real permission failure returns exit 6 with the hint: rerun with escalated permissions.
@@ -78,7 +81,7 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   refuses exit 6 `sandboxed` with `lease:"unknown"`. Escalating cannot fix that: use the live route (the session
   open in the omp TUI with glen's extension), a new session (`@new`), or ask the user to run glen outside Codex.
 - Network-enabled sandboxes support live sessions only, with writable `GLEN_HOME`. <!-- glen:if install-extension -->
-- Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker. <!-- glen:if inbox -->
+- Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker; if the marker cannot be written, `glen inbox` exits 6 and leaves them unread. <!-- glen:if inbox -->
 
 <!-- glen:if abort stop models model thinking compact -->
 ## Session controls
@@ -92,6 +95,7 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   Exit 6 extension_outdated: run `glen install-extension`, then restart that omp session.
   Abort keeps queued omp messages; queued_jobs names glen jobs that start next.
   A live timeout may still finish; a job timeout has unknown outcome: check the job before retrying.
+  Exit 7 `outcome_unknown`: the change may have been applied; check `glen models <handle>` before retrying.
 - These change the user's session: run only when asked.
 <!-- glen:end -->
 

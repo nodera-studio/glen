@@ -229,11 +229,29 @@ impl JobStore {
         session: Option<&str>,
         active: bool,
     ) -> Vec<(JobId, Job, Status)> {
-        self.list()
+        self.for_session_reporting(session, active).0
+    }
+    /// [`Self::for_session`] plus the `lost_write_failed` warnings of every job it refreshed,
+    /// including jobs the `active` filter then drops, at most one per job.
+    pub(crate) fn for_session_reporting(
+        &self,
+        session: Option<&str>,
+        active: bool,
+    ) -> (Vec<(JobId, Job, Status)>, Vec<Warning>) {
+        let mut warnings = vec![];
+        let rows = self
+            .list()
             .into_iter()
             .filter_map(|id| {
                 let job = self.read_job(&id).ok()?;
                 let status = liveness::refresh(self, &id, self.read_status(&id).ok()?);
+                warnings.extend(
+                    status
+                        .warnings
+                        .iter()
+                        .find(|w| w.code == liveness::LOST_WRITE_FAILED)
+                        .cloned(),
+                );
                 if active && status.status.is_terminal() {
                     return None;
                 }
@@ -245,7 +263,8 @@ impl JobStore {
                 }
                 Some((id, job, status))
             })
-            .collect()
+            .collect();
+        (rows, warnings)
     }
     pub fn create(&self, job: &Job) -> Result<(), GlenError> {
         self.create_mapped(job, |path, e| {
@@ -398,10 +417,10 @@ impl JobStore {
         };
         match matches.as_slice() {
             [id] => Ok(id.clone()),
-            [] => Err(GlenError::new(
-                ErrorCode::NotFound,
-                format!("no glen job matches `{arg}`"),
-            )),
+            [] => Err(
+                GlenError::new(ErrorCode::NotFound, format!("no glen job matches `{arg}`"))
+                    .with_hint("run `glen jobs`"),
+            ),
             _ => {
                 let candidates = matches.iter().map(|id| {
                     let job = self.read_job(id).ok();
@@ -468,19 +487,47 @@ fn write_json_mapped<T: Serialize>(
     b.push(b'\n');
     write_private_atomic(path, &b).map_err(|e| map(path, e))
 }
+/// Appends one NDJSON record. A torn tail (a previous append cut off before its newline, for
+/// example by ENOSPC) is terminated first, so the new record never merges into it (W8-ERR-4).
 pub(crate) fn append_line(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let mut opts = OpenOptions::new();
-    opts.append(true).create(true);
+    opts.read(true).append(true).create(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut b = bytes.to_vec();
-    b.push(b'\n');
+    let mut b = Vec::with_capacity(bytes.len() + 2);
     opts.open(path)
-        .and_then(|mut f| f.write_all(&b))
+        .and_then(|mut f| {
+            if ends_without_newline(&f)? {
+                b.push(b'\n');
+            }
+            b.extend_from_slice(bytes);
+            b.push(b'\n');
+            f.write_all(&b)
+        })
         .map_err(|e| io::Error::new(e.kind(), format!("cannot append {}: {e}", path.display())))
+}
+fn ends_without_newline(f: &fs::File) -> io::Result<bool> {
+    let len = f.metadata()?.len();
+    if len == 0 {
+        return Ok(false);
+    }
+    let mut last = [0u8; 1];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        f.read_exact_at(&mut last, len - 1)?;
+    }
+    #[cfg(not(unix))]
+    {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut f = f;
+        f.seek(SeekFrom::Start(len - 1))?;
+        f.read_exact(&mut last)?;
+    }
+    Ok(last[0] != b'\n')
 }
 
 #[cfg(test)]
@@ -871,5 +918,49 @@ mod session_jobs_tests {
         assert!(rows.iter().all(|(id, _, _)| active.contains(id)));
         assert_eq!(store.for_session(Some("s-abcd"), false).len(), 4);
         assert_eq!(store.for_session(Some("cd"), false).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod w8_g2_tests {
+    use super::*;
+    #[test]
+    fn err4_torn_tail_is_terminated_before_the_next_record() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("inbox.ndjson");
+        let reply = Reply {
+            v: 1,
+            id: "good".into(),
+            session_id: "session".into(),
+            job_id: None,
+            request_id: None,
+            tool_call_id: None,
+            text: "after the tear".into(),
+            is_final: true,
+            at: "2026-10-31T00:00:00Z".into(),
+        };
+        // A record cut off part-way, as an ENOSPC append leaves it.
+        fs::write(&path, br#"{"v":1,"id":"torn","text":"cut"#).unwrap();
+        append_line(&path, &serde_json::to_vec(&reply).unwrap()).unwrap();
+        let batch = crate::inbox::read_new(&path, crate::inbox::Cursor::default()).unwrap();
+        assert_eq!(batch.skipped, 1);
+        assert_eq!(batch.records.len(), 1);
+        assert_eq!(batch.records[0].0.text, "after the tear");
+        // A clean tail gets no extra blank line.
+        append_line(&path, b"{}").unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with("}\n{}\n"), "{text:?}");
+        assert!(!text.contains("\n\n"), "{text:?}");
+        // An empty file gets no leading newline.
+        let empty = t.path().join("empty.ndjson");
+        append_line(&empty, b"{}").unwrap();
+        assert_eq!(fs::read(&empty).unwrap(), b"{}\n");
+    }
+    #[test]
+    fn doc11_job_not_found_points_at_glen_jobs() {
+        let t = tempfile::tempdir().unwrap();
+        let e = tests::store(t.path()).resolve("j1234567").unwrap_err();
+        assert_eq!(e.code, ErrorCode::NotFound);
+        assert_eq!(e.hint.as_deref(), Some("run `glen jobs`"));
     }
 }

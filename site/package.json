@@ -16,8 +16,8 @@
     "lhci": "lhci autorun",
     "verify": "npm run check && npm run build && npm run test:unit && npm run budgets && npm run links",
     "links": "node scripts/check-links.mjs",
-    "deploy": "npm run verify && node scripts/check-links.mjs --online && npx --yes wrangler@4.124.0 deploy",
-    "deploy:dry": "npm run build && npx --yes wrangler@4.124.0 deploy --dry-run",
+    "deploy": "npm run verify && node scripts/check-links.mjs --online && npx --no wrangler deploy",
+    "deploy:dry": "npm run build && npx --no wrangler deploy --dry-run",
     "demo:refresh": "cd .. && GLEN_UPDATE_DEMO=1 cargo test --locked --test site_demo",
     "readme:shot": "node scripts/readme-shot.mjs"
   },
@@ -40,7 +40,8 @@
     "@types/react": "19.3.0",
     "@types/react-dom": "19.3.0",
     "esbuild": "0.28.2",
-    "typescript": "6.0.3"
+    "typescript": "6.0.3",
+    "wrangler": "4.124.0"
   },
   "private": true
 }

@@ -40,6 +40,9 @@ pub(crate) enum FollowEvent {
     BranchSwitch {
         leaf_id: Option<String>,
     },
+    /// A warning raised after startup, such as `branch_truncated` once a rewrite, a branch
+    /// change or a continuation leaves the active branch cut at a malformed line (SEC-1).
+    Warning(crate::error::Warning),
 }
 fn identity(m: &Metadata) -> (u64, u64) {
     #[cfg(unix)]
@@ -96,7 +99,10 @@ pub(crate) struct Follower {
     summary: Summary,
     offset: u64,
     identity: (u64, u64),
+    /// Size and mtime when the consumed prefix was last known to match.
     observed: Option<(u64, SystemTime)>,
+    /// When the consumed prefix was last hashed in full; None means a hash is due.
+    prefix_hashed: Option<Instant>,
     emitted: HashSet<Emitted>,
     occurrences: HashMap<String, usize>,
     known_ids: HashSet<String>,
@@ -106,6 +112,9 @@ pub(crate) struct Follower {
     missing: Option<Instant>,
     entries: continuation::EntryCache,
     reload_pending: bool,
+    /// Whether `branch_truncated` was already reported for the current branch; the opening
+    /// snapshot's warning is the caller's (`tail -f` emits it before the backlog).
+    truncation_warned: bool,
 }
 impl Follower {
     pub(crate) fn new(o: Opened, opts: ItemOpts) -> Self {
@@ -115,12 +124,14 @@ impl Follower {
             .map(|(_, key)| key)
             .collect();
         Self {
+            truncation_warned: o.session.branch_warning().is_some(),
             offset: o.session.consumed,
             identity: o.metadata.as_ref().map(identity).unwrap_or((0, 0)),
             observed: o
                 .metadata
                 .as_ref()
                 .and_then(|m| m.modified().ok().map(|time| (m.len(), time))),
+            prefix_hashed: None,
             emitted,
             occurrences,
             known_ids: o
@@ -166,7 +177,7 @@ impl Follower {
         let available = match File::open(&path) {
             Ok(mut file) => {
                 let metadata = file.metadata().map_err(|e| GlenError::read(&path, e))?;
-                let (available, next) = self.tick(&mut file, &metadata)?;
+                let (available, next) = self.tick_at(&mut file, &metadata, now)?;
                 events.extend(next);
                 available
             }
@@ -245,6 +256,8 @@ impl Follower {
         self.session = session;
         self.summary = summary;
         self.reload_pending = false;
+        self.truncation_warned = false;
+        self.truncation(events);
         events.push(FollowEvent::Items(self.unseen(false)));
         Ok(true)
     }
@@ -278,12 +291,26 @@ impl Follower {
         }
         Ok(hash.digest() == self.session.consumed_hash())
     }
+    #[cfg(test)]
     pub(crate) fn tick(
         &mut self,
         file: &mut File,
         m: &Metadata,
     ) -> Result<(bool, Vec<FollowEvent>), GlenError> {
+        self.tick_at(file, m, Instant::now())
+    }
+    /// The size-shrink, identity and 4 KB tail checks run on every poll. The
+    /// full prefix hash runs only when metadata moved since the prefix was last
+    /// verified and at least `PREFIX_HASH_EVERY` has passed since the last hash,
+    /// so following a busy, large session is not O(file size) per poll.
+    fn tick_at(
+        &mut self,
+        file: &mut File,
+        m: &Metadata,
+        now: Instant,
+    ) -> Result<(bool, Vec<FollowEvent>), GlenError> {
         let mut events = vec![];
+        let mut hashed = false;
         let observed = (
             m.len(),
             m.modified()
@@ -293,7 +320,11 @@ impl Follower {
             || m.len() < self.offset
             || identity(m) != self.identity
             || !self.consumed_tail_matches(file)?
-            || (self.observed != Some(observed) && !self.consumed_prefix_matches(file)?)
+            || (self.observed != Some(observed) && self.prefix_hash_due(now) && {
+                hashed = true;
+                self.prefix_hashed = Some(now);
+                !self.consumed_prefix_matches(file)?
+            })
         {
             let session = match open::snapshot(&self.session.path, file, m, true) {
                 Ok(session) if session.header.id == self.session.header.id => session,
@@ -315,7 +346,9 @@ impl Follower {
             events.push(FollowEvent::Rewritten {
                 path: self.session.path.clone(),
             });
+            self.truncation(&mut events);
             events.push(FollowEvent::Items(self.unseen(true)));
+            self.observed = Some(observed);
         } else if m.len() > self.offset {
             file.seek(SeekFrom::Start(self.offset))
                 .map_err(|e| GlenError::read(&self.session.path, e))?;
@@ -362,6 +395,7 @@ impl Follower {
                             leaf_id: self.session.leaf_id().map(str::to_owned),
                         });
                     }
+                    self.truncation(&mut events);
                     self.unseen(false)
                 };
                 if switched || !unseen.is_empty() {
@@ -369,10 +403,29 @@ impl Follower {
                 }
             }
         }
-        self.observed = Some(observed);
+        if hashed {
+            self.observed = Some(observed);
+        }
         Ok((true, events))
     }
+    /// Reports `branch_truncated` once each time the followed branch becomes truncated. Only
+    /// a rewrite, a non-linear append or a continuation can change that, so the linear
+    /// append path skips the branch walk.
+    fn truncation(&mut self, events: &mut Vec<FollowEvent>) {
+        let warning = self.session.branch_warning();
+        if let Some(w) = &warning
+            && !self.truncation_warned
+        {
+            events.push(FollowEvent::Warning(w.clone()));
+        }
+        self.truncation_warned = warning.is_some();
+    }
+    fn prefix_hash_due(&self, now: Instant) -> bool {
+        self.prefix_hashed
+            .is_none_or(|at| now.saturating_duration_since(at) >= PREFIX_HASH_EVERY)
+    }
 }
+const PREFIX_HASH_EVERY: Duration = Duration::from_secs(5);
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +663,68 @@ mod poll_tests {
         append(&path, &message("after-prefix", "padding"));
         one(&f.poll().unwrap(), "after-prefix");
     }
+    #[test]
+    fn appends_within_the_cadence_hash_the_prefix_at_most_once() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let mut f = follower(&tree, &path);
+        PREFIX_CHECKS.with(|count| count.set(0));
+        let start = Instant::now();
+        let mut parent = "10000009".to_owned();
+        for i in 0..20 {
+            let id = format!("append-{i}");
+            append(&path, &message(&id, &parent));
+            one(
+                &f.poll_at(start + Duration::from_millis(200 * i)).unwrap(),
+                &id,
+            );
+            parent = id;
+        }
+        assert!(PREFIX_CHECKS.with(|count| count.get()) <= 1);
+    }
+    #[test]
+    fn equal_size_prefix_rewrite_inside_the_cadence_is_found_when_the_hash_is_due() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let original = String::from_utf8(fixtures::bytes('A').to_vec()).unwrap()
+            + &format!(
+                "{}\n",
+                json!({"type":"future", "id":"padding", "parentId":"10000009", "data":"x".repeat(9000)})
+            );
+        fs::write(&path, &original).unwrap();
+        let mut f = follower(&tree, &path);
+        let start = Instant::now();
+        // The first append hashes the prefix and starts the cadence.
+        append(&path, &message("first", "padding"));
+        one(&f.poll_at(start).unwrap(), "first");
+        PREFIX_CHECKS.with(|count| count.set(0));
+        let current = fs::read_to_string(&path).unwrap();
+        let rewritten = current
+            .replace("10000003", "90000003")
+            .replace("Why does parser_test flake?", "prefix rewrite detected    ");
+        assert_eq!(current.len(), rewritten.len());
+        let old = fs::metadata(&path).unwrap();
+        fs::write(&path, &rewritten).unwrap();
+        File::open(&path)
+            .unwrap()
+            .set_modified(old.modified().unwrap() + Duration::from_secs(1))
+            .unwrap();
+        assert!(
+            f.poll_at(start + Duration::from_secs(1))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 0);
+        let events = f.poll_at(start + Duration::from_secs(5)).unwrap();
+        assert!(matches!(&events[0], FollowEvent::Rewritten { .. }));
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 1);
+        assert!(
+            f.poll_at(start + Duration::from_secs(11))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(PREFIX_CHECKS.with(|count| count.get()), 1);
+    }
     fn legacy_message(text: &str) -> String {
         format!(
             "{}\n",
@@ -715,6 +830,46 @@ mod poll_tests {
             matches!(&events[0], FollowEvent::BranchSwitch { leaf_id: Some(id) } if id == "other-branch")
         );
         one(&events[1..], "other-branch");
+    }
+    // SEC-1 (W8 review): a stream that starts healthy and then appends a malformed ancestor
+    // warns `branch_truncated` once, before the items, and not again on later linear appends.
+    #[test]
+    fn a_branch_cut_after_startup_warns_once() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let mut f = follower(&tree, &path);
+        assert!(f.session().branch_warning().is_none());
+        let last = f.session().leaf_id().unwrap().to_owned();
+        append(
+            &path,
+            &format!(
+                "{{\"type\":\"message\",\"id\":\"hidden\",\"parentId\":\"{last}\",\"message\":{{\"role\":\"user\",\"content\":\"cut\n"
+            ),
+        );
+        append(&path, &message("after", "hidden"));
+        let events = f.poll().unwrap();
+        let warnings: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                FollowEvent::Warning(w) => Some(w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        assert_eq!(warnings[0].code, "branch_truncated");
+        let at = events
+            .iter()
+            .position(|e| matches!(e, FollowEvent::Warning(_)))
+            .unwrap();
+        assert!(matches!(events.last(), Some(FollowEvent::Items(_))));
+        assert!(at < events.len() - 1);
+        append(&path, &message("later", "after"));
+        let events = f.poll().unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, FollowEvent::Warning(_))),
+            "{events:?}"
+        );
+        one(&events, "later");
     }
     #[test]
     fn missing_file_times_out_after_twenty_poll_intervals_without_sleep() {

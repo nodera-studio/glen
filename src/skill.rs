@@ -1,11 +1,11 @@
 //! A block guard is an exact `<!-- glen:if NAME[ NAME…] -->` line, closed by
 //! `<!-- glen:end -->`. Blocks cannot nest. A line guard uses the same opening
 //! comment after one space at the end of a line. Names match [a-z][a-z-]*.
-pub(crate) mod write;
 use crate::{
     cli,
     env::Env,
     error::{ErrorCode, GlenError},
+    install_guard,
 };
 use std::{
     cmp::Ordering,
@@ -179,25 +179,51 @@ fn inspection(state: State, version: Option<String>, detail: impl Into<String>) 
         unsafe_path: false,
     }
 }
-fn numeric(v: &str) -> Option<Vec<u64>> {
-    v.split('.')
-        .map(|s| {
-            if !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit()) {
-                s.parse().ok()
-            } else {
-                None
-            }
-        })
-        .collect()
+/// How `install-skill` writes `skills/glen/SKILL.md`.
+pub(crate) const GUARD: install_guard::Spec = install_guard::Spec {
+    noun: "skill",
+    temp_prefix: ".SKILL.md",
+    file_mode: 0o644,
+    dir_mode: 0o755,
+};
+/// A pre-release identifier; a number sorts below a word.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Identifier<'a> {
+    Number(u64),
+    Word(&'a str),
 }
-pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    match (numeric(a), numeric(b)) {
-        (Some(mut a), Some(mut b)) => {
-            let n = a.len().max(b.len());
-            a.resize(n, 0);
-            b.resize(n, 0);
-            a.cmp(&b)
+/// The precedence key of `major.minor.patch[-pre.release][+build]`: the numeric core, then
+/// whether it is a release (above its pre-releases), then the pre-release identifiers. Build
+/// metadata is ignored.
+fn semver(v: &str) -> Option<([u64; 3], bool, Vec<Identifier<'_>>)> {
+    let v = v.split_once('+').map_or(v, |(v, _)| v);
+    let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let mut parts = core.split('.');
+    let mut number = || parts.next().filter(|s| digits(s))?.parse::<u64>().ok();
+    let core = [number()?, number()?, number()?];
+    if parts.next().is_some() {
+        return None;
+    }
+    let mut identifiers = Vec::new();
+    for id in pre.map(|p| p.split('.')).into_iter().flatten() {
+        if id.is_empty() {
+            return None;
         }
+        identifiers.push(match id.parse() {
+            Ok(n) if digits(id) => Identifier::Number(n),
+            _ => Identifier::Word(id),
+        });
+    }
+    Some((core, pre.is_none(), identifiers))
+}
+/// Semver precedence (W8 DEBT-5): numeric `major.minor.patch`, a release above its
+/// pre-releases, pre-release identifiers compared numerically when both are numbers and as
+/// ASCII otherwise. A version that does not parse sorts below every valid one; two such
+/// versions compare equal.
+pub fn compare_versions(a: &str, b: &str) -> Ordering {
+    match (semver(a), semver(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
         (None, Some(_)) => Ordering::Less,
         (Some(_), None) => Ordering::Greater,
         (None, None) => Ordering::Equal,
@@ -459,6 +485,18 @@ mod tests {
             ("0.0.9", "0.1.0", Ordering::Less),
             ("0.1.10", "0.1.9", Ordering::Greater),
             ("dev", "0.1.0", Ordering::Less),
+            // W8 DEBT-5: pre-releases.
+            ("0.1.0", "0.2.0-rc.1", Ordering::Less),
+            ("0.2.0-rc.1", "0.1.1", Ordering::Greater),
+            ("0.2.0-rc.10", "0.2.0-rc.9", Ordering::Greater),
+            ("0.2.0-rc.1", "0.2.0", Ordering::Less),
+            ("0.2.0-rc.1", "0.2.0-rc.1.1", Ordering::Less),
+            ("0.2.0-1", "0.2.0-alpha", Ordering::Less),
+            ("0.2.0-alpha", "0.2.0-beta", Ordering::Less),
+            ("0.2.0+build.1", "0.2.0", Ordering::Equal),
+            ("0.2.0-", "0.1.0", Ordering::Less),
+            ("0.2", "0.1.0", Ordering::Less),
+            ("dev", "nightly", Ordering::Equal),
         ] {
             assert_eq!(compare_versions(a, b), expected);
         }

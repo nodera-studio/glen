@@ -257,7 +257,7 @@ pub(crate) fn outcome(
     Ok(o)
 }
 pub fn run(_cli: &Cli, args: &WaitArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
-    let store = JobStore::new(glen_home::resolve(env)?);
+    let store = JobStore::new(glen_home::resolve_trusted(env, &["jobs"])?);
     let id = store.resolve(&args.job)?;
     let job = store.read_job(&id)?;
     let flag = wait::install_interrupt()?;

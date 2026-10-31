@@ -156,6 +156,8 @@ pub fn omp_version(
         thread::sleep(Duration::from_millis(20));
     };
     if !status.success() {
+        // W8 ERR-10: a failed wrapper's background children die with it.
+        terminate(&mut child)?;
         return Err(format!("omp --version failed ({status})"));
     }
     // Do not wait on a reader if a descendant inherited the output descriptor.
@@ -380,5 +382,34 @@ mod tests {
             }
         });
         assert!(start.elapsed() < Duration::from_secs(25));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn failed_version_probe_kills_the_wrappers_descendants() {
+        let t = tempfile::tempdir().unwrap();
+        let bin = script(
+            t.path(),
+            "failing",
+            "( /bin/sleep 47; true ) & echo $! > \"$0.pid\"\nexit 3",
+        );
+        let error = omp_version(&bin, Duration::from_secs(10), None).unwrap_err();
+        assert!(error.contains("omp --version failed"), "{error}");
+        let raw: i32 = fs::read_to_string(bin.with_extension("pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let pid = rustix::process::Pid::from_raw(raw).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match rustix::process::test_kill_process(pid) {
+                Err(rustix::io::Errno::SRCH) => break,
+                Ok(()) => {
+                    assert!(Instant::now() < deadline, "surviving descendant");
+                    thread::sleep(Duration::from_millis(20));
+                }
+                Err(error) => panic!("cannot probe descendant: {error}"),
+            }
+        }
     }
 }

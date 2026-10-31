@@ -1,4 +1,5 @@
 use super::{JobError, JobId, JobStore, State, Status};
+use crate::error::Warning;
 use std::time::Duration;
 #[derive(Debug)]
 pub enum Probe {
@@ -117,17 +118,26 @@ pub(crate) fn try_mark_lost(
     if s.status.is_terminal() || (recheck && !is_lost(&s, jiff::Timestamp::now())) {
         return Ok(s);
     }
-    s.status = State::Lost;
+    s = lost(s);
     s.updated_at = jiff::Timestamp::now().to_string();
+    store.write_status_locked(id, &s)?;
+    Ok(s)
+}
+/// The warning code a reader attaches when it saw a dead worker but could not persist `lost`.
+pub const LOST_WRITE_FAILED: &str = "lost_write_failed";
+fn lost(mut s: Status) -> Status {
+    s.status = State::Lost;
     s.error = Some(JobError {
         code: "lost".into(),
         message: "the glen worker exited without reporting a result".into(),
         hint: None,
         details: None,
     });
-    store.write_status_locked(id, &s)?;
-    Ok(s)
+    s
 }
+/// A dead worker is reported as `lost` even when the job directory cannot be written (W8-ERR-2):
+/// the terminal status lives only in memory and carries a `lost_write_failed` warning for the
+/// caller's envelope, never a stderr line.
 fn report_lost(
     id: &JobId,
     observed: Status,
@@ -136,8 +146,14 @@ fn report_lost(
     match result {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("cannot mark job {} lost: {e}", id.handle());
-            observed
+            let mut s = lost(observed);
+            if !s.warnings.iter().any(|w| w.code == LOST_WRITE_FAILED) {
+                s.warnings.push(Warning {
+                    code: LOST_WRITE_FAILED.into(),
+                    message: format!("cannot record job {} as lost: {}", id.handle(), e.message),
+                });
+            }
+            s
         }
     }
 }
@@ -312,5 +328,46 @@ mod quiet_tests {
             try_mark_lost(&store, &id, false).unwrap().status,
             State::Completed
         );
+    }
+}
+
+#[cfg(test)]
+mod w8_err2_tests {
+    use super::*;
+    #[test]
+    fn unpersistable_lost_is_reported_in_memory_with_one_warning() {
+        let tree = tempfile::tempdir().unwrap();
+        let store = super::super::tests::store(tree.path());
+        let j = super::super::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        // No job directory at all: the status lock cannot be opened, so `lost` cannot be written.
+        let observed = Status {
+            status: State::Accepted,
+            updated_at: "2000-01-01T00:00:00Z".into(),
+            worker_pid: Some(std::process::id()),
+            worker_start: Some("dead identity".into()),
+            omp_pid: Some(42),
+            ..Status::default()
+        };
+        let s = refresh(&store, &id, observed.clone());
+        assert_eq!(s.status, State::Lost);
+        assert_eq!(s.error.as_ref().unwrap().code, "lost");
+        assert_eq!(s.omp_pid, Some(42));
+        assert_eq!(s.updated_at, observed.updated_at);
+        assert_eq!(s.warnings.len(), 1);
+        assert_eq!(s.warnings[0].code, LOST_WRITE_FAILED);
+        assert!(
+            s.warnings[0].message.contains(&id.handle()),
+            "{:?}",
+            s.warnings
+        );
+        assert!(
+            s.warnings[0].message.contains("status.lock"),
+            "{:?}",
+            s.warnings
+        );
+        // Feeding the in-memory result back in does not stack a second warning.
+        let again = mark_lost(&store, &id, s);
+        assert_eq!(again.warnings.len(), 1);
     }
 }

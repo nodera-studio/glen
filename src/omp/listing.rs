@@ -35,6 +35,14 @@ impl SessionFile {
     }
 }
 pub fn discover(dir: &Path) -> io::Result<Vec<SessionFile>> {
+    discover_reporting(dir, &mut vec![])
+}
+/// Like `discover`, but records bucket directories and session files that exist
+/// and cannot be read (any io error other than NotFound) in `unreadable`.
+pub fn discover_reporting(
+    dir: &Path,
+    unreadable: &mut Vec<PathBuf>,
+) -> io::Result<Vec<SessionFile>> {
     let buckets = match fs::read_dir(dir) {
         Ok(v) => v,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
@@ -42,30 +50,61 @@ pub fn discover(dir: &Path) -> io::Result<Vec<SessionFile>> {
     };
     let mut seen = HashSet::new();
     let mut out = vec![];
-    for b in buckets.flatten() {
+    // W8 review (ERR-5): every io error other than NotFound is recorded, including a failed
+    // directory iteration and a failed stat (a bucket that can be listed but not searched).
+    let mut record = |path: PathBuf, e: &io::Error| {
+        if e.kind() != io::ErrorKind::NotFound && !unreadable.contains(&path) {
+            unreadable.push(path);
+        }
+    };
+    for b in buckets {
+        let b = match b {
+            Ok(b) => b,
+            Err(e) => {
+                record(dir.to_path_buf(), &e);
+                continue;
+            }
+        };
         if b.file_name().to_string_lossy().starts_with('.')
             || !b.file_type().is_ok_and(|t| t.is_dir())
         {
             continue;
         }
-        let Ok(files) = fs::read_dir(b.path()) else {
-            continue;
+        let files = match fs::read_dir(b.path()) {
+            Ok(files) => files,
+            Err(e) => {
+                record(b.path(), &e);
+                continue;
+            }
         };
-        for f in files.flatten() {
+        for f in files {
+            let f = match f {
+                Ok(f) => f,
+                Err(e) => {
+                    record(b.path(), &e);
+                    continue;
+                }
+            };
             let name = f.file_name();
             let name = name.to_string_lossy();
             if name.starts_with('.') || !name.ends_with(".jsonl") {
                 continue;
             }
             let path = f.path();
-            if !fs::metadata(&path).is_ok_and(|m| m.is_file()) {
-                continue;
-            }
+            let meta = match fs::metadata(&path) {
+                Ok(m) if m.is_file() => m,
+                Ok(_) => continue,
+                Err(e) => {
+                    record(path, &e);
+                    continue;
+                }
+            };
             let real = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if seen.insert(real)
-                && let Ok(file) = SessionFile::at(&path)
-            {
-                out.push(file)
+            if seen.insert(real) {
+                match SessionFile::from_metadata(&path, &meta) {
+                    Ok(file) => out.push(file),
+                    Err(e) => record(path, &e),
+                }
             }
         }
     }
@@ -88,8 +127,22 @@ pub struct Summary {
     pub tail_redirects_leaf: bool,
 }
 pub fn scan_head(file: SessionFile) -> Option<Summary> {
-    let mut f = File::open(&file.path).ok()?;
-    read_head(file, &mut f).ok()
+    scan_head_reporting(file, &mut vec![])
+}
+/// Like `scan_head`, but records a file that exists and cannot be read in `unreadable`.
+pub fn scan_head_reporting(file: SessionFile, unreadable: &mut Vec<PathBuf>) -> Option<Summary> {
+    let path = file.path.clone();
+    let result = File::open(&path)
+        .map_err(LoadError::Io)
+        .and_then(|mut f| read_head(file, &mut f));
+    match result {
+        Ok(summary) => Some(summary),
+        Err(LoadError::Io(e)) if e.kind() != io::ErrorKind::NotFound => {
+            unreadable.push(path);
+            None
+        }
+        Err(_) => None,
+    }
 }
 /// Use the same bounded title window for discovery and transcript headers.
 pub fn read_head(file: SessionFile, mut reader: impl Read) -> Result<Summary, LoadError> {
@@ -248,6 +301,8 @@ pub struct Catalog {
     pub sessions_dir: PathBuf,
     pub sessions: Vec<Summary>,
     pub handles: HashMap<String, String>,
+    /// Session files and bucket directories that exist but could not be read.
+    pub unreadable: Vec<PathBuf>,
 }
 impl Catalog {
     pub fn scan(dir: &Path) -> Result<Self, GlenError> {
@@ -264,16 +319,31 @@ impl Catalog {
         );
     }
     pub(crate) fn read(dir: &Path) -> Result<Self, GlenError> {
-        let files = discover(dir).map_err(|e| {
+        let mut unreadable = vec![];
+        let files = discover_reporting(dir, &mut unreadable).map_err(|e| {
             GlenError::new(ErrorCode::Io, format!("cannot read {}: {e}", dir.display()))
         })?;
-        let mut sessions = files.into_iter().filter_map(scan_head).collect::<Vec<_>>();
+        let mut sessions = files
+            .into_iter()
+            .filter_map(|f| scan_head_reporting(f, &mut unreadable))
+            .collect::<Vec<_>>();
         sort_newest_first(&mut sessions);
         Ok(Self {
             sessions_dir: dir.into(),
             sessions,
             handles: HashMap::new(),
+            unreadable,
         })
+    }
+    /// One `unreadable_session` warning per path in `unreadable`.
+    pub fn unreadable_warnings(&self) -> Vec<crate::error::Warning> {
+        self.unreadable
+            .iter()
+            .map(|path| crate::error::Warning {
+                code: "unreadable_session".into(),
+                message: format!("cannot read session {}", path.display()),
+            })
+            .collect()
     }
     pub fn handle(&self, id: &str) -> String {
         self.handles

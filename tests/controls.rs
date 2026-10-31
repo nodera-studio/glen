@@ -369,6 +369,54 @@ fn ac363_rpc_bounds() {
         }
     }
 }
+/// W8-ERR-3: SIGTERM (a shell's tool timeout) and SIGHUP (a closed terminal) stop a control
+/// like SIGINT does: glen tears down its omp group, so no compaction lands after it has gone.
+/// The outcome is the documented interrupted one, exit 130, whatever the signal.
+#[test]
+fn w8_err3_term_and_hup_stop_the_rpc_control() {
+    for signal in [rustix::process::Signal::TERM, rustix::process::Signal::HUP] {
+        let b = RpcBox::new();
+        let before = fs::read(b.omp.session('A')).unwrap();
+        let mut cmd = command(&b, &["compact", "e27c0de", "--timeout", "15s", "--json"]);
+        cmd.env("FAKE_OMP_COMPACT_DELAY_MS", "4000")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let start = Instant::now();
+        let child = cmd.spawn().unwrap();
+        poll(Duration::from_secs(3), || {
+            (!b.frames_in("compact").is_empty()).then_some(())
+        });
+        std::thread::sleep(Duration::from_millis(1500).saturating_sub(start.elapsed()));
+        let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
+        rustix::process::kill_process(pid, signal).unwrap();
+        let value = checked(child.wait_with_output().unwrap(), 130);
+        assert_eq!(value["data"]["interrupted"], true, "{signal:?}");
+        assert_eq!(value["data"]["route"], "rpc", "{signal:?}");
+        let starts: Vec<_> = b
+            .fake_log()
+            .into_iter()
+            .filter(|r| r["event"] == "start")
+            .collect();
+        assert!(!starts.is_empty());
+        for start in starts {
+            poll(Duration::from_secs(2), || {
+                matches!(
+                    glen::jobs::liveness::start_token(start["pid"].as_u64().unwrap() as u32),
+                    glen::jobs::liveness::Probe::Gone
+                )
+                .then_some(())
+            });
+        }
+        // Past the fake compaction delay: a surviving omp would have appended its entry by now.
+        std::thread::sleep(Duration::from_millis(5500).saturating_sub(start.elapsed()));
+        assert_eq!(
+            fs::read(b.omp.session('A')).unwrap(),
+            before,
+            "{signal:?}: the session changed after glen stopped"
+        );
+        assert!(b.frames_in("abort").is_empty());
+    }
+}
 #[test]
 fn ac352_job_route_and_ac364_controls_share_the_client() {
     let b = RpcBox::new();
@@ -1826,9 +1874,8 @@ fn c2_9_success_after_apply_deadline_reaches_cli_with_warning() {
         0,
     );
     assert_eq!(value["data"]["model"]["id"], "fake-2");
-    assert_eq!(
-        value["data"]["warnings"][0]["code"],
-        "deadline_passed_after_apply"
-    );
+    // W8-DOC-8: the warning is in the envelope's warnings, not nested in data.
+    assert!(value["data"].get("warnings").is_none(), "{value}");
+    assert!(warning(&value, "deadline_passed_after_apply"), "{value}");
     assert_eq!(b.frames_in("set_model").len(), 1);
 }

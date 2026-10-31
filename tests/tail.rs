@@ -708,3 +708,33 @@ fn cwd_scopes_latest_and_follow_but_never_rebases_explicit_paths() {
     );
     sb.clean();
 }
+#[test]
+fn w8_follow_reports_a_truncated_branch_after_the_session_event() {
+    let sb = OmpBox::new();
+    let path = sb
+        .agent
+        .join("sessions/-work-alpha")
+        .join("2026-10-20T00-00-00-000Z_01a0dddd-0000-7000-8000-000000000003.jsonl");
+    fs::write(
+        &path,
+        [
+            r#"{"type":"session","version":3,"id":"01a0dddd-0000-7000-8000-000000000003","cwd":"/w"}"#,
+            r#"{"type":"message","id":"m1","parentId":null,"message":{"role":"user","content":"first"}}"#,
+            r#"{"type":"message","id":"m2","parentId":"m1","message":"#,
+            r#"{"type":"message","id":"m3","parentId":"m2","message":{"role":"user","content":"third"}}"#,
+        ]
+        .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    let session = f.event();
+    assert_eq!(session["event"], "session");
+    assert_eq!(session["skipped_lines"], 1);
+    let warning = f.event();
+    assert_eq!(warning["event"], "warning");
+    assert_eq!(warning["code"], "branch_truncated");
+    assert_eq!(f.event()["item"]["id"], "m3");
+    drop(f);
+    sb.clean();
+}

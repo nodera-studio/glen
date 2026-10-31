@@ -1,5 +1,4 @@
-pub(crate) mod write;
-use crate::{error::Warning, live};
+use crate::{error::Warning, install_guard, live};
 use std::{cmp::Ordering, fs, io, path::Path};
 use xxhash_rust::xxh64::xxh64;
 pub const SOURCE: &str = include_str!("../extension/glen/index.ts");
@@ -44,25 +43,51 @@ impl State {
         }
     }
 }
-fn compare(a: &str, b: &str) -> Ordering {
-    let parts = |s: &str| {
-        s.split('.')
-            .map(str::parse::<u64>)
-            .collect::<Result<Vec<_>, _>>()
-    };
-    match (parts(a), parts(b)) {
-        (Ok(mut a), Ok(mut b)) => {
-            let n = a.len().max(b.len());
-            a.resize(n, 0);
-            b.resize(n, 0);
-            a.cmp(&b)
-        }
-        (Err(_), Ok(_)) => Ordering::Less,
-        (Ok(_), Err(_)) => Ordering::Greater,
-        _ => a.cmp(b),
-    }
+/// How `install-extension` writes `extensions/glen/index.ts`.
+pub(crate) const GUARD: install_guard::Spec = install_guard::Spec {
+    noun: "extension",
+    temp_prefix: ".index.ts",
+    file_mode: 0o600,
+    dir_mode: 0o700,
+};
+#[derive(Debug, PartialEq, Eq)]
+pub struct Inspection {
+    pub state: State,
+    /// The version in the installed header, when glen wrote it.
+    pub version: Option<String>,
+    /// A symlink under the extensions directory; never replaced, even with `--force`.
+    pub unsafe_path: bool,
 }
-pub fn inspect(path: &Path, version: &str, home: &Path) -> io::Result<(State, Option<String>)> {
+/// Why a symlinked extension path is left alone; doctor and install-extension share it.
+pub fn unsafe_path_message(path: &Path) -> String {
+    format!(
+        "refusing symlink in extension path {}; --force cannot override this",
+        path.display()
+    )
+}
+/// Classify the extension at `path`. A symlink at or under `extensions_dir` is
+/// `Foreign` with `unsafe_path`, before anything is read through it (W8 DEBT-2).
+pub fn inspect(
+    path: &Path,
+    extensions_dir: &Path,
+    version: &str,
+    home: &Path,
+) -> io::Result<Inspection> {
+    if install_guard::Guard::inspect(path, GUARD)?.unsafe_path(extensions_dir) {
+        return Ok(Inspection {
+            state: State::Foreign,
+            version: None,
+            unsafe_path: true,
+        });
+    }
+    let (state, version) = classify(path, version, home)?;
+    Ok(Inspection {
+        state,
+        version,
+        unsafe_path: false,
+    })
+}
+fn classify(path: &Path, version: &str, home: &Path) -> io::Result<(State, Option<String>)> {
     let bytes = match fs::read(path) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok((State::NotInstalled, None)),
@@ -101,7 +126,7 @@ pub fn inspect(path: &Path, version: &str, home: &Path) -> io::Result<(State, Op
     if home.to_str().is_some() && bytes == render(version, home).as_bytes() {
         return Ok((State::Current, installed));
     }
-    let state = match compare(fields[0], version) {
+    let state = match crate::skill::compare_versions(fields[0], version) {
         Ordering::Less => State::Outdated(fields[0].into()),
         Ordering::Greater => State::Newer(fields[0].into()),
         Ordering::Equal => {
@@ -182,7 +207,10 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let p = t.path().join("index.ts");
         let h = Path::new("/tmp/g");
-        assert_eq!(inspect(&p, "0.1.0", h).unwrap().0, State::NotInstalled);
+        assert_eq!(
+            inspect(&p, t.path(), "0.1.0", h).unwrap().state,
+            State::NotInstalled
+        );
         for (body, want) in [
             (render("0.1.0", h), State::Current),
             (render("0.0.1", h), State::Outdated("0.0.1".into())),
@@ -195,7 +223,7 @@ mod tests {
             ("foreign".into(), State::Foreign),
         ] {
             fs::write(&p, body).unwrap();
-            assert_eq!(inspect(&p, "0.1.0", h).unwrap().0, want);
+            assert_eq!(inspect(&p, t.path(), "0.1.0", h).unwrap().state, want);
         }
     }
     #[test]
@@ -218,7 +246,79 @@ mod tests {
                 xxh64(body.as_bytes(), 0)
             );
             fs::write(&path, installed).unwrap();
-            assert_eq!(inspect(&path, "0.1.0", home).unwrap().0, expected);
+            assert_eq!(
+                inspect(&path, t.path(), "0.1.0", home).unwrap().state,
+                expected
+            );
         }
+    }
+    #[test]
+    fn pre_release_versions_order_by_semver() {
+        // W8 DEBT-5: 0.1.0 is older than 0.2.0-rc.1, and rc.10 is newer than rc.9.
+        let t = tempfile::tempdir().unwrap();
+        let p = t.path().join("index.ts");
+        let h = Path::new("/tmp/g");
+        for (installed, current, want) in [
+            ("0.1.0", "0.2.0-rc.1", State::Outdated("0.1.0".into())),
+            ("0.2.0-rc.1", "0.1.1", State::Newer("0.2.0-rc.1".into())),
+            (
+                "0.2.0-rc.10",
+                "0.2.0-rc.9",
+                State::Newer("0.2.0-rc.10".into()),
+            ),
+            ("0.2.0-rc.1", "0.2.0", State::Outdated("0.2.0-rc.1".into())),
+        ] {
+            fs::write(&p, render(installed, h)).unwrap();
+            assert_eq!(
+                inspect(&p, t.path(), current, h).unwrap().state,
+                want,
+                "{installed} vs {current}"
+            );
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_under_the_extensions_dir_are_foreign_and_unsafe() {
+        use std::os::unix::fs::symlink;
+        let h = Path::new("/tmp/g");
+        for component in ["extensions", "glen", "index.ts"] {
+            let t = tempfile::tempdir().unwrap();
+            let outside = t.path().join("outside");
+            fs::create_dir_all(outside.join("glen")).unwrap();
+            fs::write(outside.join("index.ts"), render("0.0.9", h)).unwrap();
+            fs::write(outside.join("glen/index.ts"), render("0.0.9", h)).unwrap();
+            let extensions = t.path().join("extensions");
+            match component {
+                "extensions" => symlink(&outside, &extensions).unwrap(),
+                "glen" => {
+                    fs::create_dir(&extensions).unwrap();
+                    symlink(&outside, extensions.join("glen")).unwrap();
+                }
+                _ => {
+                    fs::create_dir_all(extensions.join("glen")).unwrap();
+                    symlink(outside.join("index.ts"), extensions.join("glen/index.ts")).unwrap();
+                }
+            }
+            let i = inspect(&extensions.join("glen/index.ts"), &extensions, "0.1.0", h).unwrap();
+            assert_eq!(
+                i,
+                Inspection {
+                    state: State::Foreign,
+                    version: None,
+                    unsafe_path: true
+                },
+                "{component}"
+            );
+        }
+        // A symlink above the extensions directory is the owner's layout, not ours to judge.
+        let t = tempfile::tempdir().unwrap();
+        let real = t.path().join("real");
+        fs::create_dir_all(real.join("extensions/glen")).unwrap();
+        fs::write(real.join("extensions/glen/index.ts"), render("0.1.0", h)).unwrap();
+        symlink(&real, t.path().join("agent")).unwrap();
+        let extensions = t.path().join("agent/extensions");
+        let i = inspect(&extensions.join("glen/index.ts"), &extensions, "0.1.0", h).unwrap();
+        assert_eq!(i.state, State::Current);
+        assert!(!i.unsafe_path);
     }
 }
