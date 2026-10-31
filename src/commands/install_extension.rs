@@ -108,7 +108,7 @@ pub fn run(
                 },
             )
             .map_err(io)?;
-        if !applied {
+        if matches!(applied, crate::atomic_swap::Applied::Lost) {
             action = "skipped";
             warnings.push(Warning {
                 code: "changed_during_install".into(),
@@ -117,20 +117,31 @@ pub fn run(
                     target.display()
                 ),
             });
-        } else if a.uninstall {
-            match guard.remove_empty_parent(&target) {
-                Ok(true) => (),
-                Ok(false) => warnings.push(Warning {
-                    code: "changed_during_install".into(),
-                    message: format!("kept changed extension directory {}", dir.display()),
-                }),
-                Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
-                    warnings.push(Warning {
-                        code: "extension_dir_not_empty".into(),
-                        message: format!("kept nonempty {}", dir.display()),
-                    })
+        } else {
+            if matches!(applied, crate::atomic_swap::Applied::PublishedNotAtomic) {
+                warnings.push(Warning {
+                    code: "replace_not_atomic".into(),
+                    message: format!(
+                        "the filesystem at {} cannot swap files atomically; a concurrent change during this install may have been overwritten",
+                        dir.display()
+                    ),
+                });
+            }
+            if a.uninstall {
+                match guard.remove_empty_parent(&target) {
+                    Ok(true) => (),
+                    Ok(false) => warnings.push(Warning {
+                        code: "changed_during_install".into(),
+                        message: format!("kept changed extension directory {}", dir.display()),
+                    }),
+                    Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
+                        warnings.push(Warning {
+                            code: "extension_dir_not_empty".into(),
+                            message: format!("kept nonempty {}", dir.display()),
+                        })
+                    }
+                    Err(e) => return Err(io(e)),
                 }
-                Err(e) => return Err(io(e)),
             }
         }
     }

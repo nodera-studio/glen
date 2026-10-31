@@ -7,6 +7,8 @@ use std::{
 };
 use xxhash_rust::xxh64::xxh64;
 
+use crate::atomic_swap::{self, Applied};
+
 #[derive(Debug, PartialEq, Eq)]
 struct Identity {
     #[cfg(unix)]
@@ -79,25 +81,36 @@ impl Guard {
         }
         true
     }
-    /// False means a competing edit/replacement won. Never follow a new directory symlink.
+    /// `Applied::Lost` means a competing edit/replacement won. Never follow a new directory
+    /// symlink.
     #[cfg(unix)]
-    pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<bool> {
-        self.apply_with(path, bytes, |_, _| Ok(()))
+    pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<Applied> {
+        self.apply_with(path, bytes, false, |_, _| Ok(()))
+    }
+    #[cfg(all(unix, test))]
+    pub(crate) fn apply_forcing_fallback(
+        &mut self,
+        path: &Path,
+        bytes: Option<&[u8]>,
+    ) -> io::Result<Applied> {
+        self.apply_with(path, bytes, true, |_, _| Ok(()))
     }
     #[cfg(unix)]
     fn apply_with(
         &mut self,
         path: &Path,
         bytes: Option<&[u8]>,
+        force_fallback: bool,
         mut step: impl FnMut(&str, &Path) -> io::Result<()>,
-    ) -> io::Result<bool> {
+    ) -> io::Result<Applied> {
         use rustix::fs::{self as at, AtFlags, Mode, OFlags};
         use std::io::Write;
         let mut published = false;
+        let mut fallback_used = false;
         let mut created_dirs = Vec::new();
         let result = (|| {
             if !self.unchanged() {
-                return Ok(false);
+                return Ok(Applied::Lost);
             }
             let parent = path
                 .parent()
@@ -117,12 +130,12 @@ impl Guard {
                 dir = at::openat(&dir, part.as_os_str(), flags, Mode::empty())?;
             }
             if !self.unchanged() {
-                return Ok(false);
+                return Ok(Applied::Lost);
             }
             let expected = fs::metadata(&nearest)?;
             let pinned = at::fstat(&dir)?;
             if expected.dev() != pinned.st_dev as u64 || expected.ino() != pinned.st_ino {
-                return Ok(false);
+                return Ok(Applied::Lost);
             }
             let mut created_path = nearest.clone();
             for part in parent
@@ -135,7 +148,9 @@ impl Guard {
                         .map_err(io::Error::from)
                 }) {
                     Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+                        return Ok(Applied::Lost);
+                    }
                     Err(e) => return Err(e),
                 }
                 let created = at::statat(&dir, part.as_os_str(), AtFlags::SYMLINK_NOFOLLOW)?;
@@ -154,7 +169,7 @@ impl Guard {
                         .as_ref()
                         .is_none_or(|i| i.dev != pinned.st_dev as u64 || i.ino != pinned.st_ino)
                     {
-                        return Ok(false);
+                        return Ok(Applied::Lost);
                     }
                 }
             }
@@ -163,12 +178,13 @@ impl Guard {
                 .ok_or_else(|| io::Error::other("skill has no file name"))?;
             let Some(bytes) = bytes else {
                 if !self.unchanged() {
-                    return Ok(false);
+                    return Ok(Applied::Lost);
                 }
                 at::unlinkat(&dir, name, AtFlags::empty())?;
                 published = true;
-                return Ok(true);
+                return Ok(Applied::Published);
             };
+            let existing = self.entries[0].1.as_ref().map(|i| (i.dev, i.ino, i.digest));
             let temp = format!(".SKILL.md.{}.tmp", uuid::Uuid::now_v7());
             let fd = at::openat(
                 &dir,
@@ -177,16 +193,41 @@ impl Guard {
                 Mode::from_raw_mode(0o644),
             )?;
             let mut file = fs::File::from(fd);
+            let ours = file
+                .metadata()
+                .map(|m| (m.dev(), m.ino()))
+                .unwrap_or((0, 0));
             let result = (|| {
                 step("write", path)?;
                 file.write_all(bytes)?;
                 file.sync_all()?;
                 step("revalidate", path)?;
                 if !self.unchanged() {
-                    return Ok(false);
+                    return Ok(Applied::Lost);
                 }
-                at::renameat(&dir, &temp, &dir, name)?;
+                let applied = match existing {
+                    None => {
+                        match at::renameat_with(&dir, &temp, &dir, name, at::RenameFlags::NOREPLACE)
+                        {
+                            Ok(()) => Applied::Published,
+                            Err(rustix::io::Errno::EXIST) => return Ok(Applied::Lost),
+                            Err(e) => return Err(e.into()),
+                        }
+                    }
+                    Some(expected) => atomic_swap::publish_over(
+                        &dir,
+                        &temp,
+                        name,
+                        expected,
+                        ours,
+                        force_fallback,
+                    )?,
+                };
+                if matches!(applied, Applied::Lost) {
+                    return Ok(Applied::Lost);
+                }
                 published = true;
+                fallback_used = matches!(applied, Applied::PublishedNotAtomic);
                 if let Err(e) =
                     step("fsync", path).and_then(|()| at::fsync(&dir).map_err(io::Error::from))
                 {
@@ -196,10 +237,11 @@ impl Guard {
                         path.display()
                     ));
                 }
-                Ok(true)
+                Ok(applied)
             })();
-            if !published {
-                // This unique temporary file belongs to this operation, on the pinned directory.
+            if !published && at::statat(&dir, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok() {
+                // This unique temporary file belongs to this operation, on the pinned
+                // directory; `publish_over`'s own Lost outcome already unlinks it itself.
                 if let Err(e) = step("cleanup", path).and_then(|()| {
                     at::unlinkat(&dir, &temp, AtFlags::empty()).map_err(io::Error::from)
                 }) {
@@ -209,9 +251,16 @@ impl Guard {
             result
         })();
         let result = match result {
-            Err(_) if !published && !self.unchanged() => Ok(false),
+            Err(_) if !published && !self.unchanged() => Ok(Applied::Lost),
             other => other,
         };
+        let result = result.map(|applied| {
+            if fallback_used && matches!(applied, Applied::Published) {
+                Applied::PublishedNotAtomic
+            } else {
+                applied
+            }
+        });
         if !published {
             for (parent, name, created) in created_dirs.into_iter().rev() {
                 // Remove only this run's still-identical empty directories, through pinned parents.
@@ -292,9 +341,9 @@ impl Guard {
         Ok(true)
     }
     #[cfg(not(unix))]
-    pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<bool> {
+    pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<Applied> {
         if !self.unchanged() {
-            return Ok(false);
+            return Ok(Applied::Lost);
         }
         if let Some(bytes) = bytes {
             fs::create_dir_all(
@@ -302,13 +351,13 @@ impl Guard {
                     .ok_or_else(|| io::Error::other("skill has no parent"))?,
             )?;
             if !self.unchanged() {
-                return Ok(false);
+                return Ok(Applied::Lost);
             }
             crate::glen_home::write_atomic(path, bytes, 0o644)?;
         } else {
             fs::remove_file(path)?;
         }
-        Ok(true)
+        Ok(Applied::Published)
     }
 }
 #[cfg(all(test, unix))]
@@ -324,7 +373,7 @@ mod tests {
             let path = root.join("skills/glen/SKILL.md");
             let mut guard = Guard::inspect(&path).unwrap();
             let old = t.path().join("old");
-            let result = guard.apply_with(&path, Some(b"new"), |stage, at| {
+            let result = guard.apply_with(&path, Some(b"new"), false, |stage, at| {
                 if stage == failure {
                     if stage == "mkdir" && at.ends_with("glen") {
                         return Err(io::Error::from_raw_os_error(libc::EEXIST));
@@ -340,7 +389,7 @@ mod tests {
             if failure == "write" {
                 assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::EIO));
             } else {
-                assert!(!result.unwrap());
+                assert_eq!(result.unwrap(), Applied::Lost);
             }
             assert!(!root.join("skills").exists());
             assert!(!old.join("skills").exists());
@@ -351,16 +400,17 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let path = t.path().join("SKILL.md");
         let mut guard = Guard::inspect(&path).unwrap();
-        assert!(
+        assert_eq!(
             guard
-                .apply_with(&path, Some(b"installed"), |stage, _| {
+                .apply_with(&path, Some(b"installed"), false, |stage, _| {
                     if stage == "fsync" {
                         Err(io::Error::from_raw_os_error(libc::EIO))
                     } else {
                         Ok(())
                     }
                 })
-                .unwrap()
+                .unwrap(),
+            Applied::Published
         );
         assert_eq!(fs::read(&path).unwrap(), b"installed");
         assert!(guard.sync_warning.as_ref().unwrap().contains("cannot sync"));
@@ -371,7 +421,7 @@ mod tests {
         let path = t.path().join("SKILL.md");
         let mut guard = Guard::inspect(&path).unwrap();
         let error = guard
-            .apply_with(&path, Some(b"new"), |stage, _| match stage {
+            .apply_with(&path, Some(b"new"), false, |stage, _| match stage {
                 "write" => Err(io::Error::from_raw_os_error(libc::ENOSPC)),
                 "cleanup" => Err(io::Error::from_raw_os_error(libc::EACCES)),
                 _ => Ok(()),
@@ -388,7 +438,7 @@ mod tests {
         let path = parent.join("SKILL.md");
         fs::write(&path, b"old").unwrap();
         let mut guard = Guard::inspect(&path).unwrap();
-        assert!(guard.apply(&path, None).unwrap());
+        assert_eq!(guard.apply(&path, None).unwrap(), Applied::Published);
         let outside = t.path().join("outside");
         fs::create_dir(&outside).unwrap();
         assert!(
@@ -450,14 +500,53 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-                assert!(
-                    !guard
+                assert_eq!(
+                    guard
                         .apply(&path, if remove { None } else { Some(b"replacement") })
                         .unwrap(),
+                    Applied::Lost,
                     "{change}"
                 );
                 assert_eq!(fs::read(outside.join("SKILL.md")).unwrap(), b"external");
             }
         }
+    }
+    #[test]
+    fn replacing_an_existing_skill_swaps_atomically_and_leaves_no_temp() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("skills/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("SKILL.md");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        assert_eq!(
+            guard.apply(&path, Some(b"after")).unwrap(),
+            Applied::Published
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        assert_eq!(
+            fs::read_dir(&parent).unwrap().count(),
+            1,
+            "no temp left behind"
+        );
+    }
+    #[test]
+    fn forced_fallback_still_publishes_the_skill_without_exchange() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("skills/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("SKILL.md");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        assert_eq!(
+            guard.apply_forcing_fallback(&path, Some(b"after")).unwrap(),
+            Applied::PublishedNotAtomic
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        assert_eq!(
+            fs::read_dir(&parent).unwrap().count(),
+            1,
+            "no temp left behind"
+        );
     }
 }

@@ -120,19 +120,27 @@ fn run_inspected(
                 .ok_or_else(|| GlenError::new(ErrorCode::Internal, "skill target has no parent"))?;
             match action {
                 "installed" | "upgraded" | "reinstalled" => {
-                    if !guard
+                    match guard
                         .apply(&path, Some(rendered.as_bytes()))
                         .map_err(|e| io_error(&path, e, &done, &warnings))?
                     {
-                        action = "skipped";
-                        warnings.push(changed_warning(&path));
+                        crate::atomic_swap::Applied::Lost => {
+                            action = "skipped";
+                            warnings.push(changed_warning(&path));
+                        }
+                        crate::atomic_swap::Applied::PublishedNotAtomic => {
+                            warnings.push(replace_not_atomic_warning(parent, env));
+                        }
+                        crate::atomic_swap::Applied::Published => {}
                     }
                 }
                 "removed" => {
-                    if !guard
-                        .apply(&path, None)
-                        .map_err(|e| io_error(&path, e, &done, &warnings))?
-                    {
+                    if matches!(
+                        guard
+                            .apply(&path, None)
+                            .map_err(|e| io_error(&path, e, &done, &warnings))?,
+                        crate::atomic_swap::Applied::Lost
+                    ) {
                         action = "skipped";
                         warnings.push(changed_warning(&path));
                     } else {
@@ -252,6 +260,15 @@ fn changed_warning(path: &Path) -> Warning {
         message: format!(
             "skill at {} changed during install; skipped",
             path.display()
+        ),
+    }
+}
+fn replace_not_atomic_warning(dir: &Path, env: &Env) -> Warning {
+    Warning {
+        code: "replace_not_atomic".into(),
+        message: format!(
+            "the filesystem at {} cannot swap files atomically; a concurrent change during this install may have been overwritten",
+            render::tilde(dir, env.home())
         ),
     }
 }

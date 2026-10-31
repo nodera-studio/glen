@@ -7,6 +7,8 @@ use std::{
 };
 use xxhash_rust::xxh64::xxh64;
 
+use crate::atomic_swap::{self, Applied};
+
 #[derive(Debug, PartialEq, Eq)]
 struct Identity {
     #[cfg(unix)]
@@ -80,13 +82,31 @@ impl Guard {
         }
         true
     }
-    /// False means a competing edit/replacement won. Never follow a new directory symlink.
+    /// `Applied::Lost` means a competing edit/replacement won. Never follow a new directory
+    /// symlink.
     #[cfg(unix)]
-    pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<bool> {
+    pub(crate) fn apply(&mut self, path: &Path, bytes: Option<&[u8]>) -> io::Result<Applied> {
+        self.apply_with(path, bytes, false)
+    }
+    #[cfg(all(unix, test))]
+    pub(crate) fn apply_forcing_fallback(
+        &mut self,
+        path: &Path,
+        bytes: Option<&[u8]>,
+    ) -> io::Result<Applied> {
+        self.apply_with(path, bytes, true)
+    }
+    #[cfg(unix)]
+    fn apply_with(
+        &mut self,
+        path: &Path,
+        bytes: Option<&[u8]>,
+        force_fallback: bool,
+    ) -> io::Result<Applied> {
         use rustix::fs::{self as at, AtFlags, Mode, OFlags};
         use std::io::Write;
         if !self.unchanged() {
-            return Ok(false);
+            return Ok(Applied::Lost);
         }
         let parent = path
             .parent()
@@ -106,12 +126,12 @@ impl Guard {
             dir = at::openat(&dir, part.as_os_str(), flags, Mode::empty())?;
         }
         if !self.unchanged() {
-            return Ok(false);
+            return Ok(Applied::Lost);
         }
         let expected = fs::metadata(&nearest)?;
         let pinned = at::fstat(&dir)?;
         if expected.dev() != pinned.st_dev as u64 || expected.ino() != pinned.st_ino {
-            return Ok(false);
+            return Ok(Applied::Lost);
         }
         let mut created_path = nearest.clone();
         for part in parent
@@ -121,7 +141,7 @@ impl Guard {
         {
             match at::mkdirat(&dir, part.as_os_str(), Mode::from_raw_mode(0o700)) {
                 Ok(()) => {}
-                Err(rustix::io::Errno::EXIST) => return Ok(false),
+                Err(rustix::io::Errno::EXIST) => return Ok(Applied::Lost),
                 Err(e) => return Err(e.into()),
             }
             dir = at::openat(&dir, part.as_os_str(), flags, Mode::empty())?;
@@ -138,7 +158,7 @@ impl Guard {
                     .as_ref()
                     .is_none_or(|i| i.dev != pinned.st_dev as u64 || i.ino != pinned.st_ino)
                 {
-                    return Ok(false);
+                    return Ok(Applied::Lost);
                 }
             }
         }
@@ -147,11 +167,12 @@ impl Guard {
             .ok_or_else(|| io::Error::other("extension has no file name"))?;
         let Some(bytes) = bytes else {
             if !self.unchanged() {
-                return Ok(false);
+                return Ok(Applied::Lost);
             }
             at::unlinkat(&dir, name, AtFlags::empty())?;
-            return Ok(true);
+            return Ok(Applied::Published);
         };
+        let existing = self.entries[0].1.as_ref().map(|i| (i.dev, i.ino, i.digest));
         let temp = format!(".index.ts.{}.tmp", uuid::Uuid::now_v7());
         let fd = at::openat(
             &dir,
@@ -160,27 +181,44 @@ impl Guard {
             Mode::from_raw_mode(0o600),
         )?;
         let mut file = fs::File::from(fd);
+        // `publish_over` only needs this to recognize our own temp copy if a competing writer
+        // forces a swap-back; take it from the fd we already hold, never a path lookup.
+        let ours = file
+            .metadata()
+            .map(|m| (m.dev(), m.ino()))
+            .unwrap_or((0, 0));
+        let mut swapped = false;
         let result = (|| {
             file.write_all(bytes)?;
             file.sync_all()?;
             if !self.unchanged() {
-                return Ok(false);
+                return Ok(Applied::Lost);
             }
-            if self.entries[0].1.is_none() {
-                match at::renameat_with(&dir, &temp, &dir, name, at::RenameFlags::NOREPLACE) {
-                    Ok(()) => {}
-                    Err(rustix::io::Errno::EXIST) => return Ok(false),
-                    Err(e) => return Err(e.into()),
+            let applied = match existing {
+                None => {
+                    match at::renameat_with(&dir, &temp, &dir, name, at::RenameFlags::NOREPLACE) {
+                        Ok(()) => Applied::Published,
+                        Err(rustix::io::Errno::EXIST) => Applied::Lost,
+                        Err(e) => return Err(e.into()),
+                    }
                 }
-            } else {
-                at::renameat(&dir, &temp, &dir, name)?;
+                Some(expected) => {
+                    swapped = true;
+                    atomic_swap::publish_over(&dir, &temp, name, expected, ours, force_fallback)?
+                }
+            };
+            if matches!(applied, Applied::Published | Applied::PublishedNotAtomic) {
+                at::fsync(&dir)?;
             }
-            at::fsync(&dir)?;
-            Ok(true)
+            Ok(applied)
         })();
-        if !matches!(result, Ok(true)) {
-            // This unique temporary file belongs to this operation, on the pinned directory.
-            at::unlinkat(&dir, &temp, AtFlags::empty())?;
+        // `publish_over`'s own swap path already unlinks `temp` on both Published and Lost; the
+        // create (NOREPLACE) path and any error before the swap leave `temp` for us to clean up.
+        if !swapped
+            && !matches!(result, Ok(Applied::Published))
+            && at::statat(&dir, temp.as_str(), AtFlags::SYMLINK_NOFOLLOW).is_ok()
+        {
+            let _ = at::unlinkat(&dir, &temp, AtFlags::empty());
         }
         result
     }
@@ -235,7 +273,10 @@ mod tests {
         let path = parent.join("index.ts");
         let mut guard = Guard::inspect(&path).unwrap();
         fs::write(&path, b"external").unwrap();
-        assert!(!guard.apply(&path, Some(b"replacement")).unwrap());
+        assert_eq!(
+            guard.apply(&path, Some(b"replacement")).unwrap(),
+            Applied::Lost
+        );
         assert_eq!(fs::read(&path).unwrap(), b"external");
     }
     #[test]
@@ -269,14 +310,67 @@ mod tests {
                     }
                     _ => unreachable!(),
                 }
-                assert!(
-                    !guard
+                assert_eq!(
+                    guard
                         .apply(&path, if remove { None } else { Some(b"replacement") })
                         .unwrap(),
+                    Applied::Lost,
                     "{change}"
                 );
                 assert_eq!(fs::read(outside.join("index.ts")).unwrap(), b"external");
             }
         }
+    }
+    #[test]
+    fn replacing_an_existing_file_swaps_atomically_and_leaves_no_temp() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("extensions/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("index.ts");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        assert_eq!(
+            guard.apply(&path, Some(b"after")).unwrap(),
+            Applied::Published
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        assert_eq!(
+            fs::read_dir(&parent).unwrap().count(),
+            1,
+            "no temp left behind"
+        );
+    }
+    #[test]
+    fn forced_fallback_still_publishes_without_exchange() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("extensions/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("index.ts");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        assert_eq!(
+            guard.apply_forcing_fallback(&path, Some(b"after")).unwrap(),
+            Applied::PublishedNotAtomic
+        );
+        assert_eq!(fs::read(&path).unwrap(), b"after");
+        assert_eq!(
+            fs::read_dir(&parent).unwrap().count(),
+            1,
+            "no temp left behind"
+        );
+    }
+    #[test]
+    fn competing_replacement_during_the_swap_window_is_lost_not_clobbered() {
+        let t = tempfile::tempdir().unwrap();
+        let parent = t.path().join("extensions/glen");
+        fs::create_dir_all(&parent).unwrap();
+        let path = parent.join("index.ts");
+        fs::write(&path, b"before").unwrap();
+        let mut guard = Guard::inspect(&path).unwrap();
+        // A competing writer replaces the file in place (same inode story as a plain
+        // edit): unchanged() must catch this before any swap is attempted.
+        fs::write(&path, b"competitor").unwrap();
+        assert_eq!(guard.apply(&path, Some(b"after")).unwrap(), Applied::Lost);
+        assert_eq!(fs::read(&path).unwrap(), b"competitor");
     }
 }
