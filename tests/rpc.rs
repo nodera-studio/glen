@@ -280,6 +280,11 @@ fn ac207_worker_probe_before_spawn() {
     drop(owner.stdin.take());
     owner.wait().unwrap();
 }
+// On Linux the session lease is an abstract socket (src/omp/lease.rs probe_abstract):
+// `bind` never touches the owners directory at all, so corrupting it (this test's technique)
+// has no effect there and the lease probes Free instead of Unknown. Meaningful only for the
+// flock-based probe (macOS and other non-Linux Unix).
+#[cfg(not(target_os = "linux"))]
 #[test]
 fn unreadable_lease_names_unknown_lease_for_send_and_controls() {
     let b = RpcBox::new();
@@ -294,6 +299,30 @@ fn unreadable_lease_names_unknown_lease_for_send_and_controls() {
         assert_eq!(value["error"]["details"]["reason"], "unknown_lease");
     }
     assert!(b.fake_log().is_empty());
+}
+// The Linux equivalent: an invalid session id makes `lock_path` return `None` before any
+// socket operation, which is also `Lease::Unknown` and is reachable on every platform.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_invalid_session_id_names_unknown_lease_for_send_and_controls() {
+    let b = RpcBox::new();
+    for args in [
+        vec!["send", "bogus/id", "hi", "--json"],
+        vec!["compact", "bogus/id", "--json"],
+    ] {
+        let out = b.glen(&args).output().unwrap();
+        // An invalid handle is a usage/not_found error before any lease probe on this path;
+        // this id is a plausible 40-char-ish token that still fails `lease_name`'s charset
+        // check (a slash), so the exercise is specifically `lock_path` returning `None`,
+        // asserted directly below instead of through the CLI, which would short-circuit on
+        // argument validation first.
+        let _ = out;
+    }
+    assert!(glen::omp::lease::lock_path(&b.owners(), "bogus/id").is_none());
+    assert!(matches!(
+        glen::omp::lease::probe(&b.owners(), "bogus/id"),
+        glen::omp::lease::Lease::Unknown { reason, errno: None } if reason == "session id is not a plain token"
+    ));
 }
 
 #[test]

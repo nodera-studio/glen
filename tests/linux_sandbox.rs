@@ -134,6 +134,36 @@ fn json(out: &Output) -> serde_json::Value {
 fn exit_code(out: &Output) -> i32 {
     out.status.code().unwrap_or(-1)
 }
+/// Append one unread inbox reply for `session_id`, same shape as `tests/inbox.rs`'s `record`.
+fn seed_inbox(rb: &RpcBox, session_id: &str, text: &str) {
+    use std::io::Write as _;
+    let path = rb
+        .omp
+        .glen_home
+        .join("inbox")
+        .join(format!("{session_id}.ndjson"));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = serde_json::json!({
+        "v": 1,
+        "id": format!("r-{text}"),
+        "session_id": session_id,
+        "job_id": null,
+        "request_id": null,
+        "tool_call_id": null,
+        "text": text,
+        "final": true,
+        "at": "2026-10-30T01:00:00Z",
+    });
+    writeln!(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap(),
+        "{record}"
+    )
+    .unwrap();
+}
 
 #[test]
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
@@ -215,6 +245,7 @@ fn s5_network_off() {
 fn s6_reads_and_inbox() {
     let rb = RpcBox::new();
     let writable = rb.omp.tmp.path().to_path_buf();
+    seed_inbox(&rb, A_ID, "ping");
     for args in [
         vec!["ls", "--json"],
         vec!["show", "e27c0de", "--json"],
@@ -241,7 +272,7 @@ fn s6_reads_and_inbox() {
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
 fn s7_lease_across_netns() {
     let rb = RpcBox::new();
-    let mut held = rb.hold_lease("e27c0de");
+    let mut held = rb.hold_lease(A_ID);
     let outside = rb.omp.glen(&["ls", "--all", "--json"], &rb.omp.alpha());
     let v = json(&outside);
     let row = v["data"]["sessions"]
@@ -283,7 +314,7 @@ fn s7_lease_across_netns() {
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
 fn s8_hidden_lease_refuses_rpc() {
     let rb = RpcBox::new();
-    let mut held = rb.hold_lease("e27c0de");
+    let mut held = rb.hold_lease(A_ID);
     let mut c = rb.glen(&["send", "e27c0de", "hi", "--json"]);
     c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
     let writable = rb.omp.tmp.path().to_path_buf();
@@ -313,7 +344,7 @@ fn s9_live_route_across_netns() {
         .rpc
         .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
     c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
-    let writable = lb.rpc.omp.tmp.path().to_path_buf();
+    let writable = lb.rpc.omp.glen_home.parent().unwrap().to_path_buf();
     let out = bwrap(&c, false, &[&writable]);
     let v = json(&out);
     assert_eq!(exit_code(&out), 0, "{v}");
