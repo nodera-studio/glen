@@ -305,6 +305,7 @@ impl Worker {
             lease::probe(&self.job.owners_dir, id),
             self.job.session_handle.as_deref().unwrap_or(id),
             &Env::from_process(),
+            self.job.profile_flag.as_deref(),
         )
     }
     fn moved(&self, to: &str) -> Failure {
@@ -1000,24 +1001,11 @@ fn endpoint_result(
 ) -> Result<(), Failure> {
     match endpoint {
         crate::live::route::Endpoint::Unhealthy { kind, io, .. } => {
-            if let Some(e) = io {
-                let mapped = match kind {
-                    crate::live::route::Unhealthy::Unresponsive => {
-                        crate::sandbox::map_socket_failure(env, "connect omp socket", &e)
-                    }
-                    crate::live::route::Unhealthy::Unreadable
-                        if crate::sandbox::restricted(env, &e) =>
-                    {
-                        Some(crate::sandbox::map_home_write(env, "send", e))
-                    }
-                    _ => None,
-                };
-                if let Some(err) = mapped {
-                    let mut failure = Failure::no_route(NoRouteReason::Sandboxed, err.message);
-                    failure.hint = err.hint;
-                    failure.details = err.details.map(|d| *d);
-                    return Err(failure);
-                }
+            if let Some(err) = crate::live::route::unhealthy_sandbox(env, "send", kind, io) {
+                let mut failure = Failure::no_route(NoRouteReason::Sandboxed, err.message);
+                failure.hint = err.hint;
+                failure.details = err.details.map(|d| *d);
+                return Err(failure);
             }
             let mut failure = Failure::no_route(
                 NoRouteReason::UnhealthyEndpoint,
@@ -1038,7 +1026,12 @@ fn endpoint_result(
     }
 }
 
-fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
+fn route_probe(
+    lease: Lease,
+    handle: &str,
+    env: &Env,
+    profile: Option<&str>,
+) -> Result<(), Failure> {
     // Checked before every lease value, including Free: on Linux under a Codex marker in a
     // different network namespace, even a "free" probe cannot be trusted.
     if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &lease) {
@@ -1047,24 +1040,17 @@ fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
         failure.details = e.details.map(|d| *d);
         return Err(failure);
     }
-    let (reason, message) = match lease {
-        Lease::Free => return Ok(()),
-        Lease::Held => (
-            NoRouteReason::LiveOwner,
-            format!("before spawning omp: session {handle} is open in another omp process"),
-        ),
-        unknown @ Lease::Unknown { .. } => {
-            let r = lease::state_detail(&unknown).unwrap_or_default();
-            (
-                NoRouteReason::UnknownLease,
-                format!(
-                    "before spawning omp: cannot tell whether another omp process owns session {handle} ({r})"
-                ),
-            )
-        }
-    };
-    let mut f = Failure::no_route(reason, message);
-    f.hint=Some("close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)".into());
+    if matches!(lease, Lease::Free) {
+        return Ok(());
+    }
+    let paths = crate::omp::paths::resolve(env, profile)?;
+    let e = crate::live::route::lease_refusal(&lease, handle, &paths);
+    let mut f = Failure::new(
+        e.code.as_str(),
+        format!("before spawning omp: {}", e.message),
+    );
+    f.hint = e.hint;
+    f.details = e.details.map(|d| *d);
     Err(f)
 }
 struct Started {
@@ -1634,6 +1620,7 @@ mod tests {
                 },
                 "e27c0de",
                 &env,
+                None,
             )
             .unwrap_err();
             assert_eq!(error.code, "no_route");
@@ -1649,7 +1636,7 @@ mod tests {
             std::path::Path::new("/"),
             &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
         );
-        let error = route_probe(Lease::Free, "e27c0de", &env).unwrap_err();
+        let error = route_probe(Lease::Free, "e27c0de", &env, None).unwrap_err();
         assert_eq!(error.code, "no_route");
         let details = error.details.unwrap();
         assert_eq!(details["reason"], "sandboxed");
@@ -1658,6 +1645,9 @@ mod tests {
     }
     #[test]
     fn review11_refusal_identifies_pre_spawn_phase() {
+        let tree = tempfile::tempdir().unwrap();
+        let env = Env::for_test(Some(tree.path()), std::path::Path::new("/"), &[]);
+        let paths = crate::omp::paths::resolve(&env, None).unwrap();
         for (lease, reason) in [
             (Lease::Held, "live_owner"),
             (
@@ -1668,22 +1658,20 @@ mod tests {
                 "unknown_lease",
             ),
         ] {
-            let e = route_probe(
-                lease,
-                "e27c0de",
-                &Env::for_test(None, std::path::Path::new("/"), &[]),
-            )
-            .unwrap_err();
+            let e = route_probe(lease, "e27c0de", &env, None).unwrap_err();
             assert_eq!(e.code, "no_route");
             assert!(e.error_message.starts_with("before spawning omp:"));
             assert!(e.error_message.contains("e27c0de"));
             assert_eq!(e.details.unwrap()["reason"], reason);
+            // W8-DEBT-1: the worker's hint is the shared lease hint, not "a later glen version".
+            assert_eq!(e.hint, Some(crate::live::route::lease_held_hint(&paths)));
         }
         assert!(
             route_probe(
                 Lease::Free,
                 "e27c0de",
-                &Env::for_test(None, std::path::Path::new("/"), &[])
+                &Env::for_test(None, std::path::Path::new("/"), &[]),
+                None,
             )
             .is_ok()
         );

@@ -1,7 +1,7 @@
 use crate::{
     cli::{Cli, DeliverAs, SendArgs},
     env::Env,
-    error::{ErrorCode, GlenError, NoRouteReason, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason},
     glen_home,
     jobs::{Job, JobError, JobId, JobStore, Route, State, lock, wait},
     omp::{
@@ -118,9 +118,11 @@ pub(crate) fn send_cwd(
     };
     if !cwd.is_dir() {
         return Err(GlenError::new(
-            ErrorCode::NotFound,
+            ErrorCode::Usage,
             format!("no such directory: {}", cwd.display()),
-        ));
+        )
+        .with_details(serde_json::json!({"reason":"missing_cwd","cwd":cwd}))
+        .with_hint("check the --cwd path"));
     }
     Ok(cwd)
 }
@@ -156,38 +158,15 @@ pub(crate) fn submit(
         match crate::live::route::find(&home, &o.session.header.id, crate::live::HELLO_SEND) {
             crate::live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, &o.session.header.id) {
-                    return Err(GlenError::no_route(NoRouteReason::RpcJobRunning,format!("session {} is open in a live omp session and a glen RPC job is still running on it",o.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",o.handle)));
+                    return Err(crate::live::route::rpc_job_running(&o.handle, "send"));
                 }
-                if hello.ext_version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
-                    route_warnings.push(Warning{code:"extension_version_mismatch".into(),message:format!("extension version {} differs from glen {}; run `glen install-extension` and restart omp",hello.ext_version.as_deref().unwrap_or("unknown"),env!("CARGO_PKG_VERSION"))});
-                }
+                route_warnings.extend(crate::live::route::extension_version_warning(&hello));
                 live = Some(reg);
             }
             crate::live::route::Endpoint::Unhealthy { reason, kind, io } => {
-                if let Some(e) = io {
-                    let mapped = match kind {
-                        crate::live::route::Unhealthy::Unresponsive => {
-                            crate::sandbox::map_socket_failure(env, "connect omp socket", &e)
-                        }
-                        crate::live::route::Unhealthy::Unreadable
-                            if crate::sandbox::restricted(env, &e) =>
-                        {
-                            Some(crate::sandbox::map_home_write(env, "send", e))
-                        }
-                        _ => None,
-                    };
-                    if let Some(err) = mapped {
-                        return Err(err);
-                    }
-                }
-                return Err(GlenError::no_route(
-                    NoRouteReason::UnhealthyEndpoint,
-                    format!(
-                        "session {} has a glen live endpoint that cannot take messages ({reason})",
-                        o.handle
-                    ),
-                )
-                .with_hint(crate::live::route::hint(kind)));
+                return Err(crate::live::route::unhealthy_refusal(
+                    env, "send", &o.handle, &reason, kind, io,
+                ));
             }
             _ => (),
         }
@@ -227,21 +206,7 @@ pub(crate) fn submit(
                 return Err(error);
             }
             if !matches!(lease, Lease::Free) && !lock::is_held(&home, &o.session.header.id) {
-                let message = match &lease {
-                    unknown @ Lease::Unknown { .. } => format!(
-                        "cannot tell whether another omp process owns session {} ({})",
-                        o.handle,
-                        lease::state_detail(unknown).unwrap_or_default()
-                    ),
-                    _ => format!("session {} is open in another omp process", o.handle),
-                };
-                let hint = crate::live::route::lease_held_hint(&paths);
-                let reason = if matches!(lease, Lease::Held) {
-                    NoRouteReason::LiveOwner
-                } else {
-                    NoRouteReason::UnknownLease
-                };
-                return Err(GlenError::no_route(reason, message).with_hint(hint));
+                return Err(crate::live::route::lease_refusal(&lease, &o.handle, &paths));
             }
         }
     }
@@ -463,10 +428,16 @@ mod submit_tests {
             },
         );
         let err = run(&cli, args, &env, &ctx).err().unwrap();
-        assert_eq!(err.code, ErrorCode::NotFound);
+        // W8-ERR-8: a missing --cwd is a usage error with a fix-the-path hint, not not_found.
+        assert_eq!(err.code, ErrorCode::Usage);
         assert_eq!(
             err.message,
             format!("no such directory: {}", missing.display())
         );
+        assert_eq!(
+            err.details.as_deref(),
+            Some(&serde_json::json!({"reason":"missing_cwd","cwd":missing}))
+        );
+        assert_eq!(err.hint.as_deref(), Some("check the --cwd path"));
     }
 }
