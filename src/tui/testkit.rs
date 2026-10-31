@@ -3,7 +3,7 @@ use super::{layout, state::*, theme::TuiTheme, update, view};
 use crate::{
     cli::DeliverAs,
     commands::wait,
-    error::{ErrorCode, GlenError},
+    error::{ErrorCode, GlenError, NoRouteReason},
     glen_home::GlenHome,
     jobs::{Job, JobError, JobResult, JobStore, Reply, Route, State as JobState, Status},
     omp::{
@@ -209,11 +209,13 @@ fn jobs(app: &mut App, kind: SceneKind) {
         }
         SceneKind::JobFailedNoRoute => {
             status.status = JobState::Failed;
+            let error = GlenError::no_route(NoRouteReason::LiveOwner, "session has no live route")
+                .with_hint("run glen install-extension, then restart omp");
             status.error = Some(JobError {
-                code: "no_route".into(),
-                message: "session has no live route".into(),
-                hint: Some("run glen install-extension, then restart omp".into()),
-                details: None,
+                code: error.code.as_str().into(),
+                message: error.message,
+                hint: error.hint,
+                details: error.details.map(|details| *details),
             });
         }
         _ => (),
@@ -436,8 +438,8 @@ pub fn scene(kind: SceneKind, size: (u16, u16), theme: TuiTheme) -> App {
                     &mut app,
                     Msg::Submitted {
                         local: *local,
-                        result: Err(GlenError::new(
-                            ErrorCode::NoRoute,
+                        result: Err(GlenError::no_route(
+                            crate::error::NoRouteReason::LiveOwner,
                             "session has no live route",
                         )
                         .with_hint("run glen install-extension, then restart omp")

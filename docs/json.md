@@ -871,7 +871,9 @@ Help and version are text in every output mode, with no JSON envelope.
 ## Error details
 
 Usage errors may include clap diagnostics in details. Not-found errors supply a hint. Ambiguous errors include
-`details.candidates`. Job failure has `details:{status,job,error,forked}`. A held lease has a hint without details.
+`details.candidates`. Job failure has `details:{status,job,error,forked}`. Every exit-6 `no_route` envelope
+includes a string `details.reason`; worker-side refusals also copy it beside `status`, `job`, `error` and `forked`.
+Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`, `endpoint_gone`, `endpoint_appeared`, `rpc_job_running`, `sandboxed`, `extension_outdated`.
 Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permission-denied glen-home write adds
 `glen_home_writable:false` and a hint naming `$TMPDIR` and writable_roots. Doctor failures embed data in
 `details.report`. Install-skill filesystem failures include `details.done` (targets processed before failure).
@@ -972,6 +974,7 @@ Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permissio
 {
   "error": {
     "code": "no_route",
+    "details": {"reason": "live_owner"},
     "hint": "run `glen install-extension`, then restart that omp session",
     "message": "session e27c0de is open in another omp process"
   },

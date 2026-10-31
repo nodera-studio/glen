@@ -1,6 +1,6 @@
 //! Foreground, lock-owning RPC clients. Only omp writes the resumed transcript.
 use crate::{
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason, Warning},
     glen_home::GlenHome,
     jobs::{
         Forked,
@@ -248,8 +248,12 @@ impl Ephemeral {
         let probe = lease::probe(&paths.session_owners_dir, id);
         if !matches!(probe, Lease::Free) {
             return Err(OpenError::Failed(
-                GlenError::new(
-                    ErrorCode::NoRoute,
+                GlenError::no_route(
+                    if matches!(probe, Lease::Held) {
+                        NoRouteReason::LiveOwner
+                    } else {
+                        NoRouteReason::UnknownLease
+                    },
                     format!(
                         "session {id} has an omp owner or its lease is unknown ({})",
                         lease::state_detail(&probe).unwrap_or_default()

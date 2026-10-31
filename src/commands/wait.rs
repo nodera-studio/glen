@@ -99,6 +99,13 @@ pub(crate) fn job_error(store: &JobStore, job: &Job, s: &Status) -> Result<GlenE
         ),
     )
     .with_details(json!({"status":s.status,"job":view,"error":s.error,"forked":forked}));
+    if code == ErrorCode::NoRoute
+        && let Some(reason) = error
+            .and_then(|error| error.details.as_ref())
+            .and_then(|details| details.get("reason"))
+    {
+        e = e.with_detail("reason", reason.clone());
+    }
     e.hint =
         if error.and_then(|e| e.hint.as_ref()).is_some() {
             error.and_then(|e| e.hint.clone())

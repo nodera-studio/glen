@@ -263,6 +263,15 @@ pub fn emit_to(
     ExitCode::from(outcome.exit.exit_code())
 }
 pub(crate) fn error_value(error: &GlenError, warnings: &[Warning]) -> Value {
+    debug_assert!(
+        error.code != ErrorCode::NoRoute
+            || error
+                .details
+                .as_deref()
+                .and_then(|details| details.get("reason"))
+                .is_some_and(Value::is_string),
+        "no_route errors require a string details.reason"
+    );
     let mut object = json!({"code":error.code,"message":error.message});
     if let Some(hint) = &error.hint {
         object["hint"] = json!(hint);
@@ -349,6 +358,20 @@ mod tests {
         output::{OutputKind, Terminal},
     };
     use std::path::Path;
+    #[cfg(debug_assertions)]
+    #[test]
+    fn no_route_envelopes_require_a_string_reason_even_with_a_dynamic_code() {
+        let code = ErrorCode::NoRoute;
+        for details in [json!({}), json!({"reason":null}), json!({"reason":42})] {
+            let error = GlenError::new(code, "invalid no_route fixture").with_details(details);
+            assert!(std::panic::catch_unwind(|| error_value(&error, &[])).is_err());
+        }
+        let error = GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "refused");
+        assert_eq!(
+            error_value(&error, &[])["error"]["details"]["reason"],
+            "live_owner"
+        );
+    }
     fn ctx(home: &Path, mode: Mode, tty: bool) -> OutputCtx {
         let env = Env::for_test(
             Some(home),
@@ -670,12 +693,13 @@ mod tests {
                             flush_failure,
                         };
                         let mut err = Vec::new();
-                        let exit = emit_error_to(
-                            &c,
-                            GlenError::new(code, "failed").with_report("report"),
-                            &mut out,
-                            &mut err,
-                        );
+                        let error = if code == ErrorCode::NoRoute {
+                            GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "failed")
+                        } else {
+                            GlenError::new(code, "failed")
+                        };
+                        let exit =
+                            emit_error_to(&c, error.with_report("report"), &mut out, &mut err);
                         assert_eq!(
                             exit,
                             ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
@@ -711,7 +735,10 @@ mod tests {
                     assert_eq!(
                         emit_error_to(
                             &c,
-                            GlenError::new(ErrorCode::NoRoute, "unavailable"),
+                            GlenError::no_route(
+                                crate::error::NoRouteReason::LiveOwner,
+                                "unavailable"
+                            ),
                             &mut out,
                             &mut err
                         ),
@@ -740,7 +767,8 @@ mod tests {
         assert_eq!(
             emit_error_to(
                 &c,
-                GlenError::new(ErrorCode::NoRoute, "unavailable").with_report("report"),
+                GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "unavailable")
+                    .with_report("report"),
                 &mut out,
                 &mut err
             ),

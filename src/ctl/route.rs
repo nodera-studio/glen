@@ -7,7 +7,7 @@ use crate::{
     cli::Cli,
     commands::open::Opened,
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason, Warning},
     glen_home,
     jobs::{self, Forked, JobId, JobStore, liveness, lock},
     live::{
@@ -314,7 +314,12 @@ fn unavailable(opened: &Opened, probe: &Lease, paths: &paths::OmpPaths) -> GlenE
         ),
         _ => format!("session {} is open in another omp process", opened.handle),
     };
-    GlenError::new(ErrorCode::NoRoute, message).with_hint(live::route::lease_held_hint(paths))
+    let reason = if matches!(probe, Lease::Unknown { .. }) {
+        NoRouteReason::UnknownLease
+    } else {
+        NoRouteReason::LiveOwner
+    };
+    GlenError::no_route(reason, message).with_hint(live::route::lease_held_hint(paths))
 }
 pub(crate) fn route(
     cli: &Cli,
@@ -341,7 +346,7 @@ pub(crate) fn route(
         match endpoint {
             live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, id) {
-                    return Err(GlenError::new(ErrorCode::NoRoute,format!("session {} is open in a live omp session and a glen RPC job is still running on it",opened.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",opened.handle)));
+                    return Err(GlenError::no_route(NoRouteReason::RpcJobRunning,format!("session {} is open in a live omp session and a glen RPC job is still running on it",opened.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",opened.handle)));
                 }
                 if !hello.ops.iter().any(|op| op == op_name) {
                     let ctx = super::ErrCtx {
@@ -379,8 +384,8 @@ pub(crate) fn route(
                         return Err(error);
                     }
                 }
-                return Err(GlenError::new(
-                    ErrorCode::NoRoute,
+                return Err(GlenError::no_route(
+                    NoRouteReason::UnhealthyEndpoint,
                     format!(
                         "session {} has a glen live endpoint that cannot take controls ({reason})",
                         opened.handle
@@ -453,8 +458,8 @@ pub(crate) fn route(
             return Ok((Target::Idle, vec![]));
         }
         if opened.not_yet_persisted {
-            return Err(GlenError::new(
-                ErrorCode::NoRoute,
+            return Err(GlenError::no_route(
+                NoRouteReason::EndpointGone,
                 "the live session has not persisted a transcript and its endpoint went away",
             )
             .with_hint("restart that omp session and run `glen ls`"));

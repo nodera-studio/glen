@@ -250,12 +250,13 @@ fn ac206_fork_detected() {
 fn ac207_live_owner_refused() {
     let b = RpcBox::new();
     let mut owner = b.hold_lease(A_ID);
-    envelope(
+    let refusal = envelope(
         &b.glen(&["send", "e27c0de", "hi", "--json"])
             .output()
             .unwrap(),
         6,
     );
+    assert_eq!(refusal["error"]["details"]["reason"], "live_owner");
     assert!(!b.omp.glen_home.exists());
     assert!(b.fake_log().is_empty());
     drop(owner.stdin.take());
@@ -270,7 +271,96 @@ fn ac207_worker_probe_before_spawn() {
     drop(lock);
     let out = wait(&b, &v, 6);
     assert_eq!(out["error"]["details"]["error"]["code"], "no_route");
+    assert_eq!(out["error"]["details"]["reason"], "live_owner");
+    assert_eq!(
+        out["error"]["details"]["error"]["details"]["reason"],
+        "live_owner"
+    );
     assert!(b.fake_log().is_empty());
+    drop(owner.stdin.take());
+    owner.wait().unwrap();
+}
+#[test]
+fn unreadable_lease_names_unknown_lease_for_send_and_controls() {
+    let b = RpcBox::new();
+    fs::create_dir_all(b.owners().parent().unwrap()).unwrap();
+    fs::write(b.owners(), "not a directory").unwrap();
+    for args in [
+        vec!["send", "e27c0de", "hi", "--json"],
+        vec!["compact", "e27c0de", "--json"],
+    ] {
+        let out = b.glen(&args).output().unwrap();
+        let value = envelope(&out, 6);
+        assert_eq!(value["error"]["details"]["reason"], "unknown_lease");
+    }
+    assert!(b.fake_log().is_empty());
+}
+
+#[test]
+fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
+    let b = RpcBox::new();
+    let gate = b.omp.home.join("reason-probe-release");
+    let mut child = b
+        .glen(&["send", "e27c0de", "hi", "--wait", "30s", "--json"])
+        .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    poll(Duration::from_secs(10), || {
+        gate.with_extension("ready").exists().then_some(())
+    });
+    // The foreground already saw a free glen lock. Holding it now makes its fresh
+    // lease probe queue a job; only the worker can observe the later refusal.
+    let lock = b.hold_glen_lock(A_ID);
+    let mut owner = b.hold_lease(A_ID);
+    fs::write(&gate, "go").unwrap();
+    let id = poll(Duration::from_secs(10), || {
+        fs::read_dir(b.omp.glen_home.join("jobs"))
+            .ok()?
+            .filter_map(Result::ok)
+            .find_map(|entry| {
+                let id = entry.file_name().to_str()?.to_owned();
+                glen::jobs::JobId::parse(&id)?;
+                let status: Value =
+                    serde_json::from_slice(&fs::read(entry.path().join("status.json")).ok()?)
+                        .ok()?;
+                (status["waiting_for_lock"] == true).then_some(id)
+            })
+    });
+    let handle = b.job(&id).0["handle"].as_str().unwrap().to_owned();
+    drop(lock);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while child.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            child.kill().unwrap();
+            let output = child.wait_with_output().unwrap();
+            panic!("send did not report the worker refusal: {output:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let sent = envelope(&child.wait_with_output().unwrap(), 6);
+    let waited = envelope(
+        &b.glen(&["wait", &handle, "--timeout", "10s", "--json"])
+            .output()
+            .unwrap(),
+        6,
+    );
+    for value in [&sent, &waited] {
+        let details = &value["error"]["details"];
+        assert_eq!(details["reason"], "live_owner");
+        assert_eq!(details["status"], "failed");
+        assert_eq!(details["job"]["handle"], handle);
+        assert_eq!(details["error"]["code"], "no_route");
+        assert_eq!(details["error"]["details"]["reason"], "live_owner");
+        assert!(details.get("forked").is_some());
+        assert!(details["forked"].is_null());
+    }
+    b.wait_worker_gone(&id);
+    assert!(
+        b.fake_log().is_empty(),
+        "the refusal must happen before omp resumes"
+    );
     drop(owner.stdin.take());
     owner.wait().unwrap();
 }

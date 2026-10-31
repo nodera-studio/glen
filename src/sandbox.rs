@@ -1,6 +1,6 @@
 use crate::{
     env::Env,
-    error::{ErrorCode, GlenError},
+    error::{ErrorCode, GlenError, NoRouteReason},
     glen_home,
 };
 use serde_json::json;
@@ -37,9 +37,10 @@ fn refusal_with_extension(command: &str, s: &Sandbox, extension: bool) -> GlenEr
     if extension {
         hint.push_str(", or enable network for the sandbox and use a session open in omp with glen's extension");
     }
-    GlenError::new(ErrorCode::NoRoute, message)
+    GlenError::no_route(NoRouteReason::Sandboxed, message)
         .with_hint(hint)
-        .with_details(json!({"reason":"sandboxed", "sandbox":s.kind, "network":s.network}))
+        .with_detail("sandbox", json!(s.kind))
+        .with_detail("network", s.network)
 }
 pub fn refuse_unreachable(env: &Env, command: &str) -> Result<(), GlenError> {
     if let Some(s) = detect(env)
@@ -85,10 +86,7 @@ pub fn map_home_write(env: &Env, command: &str, err: io::Error) -> GlenError {
                 "cannot write GLEN_HOME ({path}): {err}; Codex disabled the network for this command, so it may be sandboxed"
             )
         };
-        if let Some(details) = error.details.as_mut() {
-            details["glen_home_writable"] = json!(false);
-        }
-        return error;
+        return error.with_detail("glen_home_writable", false);
     }
     GlenError::new(
         ErrorCode::Io,

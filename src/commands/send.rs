@@ -1,7 +1,7 @@
 use crate::{
     cli::{Cli, DeliverAs, SendArgs},
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason, Warning},
     glen_home,
     jobs::{Job, JobError, JobId, JobStore, Route, State, lock, wait},
     omp::{
@@ -162,7 +162,7 @@ pub(crate) fn submit(
         match crate::live::route::find(&home, &o.session.header.id, crate::live::HELLO_SEND) {
             crate::live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, &o.session.header.id) {
-                    return Err(GlenError::new(ErrorCode::NoRoute,format!("session {} is open in a live omp session and a glen RPC job is still running on it",o.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",o.handle)));
+                    return Err(GlenError::no_route(NoRouteReason::RpcJobRunning,format!("session {} is open in a live omp session and a glen RPC job is still running on it",o.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",o.handle)));
                 }
                 if hello.ext_version.as_deref() != Some(env!("CARGO_PKG_VERSION")) {
                     route_warnings.push(Warning{code:"extension_version_mismatch".into(),message:format!("extension version {} differs from glen {}; run `glen install-extension` and restart omp",hello.ext_version.as_deref().unwrap_or("unknown"),env!("CARGO_PKG_VERSION"))});
@@ -186,8 +186,8 @@ pub(crate) fn submit(
                         return Err(err);
                     }
                 }
-                return Err(GlenError::new(
-                    ErrorCode::NoRoute,
+                return Err(GlenError::no_route(
+                    NoRouteReason::UnhealthyEndpoint,
                     format!(
                         "session {} has a glen live endpoint that cannot take messages ({reason})",
                         o.handle
@@ -201,8 +201,8 @@ pub(crate) fn submit(
             crate::sandbox::refuse_rpc(env, "send")?;
         }
         if live.is_none() && o.not_yet_persisted {
-            return Err(GlenError::new(
-                ErrorCode::NoRoute,
+            return Err(GlenError::no_route(
+                NoRouteReason::EndpointGone,
                 "the live session has not persisted a transcript and its endpoint went away",
             )
             .with_hint("restart that omp session and run `glen ls`"));
@@ -242,7 +242,12 @@ pub(crate) fn submit(
                     _ => format!("session {} is open in another omp process", o.handle),
                 };
                 let hint = crate::live::route::lease_held_hint(&paths);
-                return Err(GlenError::new(ErrorCode::NoRoute, message).with_hint(hint));
+                let reason = if matches!(lease, Lease::Held) {
+                    NoRouteReason::LiveOwner
+                } else {
+                    NoRouteReason::UnknownLease
+                };
+                return Err(GlenError::no_route(reason, message).with_hint(hint));
             }
         }
     }
