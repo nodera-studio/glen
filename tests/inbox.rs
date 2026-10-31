@@ -8,6 +8,11 @@ use std::{
     process::Stdio,
     time::Duration,
 };
+fn closed_stdout() -> Stdio {
+    let (reader, writer) = std::io::pipe().unwrap();
+    drop(reader);
+    Stdio::from(writer)
+}
 const A: &str = common::A_ID;
 const B: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e2fffff";
 fn record(id: &str, text: &str, at: &str) -> Value {
@@ -127,16 +132,14 @@ fn ac319_output_failure_keeps_cursor() {
             ),
         );
     }
-    let mut c = b
+    let o = b
         .command(&["inbox", "--json"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "0")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        .stdout(closed_stdout())
+        .output()
         .unwrap();
-    drop(c.stdout.take());
-    let o = c.wait_with_output().unwrap();
-    assert!(!o.status.success());
+    assert_eq!(o.status.code(), Some(0));
+    assert!(o.stderr.is_empty());
     assert!(!b.glen_home.join("inbox/.read").exists());
 }
 #[test]
@@ -243,32 +246,52 @@ fn footer_counts_only_sessions_with_displayed_messages() {
 
 #[test]
 fn closed_stdout_does_not_mark_inbox_read() {
-    use std::os::unix::process::CommandExt;
     let b = OmpBox::new();
     append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
-    let mut command = b.command(&["inbox", "--json"], &b.alpha());
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    let mut pipe = [-1; 2];
-    // SAFETY: pipe points to two valid descriptor slots. Each returned fd gets
-    // exactly one owner; dropping the read end guarantees EPIPE on the writer.
-    assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
-    let read_end = unsafe { OwnedFd::from_raw_fd(pipe[0]) };
-    let write_end = unsafe { OwnedFd::from_raw_fd(pipe[1]) };
-    drop(read_end);
-    // SAFETY: dup2 is async-signal-safe. fd 1 stays open across exec, so Rust's
-    // startup sanitizer cannot replace it with /dev/null.
-    unsafe {
-        command.pre_exec(move || {
-            if libc::dup2(write_end.as_raw_fd(), libc::STDOUT_FILENO) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let o = command.output().unwrap();
-    assert_eq!(o.status.code(), Some(1));
+    let o = b
+        .command(&["inbox", "--json"], &b.alpha())
+        .stdout(closed_stdout())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(0));
     assert!(!b.glen_home.join("inbox/.read").exists());
-    assert!(String::from_utf8_lossy(&o.stderr).contains("messages remain unread"));
+    assert!(o.stderr.is_empty());
+}
+
+#[test]
+fn inbox_with_a_closed_stdout_keeps_messages_unread() {
+    for follow in [false, true] {
+        let b = OmpBox::new();
+        append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+        let args = if follow {
+            vec!["inbox", "--json", "-f"]
+        } else {
+            vec!["inbox", "--json"]
+        };
+        let mut child = b
+            .command(&args, &b.alpha())
+            .stdout(closed_stdout())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("inbox did not stop after EPIPE: {output:?}");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let o = child.wait_with_output().unwrap();
+        assert_eq!(o.status.code(), Some(0), "{o:?}");
+        assert!(o.stderr.is_empty(), "{o:?}");
+        assert!(!b.glen_home.join("inbox/.read").exists());
+        let remaining = data(&inbox(&b, &["--peek"]));
+        assert_eq!(remaining["total"], 1);
+        assert_eq!(remaining["messages"][0]["text"], "keep");
+        assert!(!b.glen_home.join("inbox/.read").exists());
+    }
 }
 
 #[test]

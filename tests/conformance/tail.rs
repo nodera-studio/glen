@@ -510,14 +510,14 @@ fn ac125_a_shrunk_file_emits_rewritten_then_only_new_items() {
 }
 
 #[test]
-fn a10_follow_on_a_closed_stdout_exits_1() {
+fn a10_follow_on_a_closed_stdout_exits_0() {
     let bx = OmpBox::new();
     let out = bx
         .glen(["tail", A.handle, "-f", "--json"])
         .stdout(closed_stdout())
         .run();
     out.assert_no_panic();
-    out.assert_exit(1);
+    out.assert_exit(0);
 }
 
 #[test]

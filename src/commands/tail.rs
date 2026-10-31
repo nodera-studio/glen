@@ -138,7 +138,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         Ok(())
     })();
     if init.is_err() {
-        return ExitCode::from(1);
+        return stream.write_exit();
     }
     let mut endpoint_missing: Option<Instant> = None;
     while o.not_yet_persisted {
@@ -176,7 +176,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
     let mut prev_model = None;
     for i in &backlog {
         if emit_item(&mut stream, i, &mut prev_model, &style(args, ctx)).is_err() {
-            return ExitCode::from(1);
+            return stream.write_exit();
         }
     }
     loop {
@@ -187,8 +187,12 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
         if stop.load(Ordering::Relaxed) {
             return stream.end(130);
         }
-        let result = (|| -> Result<(), GlenError> {
-            for ev in follower.poll()? {
+        let events = match follower.poll() {
+            Ok(events) => events,
+            Err(e) => return stream.fail(e),
+        };
+        let result = (|| -> std::io::Result<()> {
+            for ev in events {
                 match ev {
                     FollowEvent::Items(items) => {
                         for item in items {
@@ -225,8 +229,8 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
             }
             Ok(())
         })();
-        if let Err(e) = result {
-            return stream.fail(e);
+        if result.is_err() {
+            return stream.write_exit();
         }
     }
 }

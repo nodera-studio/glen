@@ -235,7 +235,7 @@ pub fn follow(_cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode
                 )
                 .is_err()
             {
-                return ExitCode::from(1);
+                return stream.write_exit();
             }
             if !a.peek
                 && let Some(offset) = prefixes.entry(stem.clone()).or_default().wrote(*end)

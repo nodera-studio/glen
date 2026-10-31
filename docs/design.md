@@ -361,7 +361,7 @@ Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `
 - **Glyphs:** ✓ ok, ! warn, ✗ fail, ● live, ◐ busy, ○ idle, ? unknown, · info.
 - **Paths:** `~/…` in human output, absolute in JSON.
 - **Untrusted text.** Every string glen did not author (paths, env values, session titles, cwds, previews, model output) passes through `render::sanitize` before it is painted in human mode. Escape controls; never silently strip them. Human single-line fields such as titles, previews and tool summaries first collapse whitespace runs (including newlines and tabs) to one space, then sanitize. A literal ESC followed by `[31m` is displayed literally as `\x1b[31m`. JSON fields retain the raw value, including controls and whitespace, with serde escaping on the wire; documented preview/result length limits still apply.
-- **Write failures.** A failed or closed stdout ends the command with exit 1 and no further stdout output. glen never panics on EPIPE and never writes a second envelope.
+- **Write failures (AC-1001/AC-1002, amending AC-029).** When a stdout write or flush fails with EPIPE (the reader closed the pipe), glen writes nothing more to stdout or stderr and keeps the outcome's own exit code: 0 for success, the error's code for a failure envelope, or 10, 11 or 130 for a running, forked or interrupted outcome. This applies to every command and mode, including JSON, human, raw and clap help/version/usage. Any other stdout failure exits 1, without a panic or a second JSON document. A failed stderr write also exits 1; clap usage successfully written to stderr keeps exit 2 regardless of stdout.
 - **Lazy state.** `--help`, `--version`, `doctor` and path resolution never create `GLEN_HOME`. Directories are created on first write (spill in W0; jobs, inbox and live endpoints later).
 
 ### W3b control documents
@@ -382,6 +382,9 @@ control_failed exits 7: no_auth (log into provider), busy (abort first or wait),
 - Adjacent queued user messages consumed in the same run with no intervening assistant output share a batch reply span. Every job receives the same assistant text and reply records, and a `batched` warning names the other job handles. A user message always ends the prior span outside that batch exception. A custom/async-result/system-notice message ends the span only after it contains assistant text; before an answer, the span and its glen ownership continue past the notice. The extension writes one durable inbox record per tool call; shared records have null single-owner `job_id` and `request_id` and are streamed identically to every batch member. A new run or intervening assistant output separates the spans.
 
 ## §A11 Exit codes
+
+A closed stdout pipe (EPIPE on write or flush) preserves the outcome's code below, including failure codes such as 2 (`usage`), 3 (`not_found`), 5 (`omp_unavailable`) and 6 (`no_route`), and statuses 10, 11 and 130. It does not turn failures into success: glen stops without further stdout or stderr output. Other stdout failures and failed stderr writes exit 1. Clap usage successfully written to stderr keeps exit 2 regardless of stdout (AC-1001/AC-1002).
+
 | Exit | `error.code` / status | Meaning |
 |---|---|---|
 | 0 | — | success (`ok:true`) |

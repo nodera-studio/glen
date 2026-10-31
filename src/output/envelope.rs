@@ -1,4 +1,4 @@
-use super::{Mode, OutputCtx};
+use super::{Mode, OutputCtx, stdout_failure_exit};
 use crate::{
     error::{ErrorCode, GlenError, OkExit, Warning},
     glen_home::{self, write_private_atomic},
@@ -29,16 +29,11 @@ impl Outcome {
         }
     }
 }
-fn writers(
-    ctx: &OutputCtx,
-) -> (
-    anstream::AutoStream<io::StdoutLock<'static>>,
-    anstream::AutoStream<io::StderrLock<'static>>,
-) {
+fn writers(ctx: &OutputCtx) -> (impl Write, impl Write) {
     use anstream::ColorChoice::{Always, Never};
     (
         anstream::AutoStream::new(
-            io::stdout().lock(),
+            super::stdout_writer(),
             // JSON and raw script output never carry ANSI (serde escapes ESC; completion
             // scripts are static) and must round-trip untrusted bytes such as DEL exactly, so
             // they bypass stripping rather than going through `Never`.
@@ -49,7 +44,7 @@ fn writers(
             },
         ),
         anstream::AutoStream::new(
-            io::stderr().lock(),
+            super::stderr_writer(),
             if ctx.stderr_color { Always } else { Never },
         ),
     )
@@ -78,18 +73,25 @@ fn with_warnings(mut value: Value, warnings: &[Warning]) -> Value {
     }
     value
 }
-fn write_output(ctx: &OutputCtx, bytes: &[u8], out: &mut dyn Write, err: &mut dyn Write) -> bool {
+fn write_output(
+    ctx: &OutputCtx,
+    bytes: &[u8],
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+) -> io::Result<()> {
     match out.write_all(bytes).and_then(|_| out.flush()) {
-        Ok(()) => true,
+        Ok(()) => Ok(()),
         Err(e) => {
             if ctx.mode == Mode::Human && e.kind() != io::ErrorKind::BrokenPipe {
-                let _ = writeln!(
+                writeln!(
                     err,
                     "error: cannot write output: {}",
                     sanitize(&e.to_string())
-                );
+                )
+                .and_then(|()| err.flush())
+                .map_err(io::Error::other)?;
             }
-            false
+            Err(e)
         }
     }
 }
@@ -228,7 +230,10 @@ pub fn emit_to(
     } else {
         bytes
     };
-    if !write_output(ctx, &bytes, out, err) {
+    if let Err(e) = write_output(ctx, &bytes, out, err) {
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            return stdout_failure_exit(&e, ExitCode::from(outcome.exit.exit_code()));
+        }
         if after_output.is_some()
             && writeln!(
                 err,
@@ -291,17 +296,17 @@ pub fn emit_error_to(
         let rendered = json_bytes(&error_value(&error, &ctx.warnings), ctx.stdout_tty);
         match rendered {
             Ok(b) => {
-                if !write_output(ctx, &b, out, err) {
-                    return ExitCode::from(1);
+                if let Err(e) = write_output(ctx, &b, out, err) {
+                    return stdout_failure_exit(&e, ExitCode::from(error.code.exit_code()));
                 }
             }
             Err(_) => return ExitCode::from(1),
         }
     } else {
         if let Some(report) = error.report
-            && !write_output(ctx, format!("{report}\n").as_bytes(), out, err)
+            && let Err(e) = write_output(ctx, format!("{report}\n").as_bytes(), out, err)
         {
-            return ExitCode::from(1);
+            return stdout_failure_exit(&e, ExitCode::from(error.code.exit_code()));
         }
         let p = &ctx.err_painter;
         let result = (|| {
@@ -356,7 +361,11 @@ mod tests {
                 human: mode == Mode::Human,
                 ..Default::default()
             },
-            OutputKind::Document,
+            if mode == Mode::Raw {
+                OutputKind::Raw
+            } else {
+                OutputKind::Document
+            },
             &env,
             &Terminal {
                 stdout_tty: tty,
@@ -527,12 +536,14 @@ mod tests {
         bytes: Vec<u8>,
         remaining: usize,
         calls: usize,
+        kind: io::ErrorKind,
+        flush_failure: bool,
     }
     impl Write for Failing {
         fn write(&mut self, b: &[u8]) -> io::Result<usize> {
             self.calls += 1;
             if self.remaining == 0 {
-                return Err(io::ErrorKind::BrokenPipe.into());
+                return Err(self.kind.into());
             }
             let n = self.remaining.min(b.len());
             self.bytes.extend_from_slice(&b[..n]);
@@ -540,7 +551,11 @@ mod tests {
             Ok(n)
         }
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            if self.flush_failure {
+                Err(self.kind.into())
+            } else {
+                Ok(())
+            }
         }
     }
     #[test]
@@ -552,6 +567,8 @@ mod tests {
                 bytes: vec![],
                 remaining: n,
                 calls: 0,
+                kind: io::ErrorKind::BrokenPipe,
+                flush_failure: false,
             };
             let mut err = Vec::new();
             assert_eq!(
@@ -562,12 +579,173 @@ mod tests {
                     &mut out,
                     &mut err
                 ),
-                ExitCode::from(1)
+                ExitCode::SUCCESS
             );
             assert_eq!(out.bytes.len(), n);
             assert_eq!(out.calls, if n == 0 { 1 } else { 2 });
             assert!(err.is_empty());
         }
+    }
+    #[test]
+    fn output_failures_keep_outcomes_only_for_broken_pipes_and_never_commit() {
+        use std::{cell::Cell, rc::Rc};
+        let t = tempfile::tempdir().unwrap();
+        for mode in [Mode::Json, Mode::Human, Mode::Raw] {
+            let c = ctx(t.path(), mode, false);
+            for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                for flush_failure in [false, true] {
+                    for exit in [
+                        OkExit::Done,
+                        OkExit::Running,
+                        OkExit::Forked,
+                        OkExit::Interrupted,
+                    ] {
+                        let committed = Rc::new(Cell::new(0));
+                        let counter = committed.clone();
+                        let mut outcome = Outcome::new(json!({"answer":42}), "answer");
+                        outcome.exit = exit;
+                        outcome.warnings.push(Warning {
+                            code: "test".into(),
+                            message: "must not print this warning".into(),
+                        });
+                        outcome.after_output = Some(Box::new(move || {
+                            counter.set(counter.get() + 1);
+                            Ok(())
+                        }));
+                        let mut out = Failing {
+                            bytes: Vec::new(),
+                            remaining: if flush_failure { usize::MAX } else { 0 },
+                            calls: 0,
+                            kind,
+                            flush_failure,
+                        };
+                        let mut err = Vec::new();
+                        let code = emit_to(&c, outcome, "test", &mut out, &mut err);
+                        assert_eq!(
+                            code,
+                            ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                                exit.exit_code()
+                            } else {
+                                1
+                            })
+                        );
+                        assert_eq!(committed.get(), 0);
+                        assert_eq!(out.calls, 1);
+                        if kind == io::ErrorKind::BrokenPipe {
+                            assert!(err.is_empty());
+                        }
+                        assert!(
+                            !String::from_utf8_lossy(&err).contains("must not print this warning")
+                        );
+                    }
+                }
+            }
+            let committed = Rc::new(Cell::new(0));
+            let counter = committed.clone();
+            let mut outcome = Outcome::new(json!({}), "ok");
+            outcome.after_output = Some(Box::new(move || {
+                counter.set(counter.get() + 1);
+                Ok(())
+            }));
+            assert_eq!(
+                emit_to(&c, outcome, "test", &mut Vec::new(), &mut Vec::new()),
+                ExitCode::SUCCESS
+            );
+            assert_eq!(committed.get(), 1);
+        }
+    }
+    #[test]
+    fn error_output_failures_keep_the_errors_code_only_for_broken_pipes() {
+        let t = tempfile::tempdir().unwrap();
+        for mode in [Mode::Json, Mode::Human, Mode::Raw] {
+            let c = ctx(t.path(), mode, false);
+            for code in ErrorCode::ALL {
+                for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                    for flush_failure in [false, true] {
+                        let mut out = Failing {
+                            bytes: Vec::new(),
+                            remaining: if flush_failure { usize::MAX } else { 0 },
+                            calls: 0,
+                            kind,
+                            flush_failure,
+                        };
+                        let mut err = Vec::new();
+                        let exit = emit_error_to(
+                            &c,
+                            GlenError::new(code, "failed").with_report("report"),
+                            &mut out,
+                            &mut err,
+                        );
+                        assert_eq!(
+                            exit,
+                            ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                                code.exit_code()
+                            } else {
+                                1
+                            })
+                        );
+                        assert_eq!(out.calls, 1);
+                        if kind == io::ErrorKind::BrokenPipe || mode == Mode::Json {
+                            assert!(err.is_empty());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    #[test]
+    fn failed_stderr_writes_always_exit_one() {
+        let t = tempfile::tempdir().unwrap();
+        for mode in [Mode::Human, Mode::Raw] {
+            let c = ctx(t.path(), mode, false);
+            for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+                for flush_failure in [false, true] {
+                    let mut err = Failing {
+                        bytes: Vec::new(),
+                        remaining: if flush_failure { usize::MAX } else { 0 },
+                        calls: 0,
+                        kind,
+                        flush_failure,
+                    };
+                    let mut out = Vec::new();
+                    assert_eq!(
+                        emit_error_to(
+                            &c,
+                            GlenError::new(ErrorCode::NoRoute, "unavailable"),
+                            &mut out,
+                            &mut err
+                        ),
+                        ExitCode::from(1)
+                    );
+                    assert!(out.is_empty());
+                }
+            }
+        }
+        // A broken stderr must not turn a different stdout failure into EPIPE success.
+        let c = ctx(t.path(), Mode::Human, false);
+        let mut out = Failing {
+            bytes: Vec::new(),
+            remaining: 0,
+            calls: 0,
+            kind: io::ErrorKind::Other,
+            flush_failure: false,
+        };
+        let mut err = Failing {
+            bytes: Vec::new(),
+            remaining: 0,
+            calls: 0,
+            kind: io::ErrorKind::BrokenPipe,
+            flush_failure: false,
+        };
+        assert_eq!(
+            emit_error_to(
+                &c,
+                GlenError::new(ErrorCode::NoRoute, "unavailable").with_report("report"),
+                &mut out,
+                &mut err
+            ),
+            ExitCode::from(1)
+        );
     }
     #[test]
     fn raw_unmodified_and_errors_never_spill() {
