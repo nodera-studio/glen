@@ -1032,8 +1032,8 @@ fn route_probe(
     env: &Env,
     profile: Option<&str>,
 ) -> Result<(), Failure> {
-    // Checked before every lease value, including Free: on Linux under a Codex marker in a
-    // different network namespace, even a "free" probe cannot be trusted.
+    // Checked before every lease value, including Free: on Linux under any Codex marker the
+    // lease may be hidden by the sandbox's network namespace, so even "free" cannot be trusted.
     if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &lease) {
         let mut failure = Failure::no_route(NoRouteReason::Sandboxed, e.message);
         failure.hint = e.hint;
@@ -1612,6 +1612,9 @@ mod tests {
             std::path::Path::new("/"),
             &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
         );
+        // The raw-errno mapping is the non-hidden path (macOS); on Linux the marker hides the
+        // lease first (W10 fix cycle 2 decision 1; see the next test).
+        crate::sandbox::force_lease_hidden_for_test(Some(false));
         for errno in [libc::EPERM, libc::EACCES, libc::EROFS] {
             let error = route_probe(
                 Lease::Unknown {
@@ -1627,6 +1630,7 @@ mod tests {
             assert_eq!(error.details.unwrap()["reason"], "sandboxed");
             assert!(error.hint.unwrap().contains("outside the sandbox"));
         }
+        crate::sandbox::force_lease_hidden_for_test(None);
     }
     #[test]
     fn route_probe_refuses_even_a_free_lease_when_hidden() {
@@ -1642,6 +1646,11 @@ mod tests {
         assert_eq!(details["reason"], "sandboxed");
         assert_eq!(details["lease"], "unknown");
         crate::sandbox::force_lease_hidden_for_test(None);
+        // The real rule (W10 fix cycle 2 decision 1): any marker on Linux, never elsewhere.
+        assert_eq!(
+            route_probe(Lease::Free, "e27c0de", &env, None).is_err(),
+            cfg!(target_os = "linux")
+        );
     }
     #[test]
     fn review11_refusal_identifies_pre_spawn_phase() {

@@ -309,6 +309,52 @@ fn human_follow_keeps_del_bytes_in_ndjson() {
     assert_eq!(v["message"]["text"], "A\u{7f}B\u{85}C", "{line:?}");
 }
 
+/// NEW-LOW-003 (W10 fix cycle 3): the human footer says "marked read" only when a cursor
+/// moved, like `marked_read`; `--all` of messages already read says so.
+#[test]
+fn human_footer_says_marked_read_only_when_a_cursor_moves() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "one", "2026-10-30T00:00:00Z"));
+    let human = |args: &[&str]| {
+        let mut argv = vec!["inbox", "--human"];
+        argv.extend(args);
+        let o = b.command(&argv, &b.alpha()).output().unwrap();
+        assert!(o.status.success(), "{args:?}");
+        String::from_utf8(o.stdout).unwrap()
+    };
+    assert!(human(&[]).contains("1 message · 1 session · marked read"));
+    let again = human(&["--all"]);
+    assert!(
+        again.contains("1 message · 1 session · already read"),
+        "{again}"
+    );
+    assert!(!again.contains("marked read"), "{again}");
+}
+
+/// NEW-LOW-003: a batch of only malformed lines moves the cursor past them, so `marked_read`
+/// is true with `total:0` (docs/json.md), and the lines are not skipped again.
+#[test]
+fn malformed_only_lines_move_the_cursor_and_count_as_marked_read() {
+    let b = OmpBox::new();
+    let p = path(&b, A);
+    fs::create_dir_all(p.parent().unwrap()).unwrap();
+    fs::write(&p, "{not json\n").unwrap();
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (
+            d["total"].clone(),
+            d["marked_read"].clone(),
+            d["skipped_lines"].clone()
+        ),
+        (j!(0), j!(true), j!(1))
+    );
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (d["marked_read"].clone(), d["skipped_lines"].clone()),
+        (j!(false), j!(0))
+    );
+}
+
 #[test]
 fn footer_counts_only_sessions_with_displayed_messages() {
     let b = OmpBox::new();

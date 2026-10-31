@@ -304,7 +304,8 @@ pub(crate) fn route(
     deadline: Instant,
     stop: Arc<AtomicBool>,
 ) -> Result<(Target, Vec<Warning>), GlenError> {
-    crate::sandbox::refuse_unreachable(env, cli.command.name())?;
+    crate::sandbox::refuse_unreachable(env, cli.command.name())
+        .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
     let home = glen_home::resolve_trusted(env, &["run/live", "jobs"])?;
     let store = JobStore::new(home.clone());
     let id = &opened.session.header.id;
@@ -356,10 +357,18 @@ pub(crate) fn route(
             }
             _ => (),
         }
-        crate::sandbox::refuse_rpc(env, cli.command.name())?;
-        if lock::is_held(&home, id) {
+        crate::sandbox::refuse_rpc(env, cli.command.name())
+            .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
+        // A hidden lease refuses before any lock wait or lease probe; only a control for a
+        // running glen job still reaches that job (design.md §A13, W10 clarification).
+        if !lock::is_held(&home, id) {
+            crate::sandbox::refuse_hidden_lease(env)?;
+        } else {
             let holder = owner(&store, id, deadline, &stop);
             stopped(deadline, &stop, opened)?;
+            if !matches!(holder, Owner::Job(_)) {
+                crate::sandbox::refuse_hidden_lease(env)?;
+            }
             match holder {
                 Owner::Job(job) => return Ok((job_target(store, job, id, deadline, stop), vec![])),
                 Owner::Free => continue,
@@ -447,6 +456,7 @@ pub(crate) fn route(
             deadline,
             stop.clone(),
             env,
+            cli.command.name(),
         ) {
             Ok(client) => return Ok((Target::Rpc(client), vec![])),
             Err(OpenError::Busy) => {
@@ -510,7 +520,10 @@ pub(crate) fn route_models(
             ));
         }
         let probe = lease::probe(&paths.session_owners_dir, id);
-        if !matches!(probe, Lease::Free) {
+        // A hidden lease (Linux under a Codex marker) is unknown whatever it probes as.
+        if !matches!(probe, Lease::Free)
+            || crate::sandbox::lease_hidden(env, cfg!(target_os = "linux"))
+        {
             warnings.push(Warning {
                 code: "session_unreachable".into(),
                 message: live::route::lease_held_hint(&paths),

@@ -55,6 +55,11 @@ fn accepted(b: &RpcBox, id: &str) {
         (b.job(id).1["status"] == "accepted").then_some(())
     });
 }
+/// A control request the worker's `control::poll` would read: published `<id>.json`, never a
+/// dotted write-atomic temp or a `.done.json` answer.
+fn published_request(name: &str) -> bool {
+    !name.starts_with('.') && name.ends_with(".json") && !name.ends_with(".done.json")
+}
 fn job_id(value: &Value) -> &str {
     value["data"]["job"]["id"].as_str().unwrap()
 }
@@ -843,8 +848,10 @@ fn ac364_request_before_ready_runs_after_release_and_job_ended_reroutes_once() {
         let dir = b.job_dir(id).join("control");
         poll(Duration::from_secs(3), || {
             fs::read_dir(&dir)
-                .ok()
-                .and_then(|mut entries| entries.next().map(|_| ()))
+                .ok()?
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_str().is_some_and(published_request))
+                .then_some(())
         });
         assert!(b.frames_in("set_model").is_empty());
         if end_job {
@@ -953,7 +960,7 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
         10,
     );
     let second_id = job_id(&second);
-    poll(Duration::from_secs(15), || {
+    poll(Duration::from_secs(3), || {
         let status = b.job(second_id).1;
         (status["waiting_for_lock"] == true && status["status"] == "queued").then_some(())
     });
@@ -966,10 +973,15 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
             .unwrap(),
     );
     let requests = b.job_dir(first_id).join("control");
-    poll(Duration::from_secs(15), || {
+    // Wait for the request the worker can see, not merely one this test can read: the caller
+    // fills a dotted temp and fsyncs it before renaming it to `<id>.json`, and the worker's
+    // control::poll never reads the temp. Pausing the caller between write and rename would
+    // hide the abort from j1 forever.
+    poll(Duration::from_secs(3), || {
         fs::read_dir(&requests)
             .ok()?
             .filter_map(Result::ok)
+            .filter(|entry| entry.file_name().to_str().is_some_and(published_request))
             .any(|entry| {
                 fs::read(entry.path())
                     .ok()
@@ -989,7 +1001,7 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
     accepted(&b, second_id);
     assert!(abort.0.try_wait().unwrap().is_none());
     drop(caller);
-    let status = poll(Duration::from_secs(15), || abort.0.try_wait().unwrap());
+    let status = poll(Duration::from_secs(3), || abort.0.try_wait().unwrap());
     use std::io::Read;
     let mut stdout = vec![];
     let mut stderr = vec![];

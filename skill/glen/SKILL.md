@@ -39,7 +39,8 @@ Every command has `--help`.
 | 130 | interrupted | send/wait: `glen wait <job>`; tail -f: stream ended |
 
 Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not retry in a loop or work around it.
-- `sandboxed`: rerun this command outside the sandbox (ask for escalated permissions for `glen`).
+- `sandboxed`: rerun this command outside the sandbox (ask for escalated permissions for `glen`);
+  with `lease:"unknown"` (Linux) escalating does not help: follow `error.hint`.
   With `glen_home_writable:false`, set `GLEN_HOME` to a private directory you own, e.g. `"$(mktemp -d)/glen"`,
   or run outside the sandbox.
 - Otherwise the session is open in omp and glen cannot deliver safely; follow `error.hint`.
@@ -74,10 +75,11 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   `glen_home_writable:false`: set `GLEN_HOME` to a private directory you own, e.g. `"$(mktemp -d)/glen"`.
   Prefer `glen tail <handle> -n 20`.
   Sending and session controls must reach omp outside the sandbox; exit 6 `sandboxed` explains the restriction.
-  Only non-empty `CODEX_SANDBOX` marks a sandbox. `CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends.
-  On Linux, when the command runs in its own network namespace, that holds for existing sessions only through
-  the live route: resuming over RPC refuses exit 6 `sandboxed`, `lease:"unknown"`. A real permission failure
-  returns exit 6 with the hint. Rerun with escalated permissions if refused.
+  Only non-empty `CODEX_SANDBOX` marks a sandbox. `CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends;
+  a real permission failure returns exit 6 with the hint: rerun with escalated permissions.
+- On Linux, under either variable (escalated too), `ls` shows existing sessions `unknown` and resuming one over RPC
+  refuses exit 6 `sandboxed` with `lease:"unknown"`. Escalating cannot fix that: use the live route (the session
+  open in the omp TUI with glen's extension), a new session (`@new`), or ask the user to run glen outside Codex.
 - Network-enabled sandboxes support live sessions only, with writable `GLEN_HOME`. <!-- glen:if install-extension -->
 - Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker; if the marker cannot be written, `glen inbox` exits 6 and leaves them unread. <!-- glen:if inbox -->
 

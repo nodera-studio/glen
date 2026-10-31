@@ -75,6 +75,14 @@ pub struct SessionLock {
     pub fd: OwnedFd,
     pub path: PathBuf,
 }
+/// A child spawned on another thread copies the fd table and shares this open file
+/// description until its exec closes the O_CLOEXEC copy, so closing our fd alone can leave
+/// the flock held. LOCK_UN releases it for every copy at once.
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = flock(&self.fd, FlockOperation::Unlock);
+    }
+}
 pub fn try_acquire(home: &GlenHome, id: &str) -> io::Result<Option<SessionLock>> {
     home.ensure_dir("run/locks")
         .map_err(|e| match crate::glen_home::take_refusal(e) {
@@ -171,10 +179,15 @@ pub fn is_held(home: &GlenHome, id: &str) -> bool {
     ) else {
         return false;
     };
-    matches!(
-        flock(&fd, FlockOperation::NonBlockingLockExclusive),
-        Err(Errno::WOULDBLOCK)
-    )
+    match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+        // Release the probe explicitly, as SessionLock's Drop does: a concurrently spawned
+        // child may share this description until its exec.
+        Ok(()) => {
+            let _ = flock(&fd, FlockOperation::Unlock);
+            false
+        }
+        Err(e) => e == Errno::WOULDBLOCK,
+    }
 }
 
 #[cfg(all(test, unix))]
@@ -197,7 +210,7 @@ mod tests {
         let lock = try_acquire(&h, id).unwrap().unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(
-            std::fs::metadata(lock.path).unwrap().permissions().mode() & 0o777,
+            std::fs::metadata(&lock.path).unwrap().permissions().mode() & 0o777,
             0o600
         );
     }
@@ -396,5 +409,21 @@ mod holder_tests {
             std::fs::write(lock_path(&home, "s"), bytes).unwrap();
             assert_eq!(holder(&home, "s"), None);
         }
+    }
+    #[test]
+    fn f9_release_does_not_wait_for_a_shared_descriptions_last_close() {
+        // A child spawned on another thread holds a copy of the fd until its exec; a dup
+        // shares the open file description the same way, deterministically.
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("glen"),
+        };
+        let lock = try_acquire(&home, "s").unwrap().unwrap();
+        let child_copy = rustix::io::dup(&lock.fd).unwrap();
+        drop(lock);
+        assert!(!is_held(&home, "s"));
+        let again = try_acquire(&home, "s").unwrap();
+        assert!(again.is_some());
+        drop(child_copy);
     }
 }

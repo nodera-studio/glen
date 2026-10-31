@@ -1,7 +1,7 @@
 //! bwrap-based simulation of the Linux Codex sandbox: a read-only root plus, for the
 //! network-isolation scenarios, a separate network namespace (`--unshare-net`). Proves the
-//! EROFS/sandboxed mapping (item 5/9) and the network-namespace lease rule (item 18, AC-1028)
-//! against a real kernel, never the actual Codex sandbox. Run only by the `linux-sandbox` CI
+//! EROFS/sandboxed mapping (item 5/9) and the Linux lease rule (item 18, AC-1028: any Codex
+//! marker hides the lease) against a real kernel, never the actual Codex sandbox. Run only by the `linux-sandbox` CI
 //! job (`cargo test --locked --test linux_sandbox -- --ignored --test-threads=1`); every test
 //! is `#[ignore]` so a normal `cargo test` never needs bwrap.
 #![cfg(target_os = "linux")]
@@ -16,10 +16,15 @@ use std::{
 
 /// `bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent [--unshare-net] [--bind W W]…
 /// -- <program> <args>`. Carries the harness command's own program/args/envs (via
-/// `env_clear()` + `get_envs()`), plus `PATH=/usr/bin:/bin` so `bash`/coreutils resolve. Never
+/// `env_clear()` + `get_envs()`), plus `PATH=/usr/bin:/bin` so `bash`/coreutils resolve. No
 /// `--unshare-pid`: glen's live-endpoint liveness check uses the host pid
-/// (`src/live/registry.rs`), which a pid namespace would hide.
+/// (`src/live/registry.rs`), which a pid namespace would hide; `bwrap_pid` adds it for
+/// scenarios that never reach a live endpoint.
 fn bwrap(cmd: &Command, net: bool, writable: &[&std::path::Path]) -> Output {
+    bwrap_pid(cmd, net, false, writable)
+}
+/// `bwrap`, plus `--unshare-pid` when `pid` (Codex's own bwrap shape, where PID 1 is bwrap).
+fn bwrap_pid(cmd: &Command, net: bool, pid: bool, writable: &[&std::path::Path]) -> Output {
     preflight();
     let mut c = Command::new("bwrap");
     c.arg("--ro-bind")
@@ -29,14 +34,15 @@ fn bwrap(cmd: &Command, net: bool, writable: &[&std::path::Path]) -> Output {
         .arg("/dev")
         .arg("--proc")
         .arg("/proc")
-        // /sys is its own mount, same as /proc; `--ro-bind / /` does not recurse into it, and
-        // sandbox::is_loopback_only() reads /sys/class/net to decide the lease-hidden fallback.
         .arg("--ro-bind")
         .arg("/sys")
         .arg("/sys")
         .arg("--die-with-parent");
     if !net {
         c.arg("--unshare-net");
+    }
+    if pid {
+        c.arg("--unshare-pid");
     }
     for w in writable {
         c.arg("--bind").arg(w).arg(w);
@@ -254,8 +260,8 @@ fn s5_network_off() {
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
 fn s6_reads_and_inbox() {
     let rb = RpcBox::new();
-    let writable = rb.omp.tmp.path().to_path_buf();
     seed_inbox(&rb, A_ID, "ping");
+    // AC-1024: the read verbs succeed with markers and nothing writable, not even GLEN_HOME.
     for args in [
         vec!["ls", "--json"],
         vec!["show", "e27c0de", "--json"],
@@ -265,35 +271,20 @@ fn s6_reads_and_inbox() {
         let mut c = rb.glen(&args);
         c.env("CODEX_SANDBOX", "linux-ci")
             .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
-        let out = bwrap(&c, true, &[&writable]);
+        let out = bwrap(&c, true, &[]);
         assert_eq!(exit_code(&out), 0, "{args:?}: {}", json(&out));
     }
-    // A fresh box: marking a message read needs a GLEN_HOME write, and this must be the
-    // first thing this GLEN_HOME ever sees, so no earlier writable-bound call in this test
-    // can have already created the cursor file this would otherwise just update in place.
-    let rb2 = RpcBox::new();
-    seed_inbox(&rb2, A_ID, "ping");
-    let mut c = rb2.glen(&["inbox", "--json"]);
+    // AC-1021 (W10 fix cycle 2 decision 3): marking a message read needs a GLEN_HOME write, which
+    // glen probes before it prints, so a read-only GLEN_HOME reports the sandboxed error envelope
+    // instead of an optimistic `marked_read`.
+    let mut c = rb.glen(&["inbox", "--json"]);
     c.env("CODEX_SANDBOX", "linux-ci")
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
     let out = bwrap(&c, true, &[]);
-    // Diagnostic only (not asserted): if this ever fails again, the log shows whether the
-    // sandbox's own view of GLEN_HOME is genuinely read-only from inside the same sandbox.
-    let home = rb2.omp.glen_home.clone();
-    let mut diag = Command::new("bash");
-    diag.arg("-c").arg(format!(
-        "touch '{}/.diag-probe' 2>&1; ls -la '{}'",
-        home.display(),
-        home.display()
-    ));
-    let diag_out = bwrap_raw(diag, true, &[]);
-    eprintln!(
-        "s6 glen_home diagnostic: {}{}",
-        String::from_utf8_lossy(&diag_out.stdout),
-        String::from_utf8_lossy(&diag_out.stderr)
-    );
     let v = json(&out);
     assert_eq!(exit_code(&out), 6, "{v}");
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["error"]["code"], "no_route", "{v}");
     assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
     assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
 }
@@ -302,39 +293,40 @@ fn s6_reads_and_inbox() {
 fn s7_lease_across_netns() {
     let rb = RpcBox::new();
     let mut held = rb.hold_lease(A_ID);
+    let state = |out: &Output| {
+        let v = json(out);
+        v["data"]["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| {
+                s["handle"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("e27c0de")
+            })
+            .unwrap_or_else(|| panic!("row missing: {v}"))["state"]
+            .clone()
+    };
     let outside = rb.omp.glen(&["ls", "--all", "--json"], &rb.omp.alpha());
-    let v = json(&outside);
-    let row = v["data"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| {
-            s["handle"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("e27c0de")
-        })
-        .unwrap_or_else(|| panic!("row missing: {v}"));
-    assert_eq!(row["state"], "live", "outside the sandbox: {v}");
-    let mut c = rb.glen(&["ls", "--all", "--json"]);
+    assert_eq!(state(&outside), "live", "outside the sandbox");
     let writable = rb.omp.tmp.path().to_path_buf();
+    // The kernel fact behind AC-1028 (AC-1024): without a marker, glen trusts its probe, and
+    // inside --unshare-net the host-namespace lease is invisible, so the session reads idle.
+    let inside = bwrap(&rb.glen(&["ls", "--all", "--json"]), false, &[&writable]);
+    assert_eq!(
+        state(&inside),
+        "idle",
+        "the lease is hidden by --unshare-net"
+    );
+    // The display rule: under a marker, the lease is unknown whatever the probe says.
+    let mut c = rb.glen(&["ls", "--all", "--json"]);
     c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
     let inside = bwrap(&c, false, &[&writable]);
-    let iv = json(&inside);
-    let irow = iv["data"]["sessions"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|s| {
-            s["handle"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("e27c0de")
-        })
-        .unwrap_or_else(|| panic!("row missing: {iv}"));
-    assert_ne!(
-        irow["state"], "live",
-        "a host-namespace lease must not be visible inside --unshare-net: {iv}"
+    assert_eq!(
+        state(&inside),
+        "unknown",
+        "a marker displays the lease as unknown"
     );
     let _ = held.kill();
     let _ = held.wait();
@@ -342,38 +334,34 @@ fn s7_lease_across_netns() {
 #[test]
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
 fn s8_hidden_lease_refuses_rpc() {
-    let rb = RpcBox::new();
-    let mut held = rb.hold_lease(A_ID);
-    let mut c = rb.glen(&["send", "e27c0de", "hi", "--json"]);
-    c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
-    let writable = rb.omp.tmp.path().to_path_buf();
-    let out = bwrap(&c, false, &[&writable]);
-    // Diagnostic only (not asserted): if this ever fails again, the log shows whether the
-    // namespace comparison itself disagreed with this scenario inside the very same sandbox.
-    let mut diag = Command::new("bash");
-    diag.arg("-c")
-        .arg("echo self=$(stat -L -c '%d:%i' /proc/self/ns/net) init=$(stat -L -c '%d:%i' /proc/1/ns/net 2>&1)");
-    let diag_out = bwrap_raw(diag, false, &[]);
-    eprintln!(
-        "s8 namespace diagnostic: {}{}",
-        String::from_utf8_lossy(&diag_out.stdout),
-        String::from_utf8_lossy(&diag_out.stderr)
-    );
-    let v = json(&out);
-    assert_eq!(exit_code(&out), 6, "{v}");
-    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
-    assert_eq!(v["error"]["details"]["lease"], "unknown", "{v}");
-    assert!(
-        !rb.job_dir("ignored").parent().unwrap().exists(),
-        "no jobs/ entry"
-    );
-    assert!(
-        rb.fake_log().is_empty(),
-        "fake omp was never started: {:?}",
-        rb.fake_log()
-    );
-    let _ = held.kill();
-    let _ = held.wait();
+    // Glen's netns-only shape, Codex's own shape (--unshare-pid, so PID 1 is bwrap in the
+    // same netns), and a held glen job lock (W10 fix cycle 2 decisions 1 and 2).
+    for (pid, glen_lock) in [(false, false), (true, false), (false, true)] {
+        let case = format!("unshare-pid={pid} glen-lock={glen_lock}");
+        let rb = RpcBox::new();
+        let mut held = rb.hold_lease(A_ID);
+        let lock = glen_lock.then(|| rb.hold_glen_lock(A_ID));
+        let mut c = rb.glen(&["send", "e27c0de", "hi", "--json"]);
+        c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+        let writable = rb.omp.tmp.path().to_path_buf();
+        let out = bwrap_pid(&c, false, pid, &[&writable]);
+        let v = json(&out);
+        assert_eq!(exit_code(&out), 6, "{case}: {v}");
+        assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{case}: {v}");
+        assert_eq!(v["error"]["details"]["lease"], "unknown", "{case}: {v}");
+        assert!(
+            !rb.job_dir("ignored").parent().unwrap().exists(),
+            "{case}: no jobs/ entry"
+        );
+        assert!(
+            rb.fake_log().is_empty(),
+            "{case}: fake omp was never started: {:?}",
+            rb.fake_log()
+        );
+        drop(lock);
+        let _ = held.kill();
+        let _ = held.wait();
+    }
 }
 #[test]
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
@@ -394,22 +382,21 @@ fn s9_live_route_across_netns() {
 #[test]
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
 fn s10_network_is_isolated() {
-    use std::{io::Read, net::TcpListener};
+    use std::net::TcpListener;
+    // Never accepted: a connect completes from the backlog, and the listener stays bound until
+    // both probes and the re-check are done (the release gate is the `drop` at the end).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
-    std::thread::spawn(move || {
-        if let Ok((mut stream, _)) = listener.accept() {
-            let mut buf = [0u8; 1];
-            let _ = stream.read(&mut buf);
-        }
-    });
     let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
-    let outside = Command::new("bash").arg("-c").arg(&probe).output().unwrap();
-    assert!(
-        outside.status.success(),
-        "the host can reach its own listener: {}",
-        String::from_utf8_lossy(&outside.stderr)
-    );
+    let reach_outside = |when: &str| {
+        let outside = Command::new("bash").arg("-c").arg(&probe).output().unwrap();
+        assert!(
+            outside.status.success(),
+            "{when}: the host can reach its own listener: {}",
+            String::from_utf8_lossy(&outside.stderr)
+        );
+    };
+    reach_outside("before");
     let mut inside_cmd = Command::new("bash");
     inside_cmd.arg("-c").arg(&probe);
     let inside = bwrap_raw(inside_cmd, false, &[]);
@@ -417,4 +404,6 @@ fn s10_network_is_isolated() {
         !inside.status.success(),
         "a TCP connect inside --unshare-net must fail: {inside:?}"
     );
+    reach_outside("after");
+    drop(listener);
 }

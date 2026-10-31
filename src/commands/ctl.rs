@@ -870,6 +870,99 @@ mod tests {
         );
     }
 
+    /// W10 fix cycle 3: under every marker configuration a hidden lease (Linux) is named in
+    /// the control's refusal, and with `CODEX_SANDBOX_NETWORK_DISABLED=1` alone the refusal comes
+    /// before the lease probe and before any wait on another glen control's lock (NEW-LOW-001).
+    #[test]
+    fn control_refusals_name_a_hidden_lease_before_probing_or_waiting() {
+        let tree = crate::omp::fixtures::tree();
+        let path = crate::omp::fixtures::path(&tree, 'A');
+        let agent = tree.path().join("unused-agent");
+        let glen = tempfile::tempdir().unwrap();
+        let home = crate::glen_home::GlenHome {
+            root: glen.path().join("glen"),
+        };
+        let id = crate::omp::session::Session::load(&path).unwrap().header.id;
+        let base = [
+            ("GLEN_HOME", home.root.to_str().unwrap()),
+            ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+            ("GLEN_OMP_BIN", "/nonexistent/omp"),
+        ];
+        let markers: [&[(&str, &str)]; 3] = [
+            &[("CODEX_SANDBOX", "seatbelt")],
+            &[
+                ("CODEX_SANDBOX", "seatbelt"),
+                ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+            ],
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        ];
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        for marker in markers {
+            let vars = base.iter().chain(marker).copied().collect::<Vec<_>>();
+            let env = Env::for_test(Some(tree.path()), tree.path(), &vars);
+            for control_lock in [false, true] {
+                let lock = control_lock.then(|| {
+                    let lock = crate::jobs::lock::try_acquire(&home, &id).unwrap().unwrap();
+                    let me = crate::jobs::liveness::current().unwrap();
+                    crate::jobs::lock::mark(
+                        &lock,
+                        &crate::jobs::lock::Holder {
+                            v: 1,
+                            kind: crate::jobs::lock::HolderKind::Control,
+                            job_id: None,
+                            pid: me.pid,
+                            start: Some(me.start),
+                        },
+                    )
+                    .unwrap();
+                    lock
+                });
+                for (command, extra) in [
+                    ("abort", vec![]),
+                    ("compact", vec![]),
+                    ("thinking", vec!["high"]),
+                ] {
+                    let case = format!("{marker:?} control_lock={control_lock} {command}");
+                    let mut argv =
+                        vec!["glen", command, path.to_str().unwrap(), "--timeout", "20s"];
+                    argv.extend(extra);
+                    let cli = Cli::try_parse_from(argv).unwrap();
+                    let output = OutputCtx::new(
+                        &cli.global,
+                        crate::output::OutputKind::Document,
+                        &env,
+                        &crate::output::Terminal {
+                            stdout_tty: false,
+                            stderr_tty: false,
+                            stdout_cols: None,
+                        },
+                    )
+                    .unwrap();
+                    crate::omp::lease::PROBE_CALLS.with(|calls| calls.set(0));
+                    let started = std::time::Instant::now();
+                    let Err(error) = super::super::dispatch(&cli, &env, &output) else {
+                        panic!("{case}: unexpected success")
+                    };
+                    // owner() gives a holder record up to 1 s; a lock wait would take 20 s.
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(5),
+                        "{case}: waited {:?}",
+                        started.elapsed()
+                    );
+                    assert_eq!(error.code, ErrorCode::NoRoute, "{case}: {}", error.message);
+                    let details = error.details.unwrap();
+                    assert_eq!(details["reason"], "sandboxed", "{case}");
+                    assert_eq!(details["lease"], "unknown", "{case}: {details}");
+                    crate::omp::lease::PROBE_CALLS
+                        .with(|calls| assert_eq!(calls.get(), 0, "{case}: probed"));
+                }
+                drop(lock);
+            }
+        }
+        crate::sandbox::force_lease_hidden_for_test(None);
+        assert!(!home.root.join("jobs").exists(), "no job was written");
+    }
+
     #[test]
     fn control_sandbox_refusals_follow_target_validation_and_precede_lease_probes() {
         let tree = crate::omp::fixtures::tree();

@@ -339,4 +339,55 @@ mod tests {
             }
         }
     }
+    /// Fixes2 decision 6: an error after the exchange is an `io` error naming the kept
+    /// displaced file, never a `skipped` target.
+    #[cfg(unix)]
+    #[test]
+    fn an_error_after_the_exchange_fails_the_install_and_names_the_kept_file() {
+        let t = tempfile::tempdir().unwrap();
+        let env = Env::for_test(Some(t.path()), t.path(), &[]);
+        let path = skill::user_target(&env, Agent::Claude).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "foreign skill").unwrap();
+        let cli = Cli::try_parse_from(["glen", "install-skill", "--claude", "--force"]).unwrap();
+        let Command::InstallSkill(args) = &cli.command else {
+            panic!("install-skill")
+        };
+        let ctx = OutputCtx::new(
+            &cli.global,
+            OutputKind::Document,
+            &env,
+            &Terminal {
+                stdout_tty: false,
+                stderr_tty: false,
+                stdout_cols: None,
+            },
+        )
+        .unwrap();
+        let _hook = crate::atomic_swap::set_test_hook(|stage| {
+            if stage == "exchanged" {
+                Err(io::Error::from_raw_os_error(libc::EIO))
+            } else {
+                Ok(())
+            }
+        });
+        let Err(error) = run(args, &env, &ctx) else {
+            panic!("the install must fail")
+        };
+        assert_eq!(error.code, ErrorCode::Io);
+        let parent = path.parent().unwrap();
+        let kept = fs::read_dir(parent)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.file_name().unwrap().to_string_lossy().ends_with(".tmp"))
+            .expect("the displaced file is kept");
+        assert!(
+            error
+                .message
+                .contains(&format!("displaced copy kept at {}", kept.display())),
+            "{}",
+            error.message
+        );
+        assert_eq!(fs::read_to_string(&kept).unwrap(), "foreign skill");
+    }
 }

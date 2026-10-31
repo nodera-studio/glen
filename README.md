@@ -114,19 +114,26 @@ run `reset` in the shell. Watch does not handle suspend/resume in this release.
 <!-- W3:start -->
 ## Live sessions (`glen install-extension`)
 
-A session that is open in the omp TUI owns its transcript, so glen never resumes it a second
-time. To reach it, install glen's omp extension, then restart each open omp session so it loads
-the extension:
+`glen send` reaches a session that is not open anywhere by resuming it in a short-lived omp RPC
+process. A session that is open in the omp TUI owns its transcript, so glen never resumes it a
+second time. To reach it, install glen's omp extension, then restart each open omp session so it
+loads the extension:
 
 ```sh
 glen install-extension               # writes extensions/glen/index.ts into omp's agent dir
 glen install-extension --dry-run     # show what would change
+glen install-extension --uninstall   # remove it
 ```
 
-After the restart, `glen send` delivers into the running session: it starts a turn when the
-session is idle, and queues a follow-up (or steers, with `--steer`) when it is busy. TUI sessions
-also get the `glen_reply` tool, so the omp model can answer the agent that asked. A reply that
-arrives after `glen send` stops waiting, or one the model sends on its own, lands in the inbox:
+It writes one file, `<agent dir>/extensions/glen/index.ts` (`~/.omp/agent` by default,
+`--profile NAME` for a profile), and changes nothing else in omp. A newer, edited or foreign file
+is left alone unless you pass `--force`.
+
+After the restart, `glen send` and the session controls reach the running session over its live
+endpoint: `send` starts a turn when the session is idle, and queues a follow-up (or steers, with
+`--steer`) when it is busy. TUI sessions also get the `glen_reply` tool, so the omp model can
+answer the agent that asked; its replies come back in `data.replies`. A reply that arrives after
+`glen send` stops waiting, or one the model sends on its own, lands in the inbox:
 
 ```sh
 glen inbox                           # unread replies; reading marks them read
@@ -135,27 +142,32 @@ glen inbox -f                        # stream new replies, one JSON object per l
 ```
 
 Without the extension, `glen send` to an open session refuses with exit 6 and says what to
-install. `glen doctor` shows whether the extension is current; `glen install-extension --uninstall`
-removes it.
+install. `glen doctor` shows whether the extension is current.
 <!-- W3:end -->
 
 <!-- W4:start -->
 ## Use from your coding agent (`glen install-skill`)
 
 The glen skill teaches Claude Code and Codex the loop above: find a session, read it, send, wait,
-and what each exit code means.
+read the inbox, what each exit code means and the sandbox rules. It also lets the agent run
+`glen` commands without asking each time.
 
 ```sh
 glen install-skill                   # Claude Code and Codex, for your user
 glen install-skill --claude          # Claude Code only
 glen install-skill --codex --project # Codex only, in the current directory
+glen install-skill --uninstall       # remove it
 ```
 
 User installs write `~/.claude/skills/glen/SKILL.md` (under `$CLAUDE_CONFIG_DIR` when it is set)
 and `~/.agents/skills/glen/SKILL.md`. `--project` writes `.claude/skills/glen/SKILL.md` and
 `.agents/skills/glen/SKILL.md` under the current directory, so run it from the repository root.
 Run `glen install-skill` again after upgrading glen. An edited or newer `SKILL.md` is skipped
-unless you pass `--force`; `--dry-run` and `--uninstall` work as they do for the extension.
+unless you pass `--force`; `--dry-run` works as it does for the extension.
+
+Headless Claude Code needs the skill itself allowed: `claude -p --permission-mode dontAsk` denies
+a skill that is not on the allow list, so pass `--allowedTools "Skill(glen)"`. The skill's own
+`allowed-tools: Bash(glen *)` grants the glen commands once the skill has loaded.
 <!-- W4:end -->
 
 ## Website

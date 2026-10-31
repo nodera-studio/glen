@@ -111,112 +111,71 @@ pub fn map_socket_failure(env: &Env, action: &str, err: &io::Error) -> Option<Gl
     error.message = format!("cannot {action}: {err}");
     Some(error)
 }
-/// On Linux, a sandboxed glen in its own network namespace cannot see the abstract-socket
-/// lease a host-namespace omp holds, so an RPC resume could fork a session omp already owns.
-/// True under any Codex marker when glen's network namespace differs from PID 1's (the init
-/// namespace escalated commands still run in) or that comparison cannot be made.
+/// True when any Codex marker is set: a non-empty `CODEX_SANDBOX` or
+/// `CODEX_SANDBOX_NETWORK_DISABLED=1`.
+fn marked(env: &Env) -> bool {
+    detect(env).is_some() || env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1")
+}
+/// On Linux omp's session lease is an abstract socket, which is scoped to a network namespace,
+/// and a Codex sandbox may run glen in its own (`--unshare-net`, with `--unshare-pid` making
+/// PID 1 the sandbox's own bwrap). No in-process signal tells such a namespace from the host's
+/// reliably, so under any Codex marker on Linux the lease is hidden: displayed `unknown`, and
+/// every RPC resume refuses (AC-1028, W10 fix cycle 2 decision 1). `linux` is the unit seam.
 pub fn lease_hidden(env: &Env, linux: bool) -> bool {
+    #[cfg(test)]
     if let Some(forced) = FORCE_LEASE_HIDDEN.with(|f| f.get()) {
         return forced;
     }
-    if !linux {
-        return false;
-    }
-    let marker = detect(env).is_some() || env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1");
-    marker && net_namespace_hidden()
+    linux && marked(env)
 }
+#[cfg(test)]
 thread_local! { static FORCE_LEASE_HIDDEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
-/// Test-only seam: forces `lease_hidden`'s result for the current thread, so a caller like
-/// `ls::infer_row`'s display mapping can be exercised deterministically on every host OS,
-/// never the real `cfg!(target_os)` / `/proc` namespace identity. Call with `None` to restore
-/// the real logic before the test ends.
+/// Test-only seam: forces `lease_hidden`'s result for the current thread, so a caller that
+/// passes `cfg!(target_os = "linux")` (`ls::infer_row`, `map_probe_failure`, the worker's
+/// `route_probe`) behaves the same on every host OS. Call with `None` to restore the real
+/// rule before the test ends.
 #[cfg(test)]
 pub(crate) fn force_lease_hidden_for_test(value: Option<bool>) {
     FORCE_LEASE_HIDDEN.with(|f| f.set(value));
 }
-/// Decides whether this process's network namespace is hidden from PID 1's, given three
-/// injectable facts so the whole truth table is a deterministic unit test on every OS,
-/// never real `/proc` reads:
-/// - `self_ns`: this process's own namespace identity (following the `/proc/self/ns/net`
-///   symlink to the nsfs target, never the per-process link's own inode — `fs::metadata`,
-///   not `symlink_metadata`/`lstat`, which differs per pid even in the same namespace).
-/// - `init_ns`: PID 1's namespace identity, the same way; unreadable on most hosts, since a
-///   non-root process cannot follow another uid's `/proc/<pid>/ns/net` when PID 1 is root.
-/// - `loopback_only`: true when this namespace has no interface but `lo` (the shape of a
-///   freshly `--unshare-net`'d namespace), used only when `init_ns` is unreadable.
-///
-/// Hidden when: `self_ns` itself cannot be read (fail closed); or both are readable and
-/// differ; or `init_ns` is unreadable and this namespace is loopback-only. Visible only when
-/// both are readable and equal, or `init_ns` is unreadable and this namespace has a real
-/// interface (the common non-root, non-sandboxed case: §A13's escalated commands).
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))] // only called by the Linux probe; kept visible for the cross-platform unit test
-fn net_namespace_hidden_with(
-    self_ns: impl FnOnce() -> std::io::Result<(u64, u64)>,
-    init_ns: impl FnOnce() -> std::io::Result<(u64, u64)>,
-    loopback_only: impl FnOnce() -> bool,
-) -> bool {
-    let Ok(self_id) = self_ns() else {
-        return true;
-    };
-    match init_ns() {
-        Ok(init_id) => self_id != init_id,
-        Err(_) => loopback_only(),
+/// The AC-1028 refusal: when the lease is hidden, an RPC resume of an existing session exits 6
+/// `sandboxed` with `details.lease:"unknown"`, whatever a probe would say and whether or not a
+/// glen job lock is held. Callers run it before creating a job or starting omp.
+pub fn refuse_hidden_lease(env: &Env) -> Result<(), GlenError> {
+    if !lease_hidden(env, cfg!(target_os = "linux")) {
+        return Ok(());
     }
-}
-#[cfg(target_os = "linux")]
-fn ns_identity(path: &std::path::Path) -> std::io::Result<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    // Follow the magic symlink to the nsfs target; `symlink_metadata` (lstat) would instead
-    // return the per-process link's own, always-distinct procfs inode.
-    std::fs::metadata(path).map(|m| (m.dev(), m.ino()))
-}
-#[cfg(target_os = "linux")]
-fn is_loopback_only() -> bool {
-    match std::fs::read_dir("/sys/class/net") {
-        Ok(entries) => {
-            let mut names: Vec<_> = entries
-                .filter_map(|e| e.ok().map(|e| e.file_name()))
-                .collect();
-            names.sort();
-            names == ["lo"]
-        }
-        // Can't tell: do not assume isolation from an unrelated read failure.
-        Err(_) => false,
-    }
-}
-#[cfg(target_os = "linux")]
-fn net_namespace_hidden() -> bool {
-    net_namespace_hidden_with(
-        || ns_identity(std::path::Path::new("/proc/self/ns/net")),
-        || ns_identity(std::path::Path::new("/proc/1/ns/net")),
-        is_loopback_only,
+    let kind = detect(env).and_then(|s| s.kind);
+    let network = env.get("CODEX_SANDBOX_NETWORK_DISABLED") != Some("1");
+    Err(GlenError::no_route(
+        NoRouteReason::Sandboxed,
+        "cannot tell whether an omp process owns this session: on Linux omp's session lease is an abstract socket, and a sandbox's network namespace can hide it",
     )
+    .with_hint(
+        "glen will not resume an existing session over RPC from a Codex command on Linux; open the session in omp with glen's extension so glen can use the live route, or run glen from a terminal outside Codex",
+    )
+    .with_detail("sandbox", json!(kind))
+    .with_detail("network", network)
+    .with_detail("lease", json!("unknown")))
 }
-#[cfg(not(target_os = "linux"))]
-fn net_namespace_hidden() -> bool {
-    false
+/// Adds `details.lease:"unknown"` to a sandbox refusal of an existing session's RPC resume
+/// while the lease is hidden, so the refusal names it even when `refuse_rpc` or
+/// `refuse_unreachable` fires before `refuse_hidden_lease` (design.md §A13, W10 fix cycle 3).
+pub fn with_hidden_lease(env: &Env, error: GlenError) -> GlenError {
+    if lease_hidden(env, cfg!(target_os = "linux")) {
+        error.with_detail("lease", json!("unknown"))
+    } else {
+        error
+    }
 }
-/// Every lease value is treated as unknown when `lease_hidden`; otherwise only a real probe
-/// error (`Lease::Unknown` with an errno) is mapped.
+/// Every lease value is refused when `lease_hidden` (`refuse_hidden_lease`); otherwise only a
+/// real probe error (`Lease::Unknown` with an errno) is mapped.
 pub fn map_probe_failure(
     env: &Env,
     command: &str,
     lease: &crate::omp::lease::Lease,
 ) -> Option<GlenError> {
-    let _ = command;
-    if lease_hidden(env, cfg!(target_os = "linux")) {
-        let kind = detect(env).and_then(|s| s.kind);
-        let network = env.get("CODEX_SANDBOX_NETWORK_DISABLED") != Some("1");
-        let error = GlenError::no_route(
-            NoRouteReason::Sandboxed,
-            "cannot tell whether an omp process owns this session: on Linux omp's session lease is an abstract socket, and a sandbox's network namespace can hide it",
-        )
-        .with_hint(
-            "glen will not resume an existing session over RPC from a Codex command on Linux; open the session in omp with glen's extension so glen can use the live route, or run glen from a terminal outside Codex",
-        )
-        .with_detail("sandbox", json!(kind))
-        .with_detail("network", network)
-        .with_detail("lease", json!("unknown"));
+    if let Err(error) = refuse_hidden_lease(env) {
         return Some(error);
     }
     let crate::omp::lease::Lease::Unknown {
@@ -305,15 +264,20 @@ pub fn describe(env: &Env) -> (&'static str, String, String) {
     describe_with_extension(
         env,
         crate::skill::visible_commands().contains("install-extension"),
+        cfg!(target_os = "linux"),
     )
 }
-fn describe_with_extension(env: &Env, extension: bool) -> (&'static str, String, String) {
+fn describe_with_extension(
+    env: &Env,
+    extension: bool,
+    linux: bool,
+) -> (&'static str, String, String) {
     match detect(env) {
         None if env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1") => (
             "info",
             "host network off".into(),
-            if cfg!(target_os = "linux") && lease_hidden(env, true) {
-                "network disabled by the host; this process is in its own network namespace, so RPC resume of an existing session refuses as sandboxed; the live route and new sessions still work".into()
+            if lease_hidden(env, linux) {
+                "network disabled by the host; on Linux glen will not resume an existing session over RPC here (exit 6 sandboxed); the live route and new sessions still work".into()
             } else {
                 "network disabled by the host; escalated commands still work".into()
             },
@@ -481,48 +445,79 @@ mod tests {
         }
     }
     #[test]
-    fn net_namespace_hidden_with_truth_table() {
-        let ok = |v: (u64, u64)| -> std::io::Result<(u64, u64)> { Ok(v) };
-        let eacces = || -> std::io::Result<(u64, u64)> {
-            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
-        };
-        // Same target via distinct links: readable and equal -> visible.
-        assert!(!net_namespace_hidden_with(
-            || ok((5, 100)),
-            || ok((5, 100)),
-            || true
-        ));
-        // Different targets -> hidden, regardless of loopback_only.
-        assert!(net_namespace_hidden_with(
-            || ok((5, 100)),
-            || ok((5, 101)),
-            || false
-        ));
-        // Reference (PID 1) unreadable + loopback-only (a fresh --unshare-net) -> hidden.
-        assert!(net_namespace_hidden_with(|| ok((5, 100)), eacces, || true));
-        // Reference unreadable but this namespace has a real interface (eth0 present, the
-        // common non-root escalated-command case) -> visible.
-        assert!(!net_namespace_hidden_with(
-            || ok((5, 100)),
-            eacces,
-            || false
-        ));
-        // Our own /proc/self/ns/net unreadable -> fail closed, hidden.
-        assert!(net_namespace_hidden_with(eacces, || ok((5, 100)), || false));
-    }
-    #[test]
     fn lease_hidden_truth_table() {
-        // Linux is a pure function of (linux, marker, the namespace comparison). macOS never
-        // hides a lease; the comparison itself is exhaustively tested above through the seam.
-        for (vars, linux, expected) in [
-            (vec![], true, false),
-            (vec![("CODEX_SANDBOX", "")], true, false),
-            (vec![("CODEX_SANDBOX", "seatbelt")], false, false),
-            (vec![("CODEX_SANDBOX_NETWORK_DISABLED", "0")], true, false),
+        // W10 fix cycle 2 decision 1: on Linux any Codex marker hides the lease; elsewhere
+        // (flock leases) nothing is ever hidden.
+        let both = vec![
+            ("CODEX_SANDBOX", "seatbelt"),
+            ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+        ];
+        for (vars, marked) in [
+            (vec![], false),
+            (vec![("CODEX_SANDBOX", "")], false),
+            (vec![("CODEX_SANDBOX_NETWORK_DISABLED", "0")], false),
+            (
+                vec![
+                    ("CODEX_SANDBOX", ""),
+                    ("CODEX_SANDBOX_NETWORK_DISABLED", "0"),
+                ],
+                false,
+            ),
+            (vec![("CODEX_SANDBOX", "seatbelt")], true),
+            (vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")], true),
+            (
+                vec![
+                    ("CODEX_SANDBOX", ""),
+                    ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+                ],
+                true,
+            ),
+            (both, true),
         ] {
             let e = Env::for_test(None, Path::new("/"), &vars);
-            assert_eq!(lease_hidden(&e, linux), expected, "{vars:?} linux={linux}");
+            assert_eq!(lease_hidden(&e, true), marked, "{vars:?} linux");
+            assert!(!lease_hidden(&e, false), "{vars:?} not linux");
         }
+    }
+    #[test]
+    fn the_doctor_row_for_network_disabled_alone_names_the_linux_rule() {
+        let e = Env::for_test(
+            None,
+            Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        let (status, value, detail) = describe_with_extension(&e, true, true);
+        assert_eq!((status, value.as_str()), ("info", "host network off"));
+        assert_eq!(
+            detail,
+            "network disabled by the host; on Linux glen will not resume an existing session over RPC here (exit 6 sandboxed); the live route and new sessions still work"
+        );
+        assert_eq!(
+            describe_with_extension(&e, true, false).2,
+            "network disabled by the host; escalated commands still work"
+        );
+    }
+    #[test]
+    fn refuse_hidden_lease_follows_the_predicate() {
+        let e = Env::for_test(
+            None,
+            Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        force_lease_hidden_for_test(Some(false));
+        assert!(refuse_hidden_lease(&e).is_ok());
+        force_lease_hidden_for_test(Some(true));
+        let error = refuse_hidden_lease(&e).unwrap_err();
+        force_lease_hidden_for_test(None);
+        assert_eq!(error.code.exit_code(), 6);
+        let details = error.details.unwrap();
+        assert_eq!(details["reason"], "sandboxed");
+        assert_eq!(details["lease"], "unknown");
+        assert_eq!(details["network"], false);
+        assert!(details["sandbox"].is_null());
+        // With no forcing, the real rule: refused on Linux under a marker, never elsewhere.
+        assert_eq!(refuse_hidden_lease(&e).is_err(), cfg!(target_os = "linux"));
+        assert!(refuse_hidden_lease(&Env::for_test(None, Path::new("/"), &[])).is_ok());
     }
     #[test]
     fn map_probe_failure_when_hidden_refuses_every_lease_value() {
@@ -576,6 +571,9 @@ mod cycle1_tests {
     use std::path::Path;
     #[test]
     fn only_nonempty_sandbox_refuses_and_erofs_maps_for_host_and_sandbox() {
+        // The raw-errno lease mapping below is the non-hidden path (macOS); on Linux a marker
+        // hides the lease first (W10 fix cycle 2 decision 1, tested in `tests`).
+        force_lease_hidden_for_test(Some(false));
         for vars in [
             vec![("CODEX_SANDBOX", "seatbelt")],
             vec![("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
@@ -604,6 +602,7 @@ mod cycle1_tests {
                 assert!(error.hint.unwrap().contains("outside the sandbox"));
             }
         }
+        force_lease_hidden_for_test(None);
         let env = Env::for_test(None, Path::new("/w"), &[("CODEX_SANDBOX", " ")]);
         assert!(refuse_rpc(&env, "send").is_err());
         let env = Env::for_test(None, Path::new("/w"), &[]);
@@ -669,7 +668,7 @@ mod cycle2_tests {
             assert_eq!(e.hint.unwrap().contains("glen's extension"), visible);
             let env = Env::for_test(None, Path::new("/"), &[("CODEX_SANDBOX", "seatbelt")]);
             assert_eq!(
-                describe_with_extension(&env, visible)
+                describe_with_extension(&env, visible, false)
                     .2
                     .contains("glen's extension"),
                 visible
@@ -725,6 +724,9 @@ mod cycle2_tests {
                 .is_none()
             );
         }
+        // Not hidden (macOS, or Linux with the seam): only a raw permission errno maps. On
+        // Linux the marker hides the lease and refuses every value (W10 fix cycle 2 decision 1).
+        force_lease_hidden_for_test(Some(false));
         for errno in [None, Some(libc::EINVAL)] {
             let lease = Lease::Unknown {
                 reason: io::Error::from_raw_os_error(libc::EPERM).to_string(),
@@ -732,6 +734,7 @@ mod cycle2_tests {
             };
             assert!(map_probe_failure(&env, "send", &lease).is_none());
         }
+        force_lease_hidden_for_test(None);
         for message in [
             "connect: Connection refused",
             "DNS resolution failed",
