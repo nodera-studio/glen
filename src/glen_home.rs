@@ -37,6 +37,16 @@ pub fn resolve(env: &Env) -> Result<GlenHome, GlenError> {
     };
     Ok(GlenHome { root })
 }
+/// SEC-3 read paths: [`resolve`] plus [`GlenHome::verify_private`] for each runtime subtree the
+/// caller is about to read (`run/live`, `jobs`, `inbox/.read`), so a planted registry, job
+/// record or reply in an untrusted home is refused with `invalid_env` instead of trusted.
+pub fn resolve_trusted(env: &Env, subs: &[&str]) -> Result<GlenHome, GlenError> {
+    let home = resolve(env)?;
+    for sub in subs {
+        home.verify_walk(Path::new(sub), false)?;
+    }
+    Ok(home)
+}
 impl GlenHome {
     pub fn ensure_dir(&self, sub: &str) -> io::Result<PathBuf> {
         let path = self.root.join(sub);
@@ -47,10 +57,14 @@ impl GlenHome {
             use std::os::unix::fs::DirBuilderExt;
             builder.mode(0o700);
         }
-        builder.create(&path)?;
         // SEC-3: glen never chmods an existing directory, but it refuses to trust one another
         // user could write to. The GlenError rides inside the io::Error so callers that map
-        // through `sandbox::map_home_write` keep its `invalid_env` code and hint.
+        // through `sandbox::map_home_write` keep its `invalid_env` code and hint. Checked
+        // before creating, so nothing is made inside an untrusted home, and again after, for
+        // the directories the create just made or raced with.
+        self.verify_walk(Path::new(sub), false)
+            .map_err(io::Error::other)?;
+        builder.create(&path)?;
         self.verify_private(Path::new(sub))
             .map_err(io::Error::other)?;
         Ok(path)
@@ -59,6 +73,13 @@ impl GlenHome {
     /// Each must be a real directory (not a symlink) owned by the effective uid with no
     /// group/other write bits; a missing component ends the walk (nothing deeper exists).
     pub fn verify_private(&self, rel: &Path) -> Result<(), GlenError> {
+        self.verify_walk(rel, true)
+    }
+    /// The walk behind [`Self::verify_private`]. With `strict_dirs` false a plain file on the
+    /// path ends the walk instead of being refused: nothing can be created or read beneath
+    /// it, so it is not a trust problem, and the caller's own create or read reports it as
+    /// the io error it always was. Symlinks, other owners and writable modes are refused.
+    fn verify_walk(&self, rel: &Path, strict_dirs: bool) -> Result<(), GlenError> {
         #[cfg(unix)]
         {
             use std::{os::unix::fs::MetadataExt, path::Component};
@@ -88,6 +109,9 @@ impl GlenHome {
                     return Err(refuse(&path, "it is a symlink".into()));
                 }
                 if !meta.is_dir() {
+                    if !strict_dirs {
+                        return Ok(());
+                    }
                     return Err(refuse(&path, "it is not a directory".into()));
                 }
                 if meta.uid() != euid {
@@ -123,7 +147,7 @@ impl GlenHome {
         }
         #[cfg(not(unix))]
         {
-            let _ = rel;
+            let _ = (rel, strict_dirs);
             Ok(())
         }
     }
@@ -312,6 +336,24 @@ mod tests {
         fs::write(h.root.join("out"), b"x").unwrap();
         let err = h.verify_private(Path::new("out")).unwrap_err();
         assert!(err.message.contains("not a directory"));
+    }
+    // LOW-007 (W8 review): an untrusted root is refused before anything is created in it.
+    #[cfg(unix)]
+    #[test]
+    fn nothing_is_created_inside_an_untrusted_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = GlenHome {
+            root: t.path().join("glen"),
+        };
+        fs::create_dir(&h.root).unwrap();
+        fs::set_permissions(&h.root, fs::Permissions::from_mode(0o777)).unwrap();
+        for sub in ["out", "run/locks", "inbox/.read"] {
+            let err = take_refusal(h.ensure_dir(sub).unwrap_err()).unwrap();
+            assert_eq!(err.code, ErrorCode::InvalidEnv, "{sub}");
+        }
+        assert_eq!(fs::read_dir(&h.root).unwrap().count(), 0);
+        fs::set_permissions(&h.root, fs::Permissions::from_mode(0o700)).unwrap();
     }
     #[cfg(unix)]
     #[test]

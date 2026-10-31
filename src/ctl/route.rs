@@ -305,7 +305,7 @@ pub(crate) fn route(
     stop: Arc<AtomicBool>,
 ) -> Result<(Target, Vec<Warning>), GlenError> {
     crate::sandbox::refuse_unreachable(env, cli.command.name())?;
-    let home = glen_home::resolve(env)?;
+    let home = glen_home::resolve_trusted(env, &["run/live", "jobs"])?;
     let store = JobStore::new(home.clone());
     let id = &opened.session.header.id;
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
@@ -469,7 +469,7 @@ pub(crate) fn route_models(
     stop: Arc<AtomicBool>,
 ) -> Result<(Target, Vec<Warning>, ModelsSource), GlenError> {
     crate::sandbox::refuse_unreachable(env, "models")?;
-    let home = glen_home::resolve(env)?;
+    let home = glen_home::resolve_trusted(env, &["run/live", "jobs"])?;
     let store = JobStore::new(home.clone());
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     let mut warnings = vec![];

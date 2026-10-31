@@ -50,7 +50,21 @@ pub fn discover_reporting(
     };
     let mut seen = HashSet::new();
     let mut out = vec![];
-    for b in buckets.flatten() {
+    // W8 review (ERR-5): every io error other than NotFound is recorded, including a failed
+    // directory iteration and a failed stat (a bucket that can be listed but not searched).
+    let mut record = |path: PathBuf, e: &io::Error| {
+        if e.kind() != io::ErrorKind::NotFound && !unreadable.contains(&path) {
+            unreadable.push(path);
+        }
+    };
+    for b in buckets {
+        let b = match b {
+            Ok(b) => b,
+            Err(e) => {
+                record(dir.to_path_buf(), &e);
+                continue;
+            }
+        };
         if b.file_name().to_string_lossy().starts_with('.')
             || !b.file_type().is_ok_and(|t| t.is_dir())
         {
@@ -59,27 +73,38 @@ pub fn discover_reporting(
         let files = match fs::read_dir(b.path()) {
             Ok(files) => files,
             Err(e) => {
-                if e.kind() != io::ErrorKind::NotFound {
-                    unreadable.push(b.path());
-                }
+                record(b.path(), &e);
                 continue;
             }
         };
-        for f in files.flatten() {
+        for f in files {
+            let f = match f {
+                Ok(f) => f,
+                Err(e) => {
+                    record(b.path(), &e);
+                    continue;
+                }
+            };
             let name = f.file_name();
             let name = name.to_string_lossy();
             if name.starts_with('.') || !name.ends_with(".jsonl") {
                 continue;
             }
             let path = f.path();
-            if !fs::metadata(&path).is_ok_and(|m| m.is_file()) {
-                continue;
-            }
+            let meta = match fs::metadata(&path) {
+                Ok(m) if m.is_file() => m,
+                Ok(_) => continue,
+                Err(e) => {
+                    record(path, &e);
+                    continue;
+                }
+            };
             let real = fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if seen.insert(real)
-                && let Ok(file) = SessionFile::at(&path)
-            {
-                out.push(file)
+            if seen.insert(real) {
+                match SessionFile::from_metadata(&path, &meta) {
+                    Ok(file) => out.push(file),
+                    Err(e) => record(path, &e),
+                }
             }
         }
     }

@@ -229,6 +229,7 @@ pub fn follow(cli: &Cli, args: &TailArgs, env: &Env, ctx: &OutputCtx) -> ExitCod
                         stream.event("branch_switch", fields(json!({"leaf_id":leaf_id})))?;
                         stream.text(&ctx.painter.paint(Token::Muted, "── switched branch ──"))?;
                     }
+                    FollowEvent::Warning(warning) => stream.warnings(&[warning])?,
                 }
             }
             Ok(())

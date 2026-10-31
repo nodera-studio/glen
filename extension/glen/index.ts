@@ -35,19 +35,22 @@ export function parseReplyArgs(params: any): { text: string; final: boolean } {
 export function unsafeDir(dir: string, uid: number | null | undefined): string | null {
     let st: fs.Stats;
     try { st = fs.lstatSync(dir); } catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return null; throw err; }
+    if (st.isSymbolicLink()) return `${dir} is a symlink`;
     if (!st.isDirectory()) return `${dir} is not a directory`;
     if (uid !== null && uid !== undefined && st.uid !== uid) return `${dir} is owned by uid ${st.uid}, not ${uid}`;
     if ((st.mode & 0o022) !== 0) return `${dir} is writable by group or other (mode ${(st.mode & 0o777).toString(8)})`;
     return null;
 }
-function unsafeHome(home: string, uid: number | null | undefined): string | null {
-    for (const dir of [home, path.join(home, "run"), path.join(home, "run/live")]) { const problem = unsafeDir(dir, uid); if (problem) return problem; }
+function unsafeHome(home: string, uid: number | null | undefined, sub = "run/live"): string | null {
+    let dir = home;
+    for (const part of ["", ...sub.split("/")]) { dir = part ? path.join(dir, part) : dir; const problem = unsafeDir(dir, uid); if (problem) return problem; }
     return null;
 }
 // One NDJSON record per call. A torn tail (an append cut off before its newline) is terminated
 // first so the new record never merges into it (W8-ERR-4, as glen's Rust append_line does).
 export function appendLine(file: string, line: string) {
-    const fd = fs.openSync(file, "a+", 0o600);
+    // O_NOFOLLOW: a symlink planted at the inbox file is refused, never followed (W8-SEC-3).
+    const fd = fs.openSync(file, fs.constants.O_RDWR | fs.constants.O_APPEND | fs.constants.O_CREAT | fs.constants.O_NOFOLLOW, 0o600);
     try {
         const size = fs.fstatSync(fd).size, last = Buffer.alloc(1);
         const torn = size > 0 && fs.readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a;
@@ -341,7 +344,12 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
                 try {
                     if (!isPlainToken(id)) throw new Error("invalid session id");
                     const home = e?.home ?? resolveGlenHome(deps.env, BAKED_GLEN_HOME, deps.homedir);
-                    fs.mkdirSync(path.join(home, "inbox"), { recursive: true, mode: 0o700 });
+                    // The same GLEN_HOME trust rule as the endpoint, checked before and after
+                    // creating the inbox (W8-SEC-3).
+                    const uid = deps.uid !== undefined ? deps.uid : (process.getuid?.() ?? null);
+                    let problem = unsafeHome(home, uid, "inbox");
+                    if (!problem) { fs.mkdirSync(path.join(home, "inbox"), { recursive: true, mode: 0o700 }); problem = unsafeHome(home, uid, "inbox"); }
+                    if (problem) throw new Error(`refusing GLEN_HOME: ${problem}; point GLEN_HOME at a private directory you own (mkdir -m 700)`);
                     appendLine(path.join(home, "inbox", `${id}.ndjson`), JSON.stringify(record));
                 } catch (err) { failure = err; }
                 let streamed = false;

@@ -151,7 +151,7 @@ pub(crate) fn submit(
     if opened.is_none() {
         crate::sandbox::refuse_rpc(env, "send")?;
     }
-    let home = glen_home::resolve(env)?;
+    let home = glen_home::resolve_trusted(env, &["run/live"])?;
     let mut live = None;
     let mut route_warnings = vec![];
     if let Some(o) = &opened {

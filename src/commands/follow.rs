@@ -40,6 +40,9 @@ pub(crate) enum FollowEvent {
     BranchSwitch {
         leaf_id: Option<String>,
     },
+    /// A warning raised after startup, such as `branch_truncated` once a rewrite, a branch
+    /// change or a continuation leaves the active branch cut at a malformed line (SEC-1).
+    Warning(crate::error::Warning),
 }
 fn identity(m: &Metadata) -> (u64, u64) {
     #[cfg(unix)]
@@ -109,6 +112,9 @@ pub(crate) struct Follower {
     missing: Option<Instant>,
     entries: continuation::EntryCache,
     reload_pending: bool,
+    /// Whether `branch_truncated` was already reported for the current branch; the opening
+    /// snapshot's warning is the caller's (`tail -f` emits it before the backlog).
+    truncation_warned: bool,
 }
 impl Follower {
     pub(crate) fn new(o: Opened, opts: ItemOpts) -> Self {
@@ -118,6 +124,7 @@ impl Follower {
             .map(|(_, key)| key)
             .collect();
         Self {
+            truncation_warned: o.session.branch_warning().is_some(),
             offset: o.session.consumed,
             identity: o.metadata.as_ref().map(identity).unwrap_or((0, 0)),
             observed: o
@@ -249,6 +256,8 @@ impl Follower {
         self.session = session;
         self.summary = summary;
         self.reload_pending = false;
+        self.truncation_warned = false;
+        self.truncation(events);
         events.push(FollowEvent::Items(self.unseen(false)));
         Ok(true)
     }
@@ -337,6 +346,7 @@ impl Follower {
             events.push(FollowEvent::Rewritten {
                 path: self.session.path.clone(),
             });
+            self.truncation(&mut events);
             events.push(FollowEvent::Items(self.unseen(true)));
             self.observed = Some(observed);
         } else if m.len() > self.offset {
@@ -385,6 +395,7 @@ impl Follower {
                             leaf_id: self.session.leaf_id().map(str::to_owned),
                         });
                     }
+                    self.truncation(&mut events);
                     self.unseen(false)
                 };
                 if switched || !unseen.is_empty() {
@@ -396,6 +407,18 @@ impl Follower {
             self.observed = Some(observed);
         }
         Ok((true, events))
+    }
+    /// Reports `branch_truncated` once each time the followed branch becomes truncated. Only
+    /// a rewrite, a non-linear append or a continuation can change that, so the linear
+    /// append path skips the branch walk.
+    fn truncation(&mut self, events: &mut Vec<FollowEvent>) {
+        let warning = self.session.branch_warning();
+        if let Some(w) = &warning
+            && !self.truncation_warned
+        {
+            events.push(FollowEvent::Warning(w.clone()));
+        }
+        self.truncation_warned = warning.is_some();
     }
     fn prefix_hash_due(&self, now: Instant) -> bool {
         self.prefix_hashed
@@ -807,6 +830,46 @@ mod poll_tests {
             matches!(&events[0], FollowEvent::BranchSwitch { leaf_id: Some(id) } if id == "other-branch")
         );
         one(&events[1..], "other-branch");
+    }
+    // SEC-1 (W8 review): a stream that starts healthy and then appends a malformed ancestor
+    // warns `branch_truncated` once, before the items, and not again on later linear appends.
+    #[test]
+    fn a_branch_cut_after_startup_warns_once() {
+        let tree = fixtures::tree();
+        let path = fixtures::path(&tree, 'A');
+        let mut f = follower(&tree, &path);
+        assert!(f.session().branch_warning().is_none());
+        let last = f.session().leaf_id().unwrap().to_owned();
+        append(
+            &path,
+            &format!(
+                "{{\"type\":\"message\",\"id\":\"hidden\",\"parentId\":\"{last}\",\"message\":{{\"role\":\"user\",\"content\":\"cut\n"
+            ),
+        );
+        append(&path, &message("after", "hidden"));
+        let events = f.poll().unwrap();
+        let warnings: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                FollowEvent::Warning(w) => Some(w),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warnings.len(), 1, "{events:?}");
+        assert_eq!(warnings[0].code, "branch_truncated");
+        let at = events
+            .iter()
+            .position(|e| matches!(e, FollowEvent::Warning(_)))
+            .unwrap();
+        assert!(matches!(events.last(), Some(FollowEvent::Items(_))));
+        assert!(at < events.len() - 1);
+        append(&path, &message("later", "after"));
+        let events = f.poll().unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(e, FollowEvent::Warning(_))),
+            "{events:?}"
+        );
+        one(&events, "later");
     }
     #[test]
     fn missing_file_times_out_after_twenty_poll_intervals_without_sleep() {

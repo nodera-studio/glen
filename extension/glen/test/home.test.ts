@@ -49,7 +49,8 @@ test("SEC-3 unsafeDir accepts a private directory and names each violation", () 
         fs.chmodSync(dir, 0o700);
         assert.match(unsafeDir(dir, uid + 1)!, /owned by uid/);
         fs.symlinkSync(dir, path.join(dir, "link"));
-        assert.match(unsafeDir(path.join(dir, "link"), uid)!, /not a directory/);
+        // LOW-008 (W8 review): a symlink is named as one, matching glen's Rust wording.
+        assert.match(unsafeDir(path.join(dir, "link"), uid)!, /is a symlink/);
         fs.writeFileSync(path.join(dir, "file"), "");
         assert.match(unsafeDir(path.join(dir, "file"), uid)!, /not a directory/);
     } finally { fs.rmSync(dir, { recursive: true, force: true }); }
@@ -93,4 +94,40 @@ test("SEC-3 a private 0755 GLEN_HOME still registers", async () => {
         assert.ok(e && fs.existsSync(e.socket) && fs.existsSync(e.registry));
         assert.deepEqual(f.notes, []);
     } finally { await f.close(); }
+});
+async function replyRefused(prepare: (home: string, f: any) => void) {
+    const f = await fixture();
+    try {
+        prepare(f.home, f);
+        const tool = f.tools.find((t: any) => t.name === "glen_reply");
+        const out = await tool.execute("call", { text: "secret answer" }, null, null, f.ctx);
+        assert.equal(out.isError, true);
+        assert.match(out.content[0].text, /refusing GLEN_HOME/);
+    } finally { quietChmod(f.home); await f.close(); }
+}
+test("SEC-3 glen_reply refuses an untrusted GLEN_HOME and creates no inbox", async () => {
+    let home = "";
+    await replyRefused(h => { home = h; fs.chmodSync(h, 0o777); });
+    assert.equal(fs.existsSync(path.join(home, "inbox")), false);
+});
+test("SEC-3 glen_reply refuses a writable inbox", async () => {
+    await replyRefused(home => { fs.mkdirSync(path.join(home, "inbox"), { mode: 0o700 }); fs.chmodSync(path.join(home, "inbox"), 0o777); });
+});
+test("SEC-3 glen_reply never writes through a symlinked inbox or inbox file", async () => {
+    const target = fs.mkdtempSync("/tmp/glen-target-");
+    try {
+        await replyRefused(home => fs.symlinkSync(target, path.join(home, "inbox")));
+        assert.deepEqual(fs.readdirSync(target), []);
+        const victim = path.join(target, "victim");
+        fs.writeFileSync(victim, "untouched");
+        const f = await fixture();
+        try {
+            fs.mkdirSync(path.join(f.home, "inbox"), { mode: 0o700 });
+            fs.symlinkSync(victim, path.join(f.home, "inbox", `${f.fields.sessionId}.ndjson`));
+            const tool = f.tools.find((t: any) => t.name === "glen_reply");
+            const out = await tool.execute("call", { text: "secret answer" }, null, null, f.ctx);
+            assert.equal(out.isError, true);
+            assert.equal(fs.readFileSync(victim, "utf8"), "untouched");
+        } finally { await f.close(); }
+    } finally { fs.rmSync(target, { recursive: true, force: true }); }
 });

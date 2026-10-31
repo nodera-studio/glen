@@ -200,6 +200,7 @@ impl Reader {
                 FollowEvent::BranchSwitch { .. } => {
                     FollowMsg::Notice("── switched branch ──".into())
                 }
+                FollowEvent::Warning(w) => FollowMsg::Notice(format!("── {} ──", w.message)),
             };
             if !self.send(ctx, ev) {
                 return false;

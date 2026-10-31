@@ -11,7 +11,7 @@ use crate::{
 use serde_json::json;
 use std::time::SystemTime;
 pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
-    let store = JobStore::new(glen_home::resolve(env)?);
+    let store = JobStore::new(glen_home::resolve_trusted(env, &["jobs"])?);
     let now = jiff::Timestamp::now();
     let (rows, warnings) = store.for_session_reporting(args.session.as_deref(), args.active);
     let mut rows: Vec<_> = rows

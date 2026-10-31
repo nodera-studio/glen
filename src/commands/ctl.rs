@@ -404,7 +404,7 @@ fn queued_jobs(
     session_id: &str,
     running: Option<&str>,
 ) -> Result<Vec<String>, GlenError> {
-    let store = JobStore::new(glen_home::resolve(env)?);
+    let store = JobStore::new(glen_home::resolve_trusted(env, &["jobs"])?);
     Ok(store
         .active_for_session(session_id)
         .into_iter()

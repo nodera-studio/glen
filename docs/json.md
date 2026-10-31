@@ -899,7 +899,8 @@ Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`,
 Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permission-denied glen-home write adds
 `glen_home_writable:false` and a hint to set GLEN_HOME to a private directory (for example `$(mktemp -d)/glen`),
 add it to writable_roots, or run glen outside the sandbox. A GLEN_HOME, or a directory glen writes under it, that
-is a symlink, belongs to another user or is group- or world-writable is refused before the write. Job creation
+is a symlink, belongs to another user or is group- or world-writable is refused before the write, and before glen
+reads a live registry, job record or inbox reply from it (`invalid_env`, exit 2). Job creation
 reports `invalid_env` (exit 2) with the path in `details.path` and a hint to use a private directory; other
 writes, such as an output spill, report `io` (exit 1) with the same message. Doctor failures embed data in
 `details.report`. Install-skill filesystem failures include `details.done` (targets processed before failure).
