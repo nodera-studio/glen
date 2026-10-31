@@ -284,6 +284,15 @@ fn start_input(ctx: &Ctx) -> Result<(), GlenError> {
     let reader = thread::Builder::new()
         .name("watch-input".into())
         .spawn(move || {
+            // Test knob: a reader thread scheduled late, as under heavy load (debug builds only).
+            #[cfg(debug_assertions)]
+            if let Some(ms) = ctx
+                .env
+                .get("GLEN_WATCH_TEST_INPUT_DELAY_MS")
+                .and_then(|v| v.parse().ok())
+            {
+                thread::sleep(Duration::from_millis(ms));
+            }
             while !ctx.stopped() {
                 let result = event::poll(Duration::from_millis(50)).and_then(|ready| {
                     if ready {
@@ -712,6 +721,10 @@ pub(crate) fn run(
         let mut terminal =
             Terminal::new(backend).map_err(|e| io_error("initialise terminal", e))?;
         let result = (|| {
+            // crossterm registers its SIGWINCH handler when its event source first polls. Do
+            // that here, before event_loop reads the size, not on the input thread: a resize
+            // that landed before that thread ran was lost, and the old layout stayed (F11).
+            event::poll(Duration::ZERO).map_err(|e| io_error("read terminal input", e))?;
             start_input(&ctx)?;
             effects.execute(Cmd::Refresh)?;
             #[cfg(debug_assertions)]

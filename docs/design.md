@@ -473,7 +473,7 @@ Controls in the agent loop: `glen models <h>` → `glen model <h> <provider/id>`
 - An `Env` snapshot means code and tests never mutate the process environment.
 - Integration tests use `CARGO_BIN_EXE_glen` with `env_clear()`.
 - Conformance tests live in `tests/conformance.rs` (the `/implement` tail).
-- **Flake ledger.** Each flake is fixed at its root cause, with a deterministic regression test, never by widening a timeout. The label-triggered `flake-proof` workflow reruns the suite 20 times per OS.
+- **Flake ledger.** Each flake is fixed at its root cause, with a deterministic regression test, never by widening a timeout. The label-triggered `flake-proof` workflow reruns the suite 20 times per OS under CPU load.
   - F1: `fake_ext`'s accepted socket inherited O_NONBLOCK on macOS (BSD `accept`), so `serve` dropped a request that had not arrived yet and the client saw EPIPE; it now serves in blocking mode (W10, 53fed35).
   - F2: the live client never read after a write error, losing an answer the endpoint sent before closing; it drains one frame under an absolute deadline (W10, 53fed35; cycle 3 keeps one read after that deadline).
   - F3: tests wrote `control/*.json` with a plain write, so the worker could parse a torn request; test writes are atomic like the product's (W10, 53fed35).
@@ -483,6 +483,8 @@ Controls in the agent loop: `glen models <h>` → `glen model <h> <provider/id>`
   - F7: `fake_ext` log and inbox lines tore under concurrent appends, and `records()` dropped unparseable lines; each line is one write and `records()` fails on a bad complete line (W5, PR #21).
   - F8: the abort-queue test in `tests/controls.rs` froze the caller on `write_atomic`'s temp file, before the rename, hiding the request from `control::poll`; it now waits for a published request (W10, 24bee32).
   - F9: `jobs::lock` holder tests saw a released lock still held: a child forked on another thread shared the lock's open file description until exec, and closing our fd did not release the flock; `SessionLock` and the `is_held` probe release with `LOCK_UN` (W10, fcddede).
+  - F10: conformance ac514 laid out a 512 KiB prompt four times per frame, seconds of debug-build CPU under load; `Prompt::display` caches its layout (W8 a489d6b, cherry-picked into W10).
+  - F11: crossterm registers its SIGWINCH handler on its first event poll, which the input thread made; a resize before that thread ran was lost and watch kept the old layout. The event source is polled once before the first frame; `GLEN_WATCH_TEST_INPUT_DELAY_MS` (debug builds) delays the input thread to force the case (W10).
 
 W3b fakes share `tests/support/fake_models.json` (six complete SDK ModelInfo records). fake_omp accepts --no-session, tracks selection on resumed copies, appends model/thinking/compaction entries with sync_all, and supports fork_control and compact_error. FAKE_OMP_SERIAL=1 processes ordinary commands in arrival order, including abort; FAKE_OMP_COMPACT_DELAY_MS delays compaction without writing after a stop. W2 concurrent delayed-state behaviour remains the default.
 
