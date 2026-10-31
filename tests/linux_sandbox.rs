@@ -215,11 +215,13 @@ fn s4_live_send_writable_home() {
         .rpc
         .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
     c.env("CODEX_SANDBOX", "linux-ci");
-    let writable = lb.rpc.omp.tmp.path().to_path_buf();
+    // LiveBox keeps GLEN_HOME under its own short "/tmp/gle-*" tree (needed for the abstract
+    // socket / endpoint path length limit), not under `rpc.omp.tmp`.
+    let writable = lb.rpc.omp.glen_home.parent().unwrap().to_path_buf();
     let out = bwrap(&c, true, &[&writable]);
     let v = json(&out);
     assert_eq!(exit_code(&out), 0, "{v}");
-    assert_eq!(v["data"]["route"], "live", "{v}");
+    assert_eq!(v["data"]["job"]["route"], "live", "{v}");
     assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
 }
 #[test]
@@ -258,10 +260,14 @@ fn s6_reads_and_inbox() {
         let out = bwrap(&c, true, &[&writable]);
         assert_eq!(exit_code(&out), 0, "{args:?}: {}", json(&out));
     }
-    let mut c = rb.glen(&["inbox", "--json"]);
+    // A fresh box: marking a message read needs a GLEN_HOME write, and this must be the
+    // first thing this GLEN_HOME ever sees, so no earlier writable-bound call in this test
+    // can have already created the cursor file this would otherwise just update in place.
+    let rb2 = RpcBox::new();
+    seed_inbox(&rb2, A_ID, "ping");
+    let mut c = rb2.glen(&["inbox", "--json"]);
     c.env("CODEX_SANDBOX", "linux-ci")
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
-    // No writable bind this time: marking a message read needs a GLEN_HOME write.
     let out = bwrap(&c, true, &[]);
     let v = json(&out);
     assert_eq!(exit_code(&out), 6, "{v}");
@@ -319,6 +325,17 @@ fn s8_hidden_lease_refuses_rpc() {
     c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
     let writable = rb.omp.tmp.path().to_path_buf();
     let out = bwrap(&c, false, &[&writable]);
+    // Diagnostic only (not asserted): if this ever fails again, the log shows whether the
+    // namespace comparison itself disagreed with this scenario inside the very same sandbox.
+    let mut diag = Command::new("bash");
+    diag.arg("-c")
+        .arg("echo self=$(stat -L -c '%d:%i' /proc/self/ns/net) init=$(stat -L -c '%d:%i' /proc/1/ns/net 2>&1)");
+    let diag_out = bwrap_raw(diag, false, &[]);
+    eprintln!(
+        "s8 namespace diagnostic: {}{}",
+        String::from_utf8_lossy(&diag_out.stdout),
+        String::from_utf8_lossy(&diag_out.stderr)
+    );
     let v = json(&out);
     assert_eq!(exit_code(&out), 6, "{v}");
     assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
@@ -348,7 +365,7 @@ fn s9_live_route_across_netns() {
     let out = bwrap(&c, false, &[&writable]);
     let v = json(&out);
     assert_eq!(exit_code(&out), 0, "{v}");
-    assert_eq!(v["data"]["route"], "live", "{v}");
+    assert_eq!(v["data"]["job"]["route"], "live", "{v}");
     assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
 }
 #[test]
