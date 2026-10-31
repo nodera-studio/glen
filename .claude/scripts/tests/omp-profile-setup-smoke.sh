@@ -22,7 +22,27 @@ git -C "$ENGINE_FIXTURE" -c user.name='Glen smoke' -c user.email='smoke@example.
   -c core.hooksPath=/dev/null -c commit.gpgsign=false commit --no-gpg-sign -qm fixture
 SETUP="$ENGINE_FIXTURE/.claude/scripts/omp-profile-setup.sh"
 mkdir "$WORK/bin"
-cp "$TEST_DIR/support/omp" "$WORK/bin/omp"
+cp "$TEST_DIR/support/omp" "$WORK/bin/omp-base"
+export SMOKE_OMP_BASE="$WORK/bin/omp-base"
+# Simulate native extraction only in the unsandboxed tokenizer path. Models
+# refuses a cold cache, so routing through the launcher alone cannot satisfy it.
+cat > "$WORK/bin/omp" <<'EOF'
+#!/bin/bash
+set -eu
+if [ "$*" = '--profile glen-harness toks glen-native-warmup --json' ]; then
+  [ "$HOME" = "$FAKE_OMP_TEST_HOME" ] || exit 99
+  [ "${FAKE_OMP_SANDBOX_ACTIVE:-0}" = 0 ] || exit 98
+  [ "${FAKE_OMP_PREWARM_FAIL:-0}" = 0 ] || exit 97
+  mkdir -p "$HOME/.omp/natives"
+  : > "$HOME/.omp/natives/prewarmed"
+  jq -cn --arg home "$HOME" --args '{home:$home,argv:$ARGS.positional}' -- "$@" >> "$FAKE_OMP_LOG"
+  printf '{}\n'
+  exit 0
+elif [ "$*" = '--profile glen-harness models cursor --json' ]; then
+  [ -f "$HOME/.omp/natives/prewarmed" ] || exit 96
+fi
+exec "$SMOKE_OMP_BASE" "$@"
+EOF
 export PATH="$WORK/bin:$PATH"
 STDOUT="$WORK/stdout" STDERR="$WORK/stderr"
 CASES=0 FAILURES=0 CODE=0
@@ -80,6 +100,7 @@ cat > "$WORK/bin/sandbox-exec" <<'EOF'
 set -eu
 [ "$1" = -f ] && [ -f "$2" ] || exit 99
 shift 2
+export FAKE_OMP_SANDBOX_ACTIVE=1
 jq -cn --arg agent "$OMP_PROFILE_AGENT_DIR" --arg root "$OMP_SANDBOX_RUN_ROOT" \
   --arg cwd "$(pwd -P)" --args \
   '{agent:$agent,root:$root,cwd:$cwd,argv:$ARGS.positional}' -- "${@:2}" >> "$FAKE_OMP_LAUNCH_LOG"
@@ -90,12 +111,13 @@ cat > "$WORK/bin/bwrap" <<'EOF'
 set -eu
 while [ "$1" != -- ]; do shift; done
 shift
+export FAKE_OMP_SANDBOX_ACTIVE=1
 jq -cn --arg agent "$OMP_PROFILE_AGENT_DIR" --arg root "$OMP_SANDBOX_RUN_ROOT" \
   --arg cwd "$(pwd -P)" --args \
   '{agent:$agent,root:$root,cwd:$cwd,argv:$ARGS.positional}' -- "${@:2}" >> "$FAKE_OMP_LAUNCH_LOG"
 exec "$@"
 EOF
-chmod +x "$WORK/bin/sandbox-exec" "$WORK/bin/bwrap"
+chmod +x "$WORK/bin/sandbox-exec" "$WORK/bin/bwrap" "$WORK/bin/omp-base"
 
 new_fixture() {
   CASE_DIR="$(mktemp -d "$WORK/case.XXXXXX")"
@@ -115,6 +137,7 @@ new_fixture() {
   export FAKE_OMP_LAUNCH_LOG="$CASE_DIR/launcher-calls.jsonl"
   unset FAKE_OMP_VERSION FAKE_OMP_REPORTED_DIR FAKE_OMP_REJECT_KEY FAKE_OMP_ERROR_KEY FAKE_OMP_MUTATE FAKE_GLEN_CURRENT
   unset FAKE_OMP_DB_FILE
+  unset FAKE_OMP_PREWARM_FAIL FAKE_OMP_SANDBOX_ACTIVE
   : > "$FAKE_OMP_LOG"
   : > "$FAKE_OMP_LAUNCH_LOG"
   : > "$FAKE_OMP_WRITES"
@@ -137,6 +160,11 @@ setup_run() {
     XDG_DATA_HOME="$CASE_DIR/xdg-data" XDG_STATE_HOME="$CASE_DIR/xdg-state" XDG_CACHE_HOME="$CASE_DIR/xdg-cache" \
     PI_NATIVES_DIR='' GLEN_BIN="$WORK/bin/glen" /bin/bash "$@"
 }
+
+new_fixture
+setup_run "$WORK/bin/omp" --profile glen-harness --version
+assert_exit 'native prewarm control version command succeeds' 0
+assert 'version control leaves native cache cold' test ! -e "$TEST_HOME/.omp/natives/prewarmed"
 
 new_fixture
 # Reverse the live list's order and exercise both selector and provider/id forms:
@@ -163,12 +191,24 @@ assert 'full setup fetches models before setting config' jq -es '
 assert 'setup launches only the model query with explicit profile and cwd' jq -es --arg agent "$TEST_AGENT" \
   'length==1 and all(.[]; .argv==["--profile","glen-harness","models","cursor","--json"] and .agent==$agent and .root==.cwd)' "$FAKE_OMP_LAUNCH_LOG"
 assert 'setup removes model query scratch root after the call' test ! -e "$(jq -r .root "$FAKE_OMP_LAUNCH_LOG")"
+assert 'setup prewarms native cache before sandboxed models' test -f "$TEST_HOME/.omp/natives/prewarmed"
+# shellcheck disable=SC2016 # jq binds its own $calls variable.
+assert 'setup native prewarm precedes model catalog query' jq -es '
+  map(.argv[2]) as $calls | ($calls | index("toks")) < ($calls | index("models"))' "$FAKE_OMP_LOG"
 # A modified worktree launcher cannot replace the captured main version.
 if [ "$(uname -s)" = Darwin ]; then launcher_name=omp-sandboxed.sh; else launcher_name=omp-sandboxed-linux.sh; fi
 printf '#!/bin/bash\nexit 99\n' > "$ENGINE_FIXTURE/.claude/omp/$launcher_name"
 setup_run "$SETUP" --check
 assert_exit 'setup model fetch prefers main over modified worktree launcher' 0
 assert 'setup using main launcher has no fallback warning' test ! -s "$STDERR"
+
+new_fixture
+export FAKE_OMP_PREWARM_FAIL=1
+setup_run "$SETUP" --dry-run
+assert_exit 'setup stops if native cache prewarm fails' 97
+assert 'failed prewarm never queries models or sets config' jq -es \
+  'all(.[]; .argv[2]!="models" and .argv[2:4]!=["config","set"])' "$FAKE_OMP_LOG"
+assert 'failed prewarm never invokes sandboxed payload' test ! -s "$FAKE_OMP_LAUNCH_LOG"
 
 new_fixture
 printf '%s\n' '{"models":[{"provider":"cursor","id":"gemini-3.8-flash"},{"selector":"cursor/other"}]}' > "$FAKE_OMP_STATE/models.json"

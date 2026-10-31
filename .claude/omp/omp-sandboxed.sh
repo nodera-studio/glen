@@ -11,12 +11,9 @@ REAL_HOME="$(cd "$HOME" && pwd -P)" || die 'could not resolve HOME directory'
 export HOME="$REAL_HOME"
 [ -n "${OMP_SANDBOX_RUN_ROOT:-}" ] || die 'OMP_SANDBOX_RUN_ROOT is required'
 RUN_ROOT_REAL="$(cd "$OMP_SANDBOX_RUN_ROOT" && pwd -P)" || die 'could not resolve run root'
-# Legacy callers retain the old profile-root scope. Repository callers pass the
-# resolved agent directory explicitly, including custom PI_CONFIG_DIR layouts.
-PROFILE_STATE_DIR="$REAL_HOME/.omp/profiles/glen-harness"
-if [ -n "${OMP_PROFILE_AGENT_DIR:-}" ]; then
-  PROFILE_STATE_DIR="$(cd "$OMP_PROFILE_AGENT_DIR" && pwd -P)" || die 'could not resolve profile agent directory'
-fi
+# Repository callers pass the agent directory; legacy callers use glen-harness.
+PROFILE_AGENT_DIR="$(cd "${OMP_PROFILE_AGENT_DIR:-$REAL_HOME/.omp/profiles/glen-harness/agent}" && pwd -P)" || die 'could not resolve profile agent directory'
+PROFILE_ROOT="$(cd "$PROFILE_AGENT_DIR/.." && pwd -P)" || die 'could not resolve profile root'
 
 # Resolve both ancestor aliases (/var -> /private/var) and the executable's own
 # symlink chain. omp is a self-contained Bun-compiled Mach-O; no runtime/package
@@ -47,7 +44,23 @@ sbpl_path() {
 home_sb="$(sbpl_path "$REAL_HOME")"
 run_sb="$(sbpl_path "$RUN_ROOT_REAL")"
 bin_sb="$(sbpl_path "$OMP_REAL_BIN_RESOLVED")"
-agent_sb="$(sbpl_path "$PROFILE_STATE_DIR")"
+agent_sb="$(sbpl_path "$PROFILE_AGENT_DIR")"
+profile_sb="$(sbpl_path "$PROFILE_ROOT")"
+# Preserve read-only treatment for other entries already present in the agent
+# directory. SQLite database families and sessions need directory operations;
+# new transient filenames are intentionally covered by the broad write grant.
+readonly_agent_filters() {
+  local entry entry_sb
+  find "$PROFILE_AGENT_DIR" -mindepth 1 -maxdepth 1 -print0 |
+    while IFS= read -r -d '' entry; do
+      case "${entry##*/}" in
+        agent.db* | models.db* | skill-descriptions.db* | sessions | config.yml | config.yml.lock | mcp.json | extensions | skills) continue ;;
+      esac
+      entry_sb="$(sbpl_path "$entry")" || exit 1
+      printf '  (subpath "%s")\n' "$entry_sb"
+    done
+}
+readonly_filters="$(readonly_agent_filters)" || die 'could not inspect read-only agent entries'
 profile="$(mktemp "$RUN_ROOT_REAL/omp-sandbox.XXXXXX")"
 cat > "$profile" <<EOF
 (version 1)
@@ -72,25 +85,52 @@ cat > "$profile" <<EOF
   (subpath "/private/var/db/timezone")
   ;; The physical, self-contained omp executable.
   (literal "$bin_sb")
-  ;; Harness config, mcp.json, skill, sessions and extensions.
+  ;; Agent contents are readable; the later write-deny stanza protects config,
+  ;; extensions, skills, and other non-runtime entries present at launch.
   (subpath "$agent_sb")
-  ;; Shared native-binary cache populated by any omp profile.
+  ;; Profile-scoped runtime siblings observed in the host's S3 write-map.
+  (subpath "$profile_sb/logs")
+  (subpath "$profile_sb/cache")
+  (subpath "$profile_sb/run")
+  ;; Shared native cache: populated unsandboxed by setup, then read-only here.
   (subpath "$home_sb/.omp/natives")
 )
 (allow file-write*
-  ;; Job artifacts and the harness profile's own state.
+  ;; Job artifacts and harness runtime state.
   (subpath "$run_sb")
+  ;; Host SQLite CREATE/INSERT/SELECT probes require a genuine directory grant
+  ;; for journals/locks/renames; literal DB grants (even + directory literal) fail.
   (subpath "$agent_sb")
-  ;; Cross-profile owner leases/daemon state and native-binary cache.
+  (subpath "$agent_sb/sessions")
+  (subpath "$profile_sb/logs")
+  (subpath "$profile_sb/cache")
+  (subpath "$profile_sb/run")
+  ;; Shared owner leases/daemon state: observed lock/JSON data, no executable
+  ;; code. This is a documented property, not an execute-bit rule SBPL enforces.
   (subpath "$home_sb/.omp/run")
-  (subpath "$home_sb/.omp/natives")
   ;; Standard stdio sinks. Real pty writes may be denied; glen uses pipes/files.
   (literal "/dev/null")
   (literal "/dev/tty")
 )
-;; Cursor API connections.
-(allow network-outbound)
-;; XPC services needed by dyld/Bun startup.
+;; Host-verified S3 shape: these later denies override the agent-directory allow.
+;; Keep fixed configuration protected even when a file/directory is absent.
+(deny file-write*
+  (literal "$agent_sb/config.yml")
+  (literal "$agent_sb/config.yml.lock")
+  (literal "$agent_sb/mcp.json")
+  (subpath "$agent_sb/extensions")
+  (subpath "$agent_sb/skills")
+$readonly_filters
+)
+;; Isolated S4 host-validation candidate (2026-10-31): Apple parsecd uses bare
+;; (remote ip), never the nonmatching (remote ip "*:*") form. The host's earlier
+;; deny-default trials failed DNS; sandbox_apply EPERM blocks Codex verification.
+;; DNS/chat completion is pending the owner's isolated host check, not proven by
+;; cached models output. Other Unix socket paths receive no outbound grant.
+(allow network-outbound (remote ip))
+;; Apple com.apple.security.XPCTimeStampingService.sb:79: DNS Unix socket.
+(allow network-outbound (literal "/private/var/run/mDNSResponder"))
+;; Keep XPC lookup broad while the coupled S4 DNS investigation is unresolved.
 (allow mach-lookup)
 ;; Bun JavaScript engine CPU/host feature detection.
 (allow sysctl-read)

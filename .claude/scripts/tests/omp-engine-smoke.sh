@@ -76,7 +76,13 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   real_omp="$(command -v omp || true)"
   sandbox_base="$WORK/sandbox"
   mkdir -p "$sandbox_base/home/.ssh" "$sandbox_base/home/.omp/agent" \
-    "$sandbox_base/home/.omp/profiles/glen-harness/agent" "$sandbox_base/run" "$sandbox_base/bin"
+    "$sandbox_base/home/.omp/profiles/glen-harness/agent/extensions" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/agent/skills" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/logs" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/cache" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/run" \
+    "$sandbox_base/home/.omp/natives" "$sandbox_base/run" "$sandbox_base/bin"
   sandbox_base="$(cd "$sandbox_base" && pwd -P)"
   # Exercise aliases only in launcher-owned inputs, including /var under TMPDIR.
   # The executable has a relative symlink chain as well as aliased ancestors.
@@ -91,16 +97,25 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   printf 'canary fixture\n' > "$sandbox_base/home/glen-canary.txt"
   printf 'default config fixture\n' > "$sandbox_base/home/.omp/agent/config.yml"
   printf 'parent context fixture\n' > "$sandbox_base/AGENTS.md"
+  for name in config.yml config.yml.lock mcp.json extensions/x.ts skills/x.md unknown-future-file; do
+    printf 'read-only fixture\n' > "$sandbox_base/home/.omp/profiles/glen-harness/agent/$name"
+  done
+  printf 'native fixture\n' > "$sandbox_base/home/.omp/natives/x"
 
+  # Prewarm and sandboxed startup must resolve the same HOME-based native cache.
+  # Clear caller overrides for both, rather than warming a separate XDG location.
+  fixture_omp_env() {
+    env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
+      -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+      -u XDG_STATE_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_DATA_HOME \
+      -u PI_NATIVES_DIR LC_ALL=C HOME="$sandbox_home" PI_CONFIG_DIR=.omp "$@"
+  }
   sandbox_call() (
     local binary="$1"
     shift
     # Like omp-engine.sh, give the child physical cwd and file arguments.
     cd "$sandbox_base/run" || exit 1
-    env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-      -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
-      -u XDG_STATE_HOME -u XDG_CONFIG_HOME -u XDG_CACHE_HOME -u XDG_DATA_HOME \
-      LC_ALL=C HOME="$sandbox_home" PI_CONFIG_DIR=.omp OMP_REAL_BIN="$binary" \
+    fixture_omp_env OMP_REAL_BIN="$binary" \
       OMP_SANDBOX_RUN_ROOT="$sandbox_run" \
       OMP_PROFILE_AGENT_DIR="${sandbox_agent:-$sandbox_home/.omp/profiles/glen-harness/agent}" \
       /bin/bash "$SANDBOX" "$@"
@@ -119,14 +134,87 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   assert 'sandbox profile contains no unresolved fixture alias' test "$(grep -Fc sandbox-alias "$generated_profile" || true)" -eq 0
   # An opening quote followed by /var/ must never survive physical resolution.
   assert 'sandbox profile contains no logical /var literal' test "$(grep -Fc '\"/var/' "$generated_profile" || true)" -eq 0
+  # SQLite requires directory writes; later denies keep configuration read-only.
+  sed -n '/^(allow file-write\*/,/^)/p' "$generated_profile" > "$WORK/sandbox-writes"
+  sed -n '/^(deny file-write\*/,/^)/p' "$generated_profile" > "$WORK/sandbox-write-denies"
+  assert_contains 'sandbox grants directory operations needed by SQLite' "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/agent\")" "$WORK/sandbox-writes"
+  assert 'sandbox configuration denies follow directory write allow' awk \
+    '/^\(allow file-write\*/ { allow=NR } /^\(deny file-write\*/ { deny=NR } END { exit !(allow>0 && deny>allow) }' "$generated_profile"
+  assert 'sandbox native cache has no write grant' test "$(grep -Fc '/.omp/natives' "$WORK/sandbox-writes" || true)" -eq 0
+  for name in config.yml config.yml.lock mcp.json; do
+    assert_contains "sandbox denies writes to protected file $name" \
+      "(literal \"$sandbox_base/home/.omp/profiles/glen-harness/agent/$name\")" "$WORK/sandbox-write-denies"
+  done
+  for name in extensions skills unknown-future-file; do
+    assert_contains "sandbox denies writes to protected entry $name" \
+      "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/agent/$name\")" "$WORK/sandbox-write-denies"
+  done
+  for path in agent/sessions logs cache run; do
+    assert_contains "sandbox permits runtime subtree $path" \
+      "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/$path\")" "$WORK/sandbox-writes"
+  done
+  assert_contains 'sandbox outbound IP uses bare Apple filter' '(allow network-outbound (remote ip))' "$generated_profile"
+  assert_contains 'sandbox explicitly permits DNS Unix socket' '(allow network-outbound (literal "/private/var/run/mDNSResponder"))' "$generated_profile"
+  assert 'sandbox has no blanket outbound grant' test "$(grep -Fxc '(allow network-outbound)' "$generated_profile" || true)" -eq 0
+  assert_contains 'sandbox retains broad mach lookup for isolated host check' '(allow mach-lookup)' "$generated_profile"
 
   mkdir -p "$sandbox_base/home/custom-omp/profiles/glen-harness/agent"
   sandbox_agent="$sandbox_alias/home/custom-omp/profiles/glen-harness/agent"
   run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
   custom_profile="$(grep -Fl -- "$sandbox_base/home/custom-omp/profiles/glen-harness/agent" "$sandbox_base/run"/omp-sandbox.*)"
-  assert 'sandbox explicit profile path is canonical and used for reads/writes' test "$(grep -Fc "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent\")" "$custom_profile")" -eq 2
+  assert 'sandbox explicit profile path is canonical for reads and SQLite writes' test "$(grep -Fc "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent\")" "$custom_profile")" -eq 2
+  assert_contains 'sandbox custom profile denies configuration writes' "(literal \"$sandbox_base/home/custom-omp/profiles/glen-harness/agent/config.yml\")" "$custom_profile"
+  assert_contains 'sandbox custom profile includes sibling logs' "(subpath \"$sandbox_base/home/custom-omp/profiles/glen-harness/logs\")" "$custom_profile"
   assert 'sandbox explicit profile does not admit old profile root' test "$(grep -Fc '.omp/profiles/glen-harness' "$custom_profile" || true)" -eq 0
   unset sandbox_agent
+
+  # Verify the SQLite CLI/query itself even when nested Seatbelt is unavailable.
+  # The sandboxed cases below must perform these same real transactions.
+  for journal in delete wal; do
+    run /usr/bin/sqlite3 -batch -bail "$WORK/sqlite-control-$journal.db" \
+      "PRAGMA journal_mode=$journal; CREATE TABLE t(x INTEGER); INSERT INTO t VALUES(42); SELECT x FROM t;"
+    assert_exit "unconfined SQLite $journal control succeeds" 0
+    assert_eq "unconfined SQLite $journal control returns inserted row" "$(cat "$STDOUT")" "$(printf '%s\n42' "$journal")"
+  done
+
+  # Use an interpreter whose executable/stdlib the existing policy can read.
+  # /usr/bin/python3 may forward to Xcode under unlisted /Applications instead.
+  socket_python=''
+  for candidate in /Library/Developer/CommandLineTools/usr/bin/python3 /usr/bin/python3 "$(command -v python3 || true)"; do
+    if [ -x "$candidate" ] && "$candidate" -I -c '
+import os, socket, sys
+paths = (sys.executable, sys.base_prefix, socket.__file__)
+sys.exit(0 if all(os.path.realpath(p).startswith(("/usr/", "/System/", "/Library/")) for p in paths) else 1)
+' >/dev/null 2>&1; then
+      socket_python="$candidate"
+      break
+    fi
+  done
+  assert 'Unix socket probe has Python in permitted system paths' test -n "$socket_python"
+  socket_probe="$sandbox_base/run/unix-connect-probe"
+  if [ -n "$socket_python" ]; then
+    printf '#!%s -I\n' "$socket_python" > "$socket_probe"
+    cat >> "$socket_probe" <<'PY'
+import socket
+import sys
+
+try:
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(2)
+        client.connect(sys.argv[1])
+except OSError as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
+print("glen-unix-connected")
+PY
+    chmod +x "$socket_probe"
+    # This real probe check needs neither a listening socket nor sandbox_apply.
+    # Keep below Darwin's sockaddr_un path limit, including physical TMPDIR.
+    run fixture_omp_env "$socket_probe" "$sandbox_base/no.sock"
+    assert_exit 'unconfined Unix socket probe reports failed connect' 1
+    assert_eq 'unconfined Unix socket probe prints exact OSError' "$(cat "$STDERR")" '[Errno 2] No such file or directory'
+    assert 'failed Unix socket probe prints no success marker' test ! -s "$STDOUT"
+  fi
 
   if [ "$sandbox_runtime" -eq 1 ]; then
     # shellcheck disable=SC2016 # The sandboxed child must expand its own HOME.
@@ -138,13 +226,87 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
       # Match cat's file-specific denial, not sandbox_apply failing before exec.
       assert_contains "sandbox outside read is EPERM $denied" "cat: $sandbox_base/$denied: Operation not permitted" "$STDERR"
     done
-    for writable in "$sandbox_base/run/writable" "$sandbox_base/home/.omp/profiles/glen-harness/agent/writable"; do
+    for denied in config.yml config.yml.lock mcp.json extensions/x.ts skills/x.md unknown-future-file; do
+      path="$sandbox_base/home/.omp/profiles/glen-harness/agent/$denied"
+      run_sandbox sandbox_call /usr/bin/tee "$path" <<< 'must not overwrite'
+      assert "sandbox refuses configuration write $denied" test "$CODE" -ne 0
+      assert_contains "configuration write denial is EPERM $denied" 'Operation not permitted' "$STDERR"
+      assert_eq "configuration write denial preserves $denied" "$(cat "$path")" 'read-only fixture'
+    done
+    run_sandbox sandbox_call /usr/bin/tee "$sandbox_base/home/.omp/natives/x" <<< 'must not overwrite'
+    assert 'sandbox refuses native-cache write' test "$CODE" -ne 0
+    assert_contains 'native-cache write denial is EPERM' 'Operation not permitted' "$STDERR"
+    assert_eq 'native-cache write denial preserves file' "$(cat "$sandbox_base/home/.omp/natives/x")" 'native fixture'
+    # Exercise SQLite itself before tee puts dummy bytes into these DB fixtures.
+    # Rollback journals and WAL both require more than opening literal DB paths.
+    for database in agent.db models.db skill-descriptions.db; do
+      for journal in delete wal; do
+        run_sandbox sandbox_call /usr/bin/sqlite3 -batch -bail \
+          "$sandbox_base/home/.omp/profiles/glen-harness/agent/$database" \
+          "PRAGMA journal_mode=$journal; CREATE TABLE IF NOT EXISTS t(x INTEGER); DELETE FROM t; INSERT INTO t VALUES(42); SELECT x FROM t;"
+        assert_exit "sandbox SQLite $database $journal round-trip succeeds" 0
+        assert_eq "sandbox SQLite $database $journal returns inserted row" "$(cat "$STDOUT")" "$(printf '%s\n42' "$journal")"
+      done
+    done
+    for writable in "$sandbox_base/run/writable" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/agent/agent.db" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/agent/models.db-wal" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/agent/skill-descriptions.db-shm" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions/writable" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/logs/writable" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/cache/writable" \
+      "$sandbox_base/home/.omp/profiles/glen-harness/run/writable"; do
       run_sandbox sandbox_call /usr/bin/tee "$writable" <<< 'sandbox write'
       assert_exit 'sandbox allows write in permitted directory' 0
       run_sandbox sandbox_call /bin/cat "$writable"
       assert_exit 'sandbox allows read-back in permitted directory' 0
       assert_eq 'sandbox write read-back content' "$(cat "$STDOUT")" 'sandbox write'
     done
+
+    if [ -n "$socket_python" ]; then
+      # The same executable reports connect()'s OSError in both runs. BSD nc -U
+      # emits no diagnostic on failure, so it cannot distinguish ENOENT/EPERM.
+      # Capture output through pipes; the listener stays unconfined.
+      run fixture_omp_env "$socket_python" -I - "$SANDBOX" "$sandbox_base" "$socket_probe" "$WORK/foreign.sock" <<'PY'
+import json
+import os
+import socket
+import subprocess
+import sys
+
+launcher, base, probe, foreign = sys.argv[1:]
+with socket.socket(socket.AF_UNIX) as server:
+    server.bind(foreign)
+    server.listen(2)
+    server.settimeout(2)
+    try:
+        control = subprocess.run([probe, foreign], stdin=subprocess.DEVNULL,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        connected = False
+        if control.returncode == 0:
+            accepted, _ = server.accept()
+            accepted.close()
+            connected = True
+        env = dict(os.environ, HOME=base + "/home", OMP_REAL_BIN=probe,
+                   OMP_SANDBOX_RUN_ROOT=base + "/run",
+                   OMP_PROFILE_AGENT_DIR=base + "/home/.omp/profiles/glen-harness/agent")
+        child = subprocess.run(["/bin/bash", launcher, foreign], env=env, cwd=base + "/run",
+                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, timeout=5)
+        print(json.dumps({"control_connected": connected, "control_code": control.returncode,
+                          "control_output": control.stdout.decode(errors="replace"),
+                          "control_stderr": control.stderr.decode(errors="replace"),
+                          "code": child.returncode,
+                          "stdout": child.stdout.decode(errors="replace"),
+                          "stderr": child.stderr.decode(errors="replace")}))
+    finally:
+        os.unlink(foreign)
+PY
+      assert_exit 'foreign Unix socket fixture completes' 0
+      assert 'foreign Unix socket accepts unconfined control' jq -e '.control_connected == true' "$STDOUT"
+      assert 'foreign Unix socket accepts identical unconfined Python probe' jq -e '.control_code == 0 and .control_output == "glen-unix-connected\n" and .control_stderr == ""' "$STDOUT"
+      assert 'sandbox refuses foreign Unix socket connection' jq -e '.code == 1 and .stdout == "" and (.stderr == "[Errno 1] Operation not permitted\n" or .stderr == "[Errno 13] Permission denied\n")' "$STDOUT"
+    fi
   fi
 
   mkdir "$sandbox_base/no-sandbox-bin"
@@ -155,18 +317,103 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   assert_contains 'sandbox missing executable explains refusal' 'sandbox-exec not on PATH; refusing to run omp unsandboxed' "$STDERR"
   assert 'sandbox missing executable never runs helper' test ! -s "$STDOUT"
 
-  if [ "$sandbox_runtime" -eq 1 ] && [ -n "$real_omp" ]; then
+  # Model listing must start from a configured profile, as it does after setup.
+  # S3 intentionally prevents a sandboxed first run from creating config/MCP.
+  real_sandbox_base="$WORK/real-omp-sandbox"
+  mkdir -p "$real_sandbox_base/home/.omp/profiles/glen-harness/agent" "$real_sandbox_base/run"
+  cat > "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml" <<'EOF'
+modelRoles:
+  default: cursor/gemini-4-argon
+tools:
+  approvalMode: always-ask
+mcp:
+  enableProjectConfig: false
+EOF
+  printf '%s\n' '{"mcpServers":{}}' > "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/mcp.json"
+  assert_contains 'real omp fixture seeds model configuration before sandbox startup' 'default: cursor/gemini-4-argon' "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml"
+  assert 'real omp fixture seeds MCP without external services' jq -e '.mcpServers == {}' "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/mcp.json"
+  cp "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml" "$real_sandbox_base/config-before"
+  cp "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/mcp.json" "$real_sandbox_base/mcp-before"
+
+  if [ -n "$real_omp" ]; then
+    # S3 makes natives read-only: populate the scratch HOME's cache unsandboxed
+    # first, just as setup does. Keep real omp's DBs separate from helper fixtures.
+    sandbox_base="$real_sandbox_base"
+    sandbox_home="$sandbox_base/home" sandbox_run="$sandbox_base/run"
+    real_omp_prewarm() (
+      cd "$sandbox_base/run" || exit 1
+      fixture_omp_env "$real_omp" --profile glen-harness toks glen-native-warmup --json
+    )
+    run real_omp_prewarm
+    assert_exit 'real omp unsandboxed native prewarm succeeds' 0
+    natives_dir="$sandbox_home/.omp/natives"
+    native_addon="$(find "$natives_dir" -type f -name '*.node' -print -quit 2>/dev/null || true)"
+    assert 'real omp prewarm populates default HOME native cache' test -n "$native_addon"
     # Always select glen-harness, including --version. Only scratch HOME is used.
     run_sandbox sandbox_call "$real_omp" --profile glen-harness --version
-    assert_exit 'sandbox real omp version completes' 0
-    run_sandbox sandbox_call "$real_omp" --profile glen-harness models --json
-    assert_exit 'sandbox real omp models completes without login' 0
-  elif [ -z "$real_omp" ]; then
+    if [ "$sandbox_runtime" -eq 1 ]; then assert_exit 'sandbox real omp version completes' 0; fi
+    real_profiles=("$sandbox_base/run"/omp-sandbox.*)
+    sed -n '/^(allow file-read\*/,/^)/p' "${real_profiles[0]}" > "$WORK/real-omp-reads"
+    sed -n '/^(allow file-write\*/,/^)/p' "${real_profiles[0]}" > "$WORK/real-omp-writes"
+    assert_contains 'sandbox reads the same native cache populated by prewarm' "(subpath \"$natives_dir\")" "$WORK/real-omp-reads"
+    assert 'sandbox keeps the populated native cache read-only' test "$(grep -Fc "$natives_dir" "$WORK/real-omp-writes" || true)" -eq 0
+    if [ "$sandbox_runtime" -eq 1 ]; then
+      run_sandbox sandbox_call "$real_omp" --profile glen-harness models --json
+      assert_exit 'sandbox real omp models completes without login' 0
+      assert 'sandbox real omp leaves seeded config unchanged' cmp -s "$sandbox_home/.omp/profiles/glen-harness/agent/config.yml" "$sandbox_base/config-before"
+      assert 'sandbox real omp leaves seeded MCP unchanged' cmp -s "$sandbox_home/.omp/profiles/glen-harness/agent/mcp.json" "$sandbox_base/mcp-before"
+    fi
+  else
     printf 'NOTE sandbox real omp startup skipped: omp not on PATH\n'
   fi
 else
   printf 'NOTE macOS sandbox checks skipped: Darwin with sandbox-exec required\n'
 fi
+
+# Inspect Linux bind arguments on either host OS, replacing only uname/bwrap.
+# This checks policy construction, not live Linux mount/SQLite compatibility.
+linux_policy="$WORK/linux-policy"
+mkdir -p "$linux_policy/bin" "$linux_policy/home/.omp/natives" \
+  "$linux_policy/home/custom/profiles/glen-harness/agent" "$linux_policy/run"
+cat > "$linux_policy/bin/uname" <<'EOF'
+#!/bin/sh
+printf 'Linux\n'
+EOF
+cat > "$linux_policy/bin/bwrap" <<'EOF'
+#!/bin/sh
+jq -cn --args '$ARGS.positional' -- "$@"
+EOF
+chmod +x "$linux_policy/bin/uname" "$linux_policy/bin/bwrap"
+linux_agent="$linux_policy/home/custom/profiles/glen-harness/agent"
+printf 'existing SQLite bytes\n' > "$linux_agent/agent.db"
+cp "$linux_agent/agent.db" "$linux_policy/database-before"
+run env HOME="$linux_policy/home" PATH="$linux_policy/bin:$PATH" \
+  OMP_REAL_BIN=/bin/cat OMP_PROFILE_AGENT_DIR="$linux_agent" \
+  OMP_SANDBOX_RUN_ROOT="$linux_policy/run" /bin/bash "$LINUX_SANDBOX" --version
+assert_exit 'Linux sandbox generates bind list' 0
+cp "$STDOUT" "$linux_policy/binds.json"
+has_linux_bind() {
+  # shellcheck disable=SC2016 # jq receives these variables through --arg.
+  jq -e --arg mode "$1" --arg path "$2" '
+    . as $args | any(range(0; length - 2); . as $i |
+      $args[$i:$i+3] == [$mode,$path,$path])' "$linux_policy/binds.json"
+}
+assert 'Linux agent baseline is read-only' has_linux_bind --ro-bind "$linux_agent"
+assert 'Linux native cache is read-only' has_linux_bind --ro-bind "$linux_policy/home/.omp/natives"
+# Exact positive/negative bind checks use the same captured argv, never a fake policy.
+if has_linux_bind --bind "$linux_agent" >/dev/null; then writable_agent=yes; else writable_agent=no; fi
+assert_eq 'Linux never overlays full agent with writable bind' "$writable_agent" no
+if has_linux_bind --bind "$linux_policy/home/.omp/natives" >/dev/null; then writable_natives=yes; else writable_natives=no; fi
+assert_eq 'Linux never overlays native cache with writable bind' "$writable_natives" no
+for database in agent.db models.db skill-descriptions.db; do
+  for suffix in '' -wal -shm; do
+    assert "Linux allows runtime database $database$suffix" has_linux_bind --bind "$linux_agent/$database$suffix"
+  done
+done
+for path in agent/sessions logs cache run; do
+  assert "Linux permits runtime subtree $path" has_linux_bind --bind "$linux_policy/home/custom/profiles/glen-harness/$path"
+done
+assert 'Linux file preparation preserves existing database contents' cmp -s "$linux_agent/agent.db" "$linux_policy/database-before"
 
 # Outside the gated startup checks, any accidental CLI call is a test failure.
 cat > "$WORK/bin/glen" <<'EOF'
@@ -264,7 +511,7 @@ assert_exit 'probe missing profile exit' 3
 assert_contains 'probe missing profile reason' 'profile is not set up' "$STDOUT"
 assert 'probe missing profile creates no run root or jobs' test ! -e "$WORK/tmp/glen-omp-engine"
 
-mkdir -p "$WORK/home/.omp/profiles/glen-harness/agent" "$WORK/home/tmproot"
+mkdir -p "$WORK/home/.omp/profiles/glen-harness/agent" "$WORK/home/.omp/natives" "$WORK/home/tmproot"
 printf 'tools:\n  approvalMode: always-ask\n' > "$WORK/home/.omp/profiles/glen-harness/agent/config.yml"
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp TMPDIR="$WORK/home/tmproot" GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
 assert_exit 'probe run root under home exit' 3

@@ -12,10 +12,8 @@ export HOME="$REAL_HOME"
 [ -n "${OMP_SANDBOX_RUN_ROOT:-}" ] || die 'OMP_SANDBOX_RUN_ROOT is required'
 RUN_ROOT_REAL="$(cd "$OMP_SANDBOX_RUN_ROOT" && pwd -P)" || die 'could not resolve run root'
 RUN_CWD="$(pwd -P)" || die 'could not resolve working directory'
-PROFILE_STATE_DIR="$REAL_HOME/.omp/profiles/glen-harness"
-if [ -n "${OMP_PROFILE_AGENT_DIR:-}" ]; then
-  PROFILE_STATE_DIR="$(cd "$OMP_PROFILE_AGENT_DIR" && pwd -P)" || die 'could not resolve profile agent directory'
-fi
+PROFILE_AGENT_DIR="$(cd "${OMP_PROFILE_AGENT_DIR:-$REAL_HOME/.omp/profiles/glen-harness/agent}" && pwd -P)" || die 'could not resolve profile agent directory'
+PROFILE_ROOT="$(cd "$PROFILE_AGENT_DIR/.." && pwd -P)" || die 'could not resolve profile root'
 
 # Resolve ancestor aliases and the executable's own symlink chain, as on macOS.
 # omp is self-contained; only its executable and system linking dependencies bind.
@@ -53,11 +51,22 @@ for path in /etc/ssl /etc/pki /etc/resolv.conf /etc/hosts /etc/nsswitch.conf \
 done
 binds+=(--ro-bind "$OMP_REAL_BIN_RESOLVED" "$OMP_REAL_BIN_RESOLVED")
 
-# Writable host mounts: job artifacts/snapshot, harness config/MCP/skills/sessions,
-# shared native-binary cache, and cross-profile owner leases/daemon runtime state.
-# Create only these state directories; refuse aliases that could import another
-# profile or arbitrary host data through a bind's source resolution.
-for path in "$PROFILE_STATE_DIR" "$REAL_HOME/.omp/natives" "$REAL_HOME/.omp/run"; do
+# Read-only baseline includes config.yml/lock, mcp.json, extensions, skills, and
+# every unknown agent entry. Setup populates the shared natives cache beforehand.
+[ -d "$REAL_HOME/.omp/natives" ] || die 'native cache missing; run omp-profile-setup.sh first'
+ancestor="$REAL_HOME/.omp/natives"
+while [ "$ancestor" != "$REAL_HOME" ]; do
+  [ ! -L "$ancestor" ] || die "symlink in sandbox state path: $ancestor"
+  ancestor="$(dirname "$ancestor")"
+done
+binds+=(--ro-bind "$PROFILE_AGENT_DIR" "$PROFILE_AGENT_DIR"
+  --ro-bind "$REAL_HOME/.omp/natives" "$REAL_HOME/.omp/natives")
+
+# Writable directories from the host's S3 write-map, including three profile-root
+# siblings of agent/. Shared run/ contains observed lock/JSON data, no executable
+# code; that is a documented property, not an execute-bit guarantee from bwrap.
+for path in "$PROFILE_AGENT_DIR/sessions" "$PROFILE_ROOT/logs" "$PROFILE_ROOT/cache" \
+  "$PROFILE_ROOT/run" "$REAL_HOME/.omp/run"; do
   ancestor="$path"
   while [ "$ancestor" != "$REAL_HOME" ] && [ "$ancestor" != / ]; do
     [ ! -L "$ancestor" ] || die "symlink in sandbox state path: $ancestor"
@@ -66,6 +75,24 @@ for path in "$PROFILE_STATE_DIR" "$REAL_HOME/.omp/natives" "$REAL_HOME/.omp/run"
   mkdir -p "$path"
   [ "$(cd "$path" && pwd -P)" = "$path" ] || die "noncanonical sandbox state path: $path"
   binds+=(--bind "$path" "$path")
+done
+
+# File mounts overlay only the nine confirmed SQLite main/WAL/SHM paths. Create
+# absent empty files without truncating existing data; reject symlinks/devices.
+# These mounts cannot be unlinked/renamed inside the sandbox: Linux SQLite
+# lifecycle compatibility still needs a live Linux omp check (none is available).
+for database in agent.db models.db skill-descriptions.db; do
+  for suffix in '' -wal -shm; do
+    path="$PROFILE_AGENT_DIR/$database$suffix"
+    [ ! -L "$path" ] || die "symlink in sandbox database path: $path"
+    if [ ! -e "$path" ]; then
+      # Another launcher may create it between the test and noclobber open.
+      (set -o noclobber; : > "$path") 2>/dev/null || [ -f "$path" ] || die "could not initialize database path: $path"
+    fi
+    [ ! -L "$path" ] || die "symlink in sandbox database path: $path"
+    [ -f "$path" ] || die "sandbox database path is not a regular file: $path"
+    binds+=(--bind "$path" "$path")
+  done
 done
 binds+=(--bind "$RUN_ROOT_REAL" "$RUN_ROOT_REAL")
 # Fresh device nodes include stdio sinks/randomness; private proc supports Bun's

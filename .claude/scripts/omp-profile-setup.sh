@@ -201,6 +201,11 @@ asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"
 # Resolve the default before syncing settings or installing assets. Primary login
 # signal, pending a live owner login (a cached catalog is not a network test).
 # models-cli.ts uses online-if-uncached; no usage fallback is actually invoked.
+# Native extraction is an authorized, unsandboxed setup operation. Sandboxed omp
+# only reads the shared cache; this also applies to --dry-run and --check.
+# --version returned without extraction on omp 18.14.0. commands/toks.ts imports
+# pi-natives and counts with embedded offline tokenizers; a tiny literal warms it.
+profile_omp profile toks glen-native-warmup --json >/dev/null
 MODELS="$(profile_omp sandbox models cursor --json)"
 MODEL_COUNT="$(printf '%s' "$MODELS" | jq -er '.models | length')"
 LOGIN=1
