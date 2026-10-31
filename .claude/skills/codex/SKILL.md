@@ -15,28 +15,35 @@ argument-hint: '<task or question to dispatch to Codex>'
 
 # Codex Dispatch
 
-## PRIMARY ROLE: Product-code implementer (the fused coder)
+## Roles come from routing
 
-Codex is the **sole writer of product code** in this harness (except design-heavy UI, below). Claude orchestrates,
-plans, reviews, and writes the independent conformance tests — it does **not** write
-product code. One exception: design-heavy UI (`site/`, landing pages, web (non-Rust)
-visual components)
-goes to a Claude Opus Implementer, and Codex reviews it (`implementation/orchestrator.md` →
-UI implementation routing). Codex fills three roles here, in priority order:
+Who does each kind of work is set by `.claude/routing.json`, read through
+`bash .claude/scripts/routing.sh <key>` (an owner-confirmed override in
+`.claude/auto-mode/routing.json` wins). Today (decision 148655d9) `implementation` is
+`claude`: the Claude Implementer (`coder-claude.md`) writes product code, and Codex reviews
+it. `review`, `planning`, `debug` and `audits` include `codex`. Design-heavy UI (`site/`,
+landing pages, web (non-Rust) visual components) goes to the agent `routing.sh ui` names, and
+Codex reviews it (`implementation/orchestrator.md` → UI implementation routing). Codex fills
+these roles:
 
-1. **Implementer (primary)** — the fused write → wire → harden → test → gate → fix
-   loop for `/implement` (Role 1) and `/implement-quick`, run in Codex's own context
-   via the **`coder-codex.md`** agent (`codex-companion.mjs task --json --write`).
-   Codex reads its conventions from the repo-root `AGENTS.md`. This is not the thin
-   `codex:codex-rescue` forwarder — it owns the `touchedFiles`/completion-report
-   contract the orchestrator needs.
+1. **Review engine** — one of the three engines in the Role 2 / `/review-implementation`
+   review, via the native **`codex review --base <BASE>`** diff reviewer, and the second
+   engine of the lean `/code-review` gate via `codex:codex-rescue`.
 2. **Advisor** — the **Step 4.5 advisor gate** in `/implement` and `/codex-advisor`:
    a read-only adversarial critique of the approved plan (verdict/risks/steelman) via
    the **`codex:codex-rescue`** agent — NOT `codex review`, NEVER `codex exec`.
    **Synthesize, never forward**; ONE reconcile call on disagreement; escalate
    unresolved CRITICAL risks; gate the call rate.
-3. **Review engine** — one of the three engines in the Role 2 / `/review-implementation`
-   review, via the native **`codex review --base <BASE>`** diff reviewer.
+3. **Planning, debug and audit engine** — the second engine of the dual-engine architect and
+   planner (`/plan-implementation`), the `/deep-debug` investigator pair and the audit
+   orchestrators, via `codex:codex-rescue`.
+4. **Implementer, only when `routing.sh implementation` prints `codex`** — the fused
+   write → wire → harden → test → gate → fix loop for `/implement` (Role 1) and
+   `/implement-quick`, run in Codex's own context via the **`coder-codex.md`** agent
+   (`codex-companion.mjs task --json --write`). Codex reads its conventions from the
+   repo-root `AGENTS.md`. This is not the thin `codex:codex-rescue` forwarder — it owns the
+   `touchedFiles`/completion-report contract the orchestrator needs. When routing prints
+   anything else, `coder-codex.md` stops at its Step 0 and `impl-coder-claude` runs instead.
 
 `codex exec` is never used — Codex is invoked only through the plugin runtime
 (`coder-codex.md` → `codex-companion.mjs`, `codex:codex-rescue`, or `codex review`).
@@ -50,8 +57,8 @@ should do.
 - **Second opinion / dual-engine review** — you want a different model to look at
   the same diff, design, or root-cause hypothesis.
 - **Stuck on a hard bug** — Claude has tried 2+ approaches and isn't converging.
-- **Substantial implementation handoff** — a multi-step coding task you'd rather
-  delegate than do inline.
+- **Substantial implementation handoff** — a multi-step coding task the user asks
+  Codex to take. Harness implementation follows `routing.sh implementation`, not this skill.
 - **Parallel passes** — review-implementation needs N Codex passes alongside N
   Claude passes (see Multi-pass section).
 
@@ -155,8 +162,8 @@ nothing for that long ends with "Codex app-server produced no activity for 180s 
 stalled" and exit 1. Long, high-effort final answers (a big plan after many file reads) trip
 it. Ask for a COMPACT result (about 120 lines at most) and, when the context is already local,
 no web search; that avoided the stall. After two stalls on the same task, stop retrying:
-degrade to the Claude engine alone and say so in the report. The Implementer stalls the same
-way when it reads a very long file in full before editing; small fixes go to it as line-range
+degrade to the Claude engine alone and say so in the report. The Codex Implementer (when
+routing names it) stalls the same way when it reads a very long file in full before editing; small fixes go to it as line-range
 briefs, and it reports each failed attempt and stops after two (`coder-codex.md` → Steps 3
 and 4).
 
@@ -168,8 +175,8 @@ If the retry fails too, record Codex as unavailable for that step and go on with
 single-engine (Claude) verdict, saying in the report that Codex was unavailable and why.
 Never drop the engine silently, and never report a dual-engine result when only one ran.
 This applies to every Codex path: `codex:codex-rescue`, `codex review` and the Implementer's
-`codex-companion.mjs` (where "go on" means STOP and report the blocker, since only Codex
-writes product code).
+`codex-companion.mjs` (where "go on" means STOP and report the blocker: the routed
+Implementer writes product code, and a host never takes over).
 
 ### Example — single dispatch
 
