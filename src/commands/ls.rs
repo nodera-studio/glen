@@ -628,8 +628,8 @@ mod inference_tests {
         assert!(row.detail.is_none());
     }
     /// Orchestrator decision item 2: display stays consistent with the routing refusal
-    /// (sandbox::lease_hidden). Forces the namespace comparison deterministically so this
-    /// runs the same on macOS and Linux.
+    /// (sandbox::lease_hidden, any Codex marker on Linux). Forces the predicate so this runs
+    /// the same on macOS and Linux.
     #[test]
     fn a_hidden_lease_displays_as_unknown_state_not_its_probed_value() {
         let tree = fixtures::tree();
@@ -647,7 +647,7 @@ mod inference_tests {
             assert_eq!(row.state, State::Unknown, "{name}");
         }
         crate::sandbox::force_lease_hidden_for_test(None);
-        // Without the marker, or with the comparison forced visible, display is unaffected.
+        // Without the marker, or with the predicate forced visible, display is unaffected.
         let no_marker = Env::for_test(None, tree.path(), &[]);
         let row = infer_row(&mut summary, None, &no_marker, |_| Lease::Free);
         assert_eq!(row.state, State::Idle);

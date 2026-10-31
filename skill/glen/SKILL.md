@@ -72,9 +72,9 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   `glen_home_writable:false`: set `GLEN_HOME` under `$TMPDIR`. Prefer `glen tail <handle> -n 20`.
   Sending and session controls must reach omp outside the sandbox; exit 6 `sandboxed` explains the restriction.
   Only non-empty `CODEX_SANDBOX` marks a sandbox. `CODEX_SANDBOX_NETWORK_DISABLED=1` alone allows sends
-  (on Linux, existing sessions only through the live route; resuming over RPC refuses exit 6 `sandboxed`,
-  `lease:"unknown"` outside the host network namespace); a real permission failure returns exit 6 with
-  the hint. Rerun with escalated permissions if refused.
+  (on Linux, under either variable and even escalated, existing sessions only through the live route;
+  resuming over RPC refuses exit 6 `sandboxed`, `lease:"unknown"`, and `ls` shows those sessions `unknown`);
+  a real permission failure returns exit 6 with the hint. Rerun with escalated permissions if refused.
 - Network-enabled sandboxes support live sessions only, with writable `GLEN_HOME`. <!-- glen:if install-extension -->
 - Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker. <!-- glen:if inbox -->
 

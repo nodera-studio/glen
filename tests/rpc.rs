@@ -300,29 +300,46 @@ fn unreadable_lease_names_unknown_lease_for_send_and_controls() {
     }
     assert!(b.fake_log().is_empty());
 }
-// The Linux equivalent: an invalid session id makes `lock_path` return `None` before any
-// socket operation, which is also `Lease::Unknown` and is reachable on every platform.
-#[cfg(target_os = "linux")]
+// The Linux equivalent (W10 fix cycle 2 decision 8), run on every platform: a resolvable
+// session whose id is not a plain lease token makes `lease::probe` return `Lease::Unknown`
+// before any socket or flock, so send and a control reach the CLI's unknown-lease refusal
+// end to end, through an explicit session path.
 #[test]
-fn an_invalid_session_id_names_unknown_lease_for_send_and_controls() {
+fn a_non_token_session_id_names_unknown_lease_for_send_and_controls() {
     let b = RpcBox::new();
+    let source = b.omp.session('A');
+    let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.copy";
+    assert!(glen::omp::lease::lease_name(id).is_none());
+    let text = fs::read_to_string(&source)
+        .unwrap()
+        .replace("01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de", id);
+    let target = source
+        .parent()
+        .unwrap()
+        .join(format!("2026-10-01T10-00-00-000Z_{id}.jsonl"));
+    fs::write(&target, text).unwrap();
+    let target = target.to_str().unwrap();
     for args in [
-        vec!["send", "bogus/id", "hi", "--json"],
-        vec!["compact", "bogus/id", "--json"],
+        vec!["send", target, "hi", "--json"],
+        vec!["compact", target, "--json"],
     ] {
         let out = b.glen(&args).output().unwrap();
-        // An invalid handle is a usage/not_found error before any lease probe on this path;
-        // this id is a plausible 40-char-ish token that still fails `lease_name`'s charset
-        // check (a slash), so the exercise is specifically `lock_path` returning `None`,
-        // asserted directly below instead of through the CLI, which would short-circuit on
-        // argument validation first.
-        let _ = out;
+        let value = envelope(&out, 6);
+        assert_eq!(value["error"]["code"], "no_route", "{args:?}: {value}");
+        assert_eq!(
+            value["error"]["details"]["reason"], "unknown_lease",
+            "{args:?}: {value}"
+        );
+        assert!(
+            value["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("session id is not a plain token"),
+            "the refusal comes from the lease probe: {value}"
+        );
     }
-    assert!(glen::omp::lease::lock_path(&b.owners(), "bogus/id").is_none());
-    assert!(matches!(
-        glen::omp::lease::probe(&b.owners(), "bogus/id"),
-        glen::omp::lease::Lease::Unknown { reason, errno: None } if reason == "session id is not a plain token"
-    ));
+    assert!(!b.omp.glen_home.join("jobs").exists(), "no job was created");
+    assert!(b.fake_log().is_empty(), "omp was never started");
 }
 
 #[test]
