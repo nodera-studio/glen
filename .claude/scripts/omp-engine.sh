@@ -11,7 +11,7 @@ MODE="${1:-}"
 PROFILE=glen-harness
 START="$(date +%s)"
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
-MODEL='' THINKING_LEVEL='' PROVIDER='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
+MODEL='' THINKING_LEVEL='' PROVIDER='' SOURCE_FINGERPRINT='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
 RUN_DIR='' RUN_GLEN_HOME='' POLICY_PATH='' JOB='' SESSION_HANDLE='' SESSION_PATH=''
 OUT='' PROBE_DIR='' ENVELOPE='' TREE='' ROOT='' MOVED='[]' REPLIES=0 KEEP=0
 OUTPUT_READY=0 JOB_ACTIVE=0 JOB_TIMEOUT_SECONDS=0
@@ -34,7 +34,13 @@ usage() {
 # The single environment boundary for send, wait, and the envcheck smoke helper.
 # Mnemosyne credentials pass through untouched; never log environment values.
 profile_agent_dir() {
-  printf '%s/%s/profiles/%s/agent\n' "$(cd "$HOME" && pwd -P)" "${PI_CONFIG_DIR:-.omp}" "$PROFILE"
+  local dir double='//' single='/'
+  dir="$(cd "$HOME" && pwd -P)/${PI_CONFIG_DIR:-.omp}/profiles/$PROFILE/agent"
+  # PI_CONFIG_DIR is joined under HOME even with a leading slash (setup
+  # normalizes it the same way); collapse the doubled separator so path
+  # comparisons see one spelling (fix cycle 6, omp item-5 finding).
+  while [[ "$dir" == *//* ]]; do dir="${dir//$double/$single}"; done
+  printf '%s\n' "$dir"
 }
 # A fixed, per-TMPDIR cache outside any per-dispatch run directory. The sandbox
 # profile grants file-write* only on OMP_SANDBOX_RUN_ROOT (the per-dispatch run
@@ -53,8 +59,11 @@ dispatch_env() {
   agent_dir="$(profile_agent_dir)"
   real_omp="$(command -v omp)" || stop failed 'omp not on PATH' 4
   case "$real_omp" in /*) ;; *) real_omp="$PWD/$real_omp" ;; esac
+  # XDG_*_HOME would move omp's and glen's sessions and leases away from the
+  # ~/.omp layout the sandbox grants (fix cycle 6, omp item-5 finding).
   env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CODING_AGENT_DIR \
     -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+    -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME \
     -u GLEN_OMP_BIN -u OMP_SANDBOX_RUN_ROOT -u OMP_REAL_BIN -u OMP_PROFILE_AGENT_DIR \
     GLEN_OMP_BIN="$LAUNCHER_BIN" OMP_REAL_BIN="$real_omp" \
     OMP_SANDBOX_RUN_ROOT="$RUN_DIR" OMP_PROFILE_AGENT_DIR="$agent_dir" \
@@ -282,11 +291,11 @@ result_json() {
     --arg glen_home "$RUN_GLEN_HOME" --arg job "$JOB" --arg handle "$SESSION_HANDLE" \
     --arg path "$SESSION_PATH" --arg out "$OUT" --arg run_dir "$RUN_DIR" \
     --argjson elapsed_ms "$elapsed" --argjson usage "$USAGE" --argjson replies "$REPLIES" \
-    --argjson moved "$MOVED" '
+    --argjson moved "$MOVED" --arg source_fingerprint "$SOURCE_FINGERPRINT" '
     def nullable: if . == "" then null else . end;
     if $mode == "snapshot" then
       {v:1,engine:"omp",mode:$mode,status:$status,reason:($reason|nullable),head:($head|nullable),
-       snapshot_sha256:($snapshot_sha256|nullable),moved:$moved}
+       snapshot_sha256:($snapshot_sha256|nullable),moved:$moved,source_fingerprint:($source_fingerprint|nullable)}
     else
       {v:1,engine:"omp",mode:$mode,status:$status,reason:($reason|nullable),profile:"glen-harness",
        model:($model|nullable),provider:($provider|nullable),policy_source:($policy_source|nullable),
@@ -305,7 +314,7 @@ save_result() {
 
 # shellcheck disable=SC2329 # Called by the EXIT handler.
 capture() {
-  local meta last_line
+  local meta last_line transcript_model
   [ -n "$ENVELOPE" ] && [ -s "$ENVELOPE" ] || return 0
   jq -jr '.data.assistant_text // ""' "$ENVELOPE" > "$OUT" || return 1
   REPLIES="$(jq -r '(.data.replies // []) | length' "$ENVELOPE")" || return 1
@@ -320,9 +329,12 @@ capture() {
       ' "$SESSION_PATH")" || return 1
     # The transcript records a bare model id; report it as provider/id, the
     # same form probe and setup use (Step 11 acceptance, item 2).
-    MODEL="$(printf '%s' "$meta" | jq -r '
+    # Keep the probed model when the transcript has no assistant message yet
+    # (fix cycle 6, omp item-5 finding).
+    transcript_model="$(printf '%s' "$meta" | jq -r '
       if .model != "" and .provider != "" and (.model | contains("/") | not)
       then .provider + "/" + .model else .model end')"
+    [ -z "$transcript_model" ] || MODEL="$transcript_model"
     PROVIDER="$(printf '%s' "$meta" | jq -r .provider)"
     USAGE="$(printf '%s' "$meta" | jq -c .usage)"
   fi
@@ -482,11 +494,13 @@ bounded_omp() {
     if command -v timeout >/dev/null 2>&1; then
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+        -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME \
         OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" OMP_PROFILE_AGENT_DIR="$agent_dir" \
         timeout "$seconds" "$LAUNCHER_BIN" --profile "$PROFILE" "$@" 3>&-
     else
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+        -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME \
         OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" OMP_PROFILE_AGENT_DIR="$agent_dir" \
         perl -e 'alarm shift @ARGV; exec @ARGV' "$seconds" "$LAUNCHER_BIN" --profile "$PROFILE" "$@" 3>&-
     fi
@@ -603,6 +617,7 @@ snapshot_command() {
       (cd "$SRC"; eval "$GLEN_OMP_ENGINE_TEST_MUTATE") >&2
     fi
     after="$(fingerprint_source "$SRC")"
+    SOURCE_FINGERPRINT="$after"
     [ "$before" != "$after" ] || break
     find "$DEST" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
     [ "$attempt" -ne 2 ] || stop skipped 'source changed during capture' 3
@@ -766,6 +781,13 @@ if [ "$MODE" = review ] || [ -n "$BASE" ]; then
     [ "$diff_rc" -le 1 ] || stop failed 'could not capture untracked diff' 4
   done < "$RUN_DIR/untracked.z"
 fi
+# The changed-file list and patches come from the live repository after the
+# copy: they must still describe the same source state the snapshot fixed
+# (fix cycle 6, Codex item-5 P2), or the reviewer reads a tree and a diff
+# that disagree.
+if [ "$(fingerprint_source "$REPO")" != "$(jq -r '.source_fingerprint // empty' "$RUN_DIR/snapshot.json")" ]; then
+  stop skipped 'source changed during capture' 3
+fi
 [ "$MODE" != debug ] || cp "$BRIEF" "$TREE/_review/brief.md"
 cat "$ENGINE_ROOT/.claude/skills/omp/templates/$MODE.md" > "$RUN_DIR/prompt.md"
 {
@@ -844,10 +866,16 @@ while :; do
       map(select(type == "string")) | join(" ") |
       test("429|rate.?limit|capacity|quota|overloaded"; "i")' "$ENVELOPE" >/dev/null; then
     log 'capacity failure; retrying once after 60 seconds in a new session'
+    # The failed attempt's job is dead: forget it before the backoff, so an
+    # interruption is a failure rather than a recoverable timeout and FILE.json
+    # never advertises that job as running (fix cycle 6, omp item-5 finding).
+    JOB='' SESSION_HANDLE='' SESSION_PATH=''
+    STATUS=failed REASON='capacity failure; retrying once in a new session' EXIT_CODE=4
+    rm -f "$ENVELOPE"
+    save_result || stop failed 'could not write result JSON' 4
     sleep 60
     JOB_TIMEOUT_SECONDS=$((DEADLINE_SECONDS - ($(date +%s) - FIRST_SEND)))
     RETRIED=1
-    JOB='' SESSION_HANDLE='' SESSION_PATH=''
     continue
   fi
   if [ "$RC" -eq 0 ] || [ "$RC" -eq 11 ]; then

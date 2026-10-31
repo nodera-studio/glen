@@ -173,12 +173,21 @@ ensure_dir() {
   mkdir -p "$1" 2>/dev/null || die "could not create runtime directory $1"
   [ -d "$1" ] && [ ! -L "$1" ] || die "runtime path is not a directory: $1"
 }
-OWNERS_DIR="$REAL_HOME/.omp/run/session-owners"
+# Leases live under omp's base config root, $HOME/${PI_CONFIG_DIR:-.omp}
+# (utils/src/dirs.ts:116-118,1151), shared by every profile of that root
+# (fix cycle 6, Codex item-5 P2: never hardcode .omp here).
+BASE_RUN_DIR="$REAL_HOME/${PI_CONFIG_DIR:-.omp}/run"
+OWNERS_DIR="$BASE_RUN_DIR/session-owners"
 DAEMONS_DIR="$PROFILE_ROOT/run/daemons"
 runtime_dirs=("$PROFILE_AGENT_DIR/sessions" "$PROFILE_ROOT/logs" "$PROFILE_ROOT/cache" "$PROFILE_ROOT/run"
-  "$DAEMONS_DIR" "$REAL_HOME/.omp/run" "$OWNERS_DIR" "$RUN_ROOT_REAL/tmp")
+  "$DAEMONS_DIR" "$BASE_RUN_DIR" "$OWNERS_DIR" "$RUN_ROOT_REAL/tmp")
 [ -z "$DAEMON_SCOPE" ] || runtime_dirs+=("$DAEMONS_DIR/$DAEMON_SCOPE" "$DAEMONS_DIR/$DAEMON_SCOPE/clients")
 for dir in "${runtime_dirs[@]}"; do ensure_dir "$dir"; done
+# One physical spelling for the policy, whatever PI_CONFIG_DIR looked like.
+OWNERS_DIR="$(cd "$OWNERS_DIR" && pwd -P)" || die 'could not resolve the session-owner directory'
+# XDG_*_HOME would move omp's sessions, leases and daemon state outside the
+# ~/.omp layout granted here (fix cycle 6, omp item-5 finding).
+unset XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_CONFIG_HOME
 # omp spools RPC output it cannot deliver yet under os.tmpdir()
 # (modes/rpc/rpc-output.ts:72) and exits when that fails (Step 11 acceptance:
 # EPERM on mkdtemp under the caller's TMPDIR). Give it a private one inside
@@ -304,6 +313,12 @@ $readonly_filters
 ;; root. omp's own rename-over of session files (session-storage.ts:1004,1143)
 ;; happens one level deeper and stays allowed.
 (deny file-write-unlink (regex #"^$agent_regex/sessions/[^/]+\$"))
+;; Lease sidecars are empty flock files omp never removes: unlinking or
+;; replacing one splits a held lease between the old inode's holder and a new
+;; creator (session/session-storage.ts:623-626), so another profile's live
+;; session could read as free (fix cycle 6, Codex item-5 P1). Creating and
+;; locking them stays allowed.
+(deny file-write-unlink (subpath "$owners_sb"))
 $scope_rules
 ;; Fix cycle 5, decision 4 (Claude MED-2): deny creating a symlink anywhere
 ;; writable. A planted symlink in an allowed path (for example

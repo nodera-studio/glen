@@ -171,17 +171,17 @@ omp_run() {
       launcher="$(/bin/bash "$ENGINE_ROOT/.claude/scripts/omp-engine.sh" launcher "$ENGINE_ROOT")" || exit 1
       real_omp="$(command -v omp)" || exit 1
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR \
+        -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME \
         HOME="$PROFILE_HOME" OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" \
         OMP_PROFILE_AGENT_DIR="$AGENT_DIR" "$launcher" "$@" 3>&-
     elif [ "$layer" = overlay ]; then
       # PI_NATIVES_DIR is dropped on every layer (fix cycle 6, Codex P2): the
       # warmup must fill ~/.omp/natives, the only native cache the sandbox reads.
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR HOME="$PROFILE_HOME" PI_CONFIG_FILES="$OVERLAY" omp "$@"
+        -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME HOME="$PROFILE_HOME" PI_CONFIG_FILES="$OVERLAY" omp "$@"
     else
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR HOME="$PROFILE_HOME" omp "$@"
+        -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME HOME="$PROFILE_HOME" omp "$@"
     fi
   )
 }
@@ -335,7 +335,8 @@ glen_run() {
   (
     cd "$(mktemp -d "$TMPROOT/glen.XXXXXX")" || exit 1
     env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-      -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" "$GLEN_BIN" "$@"
+      -u OMP_PROFILE -u PI_PROFILE -u XDG_STATE_HOME -u XDG_DATA_HOME -u XDG_CACHE_HOME -u XDG_CONFIG_HOME \
+      HOME="$PROFILE_HOME" "$GLEN_BIN" "$@"
   )
 }
 if [ "$CHECK" -eq 0 ]; then

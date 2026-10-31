@@ -59,7 +59,8 @@ by `fetch.enabled: false`, `web_search.enabled: false`, and `tools.restrictedFol
 Mnemosyne memory is read-only; every memory call uses `project: "glen"`.
 
 Dispatch scrubs `CLAUDE_CONFIG_DIR`, `PI_PY`, `PI_JS`, `PI_CODING_AGENT_DIR`,
-`OMP_CODING_AGENT_DIR`, `OMP_PROFILE`, and `PI_PROFILE`. It sets a private `GLEN_HOME`,
+`OMP_CODING_AGENT_DIR`, `OMP_PROFILE`, `PI_PROFILE`, and the four `XDG_*_HOME` variables (which
+would move sessions and leases away from the `~/.omp` layout the sandbox grants). It sets a private `GLEN_HOME`,
 the captured policy's absolute `PI_CONFIG_FILES`, and the job deadline. The Mnemosyne token
 passes through untouched; never print its value or any other environment values.
 
@@ -84,7 +85,8 @@ The macOS `sandbox-exec` launcher contains reads of other processes' sibling dir
 under `$TMPDIR`; containment does not rely solely on file permissions. Any omp invocation
 can write shared, cross-profile state in `~/.omp/natives/` and `~/.omp/run/`; the
 default-profile fingerprint excludes both. Inside the sandbox only `~/.omp/run/session-owners`
-(lease files) is readable and writable; `~/.omp/run/daemons` (broker tokens and launch specs
+(lease files, under `$HOME/$PI_CONFIG_DIR` when that is set) is readable and writable, and its
+lease files can be created and locked but never removed or replaced; `~/.omp/run/daemons` (broker tokens and launch specs
 that an unsandboxed broker trusts) is neither, and of the harness profile's own `run/daemons`
 only this run's presence directory is (fix cycle 6). The launcher creates the runtime
 directories the policy protects (`agent/sessions`, `logs`, `cache`, `run`, that scope, and

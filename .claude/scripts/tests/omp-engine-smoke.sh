@@ -246,7 +246,7 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
     sandbox_agent="$sandbox_alias/home/mnemosyne-$1/profiles/glen-harness/agent"
     run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
     case_profile="$(grep -Fl -- "$sandbox_base/home/mnemosyne-$1/profiles/glen-harness/agent" "$sandbox_base/run"/omp-sandbox.*)"
-    assert_exit "sandbox runs with a $1 Mnemosyne URL" 0
+    [ "$sandbox_runtime" -eq 0 ] || assert_exit "sandbox runs with a $1 Mnemosyne URL" 0
     if [ "$3" = - ]; then
       assert "sandbox derives no rule from a $1 Mnemosyne URL" test \
         "$(grep -Fc '(allow network-outbound (remote tcp "localhost:' "$case_profile" || true)" -eq 0
@@ -277,11 +277,24 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   mkdir -p "$sandbox_base/home/fresh/profiles/glen-harness/agent"
   sandbox_agent="$sandbox_alias/home/fresh/profiles/glen-harness/agent"
   run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
-  assert_exit 'sandbox starts on a fresh profile without runtime directories' 0
+  [ "$sandbox_runtime" -eq 0 ] || assert_exit 'sandbox starts on a fresh profile without runtime directories' 0
   for path in agent/sessions logs cache run run/daemons; do
     assert "launcher creates fresh-profile $path" test -d "$sandbox_base/home/fresh/profiles/glen-harness/$path" -a ! -L "$sandbox_base/home/fresh/profiles/glen-harness/$path"
   done
   assert 'launcher creates the shared lease directory' test -d "$sandbox_base/home/.omp/run/session-owners"
+  # Codex item-5 P2: an alternate config root keeps its own lease directory.
+  alt_root_call() (
+    cd "$sandbox_base/run" || exit 1
+    fixture_omp_env PI_CONFIG_DIR=.omp-alt OMP_REAL_BIN=/bin/cat OMP_SANDBOX_RUN_ROOT="$sandbox_run" \
+      OMP_PROFILE_AGENT_DIR="$sandbox_alias/home/fresh/profiles/glen-harness/agent" \
+      /bin/bash "$SANDBOX" "$sandbox_base/run/readable"
+  )
+  # A pipe, like run_sandbox: the sandbox may not write a file outside its roots.
+  run_sandbox alt_root_call
+  [ "$sandbox_runtime" -eq 0 ] || assert_exit 'sandbox runs with an alternate config root' 0
+  assert 'alternate config root grants its own lease directory' grep -Fq \
+    "(subpath \"$sandbox_base/home/.omp-alt/run/session-owners\")" "$sandbox_base/run"/omp-sandbox.*
+  assert 'launcher creates the alternate root lease directory' test -d "$sandbox_base/home/.omp-alt/run/session-owners"
   assert 'launcher creates the private TMPDIR in the run root' test -d "$sandbox_base/run/tmp"
   if [ "$sandbox_runtime" -eq 1 ]; then
     run_sandbox sandbox_call /bin/mkdir "$sandbox_base/home/fresh/profiles/glen-harness/agent/sessions/new-slug"
@@ -438,6 +451,14 @@ PY
     assert 'refused staged scope never appears' test ! -e "$harness_profile/run/daemons/fedcba9876543210"
     run_sandbox sandbox_call /usr/bin/tee "$sandbox_base/home/.omp/run/session-owners/fixture.lock" <<< ''
     assert_exit 'sandbox allows writing a session-owner lease' 0
+    # Codex item-5 P1: lease sidecars can be neither removed nor replaced.
+    run_sandbox sandbox_call /bin/rm "$sandbox_base/home/.omp/run/session-owners/fixture.lock"
+    assert_exit 'sandbox refuses removing a session-owner lease' 1
+    assert 'refused lease removal leaves the lease file' test -f "$sandbox_base/home/.omp/run/session-owners/fixture.lock"
+    printf 'replacement\n' > "$sandbox_base/run/lease-replacement"
+    run_sandbox sandbox_call /bin/mv "$sandbox_base/run/lease-replacement" "$sandbox_base/home/.omp/run/session-owners/fixture.lock"
+    assert_exit 'sandbox refuses replacing a session-owner lease' 1
+    assert_eq 'refused lease replacement keeps the original file' "$(cat "$sandbox_base/home/.omp/run/session-owners/fixture.lock")" ''
 
     # Step 11 acceptance root cause: omp's RPC output spool lands in TMPDIR,
     # which must be the writable run root's private tmp/.
@@ -446,6 +467,16 @@ PY
     run_sandbox sandbox_call /usr/bin/mktemp -d -t omp-rpc-output
     assert_exit 'sandbox child can create a temp directory in TMPDIR' 0
     assert 'sandbox temp directory lands in the run root tmp' grep -Fq "$sandbox_base/run/tmp/" "$STDOUT"
+    # omp item-5 finding: XDG_*_HOME never reaches omp inside the sandbox.
+    xdg_call() (
+      cd "$sandbox_base/run" || exit 1
+      fixture_omp_env XDG_STATE_HOME="$sandbox_base/xdg-state" OMP_REAL_BIN=/usr/bin/printenv \
+        OMP_SANDBOX_RUN_ROOT="$sandbox_run" OMP_PROFILE_AGENT_DIR="$sandbox_home/.omp/profiles/glen-harness/agent" \
+        /bin/bash "$SANDBOX" XDG_STATE_HOME
+    )
+    run_sandbox xdg_call
+    assert_exit 'sandbox child has no XDG_STATE_HOME' 1
+    assert 'sandbox child prints no XDG_STATE_HOME' test ! -s "$STDOUT"
 
     if [ -n "$socket_python" ]; then
       # S5 (fix cycle 4) restricts process-exec* to the literal resolved
@@ -1086,9 +1117,11 @@ assert 'abandoned fetch file is pruned' test ! -e "$WORK/launcher-reuse/.omp-san
   export GLEN_OMP_BIN=hostile-inherited OMP_SANDBOX_RUN_ROOT=hostile-inherited
   export OMP_PROFILE_AGENT_DIR=hostile-inherited OMP_REAL_BIN=hostile-inherited
   export MNEMOSYNE_TOKEN=smoke-placeholder
+  export XDG_STATE_HOME=smoke XDG_DATA_HOME=smoke XDG_CACHE_HOME=smoke XDG_CONFIG_HOME=smoke
   HOME="$WORK/home" /bin/bash "$ENGINE" envcheck -- /bin/sh -c 'test -f "$GLEN_OMP_BIN" && test -x "$GLEN_OMP_BIN" && env'
 ) > "$WORK/env.out" 2> "$STDERR"
-for name in CLAUDE_CONFIG_DIR COPILOT_CUSTOM_INSTRUCTIONS_DIRS PI_PY PI_JS PI_CODING_AGENT_DIR OMP_CODING_AGENT_DIR OMP_PROFILE PI_PROFILE; do
+for name in CLAUDE_CONFIG_DIR COPILOT_CUSTOM_INSTRUCTIONS_DIRS PI_PY PI_JS PI_CODING_AGENT_DIR OMP_CODING_AGENT_DIR OMP_PROFILE PI_PROFILE \
+  XDG_STATE_HOME XDG_DATA_HOME XDG_CACHE_HOME XDG_CONFIG_HOME; do
   if grep -q "^${name}=" "$WORK/env.out"; then present=yes; else present=no; fi
   assert_eq "dispatch scrubs $name" "$present" no
 done
@@ -1293,6 +1326,8 @@ cat > "$DISPATCH_BIN/sleep" <<'EOF'
 set -eu
 [ "$*" = 60 ] || exit 99
 printf '60\n' >> "$FAKE_GLEN_STATE/sleeps"
+# What a recovering supervisor would read during the backoff.
+[ ! -f "$FAKE_GLEN_STATE/answer.md.json" ] || cp "$FAKE_GLEN_STATE/answer.md.json" "$FAKE_GLEN_STATE/at-sleep.json"
 printf '%s\n' "$(( $(cat "$FAKE_GLEN_STATE/clock") + 60 ))" > "$FAKE_GLEN_STATE/clock"
 EOF
 cat > "$DISPATCH_BIN/du" <<'EOF'
@@ -1357,7 +1392,7 @@ dispatch_command() {
   shift
   [ "$mode" = review ] || mode_args=(--brief "$WORK/brief.md")
   env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on \
-    FAKE_GLEN_STATE="$STATE" PATH="$DISPATCH_BIN:$PATH" \
+    FAKE_GLEN_STATE="$STATE" PATH="${DISPATCH_EXTRA_PATH:-}$DISPATCH_BIN:$PATH" \
     GLEN_BIN="$TEST_DIR/support/glen" /bin/bash "$ENGINE" "$mode" --repo "$DISPATCH_SRC" \
     "${mode_args[@]}" --out "$CASE_OUT" --deadline "$CASE_DEADLINE" "$@"
 }
@@ -1448,6 +1483,16 @@ for ladder_case in argon grok override bare; do
   fi
 done
 
+# omp item-5 finding: a transcript without an assistant message keeps the
+# probed model instead of reporting null.
+dispatch_fixture empty-transcript
+: > "$STATE/session-j0000001.jsonl"
+dispatch_step send 0 "$DONE"
+dispatch_run
+assert_exit 'empty-transcript result exits 4' 4
+assert_eq 'empty-transcript result reason' "$(jq -r .reason "$STDOUT")" 'ran on unknown, not cursor'
+assert_eq 'empty-transcript failure keeps the probed model' "$(jq -r .model "$STDOUT")" cursor/fixture
+
 dispatch_fixture running-no-job
 dispatch_step send 10 "$(printf '%s' "$RUNNING" | jq '.data.job=null')"
 dispatch_run
@@ -1497,6 +1542,9 @@ for location in top nested code incidental; do
       all(.[]; .argv[2:6]==["send","@new","-","--cwd"]) and
       .[0].job_timeout=="900s" and .[1].job_timeout=="840s"' "$STATE/calls.jsonl"
     assert_eq "capacity $location final job is new job" "$(jq -r .job "$STDOUT")" j0000002
+    # omp item-5 finding: the dead first job is never advertised during backoff.
+    assert "capacity $location backoff FILE.json names no dead job" \
+      jq -e '.job == null and .status == "failed"' "$STATE/at-sleep.json"
     assert_contains "capacity $location final session is new session" session-j0000002.jsonl "$STDOUT"
   fi
 done
@@ -1597,6 +1645,33 @@ for advance in 75 76; do
     assert_tree 'engine deadline preserves tree' retained
   fi
 done
+# Fix cycle 6, Codex item-5 P2: an edit after the copy but before the diff
+# capture is caught, so the reviewer never gets a diff the tree disagrees with.
+FAKE_REAL_GIT="$(command -v git)"
+export FAKE_REAL_GIT
+mkdir -p "$WORK/race-git-bin"
+cat > "$WORK/race-git-bin/git" <<'EOF'
+#!/bin/bash
+case " $* " in
+  *" diff --name-only "*)
+    if [ ! -e "$FAKE_GLEN_STATE/raced" ]; then
+      : > "$FAKE_GLEN_STATE/raced"
+      printf 'raced after copy\n' >> "$SMOKE_RACE_FILE"
+    fi
+    ;;
+esac
+exec "$FAKE_REAL_GIT" "$@"
+EOF
+chmod +x "$WORK/race-git-bin/git"
+dispatch_fixture capture-diff-race
+SMOKE_RACE_FILE="$DISPATCH_SRC/tracked" DISPATCH_EXTRA_PATH="$WORK/race-git-bin:" dispatch_run
+assert_exit 'edit between copy and diff capture skips' 3
+assert_eq 'edit between copy and diff capture reason' "$(jq -r .reason "$STDOUT")" 'source changed during capture'
+assert 'edit between copy and diff capture actually raced' test -e "$STATE/raced"
+assert 'edit between copy and diff capture never dispatches' test ! -s "$STATE/calls.jsonl"
+assert_tree 'edit between copy and diff capture cleans tree' removed
+git -C "$DISPATCH_SRC" checkout -q -- tracked
+
 dispatch_fixture snapshot-skipped
 : > "$STATE/oversize"
 dispatch_run
