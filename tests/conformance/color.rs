@@ -61,7 +61,7 @@ fn ac008_clicolor_force_colours_human_output_on_a_pipe() {
 fn a10_colour_is_decided_per_stream() {
     let sb = Sandbox::new();
     let out = sb
-        .glen(["--human", "bogus"])
+        .glen(["--human", "watch"])
         .env("CLICOLOR_FORCE", "1")
         .run();
     out.assert_exit(2);

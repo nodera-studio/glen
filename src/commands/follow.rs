@@ -144,17 +144,14 @@ impl Follower {
         items.drain(..items.len().saturating_sub(n));
         items
     }
-    #[allow(dead_code)] // Shared with the watch view in the next slice.
     pub(crate) fn rebuild(&mut self, opts: ItemOpts) -> Vec<Item> {
         self.opts = opts;
         self.emitted.clear();
         self.unseen(true)
     }
-    #[allow(dead_code)] // Shared with the watch view in the next slice.
     pub(crate) fn session(&self) -> &Session {
         &self.session
     }
-    #[allow(dead_code)] // Shared with the watch view in the next slice.
     pub(crate) fn summary(&self) -> &Summary {
         &self.summary
     }

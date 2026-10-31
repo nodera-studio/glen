@@ -463,6 +463,26 @@ pub(crate) fn help_groups() -> Vec<(&'static str, Vec<Binding>)> {
     })
     .collect()
 }
+/// Overlay-local input is handled directly by the reducer; keep its help in one table too.
+pub(crate) const LOCAL_HELP: &[(&str, &[(&str, &str)])] = &[
+    (
+        "picker",
+        &[
+            ("up/down", "move"),
+            ("typing / paste", "filter choices"),
+            ("backspace", "edit filter"),
+        ],
+    ),
+    (
+        "help navigation",
+        &[
+            ("up/down / j/k", "scroll"),
+            ("pgup/pgdn", "page"),
+            ("home/end", "first / last"),
+        ],
+    ),
+    ("inbox navigation", &[("up/down / j/k", "scroll")]),
+];
 fn applies(w: Where, c: KeymapCtx) -> bool {
     match w {
         Where::All => true,

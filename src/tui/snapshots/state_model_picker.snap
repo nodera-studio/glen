@@ -24,7 +24,7 @@ glen watch                                   4 sessions · 2 live · ◐ 1 job �
                         │
                         │
                         │
-                        │ ↑↓ move · enter picks · type to filter · Esc closes
+                        │ up/down move · esc cancels
 ──────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
 esc close overlay  enter choose  f1 help  ^c clear prompt / quit
@@ -131,8 +131,8 @@ r19 c25-80 fg=default
 r20 c0-24 fg=default
 r20 c24-25 fg=border(#45474d)
 r20 c25-26 fg=default
-r20 c26-77 fg=muted(#b4b5bd)
-r20 c77-80 fg=default
+r20 c26-52 fg=muted(#b4b5bd)
+r20 c52-80 fg=default
 r21 c0-72 fg=border(#45474d)
 r21 c72-78 fg=muted(#b4b5bd)
 r21 c78-80 fg=border(#45474d)

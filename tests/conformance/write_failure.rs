@@ -52,7 +52,7 @@ fn ac029_closed_stdout_in_human_mode() {
 #[test]
 fn ac029_closed_stdout_while_reporting_an_error() {
     let sb = Sandbox::new();
-    for args in [vec!["bogus"], vec!["doctor"]] {
+    for args in [vec!["watch"], vec!["doctor"]] {
         let out = sb.glen(&args).stdout(closed_stdout()).run();
         assert_failed_write(&out);
     }

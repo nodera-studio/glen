@@ -5,7 +5,7 @@ description: sessions_dir_missing · 80x24 · Dark TrueColor
 cursor: hidden
 grid 80x24
 glen watch                                                   0 sessions · 0 live
-▍sessions               │ ? · session · ? unknown
+▍sessions               │ select a session
 no omp sessions yet     │ select a session
 (/fixtures/agent/sessio…│ ↑↓ choose · enter write
                         │
@@ -27,7 +27,7 @@ no omp sessions yet     │ select a session
                         │
 ──────────────────────────────────────────────────────────────────────── auto ──
 select a session to write to it
-tab next focus  f1 help  q quit  enter focus prompt  down down  up up
+tab next focus  f1 help  q quit  enter focus prompt  up/down scroll
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)
@@ -37,8 +37,8 @@ r1 c0-1 fg=accent(#7170ff)
 r1 c1-9 fg=default bold
 r1 c9-24 fg=default
 r1 c24-25 fg=border(#45474d)
-r1 c25-49 fg=muted(#b4b5bd)
-r1 c49-80 fg=default
+r1 c25-42 fg=muted(#b4b5bd)
+r1 c42-80 fg=default
 r2 c0-19 fg=muted(#b4b5bd)
 r2 c19-24 fg=default
 r2 c24-25 fg=border(#45474d)
@@ -114,9 +114,7 @@ r23 c23-26 fg=default
 r23 c26-31 fg=muted(#b4b5bd)
 r23 c31-38 fg=default
 r23 c38-51 fg=muted(#b4b5bd)
-r23 c51-57 fg=default
-r23 c57-62 fg=muted(#b4b5bd)
-r23 c62-66 fg=default
-r23 c66-69 fg=muted(#b4b5bd)
-r23 c69-80 fg=default
+r23 c51-60 fg=default
+r23 c60-67 fg=muted(#b4b5bd)
+r23 c67-80 fg=default
 bg: none

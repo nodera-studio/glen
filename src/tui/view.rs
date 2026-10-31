@@ -1,7 +1,9 @@
 //! Pure drawing. `prepare` updates only the render cache; `draw` borrows state immutably.
+#[cfg(test)]
+use super::keymap::OverlayCtx;
 use super::{
     ansi,
-    keymap::{self, Action, KeyBinding, KeymapCtx, OverlayCtx},
+    keymap::{self, Action, KeyBinding, KeymapCtx},
     layout::{self, Areas, Mode},
     state::*,
     theme, update,
@@ -203,11 +205,28 @@ pub fn title_segments(app: &App, width: u16) -> Vec<(TitlePart, String)> {
         .filter(|r| matches!(r.state, State::Live | State::Busy))
         .count();
     let jobs = app.jobs.active_total;
-    let unread = app.inbox.unread_by_session.values().copied().sum::<usize>();
+    let unread = match app.scope {
+        Scope::All => app.inbox.unread_by_session.values().copied().sum::<usize>(),
+        Scope::Bucket { .. } => app
+            .list
+            .rows
+            .iter()
+            .filter_map(|row| app.inbox.unread_by_session.get(&row.id))
+            .copied()
+            .sum(),
+    };
     let mut parts = vec![
         (
             TitlePart::Sessions,
-            format!("{} sessions", app.list.rows.len()),
+            format!(
+                "{} {}",
+                app.list.rows.len(),
+                if app.list.rows.len() == 1 {
+                    "session"
+                } else {
+                    "sessions"
+                }
+            ),
         ),
         (TitlePart::Live, format!("{live} live")),
     ];
@@ -282,6 +301,17 @@ fn tab_line(app: &App, title: String, focus: bool, prompt: bool) -> Line<'static
     ])
 }
 fn transcript_tab(app: &App, width: u16, narrow: bool) -> Line<'static> {
+    if app.list.selected.is_none() && app.transcript.target.is_none() {
+        return fit(
+            tab_line(
+                app,
+                "select a session".into(),
+                app.focus == Focus::Transcript,
+                app.focus == Focus::Prompt,
+            ),
+            width,
+        );
+    }
     let row = selected(app);
     let (glyph, label, token) = state(row.map_or(State::Unknown, |r| r.state));
     let title = app
@@ -406,8 +436,13 @@ fn list(f: &mut Frame, app: &App, rect: Rect) {
             });
             if app.list.total_all > 0 {
                 messages.push(format!(
-                    "a shows {} sessions in other projects",
-                    app.list.total_all
+                    "a shows {} {} in other projects",
+                    app.list.total_all,
+                    if app.list.total_all == 1 {
+                        "session"
+                    } else {
+                        "sessions"
+                    }
                 ));
             }
         }
@@ -1068,7 +1103,6 @@ const PANE_HINT_PRIORITY: &[Action] = &[
     Action::Quit,
     Action::FocusPrompt,
     Action::Down,
-    Action::Up,
     Action::Last,
     Action::Thinking,
     Action::Tools,
@@ -1123,8 +1157,20 @@ fn all_status_hints(app: &App) -> Vec<Hint> {
                 .find(|(_, action, _)| action == a)
                 .map(|(binding, action, label)| Hint {
                     action: *action,
-                    key: key_label(*binding, app.theme.depth),
-                    label: if control_action(*action) && !app.caps.controls {
+                    key: if *action == Action::Down {
+                        let up = table.iter().find(|(_, action, _)| *action == Action::Up);
+                        format!(
+                            "{}/{}",
+                            up.map(|(binding, _, _)| key_label(*binding, app.theme.depth))
+                                .unwrap_or_default(),
+                            key_label(*binding, app.theme.depth)
+                        )
+                    } else {
+                        key_label(*binding, app.theme.depth)
+                    },
+                    label: if *action == Action::Down {
+                        "scroll".into()
+                    } else if control_action(*action) && !app.caps.controls {
                         format!("{label} (not in this build)")
                     } else {
                         (*label).into()
@@ -1263,6 +1309,24 @@ fn help_rows(app: &App) -> Vec<(String, String, bool)> {
             }
         }
         rows.extend(group);
+        if let Some((_, local)) = keymap::LOCAL_HELP.iter().find(|(name, _)| *name == title) {
+            rows.extend(
+                local
+                    .iter()
+                    .map(|(key, label)| ((*key).into(), (*label).into(), false)),
+            );
+        }
+    }
+    for (title, local) in keymap::LOCAL_HELP
+        .iter()
+        .filter(|(title, _)| *title != "picker")
+    {
+        rows.push((String::new(), (*title).into(), false));
+        rows.extend(
+            local
+                .iter()
+                .map(|(key, label)| ((*key).into(), (*label).into(), false)),
+        );
     }
     rows
 }
@@ -1505,26 +1569,12 @@ fn overlay(f: &mut Frame, app: &App, a: &Areas) {
                     lines
                 },
             );
-            let table = keymap::bindings(KeymapCtx {
-                overlay: OverlayCtx::Picker,
-                focus: app.focus,
-            });
-            let enter = table
-                .iter()
-                .find(|(_, a, _)| *a == Action::Pick)
-                .map(|(k, _, _)| key_label(*k, app.theme.depth))
-                .unwrap_or_default();
-            let arrows = if app.theme.depth == ColorDepth::None {
-                "Up/Down"
-            } else {
-                "↑↓"
-            };
             paint(
                 f,
                 app,
                 footer,
                 vec![styled(
-                    format!("{arrows} move · {enter} picks · type to filter · Esc closes"),
+                    "up/down move · esc cancels",
                     app.theme.style(Token::Muted),
                 )],
             );
@@ -1543,7 +1593,7 @@ fn overlay(f: &mut Frame, app: &App, a: &Areas) {
                 f,
                 app,
                 footer,
-                vec![styled("Esc cancels", app.theme.style(Token::Muted))],
+                vec![styled("esc cancels", app.theme.style(Token::Muted))],
             );
         }
     }
@@ -1863,6 +1913,174 @@ pub(crate) mod tests {
                 }
             }
         }
+    }
+    #[test]
+    fn movement_status_hint_is_one_readable_scroll_binding() {
+        let mut app = scene(palette(ColorDepth::None, Theme::Dark));
+        app.toast = None;
+        for focus in [Focus::Sessions, Focus::Transcript] {
+            app.focus = focus;
+            let hints = all_status_hints(&app);
+            let movement = hints
+                .iter()
+                .filter(|hint| matches!(hint.action, Action::Up | Action::Down))
+                .collect::<Vec<_>>();
+            assert_eq!(movement.len(), 1);
+            assert_eq!(movement[0].key, "up/down");
+            assert_eq!(movement[0].label, "scroll");
+            let (buffer, _, _) = screenshot(&mut app);
+            let row = row_text(&buffer, layout::areas(&app).status.y);
+            assert!(row.contains("up/down scroll"), "{row}");
+            assert!(!row.contains("down down") && !row.contains("up up"));
+        }
+    }
+    #[test]
+    fn overlay_footer_key_names_are_ascii_at_every_colour_depth() {
+        for depth in [
+            ColorDepth::None,
+            ColorDepth::Ansi16,
+            ColorDepth::Ansi256,
+            ColorDepth::TrueColor,
+        ] {
+            let mut app = scene(palette(depth, Theme::Dark));
+            app.size = (120, 50);
+            for (overlay, expected) in [
+                (Overlay::Help, "up/down scroll · esc closes"),
+                (picker(&app), "up/down move · esc cancels"),
+                (Overlay::Confirm(ControlOp::Abort), "esc cancels"),
+                (Overlay::Inbox, "peek only · glen inbox marks these read"),
+            ] {
+                app.overlay = Some(overlay);
+                let (buffer, _, _) = screenshot(&mut app);
+                let area = layout::inner(overlay_area(&layout::areas(&app)).unwrap());
+                let footer = Rect::new(area.x, area.bottom() - 1, area.width, 1);
+                let shown = region_text(&buffer, footer).join("").trim().to_owned();
+                assert_eq!(shown, expected);
+                assert!(shown.split(" · ").all(str::is_ascii));
+            }
+        }
+    }
+    #[test]
+    fn help_documents_picker_filter_and_overlay_navigation() {
+        let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
+        app.size = (160, 90);
+        app.overlay = Some(Overlay::Help);
+        let (buffer, _, _) = screenshot(&mut app);
+        let shown = region_text(&buffer, buffer.area).join("\n");
+        let rows = help_rows(&app);
+        for (group, bindings) in keymap::LOCAL_HELP {
+            assert!(shown.contains(group), "missing group: {group}");
+            for (key, label) in *bindings {
+                assert!(key.is_ascii());
+                assert!(
+                    rows.iter()
+                        .any(|(keys, action, _)| keys == key && action == label)
+                );
+                assert!(
+                    shown.contains(key) && shown.contains(label),
+                    "missing {key} {label}"
+                );
+            }
+        }
+        assert!(
+            rows.iter()
+                .any(|(keys, action, _)| keys == "enter" && action == "choose")
+        );
+        assert!(
+            rows.iter()
+                .any(|(keys, action, _)| keys == "esc" && action == "close overlay")
+        );
+    }
+    #[test]
+    fn no_selection_tab_is_an_empty_state_in_each_layout() {
+        let mut app = scene(palette(ColorDepth::None, Theme::Dark));
+        app.list.rows.clear();
+        app.list.selected = None;
+        app.transcript = Transcript::default();
+        app.focus = Focus::Transcript;
+        app.narrow_tab = Pane::Transcript;
+        for width in [40, 60, 72, 80, 100, 120] {
+            app.size = (width, 24);
+            let (buffer, _, _) = screenshot(&mut app);
+            let row = row_text(&buffer, 1);
+            assert!(row.contains("select a session"), "{width}: {row}");
+            assert!(!row.contains('?') && !row.contains("unknown"), "{row}");
+        }
+    }
+    #[test]
+    fn session_counts_use_the_singular_only_for_one() {
+        let mut app = scene(palette(ColorDepth::None, Theme::Dark));
+        let rows = app.list.rows.clone();
+        for (count, label) in [(0, "0 sessions"), (1, "1 session"), (2, "2 sessions")] {
+            app.list.rows = rows[..count].to_vec();
+            assert_eq!(
+                title_segments(&app, 200)
+                    .iter()
+                    .find(|(part, _)| *part == TitlePart::Sessions)
+                    .unwrap()
+                    .1,
+                label
+            );
+        }
+        app.list.rows.clear();
+        app.list.selected = None;
+        app.transcript = Transcript::default();
+        app.size = (60, 24);
+        app.focus = Focus::Sessions;
+        app.narrow_tab = Pane::Sessions;
+        app.list.total_all = 1;
+        let (buffer, _, _) = screenshot(&mut app);
+        let text = region_text(&buffer, layout::areas(&app).list.unwrap()).join(" ");
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(text.contains("1 session in other projects"), "{text}");
+        assert!(!text.contains("1 sessions"));
+    }
+    #[test]
+    fn unread_badges_follow_scope_while_the_inbox_overlay_stays_global() {
+        let mut app = scene(palette(ColorDepth::None, Theme::Dark));
+        app.size = (160, 50);
+        app.list.rows.truncate(2);
+        app.inbox.unread_by_session = [
+            (app.list.rows[0].id.clone(), 2),
+            (app.list.rows[1].id.clone(), 3),
+            ("other-project".into(), 7),
+        ]
+        .into_iter()
+        .collect();
+        app.inbox.records.push(InboxMsg {
+            id: "other-reply".into(),
+            session_id: "other-project".into(),
+            job_id: None,
+            text: "outside project reply".into(),
+            is_final: false,
+            at: "1970-01-01T00:00:00Z".into(),
+            unread: true,
+        });
+        let unread = |app: &App| {
+            title_segments(app, 200)
+                .into_iter()
+                .find(|(part, _)| *part == TitlePart::Unread)
+                .map(|(_, label)| label)
+        };
+        assert_eq!(unread(&app).as_deref(), Some("↩ 5"));
+        app.overlay = Some(Overlay::Inbox);
+        let (buffer, _, _) = screenshot(&mut app);
+        assert!(
+            region_text(&buffer, buffer.area)
+                .join("\n")
+                .contains("outside project reply")
+        );
+        assert!(row_text(&buffer, 2).contains("↩2"));
+        assert!(row_text(&buffer, 4).contains("↩3"));
+        app.scope = Scope::All;
+        assert_eq!(unread(&app).as_deref(), Some("↩ 12"));
+        app.scope = Scope::Bucket {
+            cwd: "/elsewhere".into(),
+            label: "elsewhere".into(),
+        };
+        app.list.rows.clear();
+        assert_eq!(unread(&app), None);
+        assert_eq!(app.inbox.unread_by_session["other-project"], 7);
     }
     #[test]
     fn collapse_sweep_is_monotonic_and_hint_drops_have_stable_widths_between_them() {

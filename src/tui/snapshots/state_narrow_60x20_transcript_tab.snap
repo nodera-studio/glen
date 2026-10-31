@@ -23,7 +23,7 @@ glen watch               4 sessions · 2 live · ◐ 1 job · ↩ 1
  ↩ I found the flaky assertion.
 ──────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-tab next focus  f1 help  q quit  down down  up up
+tab next focus  f1 help  q quit  up/down scroll
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)
@@ -89,9 +89,7 @@ r19 c14-18 fg=default
 r19 c18-23 fg=muted(#b4b5bd)
 r19 c23-26 fg=default
 r19 c26-31 fg=muted(#b4b5bd)
-r19 c31-37 fg=default
-r19 c37-42 fg=muted(#b4b5bd)
-r19 c42-46 fg=default
-r19 c46-49 fg=muted(#b4b5bd)
-r19 c49-60 fg=default
+r19 c31-40 fg=default
+r19 c40-47 fg=muted(#b4b5bd)
+r19 c47-60 fg=default
 bg: none

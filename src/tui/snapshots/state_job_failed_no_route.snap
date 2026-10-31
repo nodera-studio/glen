@@ -27,7 +27,7 @@ glen watch                                             4 sessions · 2 live · �
                         │   run glen install-extension, then restart omp
 ──────────────────────────────────────────────────────────────────────── auto ──
 e27c0de ❯ run the tests again
-tab next focus  f1 help  q quit  down down  up up  end last / follow
+tab next focus  f1 help  q quit  up/down scroll  end last / follow
 styles (zero-based, half-open columns):
 r0 c0-4 fg=default bold
 r0 c4-10 fg=muted(#b4b5bd)
@@ -150,11 +150,9 @@ r23 c14-18 fg=default
 r23 c18-23 fg=muted(#b4b5bd)
 r23 c23-26 fg=default
 r23 c26-31 fg=muted(#b4b5bd)
-r23 c31-37 fg=default
-r23 c37-42 fg=muted(#b4b5bd)
-r23 c42-46 fg=default
-r23 c46-49 fg=muted(#b4b5bd)
-r23 c49-54 fg=default
-r23 c54-68 fg=muted(#b4b5bd)
-r23 c68-80 fg=default
+r23 c31-40 fg=default
+r23 c40-47 fg=muted(#b4b5bd)
+r23 c47-52 fg=default
+r23 c52-66 fg=muted(#b4b5bd)
+r23 c66-80 fg=default
 bg: none

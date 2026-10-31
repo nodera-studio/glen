@@ -3709,8 +3709,21 @@ fn ac516_control_keys_dispatch_the_matching_control() {
         status_bar(v).contains("y stop  n cancel")
     });
     t.key(b"n");
+    let control_ops = || {
+        ext.ops_in()
+            .into_iter()
+            .filter(|op| !matches!(op.as_str(), "hello" | "state"))
+            .collect::<Vec<_>>()
+    };
+    let before_typing = control_ops();
     t.typ("mTC");
     t.wait_for("m T C type in the prompt", UI, |v| input_text(v) == "mTC");
+    t.settle(Duration::from_millis(500));
+    assert_eq!(
+        control_ops(),
+        before_typing,
+        "typing mTC in the prompt must start no control"
+    );
     assert!(lb.job_ids().is_empty());
     lb.assert_no_omp();
     t.quit();
