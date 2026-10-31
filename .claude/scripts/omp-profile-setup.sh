@@ -4,8 +4,9 @@
 set -euo pipefail
 
 PROFILE=glen-harness
-DEFAULT_MODEL=cursor/gemini-3.1-pro
-MODEL="$DEFAULT_MODEL"
+DEFAULT_MODEL_PREFERENCE=(cursor/gemini-4-argon cursor/gemini-3.8-flash)
+MODEL="${DEFAULT_MODEL_PREFERENCE[0]}"
+EXPLICIT_MODEL=0
 CHECK=0
 DRY_RUN=0
 say() { printf '%s\n' "$*"; }
@@ -16,6 +17,7 @@ while [ "$#" -gt 0 ]; do
     --model)
       [ "$#" -ge 2 ] || die '--model needs cursor/<id>'
       MODEL="$2"
+      EXPLICIT_MODEL=1
       shift 2
       ;;
     --check) CHECK=1; shift ;;
@@ -183,6 +185,40 @@ asset_guard() {
 asset_guard "$MCP_SOURCE" "$MCP_TARGET" '"mnemosyne"'
 asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"
 
+# Resolve the default before syncing settings or installing assets. Primary login
+# signal, pending a live owner login; usage accounts --json is an alternate.
+MODELS="$(profile_omp profile models cursor --json)"
+MODEL_COUNT="$(printf '%s' "$MODELS" | jq -er '.models | length')"
+LOGIN=1
+[ "$MODEL_COUNT" -gt 0 ] || LOGIN=0
+MODEL_OK=1
+model_available() {
+  printf '%s' "$MODELS" | jq -e --arg model "$1" \
+    'any(.models[]; (.selector // (.provider + "/" + .id)) == $model)' >/dev/null
+}
+if [ "$LOGIN" -eq 1 ]; then
+  if [ "$EXPLICIT_MODEL" -eq 0 ]; then
+    MODEL=''
+    for candidate in "${DEFAULT_MODEL_PREFERENCE[@]}"; do
+      if model_available "$candidate"; then MODEL="$candidate"; break; fi
+    done
+    if [ -z "$MODEL" ]; then
+      say "ERROR: neither preferred model ${DEFAULT_MODEL_PREFERENCE[0]} nor ${DEFAULT_MODEL_PREFERENCE[1]} is listed. Available ids:" >&2
+      printf '%s' "$MODELS" | jq -r '.models[] | .selector // (.provider + "/" + .id)' >&2
+      exit 1
+    fi
+    [ "$CHECK" -eq 1 ] || say "chose $MODEL from preference list"
+  elif ! model_available "$MODEL"; then
+    MODEL_OK=0
+    say "ERROR: model $MODEL is not listed. Available ids:" >&2
+    printf '%s' "$MODELS" | jq -r '.models[] | .selector // (.provider + "/" + .id)' >&2
+  else
+    [ "$CHECK" -eq 1 ] || say "model: $MODEL (explicit --model)"
+  fi
+elif [ "$EXPLICIT_MODEL" -eq 0 ] && [ "$CHECK" -eq 0 ]; then
+  say "no live Cursor login yet; preference list unvalidated (using $MODEL)"
+fi
+
 KEYS=(modelRoles tools.approvalMode tools.approval tools.xdev
   tools.restrictedFolders fetch.enabled web_search.enabled bash.enabled eval.py
   eval.js browser.enabled lsp.enabled mcp.enableProjectConfig mcp.startupTimeoutMs)
@@ -252,19 +288,6 @@ if [ "$CHECK" -eq 0 ]; then
   fi
 fi
 
-# Primary login signal, pending a live owner login. If unreliable, an alternate
-# is `omp --profile glen-harness usage accounts --json` containing a cursor entry.
-MODELS="$(profile_omp profile models cursor --json)"
-MODEL_COUNT="$(printf '%s' "$MODELS" | jq -er '.models | length')"
-LOGIN=1
-[ "$MODEL_COUNT" -gt 0 ] || LOGIN=0
-MODEL_OK=1
-if [ "$LOGIN" -eq 1 ] && ! printf '%s' "$MODELS" | jq -e --arg model "$MODEL" \
-  'any(.models[]; (.selector // (.provider + "/" + .id)) == $model)' >/dev/null; then
-  MODEL_OK=0
-  say "ERROR: model $MODEL is not listed. Available ids:" >&2
-  printf '%s' "$MODELS" | jq -r '.models[] | .selector // (.provider + "/" + .id)' >&2
-fi
 if [ "$LOGIN" -eq 0 ]; then
   say "Owner action: run 'omp --profile glen-harness login cursor', then rerun"
 fi

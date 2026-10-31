@@ -18,9 +18,10 @@ the `glen-harness` profile. It has no supervisor or plan-judge role.
 
 The owner runs `omp --profile glen-harness login cursor`, then
 `.claude/scripts/omp-profile-setup.sh`, then `.claude/scripts/omp-profile-setup.sh --check`.
-Cursor login detection, the final model id, and the predicted `mcp__mnemosyne_memory_*`
-tool names await the owner's live login. The placeholder default is
-`cursor/gemini-3.1-pro`; setup validates availability, and `--model cursor/<id>` selects another.
+Cursor login detection and the predicted `mcp__mnemosyne_memory_*` tool names await
+the owner's live login. Setup prefers `cursor/gemini-4-argon`, falling back to
+`cursor/gemini-3.8-flash` from the live Cursor model list. `--model cursor/<id>` selects
+another model and requires that exact id; it does not use the fallback.
 
 ## How to invoke
 
