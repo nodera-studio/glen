@@ -143,7 +143,6 @@ pub(crate) fn exec_until(
                 let after = state(client)?;
                 let row = super::row_from_info(&model);
                 value(ModelSetData {
-                    warnings: vec![],
                     session_id: after.session_id.clone(),
                     model: ModelName {
                         provider: model.provider,
@@ -189,7 +188,6 @@ pub(crate) fn exec_until(
                 }
                 let after = state(client)?;
                 value(ThinkingSetData {
-                    warnings: vec![],
                     session_id: after.session_id.clone(),
                     thinking_level: thinking(&after),
                     previous: thinking(&before),
@@ -217,7 +215,6 @@ pub(crate) fn exec_until(
                 }
                 let after = state(client)?;
                 value(CompactData {
-                    warnings: vec![],
                     session_id: after.session_id,
                     tokens_before: Some(result.tokens_before),
                     tokens_after: after.context_usage.map(|u| u.tokens),
@@ -229,33 +226,25 @@ pub(crate) fn exec_until(
             )),
         }
     })();
-    result
-        .map(|mut data| {
-            if submitted && deadline.is_some_and(|d| std::time::Instant::now() >= d) {
-                data["warnings"] = json!([crate::error::Warning {
-                    code: "deadline_passed_after_apply".into(),
-                    message: "the control deadline passed after the change was applied".into(),
-                }]);
-            }
-            data
-        })
-        .map_err(|error| {
-            if submitted
-                && error.code == ops::OMP_ERROR
-                && error
-                    .details
-                    .as_ref()
-                    .is_some_and(|d| d["transport_closed"] == true)
-            {
-                OpError::new(
-                    ops::OUTCOME_UNKNOWN,
-                    "omp disconnected after the change was submitted",
-                )
-                .with_details(json!({"reason":ops::OUTCOME_UNKNOWN}))
-            } else {
-                error
-            }
-        })
+    // A success past the deadline stays a success; the CLI adds the envelope warning for it
+    // (W8-DOC-8), so the data carries no warnings of its own.
+    result.map_err(|error| {
+        if submitted
+            && error.code == ops::OMP_ERROR
+            && error
+                .details
+                .as_ref()
+                .is_some_and(|d| d["transport_closed"] == true)
+        {
+            OpError::new(
+                ops::OUTCOME_UNKNOWN,
+                "omp disconnected after the change was submitted",
+            )
+            .with_details(json!({"reason":ops::OUTCOME_UNKNOWN}))
+        } else {
+            error
+        }
+    })
 }
 #[cfg(all(test, unix))]
 mod tests {
@@ -795,7 +784,10 @@ mod c2_tests {
         }
     }
     #[test]
-    fn c2_9_deadline_after_apply_warns_and_preserves_success() {
+    fn c2_9_deadline_after_apply_preserves_success() {
+        // W8-DOC-8: the deadline_passed_after_apply warning moved from data.warnings to the
+        // envelope's warnings, added by the CLI (tests/controls.rs c2_9_…); the executor only
+        // keeps the success.
         for (op, command, response) in mutations() {
             let mut script = preflight(&op);
             let at = script.len();
@@ -806,7 +798,7 @@ mod c2_tests {
             ));
             let data = peer(&op, script, Some((at, false))).unwrap();
             assert_eq!(data["session_id"], "forked");
-            assert_eq!(data["warnings"][0]["code"], "deadline_passed_after_apply");
+            assert!(data.get("warnings").is_none(), "{data}");
             let normalized = match op {
                 Op::SetModel(_) => value(serde_json::from_value::<ModelSetData>(data).unwrap()),
                 Op::SetThinkingLevel(_) => {
@@ -815,10 +807,8 @@ mod c2_tests {
                 _ => value(serde_json::from_value::<CompactData>(data).unwrap()),
             }
             .unwrap();
-            assert_eq!(
-                normalized["warnings"][0]["code"],
-                "deadline_passed_after_apply"
-            );
+            assert_eq!(normalized["session_id"], "forked");
+            assert!(normalized.get("warnings").is_none(), "{normalized}");
         }
     }
     #[test]

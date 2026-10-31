@@ -269,7 +269,7 @@ fn run_control(
     control: Control,
 ) -> Result<Outcome, GlenError> {
     let deadline = Instant::now() + timeout;
-    let stop = wait::install_interrupt()?;
+    let stop = wait::install_interrupt_all()?;
     let opened = open(cli, env, target)?;
     if let Control::Compact(Some(instructions)) = &control {
         check_instructions_len(instructions)?;
@@ -319,6 +319,9 @@ fn run_control(
             _ => None,
         };
         let result = execute(&mut transport, &control, &context);
+        // A mutating control that succeeds past the deadline was applied in time, and only the
+        // state read after it overran; say so in the envelope's warnings (W8-DOC-8).
+        let late = !matches!(control, Control::Abort) && Instant::now() >= deadline;
         let finished = transport.finish();
         if stop.load(Ordering::SeqCst) {
             return Ok(interrupted(session(&opened), route, job.as_deref()));
@@ -338,6 +341,12 @@ fn run_control(
         };
         let (rpc_fork, finish_warnings) = finished.map_err(|e| op_error(e, &context))?;
         warnings.extend(op_warnings);
+        if late {
+            warnings.push(Warning {
+                code: "deadline_passed_after_apply".into(),
+                message: "the control deadline passed after the change was applied".into(),
+            });
+        }
         warnings.extend(finish_warnings);
         let post_id = data["session_id"].as_str().map(str::to_owned);
         let fork = rpc_fork.or_else(|| {
@@ -548,7 +557,7 @@ pub fn run_models(
     output: &OutputCtx,
 ) -> Result<Outcome, GlenError> {
     let deadline = Instant::now() + args.timeout;
-    let stop = wait::install_interrupt()?;
+    let stop = wait::install_interrupt_all()?;
     let opened = args
         .session
         .as_deref()
