@@ -82,12 +82,20 @@ SKILL_MARKER='<!-- Managed by omp-profile-setup.sh: mnemosyne-glen -->'
 # invocations under any profile, intentionally outside the default-profile fingerprint.
 # Shared run/daemons/global and run/session-owners (possibly under
 # XDG_STATE_HOME/omp/run) are runtime state, intentionally not fingerprinted.
-COMPONENTS=(config.yml mcp.json extensions sessions)
+COMPONENTS=(config.yml mcp.json agent.db extensions sessions)
 fingerprint() {
   local component="$1" path="$DEFAULT_AGENT_DIR/$1"
   case "$component" in
     config.yml | mcp.json)
       if [ -f "$path" ]; then shasum -a 256 < "$path"; else say absent; fi
+      ;;
+    agent.db)
+      # omp utils/src/dirs.ts:getAgentDbPath puts settings/auth SQLite state
+      # directly under agent/. Compare existence and bytes only, never content/mtime.
+      if [ ! -f "$path" ]; then say absent
+      elif [ "$(uname -s)" = Darwin ]; then stat -f '%z' "$path"
+      else stat -c '%s' "$path"
+      fi
       ;;
     extensions)
       if [ -d "$path" ]; then

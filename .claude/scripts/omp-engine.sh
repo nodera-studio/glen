@@ -335,7 +335,7 @@ validate_snapshot_links() {
       die "snapshot symlink aliases dotenv quarantine: $_\n" if
         $target eq "$root/_agent-config/dotenv" || index($target, "$root/_agent-config/dotenv/") == 0;
     }}, $root);
-  ' "$1" || stop failed 'snapshot contains unsafe symlink' 4
+  ' "$1" || stop skipped 'snapshot contains unsafe symlink' 3
 }
 snapshot_command() {
   local SRC="$1" DEST="$2" before after attempt name size path hash dotenv_ready=0 relative

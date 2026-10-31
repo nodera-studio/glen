@@ -337,8 +337,10 @@ ln -s "$WORK/external-context" "$LINK_SRC/AGENTS.md"
 git -C "$LINK_SRC" add .
 commit_fixture "$LINK_SRC"
 run /bin/bash "$ENGINE" snapshot "$LINK_SRC" "$WORK/link-tracked"
-assert_exit 'snapshot refuses tracked external context symlink' 4
+assert_exit 'snapshot refuses tracked external context symlink' 3
+assert 'snapshot external context symlink is a skip' jq -e '.status == "skipped"' "$STDOUT"
 assert_contains 'snapshot external context symlink reason' 'unsafe symlink' "$STDOUT"
+assert_contains 'snapshot external context symlink diagnostic names link' "$WORK/link-tracked/AGENTS.md" "$STDERR"
 assert_eq 'snapshot never rewrites external symlink target' "$(cat "$WORK/external-context")" '@~/external-secret'
 rm "$LINK_SRC/AGENTS.md"
 printf 'safe\n' > "$LINK_SRC/plain"
@@ -350,16 +352,20 @@ for kind in directory chain dangling cycle; do
     cycle) ln -s link "$LINK_SRC/link" ;;
   esac
   run /bin/bash "$ENGINE" snapshot "$LINK_SRC" "$WORK/link-$kind"
-  assert_exit "snapshot refuses untracked $kind symlink" 4
+  assert_exit "snapshot refuses untracked $kind symlink" 3
+  assert "snapshot $kind symlink is a skip" jq -e '.status == "skipped"' "$STDOUT"
   assert_contains "snapshot $kind symlink reason" 'unsafe symlink' "$STDOUT"
+  assert_contains "snapshot $kind symlink diagnostic names location" "$WORK/link-$kind/" "$STDERR"
   rm "$LINK_SRC/link"
   [ "$kind" != chain ] || rm "$LINK_SRC/first"
 done
 mkdir -p "$LINK_SRC/.claude"
 ln -s ../plain "$LINK_SRC/.claude/link"
 run /bin/bash "$ENGINE" snapshot "$LINK_SRC" "$WORK/link-relocation"
-assert_exit 'snapshot revalidates relative links after relocation' 4
+assert_exit 'snapshot revalidates relative links after relocation' 3
+assert 'snapshot relocated symlink is a skip' jq -e '.status == "skipped"' "$STDOUT"
 assert_contains 'snapshot relocation symlink reason' 'unsafe symlink' "$STDOUT"
+assert_contains 'snapshot relocation symlink diagnostic names link' "$WORK/link-relocation/_agent-config/claude/link" "$STDERR"
 rm "$LINK_SRC/.claude/link"
 ln -s plain "$LINK_SRC/AGENTS.md"
 run /bin/bash "$ENGINE" snapshot "$LINK_SRC" "$WORK/link-safe"

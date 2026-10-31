@@ -57,6 +57,15 @@ The engine sees a snapshot outside HOME, without Git metadata. Root agent config
 is relocated to `_agent-config/` (for example `.claude/` becomes `_agent-config/claude/`).
 Policy comes from `main` when available, with a warned worktree fallback.
 
+## Risks
+
+The macOS `sandbox-exec` and Linux `bwrap` launchers contain reads of other processes'
+sibling directories under `$TMPDIR`; containment does not rely solely on file permissions.
+Any omp invocation can write shared, cross-profile state in `~/.omp/natives/` and
+`~/.omp/run/`; the default-profile fingerprint excludes both. Setup's `--dry-run` makes
+no config changes, but querying config still initializes databases and caches on disk
+under `glen-harness`.
+
 ## Results
 
 Read both `FILE` and `FILE.json`: status/reason, job, session, model/provider, snapshot hash,

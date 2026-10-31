@@ -259,5 +259,63 @@ for component in run natives; do
   assert "shared $component fixture really changed" test -f "$path"
 done
 
+# Wrap the existing scoped fake only for database mutations. No SQLite content
+# or timestamp belongs in this fingerprint: existence plus byte size is enough.
+mkdir "$WORK/db-bin"
+export SMOKE_DB_OMP="$WORK/bin/omp"
+cat > "$WORK/db-bin/omp" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [ "$*" = '--profile glen-harness models cursor --json' ]; then
+  database="$FAKE_OMP_TEST_HOME/${PI_CONFIG_DIR:-.omp}/agent/agent.db"
+  case "$FAKE_OMP_DB_CHANGE" in
+    size | appear) printf 'database grew\n' >> "$database" ;;
+    disappear) rm "$database" ;;
+    mtime) touch -t 200101010000 "$database" ;;
+    content) printf 'DATABASE fixture\n' > "$database" ;;
+    *) exit 99 ;;
+  esac
+fi
+exec "$SMOKE_DB_OMP" "$@"
+EOF
+chmod +x "$WORK/db-bin/omp"
+for change in size appear disappear mtime content; do
+  new_fixture
+  ready_assets
+  database="$TEST_ROOT/agent/agent.db"
+  if [ "$change" != appear ]; then
+    printf 'database fixture\n' > "$database"
+    touch -t 200001010000 "$database"
+  fi
+  export FAKE_OMP_DB_CHANGE="$change"
+  PATH="$WORK/db-bin:$PATH" setup_run "$SETUP" --check
+  case "$change" in
+    size | appear | disappear)
+      assert_exit "default fingerprint agent.db $change change fails" 1
+      assert_contains "default fingerprint agent.db detects $change" 'default-profile fingerprint changed: agent.db' "$STDERR"
+      assert "database $change mismatch reports no unchanged claim" test "$(grep -c 'fingerprint-unchanged.*yes' "$STDOUT" || true)" -eq 0
+      ;;
+    mtime | content)
+      assert_exit "default fingerprint agent.db ignores $change-only change" 0
+      assert_contains "database $change-only change leaves fingerprint unchanged" 'fingerprint-unchanged' "$STDOUT"
+      assert "database $change-only change reports no fingerprint error" test ! -s "$STDERR"
+      ;;
+  esac
+  case "$change" in
+    size) assert_eq 'database size fixture really grew' "$(wc -c < "$database" | tr -d ' ')" 31 ;;
+    appear) assert_contains 'database appearance fixture really appeared' 'database grew' "$database" ;;
+    disappear) assert 'database disappearance fixture really disappeared' test ! -e "$database" ;;
+    mtime)
+      assert 'database mtime fixture really changed' test "$(perl -e 'print((stat shift)[9])' "$database")" -gt 970000000
+      assert_eq 'database mtime change preserves size' "$(wc -c < "$database" | tr -d ' ')" 17
+      ;;
+    content)
+      assert_contains 'database content fixture really changed' 'DATABASE fixture' "$database"
+      assert_eq 'database content change preserves size' "$(wc -c < "$database" | tr -d ' ')" 17
+      ;;
+  esac
+  assert 'database fingerprint test keeps every omp call scoped' all_scoped
+done
+
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]

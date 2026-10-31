@@ -20,6 +20,7 @@ to the repo's `.<x>/`. For example, `.claude/` is at `_agent-config/claude/`.
 Names without a leading dot retain their name under `_agent-config/`.
 The generated Run context lists the actual relocated names. Cite original repo paths.
 Conventions are in `AGENTS.md`, already loaded/readable in this tree; follow them.
+Any `\@` in snapshot context files (including `AGENTS.md`/`CLAUDE.md`) is an intentional sanitizer escape preventing live imports outside the snapshot; do not flag it as a typo or issue.
 
 ## Optional decision recall
 
