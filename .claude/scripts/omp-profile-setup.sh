@@ -205,18 +205,24 @@ asset_guard() {
     die "Conflict at $target. Owner action: resolve the owner-authored file manually, then rerun."
   fi
 }
-# A differing mcp.json counts as setup-managed only when it has the shape any
-# template version wrote (fix cycle 6, Codex P2): the mnemosyne server alone,
-# and every URL/header value still a ${MNEMOSYNE_...} template rather than a
-# literal the owner filled in. A merely present "mnemosyne" key is not enough.
+# A differing mcp.json is setup-managed only when its bytes are exactly a
+# template version setup shipped (fix cycle 7, Codex P2-b / Claude LOW-9).
+# Any other difference, such as an added server or key, or an edited URL,
+# default, header or token, is the owner's: a conflict, and the file is left
+# alone. When .claude/omp/mcp.json changes, append the new version's sha256.
+MANAGED_MCP_SHA256=(
+  4cfc29650a8ffe59573318c54ac52b3dc66fe575167904793261ec3f319d0d01 # 2b8b542, W9 steps 1-2
+)
 mcp_guard() {
+  local digest known
   [ -e "$MCP_TARGET" ] && ! cmp -s "$MCP_SOURCE" "$MCP_TARGET" || return 0
-  jq -e '
-    (.mcpServers | type == "object" and keys == ["mnemosyne"]) and
-    (.mcpServers.mnemosyne | type == "object" and (.url | type == "string" and test("\\$\\{MNEMOSYNE_")) and
-      ((.headers // {}) | type == "object" and all(.[]; type == "string" and test("\\$\\{MNEMOSYNE_"))))
-  ' "$MCP_TARGET" >/dev/null 2>&1 ||
-    die "Conflict at $MCP_TARGET. Owner action: resolve the owner-authored file manually, then rerun."
+  if [ -f "$MCP_TARGET" ]; then
+    digest="$(shasum -a 256 < "$MCP_TARGET" | awk '{print $1}')" || digest=''
+    for known in "${MANAGED_MCP_SHA256[@]}"; do
+      [ "$digest" != "$known" ] || return 0
+    done
+  fi
+  die "Conflict at $MCP_TARGET: it is not a managed template version (an owner-added key or an edited value). Owner action: merge or move it by hand, then rerun."
 }
 mcp_guard
 asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"

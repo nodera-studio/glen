@@ -529,31 +529,37 @@ for sidecar in agent.db-wal agent.db-shm; do
   done
 done
 
-# Fix cycle 6, Codex P2: an owner-customized mcp.json that merely mentions
-# "mnemosyne" is a conflict; an older template-shaped one is still managed.
-for mcp_case in extra-server literal-token template-shaped; do
+# Fix cycle 7 (Codex P2-b / Claude LOW-9): only a byte-exact managed template
+# version is replaced. Every other difference, an extra server, an extra key
+# on the managed server, a literal token, an edited default URL or an edited
+# header, is a conflict that leaves the file alone.
+template_digest="$(shasum -a 256 < "$REPO_ROOT/.claude/omp/mcp.json" | awk '{print $1}')"
+assert 'current mcp.json template is a registered managed version' grep -Fq "$template_digest" "$SETUP"
+for mcp_case in extra-server extra-key literal-token edited-default edited-header; do
   new_fixture
   ready_assets
   case "$mcp_case" in
     extra-server)
       jq '.mcpServers.other = {type:"http",url:"http://localhost:9/mcp"}' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
+    extra-key)
+      jq '.mcpServers.mnemosyne.timeout = 5000' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
     literal-token)
       jq '.mcpServers.mnemosyne.headers.Authorization = "Bearer literal-owner-value"' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
-    template-shaped)
+    edited-default)
+      # shellcheck disable=SC2016 # A literal template placeholder, not shell.
       jq '.mcpServers.mnemosyne.url = "${MNEMOSYNE_MEMORY_URL:-http://localhost:7777/mcp}"' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
+    edited-header)
+      # shellcheck disable=SC2016 # A literal template placeholder, not shell.
+      jq '.mcpServers.mnemosyne.headers.Authorization = "Token ${MNEMOSYNE_TOKEN}"' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
   esac
   cp "$TEST_AGENT/mcp.json" "$CASE_DIR/mcp-before"
   setup_run "$SETUP"
-  if [ "$mcp_case" = template-shaped ]; then
-    assert_exit 'template-shaped mcp.json is still managed' 0
-    assert 'template-shaped mcp.json is replaced by the template' cmp -s "$REPO_ROOT/.claude/omp/mcp.json" "$TEST_AGENT/mcp.json"
-  else
-    assert_exit "owner mcp.json with $mcp_case is a conflict" 1
-    assert_contains "owner mcp.json $mcp_case conflict names the file" "Conflict at $TEST_AGENT/mcp.json" "$STDERR"
-    assert "owner mcp.json $mcp_case is left untouched" cmp -s "$CASE_DIR/mcp-before" "$TEST_AGENT/mcp.json"
-    assert "owner mcp.json $mcp_case conflict never prints its contents" test "$(grep -c 'literal-owner-value\|localhost:9/' "$STDERR" "$STDOUT" | awk -F: '{s+=$2} END {print s+0}')" -eq 0
-    assert "owner mcp.json $mcp_case conflict precedes config changes" jq -es 'all(.[]; .argv[2:4] != ["config","set"])' "$FAKE_OMP_LOG"
-  fi
+  assert_exit "owner mcp.json with $mcp_case is a conflict" 1
+  assert_contains "owner mcp.json $mcp_case conflict names the file" "Conflict at $TEST_AGENT/mcp.json" "$STDERR"
+  assert_contains "owner mcp.json $mcp_case conflict gives the reason" 'not a managed template version' "$STDERR"
+  assert "owner mcp.json $mcp_case is left untouched" cmp -s "$CASE_DIR/mcp-before" "$TEST_AGENT/mcp.json"
+  assert "owner mcp.json $mcp_case conflict never prints its contents" test "$(grep -c 'literal-owner-value\|localhost:9/\|7777\|Token ' "$STDERR" "$STDOUT" | awk -F: '{s+=$2} END {print s+0}')" -eq 0
+  assert "owner mcp.json $mcp_case conflict precedes config changes" jq -es 'all(.[]; .argv[2:4] != ["config","set"])' "$FAKE_OMP_LOG"
 done
 
 # Fix cycle 6, Codex P2: a caller's PI_NATIVES_DIR never reaches the warmup

@@ -83,6 +83,89 @@ check_no_group_other_write() {
   [ "$owner" = "$(id -u)" ] || return 1
   (( (8#$permissions & 0022) == 0 ))
 }
+# Fix cycle 7 (Codex P1): no component of the glen-harness profile path, from
+# the omp root down through profiles/glen-harness/agent and the runtime
+# children the sandbox can write, may be a symlink. A relocated profile (for
+# example profiles/glen-harness -> /elsewhere) would let the containment
+# checks below compare against one spelling while the sandbox grants writes
+# to another, so it is refused with its path, never followed. With no
+# symlinks in the chain, the lexical and physical profile paths agree.
+profile_symlink_guard() {
+  local home_real omp_root part path profile_root
+  local -a parts=()
+  home_real="$(cd "$HOME" && pwd -P)" || { REASON='could not resolve HOME'; return 1; }
+  omp_root="$home_real"
+  IFS=/ read -r -a parts <<< "${PI_CONFIG_DIR:-.omp}"
+  if [ "${#parts[@]}" -gt 0 ]; then
+    for part in "${parts[@]}"; do
+      case "$part" in
+        '' | .) continue ;;
+        ..) REASON='PI_CONFIG_DIR must not contain a .. component'; return 1 ;;
+      esac
+      omp_root="$omp_root/$part"
+      [ ! -L "$omp_root" ] || { REASON="refusing symlinked $PROFILE profile path: $omp_root"; return 1; }
+    done
+  fi
+  profile_root="$omp_root/profiles/$PROFILE"
+  for path in "$omp_root/profiles" "$profile_root" "$profile_root/agent" "$profile_root/agent/sessions" \
+    "$profile_root/logs" "$profile_root/cache" "$profile_root/run" "$profile_root/run/daemons" \
+    "$omp_root/run" "$omp_root/run/session-owners"; do
+    [ ! -L "$path" ] || { REASON="refusing symlinked $PROFILE profile path: $path"; return 1; }
+  done
+}
+# The physical spelling of a directory that need not exist yet: the nearest
+# existing ancestor resolved with pwd -P, plus the missing suffix. Fails on a
+# non-directory or dangling-symlink ancestor and on . or .. in the suffix.
+physical_spelling() {
+  local path="$1" suffix='' name base
+  while [ "${path%/}" != "$path" ] && [ "$path" != / ]; do path="${path%/}"; done
+  while [ ! -d "$path" ]; do
+    [ ! -e "$path" ] && [ ! -L "$path" ] || return 1
+    name="${path##*/}"
+    case "$name" in '' | . | ..) return 1 ;; esac
+    suffix="/$name$suffix"
+    case "$path" in */*) path="${path%/*}"; [ -n "$path" ] || path=/ ;; *) path=. ;; esac
+  done
+  base="$(cd "$path" && pwd -P)" || return 1
+  [ "$base" != / ] || base=''
+  printf '%s%s\n' "$base" "$suffix"
+}
+# Physical containment (fix cycle 5, decision 1): DEST is already resolved, so
+# a cache dir reached only through a symlink into a sandbox-writable tree is
+# checked at its real, writable location. A lexical check could not.
+launcher_dest_refusal() {
+  local dest="$1" home_real writable writable_real
+  case "$dest/" in
+    "$(profile_agent_dir)"/*) REASON='sandbox launcher must not resolve under the profile agent directory'; return 1 ;;
+  esac
+  case "$dest" in
+    */glen-omp-engine/run-*)
+      REASON='sandbox launcher must not resolve inside a per-dispatch run directory'
+      return 1
+      ;;
+  esac
+  # Fix cycle 6 (Claude MED-1 / Codex P1): compare the resolved directory with
+  # every root the sandboxed child can write to, also resolved: the whole omp
+  # home (profile logs/cache/run, sessions, ~/.omp/run), every engine run and
+  # probe root, and any active run root.
+  home_real="$(cd "$HOME" && pwd -P)" || { REASON='could not resolve HOME'; return 1; }
+  for writable in "$home_real/.omp" "$home_real/${PI_CONFIG_DIR:-.omp}" "${RUN_DIR:-}" "${OMP_SANDBOX_RUN_ROOT:-}"; do
+    [ -n "$writable" ] && [ -d "$writable" ] || continue
+    writable_real="$(cd "$writable" && pwd -P)" || { REASON='could not resolve a sandbox-writable root'; return 1; }
+    case "$dest/" in
+      "$writable_real"/*)
+        REASON="sandbox launcher must not resolve under sandbox-writable $writable_real"
+        return 1
+        ;;
+    esac
+  done
+  case "$dest/" in
+    */glen-omp-engine/*)
+      REASON='sandbox launcher must not resolve inside the engine run root'
+      return 1
+      ;;
+  esac
+}
 # The one platform/source decision, shared by dispatch, probes, and setup's
 # internal `launcher SRC DIR` helper. DEST must never be a directory the
 # sandboxed child can write to: refuse any destination that is, or sits
@@ -100,6 +183,7 @@ resolve_launcher() {
     REASON="$tool not on PATH; the omp sandbox requires it on macOS"
     return 1
   fi
+  profile_symlink_guard || return 1
   case "$dest" in
     */glen-omp-engine/run-*)
       REASON='sandbox launcher must not be placed inside a per-dispatch run directory'
@@ -118,47 +202,14 @@ resolve_launcher() {
     esac
     [ "$dest" != "$OMP_SANDBOX_RUN_ROOT" ] || { REASON='sandbox launcher must not be placed inside an active sandbox run root'; return 1; }
   fi
+  # Run every refusal on the planned physical spelling before creating
+  # anything (fix cycle 7, Claude LOW-5), then again on the created directory.
+  local planned
+  planned="$(physical_spelling "$dest")" || { REASON='could not resolve sandbox launcher directory'; return 1; }
+  launcher_dest_refusal "$planned" || return 1
   mkdir -p "$dest" || { REASON='could not create sandbox launcher directory'; return 1; }
-  # Physical containment (fix cycle 5, decision 1): pwd -P resolves every
-  # symlinked ancestor, so a cache dir reached only through a symlink into a
-  # sandbox-writable tree resolves to its real, writable location here, where
-  # the checks below catch it. A lexical check on the raw argument could not.
   dest="$(cd "$dest" && pwd -P)" || { REASON='could not resolve sandbox launcher directory'; return 1; }
-  case "$dest/" in
-    "$(profile_agent_dir)"/*) REASON='sandbox launcher must not resolve under the profile agent directory'; return 1 ;;
-  esac
-  [ "$dest" != "$(profile_agent_dir)" ] || {
-    REASON='sandbox launcher must not resolve to the profile agent directory'
-    return 1
-  }
-  case "$dest" in
-    */glen-omp-engine/run-*)
-      REASON='sandbox launcher must not resolve inside a per-dispatch run directory'
-      return 1
-      ;;
-  esac
-  # Fix cycle 6 (Claude MED-1 / Codex P1): compare the resolved directory with
-  # every root the sandboxed child can write to, also resolved: the whole omp
-  # home (profile logs/cache/run, sessions, ~/.omp/run), every engine run and
-  # probe root, and any active run root.
-  local home_real writable writable_real
-  home_real="$(cd "$HOME" && pwd -P)" || { REASON='could not resolve HOME'; return 1; }
-  for writable in "$home_real/.omp" "$home_real/${PI_CONFIG_DIR:-.omp}" "${RUN_DIR:-}" "${OMP_SANDBOX_RUN_ROOT:-}"; do
-    [ -n "$writable" ] && [ -d "$writable" ] || continue
-    writable_real="$(cd "$writable" && pwd -P)" || { REASON='could not resolve a sandbox-writable root'; return 1; }
-    case "$dest/" in
-      "$writable_real"/*)
-        REASON="sandbox launcher must not resolve under sandbox-writable $writable_real"
-        return 1
-        ;;
-    esac
-  done
-  case "$dest/" in
-    */glen-omp-engine/*)
-      REASON='sandbox launcher must not resolve inside the engine run root'
-      return 1
-      ;;
-  esac
+  launcher_dest_refusal "$dest" || return 1
   chmod 0700 "$dest" || { REASON='could not secure sandbox launcher directory'; return 1; }
   check_no_group_other_write "$dest" || {
     REASON="unsafe sandbox launcher directory: $dest is not exclusively owned and writable by the current user"
@@ -568,6 +619,12 @@ probe_checks() {
 fingerprint_source() {
   # Untracked files' bytes too (fix cycle 6, Codex P2): status names them and
   # diff HEAD omits them, so an untracked edit mid-capture changed neither.
+  # The commit id leads (fix cycle 7, Codex P2-a / Claude LOW-1): a clean
+  # checkout or reset leaves status, diff HEAD and the untracked list empty on
+  # both sides, so only HEAD tells the two states apart. Output: "<commit> <hash>".
+  local head
+  head="$(git -C "$1" rev-parse --verify HEAD)" || return 1
+  printf '%s ' "$head"
   {
     git -C "$1" status --porcelain=v1 -z || return 1
     git -C "$1" diff HEAD || return 1
@@ -682,7 +739,9 @@ snapshot_command() {
   done < <(find "$DEST" \( -type f -o -type l \) \
     \( -iname AGENTS.md -o -iname CLAUDE.md -o -iname copilot-instructions.md \
       -o -iname WATCHDOG.md -o -iname WATCHDOG.yml \) -print0)
-  HEAD="$(git -C "$SRC" rev-parse HEAD)"
+  # The commit the matching fingerprints recorded, never a later re-read
+  # (fix cycle 7): head and source_fingerprint describe the same state.
+  HEAD="${SOURCE_FINGERPRINT%% *}"
   SNAPSHOT_SHA256="$(
     cd "$DEST" || exit 1
     find . -type f | LC_ALL=C sort | while IFS= read -r path; do
@@ -741,7 +800,10 @@ OUTPUT_READY=1
 probe_checks
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
 REPO="$(git -C "$REPO" rev-parse --show-toplevel)"
-if [ -n "$BASE" ]; then MERGE_BASE="$(git -C "$REPO" merge-base HEAD "$BASE")"; else MERGE_BASE="$(git -C "$REPO" rev-parse HEAD)"; fi
+# Validate the base early; the merge-base itself is taken from the snapshot's
+# own commit below (fix cycle 7), never from whatever HEAD is by then.
+[ -z "$BASE" ] || git -C "$REPO" rev-parse --verify --quiet "$BASE^{commit}" >/dev/null || \
+  stop failed "base ref $BASE does not name a commit" 4
 
 # Prune only this engine's old run directories, never a caller-supplied tree.
 case "$ROOT" in /*/glen-omp-engine) ;; *) stop skipped 'unsafe run root' 3 ;; esac
@@ -761,6 +823,9 @@ if [ "$SNAP_RC" -ne 0 ]; then
   if [ "$SNAP_RC" -eq 3 ]; then stop skipped "$SNAP_REASON" 3; else stop failed "$SNAP_REASON" 4; fi
 fi
 HEAD="$(jq -r .head "$RUN_DIR/snapshot.json")"
+# Bind the merge-base to the commit the snapshot fingerprint recorded; the
+# post-diff fingerprint check below catches HEAD moving after the copy.
+if [ -n "$BASE" ]; then MERGE_BASE="$(git -C "$REPO" merge-base "$HEAD" "$BASE")"; else MERGE_BASE="$HEAD"; fi
 SNAPSHOT_SHA256="$(jq -r .snapshot_sha256 "$RUN_DIR/snapshot.json")"
 MOVED="$(jq -c .moved "$RUN_DIR/snapshot.json")"
 [ ! -e "$TREE/_review" ] && [ ! -L "$TREE/_review" ] || stop failed 'snapshot contains reserved _review path' 4

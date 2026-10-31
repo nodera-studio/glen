@@ -310,6 +310,83 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   assert 'symlinked runtime directory refusal runs nothing' test ! -s "$STDOUT"
   unset sandbox_agent
 
+  # Fix cycle 7 (Codex P1): a relocated profile root, agent directory or omp
+  # root is refused by name before any policy is written, never followed.
+  mkdir -p "$sandbox_base/relocated-profile/agent" "$sandbox_base/relocated-agent" \
+    "$sandbox_base/relocated-omp/profiles/glen-harness/agent" \
+    "$sandbox_base/home/reloc-root/profiles" "$sandbox_base/home/reloc-agent/profiles/glen-harness"
+  ln -s "$sandbox_base/relocated-profile" "$sandbox_base/home/reloc-root/profiles/glen-harness"
+  ln -s "$sandbox_base/relocated-agent" "$sandbox_base/home/reloc-agent/profiles/glen-harness/agent"
+  ln -s "$sandbox_base/relocated-omp" "$sandbox_base/home/reloc-omp"
+  for reloc_case in "reloc-root $sandbox_base/home/reloc-root/profiles/glen-harness" \
+    "reloc-agent $sandbox_base/home/reloc-agent/profiles/glen-harness/agent" \
+    "reloc-omp $sandbox_base/home/reloc-omp"; do
+    reloc_name="${reloc_case%% *}" reloc_link="${reloc_case#* }"
+    sandbox_agent="$sandbox_alias/home/$reloc_name/profiles/glen-harness/agent"
+    policies_before="$(find "$sandbox_base/run" -maxdepth 1 -name 'omp-sandbox.*' | wc -l)"
+    run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+    assert_exit "sandbox refuses a relocated profile ($reloc_name)" 1
+    assert_contains "relocated profile ($reloc_name) refusal names the symlink" \
+      "refusing symlinked glen-harness profile path: $reloc_link" "$STDERR"
+    assert "relocated profile ($reloc_name) refusal runs nothing" test ! -s "$STDOUT"
+    assert "relocated profile ($reloc_name) refusal writes no policy" test \
+      "$(find "$sandbox_base/run" -maxdepth 1 -name 'omp-sandbox.*' | wc -l)" -eq "$policies_before"
+    unset sandbox_agent
+  done
+  sandbox_agent="$sandbox_alias/home/custom-omp/glen-harness/agent"
+  mkdir -p "$sandbox_base/home/custom-omp/glen-harness/agent"
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  assert_exit 'sandbox refuses an agent directory outside profiles/glen-harness' 1
+  assert_contains 'misplaced agent directory refusal names the shape' 'must be <omp root>/profiles/glen-harness/agent' "$STDERR"
+  unset sandbox_agent
+
+  # Fix cycle 7, Claude LOW-8: other loopback spellings are refused by name.
+  for loopback_case in 'v6long http://[0:0:0:0:0:0:0:1]:7777/mcp' 'v4other http://127.0.0.2:7777/mcp' \
+    'v6mapped http://[::ffff:127.0.0.1]:7777/mcp' 'dotted http://localhost.:7777/mcp'; do
+    # shellcheck disable=SC2086 # intentional word splitting of the case.
+    set -- $loopback_case
+    mkdir -p "$sandbox_base/home/loopback-$1/profiles/glen-harness/agent"
+    jq -cn --arg url "$2" '{mcpServers:{mnemosyne:{type:"http",url:$url}}}' \
+      > "$sandbox_base/home/loopback-$1/profiles/glen-harness/agent/mcp.json"
+    sandbox_agent="$sandbox_alias/home/loopback-$1/profiles/glen-harness/agent"
+    run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+    assert_exit "sandbox refuses a $1 loopback spelling" 1
+    assert_contains "sandbox $1 loopback refusal names the reason" 'loopback address in an unsupported spelling' "$STDERR"
+    assert "sandbox $1 loopback refusal runs nothing" test ! -s "$STDOUT"
+    unset sandbox_agent
+  done
+
+  # Fix cycle 7, Claude LOW-4: the scope comes from the resolved binary
+  # whatever its name; a binary that cannot derive one, or hangs, gets a
+  # named warning, and the hang is bounded.
+  cat > "$sandbox_base/bin/omp-darwin-arm64" <<'EOF'
+#!/bin/sh
+[ "${BUN_BE_BUN:-}" = 1 ] && printf 'abcdefabcdef0123' && exit 0
+exit 0
+EOF
+  cat > "$sandbox_base/bin/omp-hangs" <<'EOF'
+#!/bin/sh
+[ "${BUN_BE_BUN:-}" = 1 ] && exec /bin/sleep 60
+exit 0
+EOF
+  chmod +x "$sandbox_base/bin/omp-darwin-arm64" "$sandbox_base/bin/omp-hangs"
+  run_sandbox sandbox_call "$sandbox_base/bin/omp-darwin-arm64" --version
+  assert 'sandbox derives the scope from a differently named omp binary' grep -Fq \
+    "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/run/daemons/abcdefabcdef0123/clients\")" \
+    "$sandbox_base/run"/omp-sandbox.*
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  assert_contains 'sandbox warns, naming the binary, when no scope can be derived' \
+    'could not derive the daemon presence scope from cat' "$STDERR"
+  scope_started="$(date +%s)"
+  run_sandbox sandbox_call "$sandbox_base/bin/omp-hangs" --version
+  assert 'sandbox bounds a hanging scope hash call' test "$(( $(date +%s) - scope_started ))" -lt 30
+  assert_contains 'hanging scope hash call warns' 'could not derive the daemon presence scope from omp-hangs' "$STDERR"
+
+  # Fix cycle 7, Claude LOW-6: an alternate config root's natives are granted
+  # read-only next to ~/.omp/natives, which omp's addon loader always uses.
+  assert 'alternate config root grants its own natives read-only' grep -Fq \
+    "(subpath \"$sandbox_base/home/.omp-alt/natives\")" "$(grep -Fl '.omp-alt/run/session-owners' "$sandbox_base/run"/omp-sandbox.* | head -1)"
+
   # Verify the SQLite CLI/query itself even when nested Seatbelt is unavailable.
   # The sandboxed cases below must perform these same real transactions.
   for journal in delete wal; do
@@ -1081,6 +1158,57 @@ done
 run env HOME="$containment_home" TMPDIR="$containment_home/.omp/profiles/glen-harness/cache" \
   /bin/bash "$ENGINE" launcher "$POLICY_REPO"
 assert_exit 'launcher refuses a default cache under a TMPDIR inside the profile' 4
+# Claude LOW-5: a refused destination is never created first.
+run env HOME="$containment_home" /bin/bash "$ENGINE" launcher "$POLICY_REPO" \
+  "$containment_home/.omp/profiles/glen-harness/logs/never/created"
+assert_exit 'launcher refuses a missing destination inside the profile' 4
+assert 'refused launcher destination is never created' test ! -e "$containment_home/.omp/profiles/glen-harness/logs/never"
+
+# Fix cycle 7 (Codex P1): a relocated profile is refused by name at launcher
+# resolution and at probe, whichever component is the symlink, even when the
+# destination itself is outside every ~/.omp spelling.
+for relocated_case in profile-root omp-root agent profiles-dir logs-child shared-owners; do
+  relocated_home="$WORK/relocated-$relocated_case/home" relocated_out="$WORK/relocated-$relocated_case/outside"
+  mkdir -p "$relocated_home" "$relocated_out/harness/agent" "$relocated_out/harness/cache"
+  case "$relocated_case" in
+    profile-root)
+      mkdir -p "$relocated_home/.omp/profiles"
+      ln -s "$relocated_out/harness" "$relocated_home/.omp/profiles/glen-harness"
+      relocated_link="$relocated_home/.omp/profiles/glen-harness" ;;
+    omp-root)
+      mkdir -p "$relocated_out/omp/profiles/glen-harness/agent"
+      ln -s "$relocated_out/omp" "$relocated_home/.omp"
+      relocated_link="$relocated_home/.omp" ;;
+    agent)
+      mkdir -p "$relocated_home/.omp/profiles/glen-harness"
+      ln -s "$relocated_out/harness/agent" "$relocated_home/.omp/profiles/glen-harness/agent"
+      relocated_link="$relocated_home/.omp/profiles/glen-harness/agent" ;;
+    profiles-dir)
+      mkdir -p "$relocated_home/.omp" "$relocated_out/profiles/glen-harness/agent"
+      ln -s "$relocated_out/profiles" "$relocated_home/.omp/profiles"
+      relocated_link="$relocated_home/.omp/profiles" ;;
+    logs-child)
+      mkdir -p "$relocated_home/.omp/profiles/glen-harness/agent"
+      ln -s "$relocated_out/harness/cache" "$relocated_home/.omp/profiles/glen-harness/logs"
+      relocated_link="$relocated_home/.omp/profiles/glen-harness/logs" ;;
+    shared-owners)
+      mkdir -p "$relocated_home/.omp/profiles/glen-harness/agent" "$relocated_home/.omp/run"
+      ln -s "$relocated_out/harness/cache" "$relocated_home/.omp/run/session-owners"
+      relocated_link="$relocated_home/.omp/run/session-owners" ;;
+  esac
+  run env HOME="$relocated_home" /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$relocated_out/harness/cache/launcher"
+  assert_exit "launcher refuses a relocated $relocated_case" 4
+  assert_contains "relocated $relocated_case refusal names the symlink" \
+    "refusing symlinked glen-harness profile path: $(cd "$(dirname "$relocated_link")" && pwd -P)/${relocated_link##*/}" "$STDERR"
+  assert "relocated $relocated_case refusal returns no launcher path" test ! -s "$STDOUT"
+  assert "relocated $relocated_case refusal creates nothing" test ! -e "$relocated_out/harness/cache/launcher"
+done
+mkdir -p "$WORK/relocated-profile-root/outside/harness/agent"
+printf 'modelRoles: {}\n' > "$WORK/relocated-profile-root/outside/harness/agent/config.yml"
+run env HOME="$WORK/relocated-profile-root/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
+assert_exit 'probe skips a relocated profile' 3
+assert_contains 'relocated profile probe names the reason' 'refusing symlinked glen-harness profile path' "$STDOUT"
+assert 'relocated profile probe never calls glen or omp' test ! -e "$SMOKE_UNEXPECTED_CALL"
 
 # A cached launcher is reused only as a regular file with the same bytes.
 mkdir "$WORK/launcher-reuse"
@@ -1671,6 +1799,56 @@ assert 'edit between copy and diff capture actually raced' test -e "$STATE/raced
 assert 'edit between copy and diff capture never dispatches' test ! -s "$STATE/calls.jsonl"
 assert_tree 'edit between copy and diff capture cleans tree' removed
 git -C "$DISPATCH_SRC" checkout -q -- tracked
+
+# Fix cycle 7 (Codex P2-a / Claude LOW-1): a clean checkout of another commit
+# between the snapshot and the diff capture leaves status, diff HEAD and the
+# untracked list empty on both sides; only the commit id in the fingerprint
+# catches it, and the run refuses.
+dispatch_main_commit="$(git -C "$DISPATCH_SRC" rev-parse HEAD)"
+git -C "$DISPATCH_SRC" checkout -q -b clean-race
+printf 'other commit\n' > "$DISPATCH_SRC/tracked"
+git -C "$DISPATCH_SRC" add tracked
+commit_fixture "$DISPATCH_SRC"
+dispatch_other_commit="$(git -C "$DISPATCH_SRC" rev-parse HEAD)"
+git -C "$DISPATCH_SRC" checkout -q main
+cat > "$WORK/race-git-bin/git" <<'EOF'
+#!/bin/bash
+case " $* " in
+  *" diff --name-only "*)
+    if [ ! -e "$FAKE_GLEN_STATE/raced" ]; then
+      : > "$FAKE_GLEN_STATE/raced"
+      "$FAKE_REAL_GIT" -C "$SMOKE_RACE_REPO" checkout -q clean-race
+      "$FAKE_REAL_GIT" -C "$SMOKE_RACE_REPO" status --porcelain=v1 > "$FAKE_GLEN_STATE/status-after-race"
+    fi
+    ;;
+esac
+exec "$FAKE_REAL_GIT" "$@"
+EOF
+dispatch_fixture capture-commit-race
+SMOKE_RACE_REPO="$DISPATCH_SRC" DISPATCH_EXTRA_PATH="$WORK/race-git-bin:" dispatch_run
+assert 'clean checkout between snapshot and diff capture actually raced' test -e "$STATE/raced"
+assert 'clean checkout race leaves a clean tree' test ! -s "$STATE/status-after-race"
+assert_eq 'clean checkout race really moved HEAD' "$(git -C "$DISPATCH_SRC" rev-parse HEAD)" "$dispatch_other_commit"
+assert_exit 'clean checkout between snapshot and diff capture skips' 3
+assert_eq 'clean checkout race reason' "$(jq -r .reason "$STDOUT")" 'source changed during capture'
+assert 'clean checkout race never dispatches' test ! -s "$STATE/calls.jsonl"
+assert_tree 'clean checkout race cleans tree' removed
+git -C "$DISPATCH_SRC" checkout -q main
+# The snapshot itself recaptures across a clean checkout and reports the
+# commit its matching fingerprints recorded.
+# shellcheck disable=SC2016 # Expanded by the snapshot subprocess, not this shell.
+run env SMOKE_RACE_MARKER="$WORK/commit-race-marker" SMOKE_RACE_COMMIT="$dispatch_other_commit" \
+  GLEN_OMP_ENGINE_TEST_MUTATE='if [ ! -e "$SMOKE_RACE_MARKER" ]; then git checkout -q --detach "$SMOKE_RACE_COMMIT"; : > "$SMOKE_RACE_MARKER"; fi' \
+  /bin/bash "$ENGINE" snapshot "$DISPATCH_SRC" "$WORK/commit-race-snapshot"
+assert_exit 'snapshot recaptures across a clean checkout' 0
+assert_contains 'clean checkout snapshot logs the recapture' 'source changed during capture; recapturing once' "$STDERR"
+assert_eq 'clean checkout snapshot head is the recaptured commit' "$(jq -r .head "$STDOUT")" "$dispatch_other_commit"
+# shellcheck disable=SC2016 # jq binds $head through --arg.
+assert 'clean checkout snapshot fingerprint leads with that commit' jq -e --arg head "$dispatch_other_commit" \
+  '.source_fingerprint | startswith($head + " ")' "$STDOUT"
+assert_eq 'clean checkout snapshot copies the recaptured bytes' "$(cat "$WORK/commit-race-snapshot/tracked")" 'other commit'
+git -C "$DISPATCH_SRC" checkout -q main
+assert_eq 'dispatch fixture is back on its main commit' "$(git -C "$DISPATCH_SRC" rev-parse HEAD)" "$dispatch_main_commit"
 
 dispatch_fixture snapshot-skipped
 : > "$STATE/oversize"

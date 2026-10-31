@@ -11,9 +11,39 @@ REAL_HOME="$(cd "$HOME" && pwd -P)" || die 'could not resolve HOME directory'
 export HOME="$REAL_HOME"
 [ -n "${OMP_SANDBOX_RUN_ROOT:-}" ] || die 'OMP_SANDBOX_RUN_ROOT is required'
 RUN_ROOT_REAL="$(cd "$OMP_SANDBOX_RUN_ROOT" && pwd -P)" || die 'could not resolve run root'
+# omp's base config root, $HOME/${PI_CONFIG_DIR:-.omp} (utils/src/dirs.ts:116-118).
+CONFIG_ROOT="$REAL_HOME/${PI_CONFIG_DIR:-.omp}"
+double='//' single='/'
+while [[ "$CONFIG_ROOT" == *//* ]]; do CONFIG_ROOT="${CONFIG_ROOT//$double/$single}"; done
+CONFIG_ROOT="${CONFIG_ROOT%/}"
+[ ! -L "$CONFIG_ROOT" ] || die "refusing symlinked glen-harness profile path: $CONFIG_ROOT"
 # Repository callers pass the agent directory; legacy callers use glen-harness.
-PROFILE_AGENT_DIR="$(cd "${OMP_PROFILE_AGENT_DIR:-$REAL_HOME/.omp/profiles/glen-harness/agent}" && pwd -P)" || die 'could not resolve profile agent directory'
-PROFILE_ROOT="$(cd "$PROFILE_AGENT_DIR/.." && pwd -P)" || die 'could not resolve profile root'
+# Fix cycle 7 (Codex P1): the agent directory must be <omp root>/profiles/
+# glen-harness/agent, and none of those four components may be a symlink.
+# A relocated profile would make this policy grant writes wherever it points
+# while the engine's launcher containment checks the ~/.omp spelling, so it
+# is refused, never followed; the lexical and physical paths then agree.
+# Ancestors above the omp root (/var -> /private/var) still resolve.
+agent_arg="${OMP_PROFILE_AGENT_DIR:-$CONFIG_ROOT/profiles/glen-harness/agent}"
+while [ "${agent_arg%/}" != "$agent_arg" ]; do agent_arg="${agent_arg%/}"; done
+case "$agent_arg" in
+  */*/profiles/glen-harness/agent) ;;
+  *) die 'profile agent directory must be <omp root>/profiles/glen-harness/agent' ;;
+esac
+agent_rest="${agent_arg%/profiles/glen-harness/agent}"
+omp_root_name="${agent_rest##*/}"
+case "$omp_root_name" in '' | . | ..) die 'profile agent directory must name a real omp root' ;; esac
+omp_root_parent="${agent_rest%/*}"
+omp_root_parent="$(cd "${omp_root_parent:-/}" && pwd -P)" || die 'could not resolve profile agent directory'
+[ "$omp_root_parent" != / ] || omp_root_parent=''
+profile_path="$omp_root_parent"
+for part in "$omp_root_name" profiles glen-harness agent; do
+  profile_path="$profile_path/$part"
+  [ ! -L "$profile_path" ] || die "refusing symlinked glen-harness profile path: $profile_path"
+  [ -d "$profile_path" ] || die 'could not resolve profile agent directory'
+done
+PROFILE_AGENT_DIR="$profile_path"
+PROFILE_ROOT="${PROFILE_AGENT_DIR%/agent}"
 
 # Resolve both ancestor aliases (/var -> /private/var) and the executable's own
 # symlink chain. omp is a self-contained Bun-compiled Mach-O; no runtime/package
@@ -67,6 +97,15 @@ sbpl_regex_literal() {
   printf '%s' "$out"
 }
 home_sb="$(sbpl_path "$REAL_HOME")"
+# omp 18.14.0's addon loader always uses ~/.omp/natives, whatever
+# PI_CONFIG_DIR says (natives/native/loader-state.js:58-71); the config root's
+# own natives/ is granted too, so an alternate root is honoured the same way
+# as for leases (fix cycle 7, Claude LOW-6). Both stay read-only.
+natives_filters="  (subpath \"$home_sb/.omp/natives\")"
+if [ "$CONFIG_ROOT" != "$REAL_HOME/.omp" ]; then
+  natives_filters="$natives_filters
+  (subpath \"$(sbpl_path "$CONFIG_ROOT")/natives\")"
+fi
 run_sb="$(sbpl_path "$RUN_ROOT_REAL")"
 bin_sb="$(sbpl_path "$OMP_REAL_BIN_RESOLVED")"
 agent_sb="$(sbpl_path "$PROFILE_AGENT_DIR")"
@@ -126,9 +165,18 @@ mnemosyne_network_rule() {
   if [ -z "$port" ]; then
     if [ "$scheme" = https ]; then port=443; else port=80; fi
   fi
+  # Any other spelling of a loopback address is refused by name (fix cycle 7,
+  # Claude LOW-8), rather than misreported as a non-loopback host.
+  local v6_loopback='^\[[0:]*1\]$' v6_mapped='^\[::ffff:(127\.|7f)'
   case "$host" in
     localhost | 127.0.0.1 | '[::1]') ;;
+    127.* | localhost. | *.localhost | *.localhost.)
+      die "Mnemosyne MCP host $host is a loopback address in an unsupported spelling; use localhost, 127.0.0.1 or [::1]"
+      ;;
     *)
+      if [[ "$host" =~ $v6_loopback ]] || [[ "$host" =~ $v6_mapped ]]; then
+        die "Mnemosyne MCP host $host is a loopback address in an unsupported spelling; use localhost, 127.0.0.1 or [::1]"
+      fi
       [ "$port" = 443 ] || die "Mnemosyne MCP host $host is neither loopback nor on 443; refusing rather than granting an unbounded outbound host"
       return 0
       ;;
@@ -148,17 +196,22 @@ mnemosyne_rule="$(mnemosyne_network_rule)" || die 'could not derive the Mnemosyn
 # children past any per-path deny (host-verified). The hash is computed here,
 # unsandboxed, by omp's own Bun runtime, from / with an empty environment so
 # no bunfig.toml or .env from the reviewed tree or the run root is read.
+# Whatever the resolved binary is called (an installer may ship
+# omp-darwin-arm64), and bounded to 10 seconds (fix cycle 7, Claude LOW-4):
+# only the ^[0-9a-f]{16}$ check below decides whether a scope was derived.
 daemon_scope_for() {
   local scope
-  case "${OMP_REAL_BIN_RESOLVED##*/}" in omp) ;; *) return 0 ;; esac
+  local -a bounded=(perl -e 'alarm shift @ARGV; exec @ARGV' 10)
+  ! command -v timeout >/dev/null 2>&1 || bounded=(timeout 10)
   # shellcheck disable=SC2016 # JavaScript, not shell.
-  scope="$(cd / && env -i BUN_BE_BUN=1 HOME=/var/empty GLEN_SCOPE_DIR="$1" "$OMP_REAL_BIN_RESOLVED" -e \
+  scope="$(cd / && "${bounded[@]}" env -i BUN_BE_BUN=1 HOME=/var/empty GLEN_SCOPE_DIR="$1" "$OMP_REAL_BIN_RESOLVED" -e \
     'process.stdout.write(Bun.hash.wyhash(process.env.GLEN_SCOPE_DIR).toString(16).padStart(16, "0"))' \
     < /dev/null 2> /dev/null)" || scope=''
   if [[ "$scope" =~ ^[0-9a-f]{16}$ ]]; then
     printf '%s' "$scope"
   else
-    printf 'omp-sandboxed: warning: could not derive the daemon presence scope; omp may refuse to start\n' >&2
+    printf 'omp-sandboxed: warning: could not derive the daemon presence scope from %s; omp may refuse to start\n' \
+      "${OMP_REAL_BIN_RESOLVED##*/}" >&2
   fi
 }
 CWD_REAL="$(pwd -P)" || die 'could not resolve the working directory'
@@ -176,7 +229,7 @@ ensure_dir() {
 # Leases live under omp's base config root, $HOME/${PI_CONFIG_DIR:-.omp}
 # (utils/src/dirs.ts:116-118,1151), shared by every profile of that root
 # (fix cycle 6, Codex item-5 P2: never hardcode .omp here).
-BASE_RUN_DIR="$REAL_HOME/${PI_CONFIG_DIR:-.omp}/run"
+BASE_RUN_DIR="$CONFIG_ROOT/run"
 OWNERS_DIR="$BASE_RUN_DIR/session-owners"
 DAEMONS_DIR="$PROFILE_ROOT/run/daemons"
 runtime_dirs=("$PROFILE_AGENT_DIR/sessions" "$PROFILE_ROOT/logs" "$PROFILE_ROOT/cache" "$PROFILE_ROOT/run"
@@ -246,7 +299,7 @@ cat > "$profile" <<EOF
   (subpath "$profile_sb/cache")
   (subpath "$profile_sb/run")
   ;; Shared native cache: populated unsandboxed by setup, then read-only here.
-  (subpath "$home_sb/.omp/natives")
+$natives_filters
   ;; Session ownership leases (flock sidecars, session/session-storage.ts:1295),
   ;; shared by every profile. Only this directory of ~/.omp/run (fix cycle 6,
   ;; HIGH-1): its daemons/ tree holds broker tokens and launch specs.
