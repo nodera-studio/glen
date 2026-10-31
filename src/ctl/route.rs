@@ -486,6 +486,7 @@ pub(crate) fn route(
             deadline,
             stop.clone(),
             env,
+            cli.command.name(),
         ) {
             Ok(client) => return Ok((Target::Rpc(client), vec![])),
             Err(OpenError::Busy) => {
@@ -549,7 +550,10 @@ pub(crate) fn route_models(
             ));
         }
         let probe = lease::probe(&paths.session_owners_dir, id);
-        if !matches!(probe, Lease::Free) {
+        // A hidden lease (Linux under a Codex marker) is unknown whatever it probes as.
+        if !matches!(probe, Lease::Free)
+            || crate::sandbox::lease_hidden(env, cfg!(target_os = "linux"))
+        {
             warnings.push(Warning {
                 code: "session_unreachable".into(),
                 message: live::route::lease_held_hint(&paths),

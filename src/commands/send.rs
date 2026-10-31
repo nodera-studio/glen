@@ -201,6 +201,11 @@ pub(crate) fn submit(
             )
             .with_hint("restart that omp session and run `glen ls`"));
         }
+        // Before the lock check: a held glen lock would otherwise skip the lease probe and
+        // queue a job the worker could only refuse (W10 fix cycle 2 decision 2).
+        if live.is_none() {
+            crate::sandbox::refuse_hidden_lease(env)?;
+        }
         if live.is_none() && !lock::is_held(&home, &o.session.header.id) {
             #[cfg(debug_assertions)]
             if let Some(path) = env.get("FAKE_OMP_LEASE_PROBE_GATE") {
@@ -384,6 +389,66 @@ mod tests {
                 lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0));
             }
         }
+    }
+    /// W10 fix cycle 2 decision 2: a hidden lease refuses an RPC resume whether or not a glen
+    /// job lock is held, before the lease probe, the omp lookup and any job write.
+    #[test]
+    fn a_hidden_lease_refuses_rpc_resume_even_while_the_glen_lock_is_held() {
+        let tree = crate::omp::fixtures::tree();
+        let target = crate::omp::fixtures::path(&tree, 'A');
+        let glen = tempfile::tempdir().unwrap();
+        let home = crate::glen_home::GlenHome {
+            root: glen.path().join("glen"),
+        };
+        let agent = tree.path().join("unused-agent");
+        let env = Env::for_test(
+            Some(tree.path()),
+            tree.path(),
+            &[
+                ("GLEN_HOME", home.root.to_str().unwrap()),
+                ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+                // A lookup would fail as omp_unavailable, never sandboxed.
+                ("GLEN_OMP_BIN", "/nonexistent/omp"),
+                ("CODEX_SANDBOX_NETWORK_DISABLED", "1"),
+            ],
+        );
+        let id = crate::omp::session::Session::load(&target)
+            .unwrap()
+            .header
+            .id;
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        for held in [true, false] {
+            let lock = held.then(|| lock::try_acquire(&home, &id).unwrap().unwrap());
+            let cli =
+                Cli::try_parse_from(["glen", "send", target.to_str().unwrap(), "hi"]).unwrap();
+            let crate::cli::Command::Send(args) = &cli.command else {
+                panic!("send")
+            };
+            let ctx = OutputCtx::new(
+                &cli.global,
+                OutputKind::Document,
+                &env,
+                &Terminal {
+                    stdout_tty: false,
+                    stderr_tty: false,
+                    stdout_cols: None,
+                },
+            )
+            .unwrap();
+            lease::PROBE_CALLS.with(|calls| calls.set(0));
+            let err = match run(&cli, args, &env, &ctx) {
+                Err(e) => e,
+                Ok(_) => panic!("held={held}: unexpected success"),
+            };
+            assert_eq!(err.code, ErrorCode::NoRoute, "held={held}: {}", err.message);
+            let details = err.details.unwrap();
+            assert_eq!(details["reason"], "sandboxed", "held={held}");
+            assert_eq!(details["lease"], "unknown", "held={held}");
+            lease::PROBE_CALLS.with(|calls| assert_eq!(calls.get(), 0, "held={held}"));
+            assert!(!home.root.join("jobs").exists(), "held={held}: no job");
+            drop(lock);
+        }
+        crate::sandbox::force_lease_hidden_for_test(None);
     }
 }
 

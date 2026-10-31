@@ -2935,8 +2935,29 @@ fn ac410_network_disabled_without_codex_sandbox_is_not_a_sandbox() {
             vars,
         )
         .run();
-        let d = data_of(&out, 0);
-        assert_eq!(d["status"], "completed", "{vars:?}: {d}");
+        if cfg!(target_os = "linux") {
+            // AC-1028 (W10 fix cycle 2 decision 1): on Linux any marker hides omp's lease, so
+            // an RPC resume refuses before any job or omp start; `@new` still sends.
+            let err = failed(&out, "no_route");
+            assert_eq!(err["details"]["reason"], "sandboxed", "{vars:?}: {err}");
+            assert_eq!(err["details"]["lease"], "unknown", "{vars:?}: {err}");
+            assert!(!rb.jobs_dir().exists(), "{vars:?}: no job\n{}", out.ctx());
+            assert!(
+                rb.starts().is_empty(),
+                "{vars:?}: omp was started\n{}",
+                rb.diag()
+            );
+            let out = envs(
+                rb.glen(["send", "@new", "hi", "--wait", "20s", "--json"]),
+                vars,
+            )
+            .run();
+            let d = data_of(&out, 0);
+            assert_eq!(d["status"], "completed", "{vars:?}: {d}");
+        } else {
+            let d = data_of(&out, 0);
+            assert_eq!(d["status"], "completed", "{vars:?}: {d}");
+        }
         rb.assert_quiet();
     }
 }
@@ -2953,8 +2974,15 @@ fn ac410_network_disabled_alone_maps_a_glen_home_permission_failure_to_sandboxed
     fs::create_dir(&ro).unwrap();
     set_mode(&ro, 0o555);
     let _restore = RestoreMode(ro.clone(), 0o755);
+    // AC-1028 (W10 fix cycle 2 decision 1): on Linux the hidden-lease refusal precedes the
+    // job write for an existing session, so the GLEN_HOME mapping is reached through `@new`.
+    let target = if cfg!(target_os = "linux") {
+        "@new"
+    } else {
+        A.handle
+    };
     let out = rb
-        .glen(["send", A.handle, "hi", "--json"])
+        .glen(["send", target, "hi", "--json"])
         .env("GLEN_HOME", ro.join("glen"))
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
         .run();
