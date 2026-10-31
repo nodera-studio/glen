@@ -9,12 +9,6 @@ exec 3>&1
 MODE="${1:-}"
 [ "$#" -eq 0 ] || shift
 PROFILE=glen-harness
-# The engine never writes config; it only maps the resolved modelRoles.default
-# back to the level setup chose when it selected that id. $0, not
-# BASH_SOURCE[0]: consistent with omp-profile-setup.sh's sibling line, robust
-# to a test running this script's text through `bash -c "$text" ...`.
-# shellcheck source=.claude/omp/model-ladder.sh
-. "$(cd "$(dirname "$0")/../omp" && pwd -P)/model-ladder.sh"
 START="$(date +%s)"
 STATUS=failed REASON='engine command failed' EXIT_CODE=4
 MODEL='' THINKING_LEVEL='' PROVIDER='' POLICY_SOURCE='' LAUNCHER_SOURCE='' LAUNCHER_BIN='' HEAD='' MERGE_BASE='' SNAPSHOT_SHA256=''
@@ -109,35 +103,85 @@ resolve_launcher() {
     esac
     [ "$dest" != "$RUN_DIR" ] || { REASON='sandbox launcher must not be placed inside the active run directory'; return 1; }
   fi
+  if [ -n "${OMP_SANDBOX_RUN_ROOT:-}" ]; then
+    case "$dest/" in
+      "$OMP_SANDBOX_RUN_ROOT"/*) REASON='sandbox launcher must not be placed inside an active sandbox run root'; return 1 ;;
+    esac
+    [ "$dest" != "$OMP_SANDBOX_RUN_ROOT" ] || { REASON='sandbox launcher must not be placed inside an active sandbox run root'; return 1; }
+  fi
   mkdir -p "$dest" || { REASON='could not create sandbox launcher directory'; return 1; }
+  # Physical containment (fix cycle 5, decision 1): pwd -P resolves every
+  # symlinked ancestor, so a cache dir reached only through a symlink into a
+  # sandbox-writable tree resolves to its real, writable location here, where
+  # the checks below catch it. A lexical check on the raw argument could not.
+  dest="$(cd "$dest" && pwd -P)" || { REASON='could not resolve sandbox launcher directory'; return 1; }
+  case "$dest/" in
+    "$(profile_agent_dir)"/*) REASON='sandbox launcher must not resolve under the profile agent directory'; return 1 ;;
+  esac
+  [ "$dest" != "$(profile_agent_dir)" ] || {
+    REASON='sandbox launcher must not resolve to the profile agent directory'
+    return 1
+  }
+  case "$dest" in
+    */glen-omp-engine/run-*)
+      REASON='sandbox launcher must not resolve inside a per-dispatch run directory'
+      return 1
+      ;;
+  esac
   chmod 0700 "$dest" || { REASON='could not secure sandbox launcher directory'; return 1; }
   check_no_group_other_write "$dest" || {
     REASON="unsafe sandbox launcher directory: $dest is not exclusively owned and writable by the current user"
     return 1
   }
-  # Reuse the captured executable within this run, but recheck ownership/mode
-  # and tool availability on every dispatch. Never select an inherited
-  # GLEN_OMP_BIN/OMP_REAL_BIN.
-  case "$LAUNCHER_BIN" in
-    "$dest"/*)
-      if [ -x "$LAUNCHER_BIN" ] && check_no_group_other_write "$LAUNCHER_BIN"; then
-        return 0
-      fi
-      ;;
-  esac
-  LAUNCHER_BIN="$(mktemp "$dest/$launcher.XXXXXX")" || { REASON='could not create sandbox launcher'; return 1; }
-  if git -C "$src" show "main:.claude/omp/$launcher" > "$LAUNCHER_BIN" 2>/dev/null; then
+  # Fetch into a scratch file, then adopt a content-addressed final name so
+  # repeated calls reuse the same file instead of piling up mktemp siblings
+  # (LOW-3), and remove any stale sibling this cache dir owns under the same
+  # launcher basename. Recheck ownership/mode and source on every call; never
+  # select an inherited GLEN_OMP_BIN/OMP_REAL_BIN.
+  local fetch_tmp hash final stale
+  fetch_tmp="$(mktemp "$dest/.$launcher.fetch.XXXXXX")" || {
+    REASON='could not create sandbox launcher'
+    return 1
+  }
+  if git -C "$src" show "main:.claude/omp/$launcher" > "$fetch_tmp" 2>/dev/null; then
     LAUNCHER_SOURCE=main
   else
-    cp "$src/.claude/omp/$launcher" "$LAUNCHER_BIN" || { REASON='sandbox launcher unavailable on main and in worktree'; return 1; }
+    if ! cp "$src/.claude/omp/$launcher" "$fetch_tmp" 2>/dev/null; then
+      rm -f "$fetch_tmp"
+      REASON='sandbox launcher unavailable on main and in worktree'
+      return 1
+    fi
     LAUNCHER_SOURCE=worktree
     log 'warning: main launcher unavailable; using the worktree launcher'
   fi
-  chmod 0700 "$LAUNCHER_BIN" || { REASON='could not make sandbox launcher executable'; return 1; }
-  check_no_group_other_write "$LAUNCHER_BIN" || {
+  chmod 0500 "$fetch_tmp" || { rm -f "$fetch_tmp"; REASON='could not secure sandbox launcher file'; return 1; }
+  if [ "$(uname -s)" = Darwin ]; then
+    hash="$(shasum -a 256 "$fetch_tmp" | awk '{print $1}')"
+  else
+    hash="$(sha256sum "$fetch_tmp" | awk '{print $1}')"
+  fi
+  if [ -z "$hash" ]; then
+    rm -f "$fetch_tmp"
+    REASON='could not hash sandbox launcher'
+    return 1
+  fi
+  final="$dest/$launcher.${hash:0:16}"
+  if [ -e "$final" ]; then
+    rm -f "$fetch_tmp"
+  elif ! mv "$fetch_tmp" "$final"; then
+    rm -f "$fetch_tmp"
+    REASON='could not install sandbox launcher'
+    return 1
+  fi
+  check_no_group_other_write "$final" || {
     REASON='unsafe sandbox launcher file permissions after creation'
     return 1
   }
+  LAUNCHER_BIN="$final"
+  for stale in "$dest/$launcher".*; do
+    [ -e "$stale" ] && [ "$stale" != "$final" ] || continue
+    rm -f "$stale"
+  done
 }
 
 # SRC is an engine checkout, not the tree being reviewed.
@@ -155,8 +199,11 @@ policy() {
 # Internal helpers deliberately expose only their requested command/path/YAML.
 case "$MODE" in
   launcher)
-    [ "$#" -eq 2 ] || { log 'usage: launcher SRC DIR'; exit 2; }
-    resolve_launcher "$1" "$2" || { log "$REASON"; exit 4; }
+    case "$#" in
+      1) resolve_launcher "$1" "$(launcher_dir_for)" || { log "$REASON"; exit 4; } ;;
+      2) resolve_launcher "$1" "$2" || { log "$REASON"; exit 4; } ;;
+      *) log 'usage: launcher SRC [DIR]'; exit 2 ;;
+    esac
     printf '%s\n' "$LAUNCHER_BIN"
     exit 0
     ;;
@@ -286,6 +333,15 @@ finish() {
 }
 trap finish EXIT
 trap interrupted INT TERM
+# Sourced only after the EXIT trap is registered (fix cycle 5, decision 10):
+# a missing/broken ladder file must still produce the normal JSON failure
+# envelope through `finish`, not a bare, uncaught `set -e` exit. The engine
+# never writes config; it only maps the resolved modelRoles.default back to
+# the level setup chose when it selected that id. $0, not BASH_SOURCE[0]:
+# consistent with omp-profile-setup.sh's sibling line, robust to a test
+# running this script's text through `bash -c "$text" ...`.
+# shellcheck source=.claude/omp/model-ladder.sh
+. "$(cd "$(dirname "$0")/../omp" && pwd -P)/model-ladder.sh"
 
 # The disabled probe must not pay for repository/tool discovery in a fresh TMPDIR.
 # Keep its JSON identical to other skips.
@@ -333,18 +389,28 @@ validate_snapshot_ancestors() {
   local ancestor context permissions matches
   ancestor="$(cd "$(dirname "$1")" && pwd -P)" || stop skipped 'unsafe snapshot ancestor: could not resolve parent' 3
   while :; do
-    # Glob only this directory's own entry names, case-insensitively, instead
-    # of a find traversal: a sibling vanishing mid-scan must never turn into
-    # a false "could not inspect" failure (Claude MED-002). nullglob makes a
-    # non-match expand to nothing rather than the literal pattern; nocaseglob
-    # covers every AGENTS.md/CLAUDE.md case variant without -iname.
-    shopt -s nocaseglob nullglob
-    matches=("$ancestor"/AGENTS.md "$ancestor"/CLAUDE.md)
-    shopt -u nocaseglob nullglob
-    for context in "${matches[@]}"; do
-      [ -f "$context" ] || [ -L "$context" ] || continue
-      stop skipped "unsafe snapshot ancestor: context file $context" 3
-    done
+    # Glob only this directory's own entry names, instead of a find traversal:
+    # a sibling vanishing mid-scan must never turn into a false "could not
+    # inspect" failure (Claude MED-002). nullglob makes a non-match expand to
+    # nothing rather than the literal pattern. Bracket-class patterns are real
+    # glob metacharacters, so every AGENTS.md/CLAUDE.md case variant is caught
+    # on a case-SENSITIVE filesystem too (fix cycle 5, decision 6); plain
+    # nocaseglob alone has no effect on a pattern with no metacharacters at
+    # all, which only worked here by accident on a case-insensitive one.
+    shopt -s nullglob
+    matches=(
+      "$ancestor"/[Aa][Gg][Ee][Nn][Tt][Ss].[Mm][Dd]
+      "$ancestor"/[Cc][Ll][Aa][Uu][Dd][Ee].[Mm][Dd]
+    )
+    shopt -u nullglob
+    # Bash 3.2 (macOS's default) treats "${arr[@]}" on a zero-element array
+    # as unbound under set -u; guard the count before iterating.
+    if [ "${#matches[@]}" -gt 0 ]; then
+      for context in "${matches[@]}"; do
+        [ -f "$context" ] || [ -L "$context" ] || continue
+        stop skipped "unsafe snapshot ancestor: context file $context" 3
+      done
+    fi
     if [ "$(uname -s)" = Darwin ]; then
       permissions="$(stat -f '%Lp' "$ancestor")" || stop skipped "unsafe snapshot ancestor: could not stat $ancestor" 3
     else
@@ -417,7 +483,12 @@ probe_checks() {
   # Probe cwd is also below ROOT; reject unsafe discovery ancestry before omp.
   validate_snapshot_ancestors "$ROOT/.probe"
   PROBE_DIR="$(mktemp -d "$ROOT/probe.XXXXXX")"
-  resolve_launcher "$ENGINE_ROOT" "$PROBE_DIR" || stop skipped "$REASON" 3
+  # Resolve once in this (non-subshell) parent so LAUNCHER_SOURCE reaches the
+  # final report; bounded_omp also resolves internally (each call runs in its
+  # own subshell, so LAUNCHER_SOURCE there never propagates back), but both
+  # calls land on the same shared launcher cache and the same content-addressed
+  # file (fix cycle 5, LOW-3): no separate, unused copy into PROBE_DIR.
+  resolve_launcher "$ENGINE_ROOT" "$(launcher_dir_for)" || stop skipped "$REASON" 3
   # Provisional login signal; Step 3 must confirm this after the owner's login.
   if models="$(bounded_omp 9 models cursor --json)"; then rc=0; else rc="$?"; fi
   case "$rc" in
@@ -435,8 +506,15 @@ probe_checks() {
     stop skipped 'modelRoles.default config check failed' 3
   # Item 10 (fix cycle 4): setup persists "<id>:<level>" (omp honours this
   # suffix itself); strip it before matching the ladder or reporting MODEL.
-  MODEL="${MODEL%%:*}"
-  THINKING_LEVEL="$(thinking_level_for "$MODEL")"
+  # Only strip a trailing :<level> that is one of omp's own levels (fix cycle
+  # 5, LOW-1): a bare %%:* cut would also mangle a model id that happened to
+  # contain a colon for an unrelated reason.
+  case "$MODEL" in
+    *:off | *:minimal | *:low | *:medium | *:high | *:xhigh | *:max | *:auto)
+      MODEL="${MODEL%:*}"
+      ;;
+  esac
+  THINKING_LEVEL="$(thinking_level_for "$MODEL")" || THINKING_LEVEL=''
   STATUS=ready REASON='' EXIT_CODE=0
 }
 
@@ -690,8 +768,18 @@ while :; do
   # Re-check immediately before every new omp cwd use, including capacity retry.
   validate_snapshot_ancestors "$TREE"
   JOB_ACTIVE=1
-  if dispatch_env "$GLEN_BIN" --profile "$PROFILE" send @new - --cwd "$TREE" --thinking "$THINKING_LEVEL" --wait 30s --json \
-    < "$RUN_DIR/prompt.md" > "$RUN_DIR/response.raw"; then RC=0; else RC="$?"; fi
+  # Fix cycle 5, decision 7: omit --thinking entirely for an off-ladder
+  # (explicit --model) configuration, rather than guessing a ladder level.
+  # Bash 3.2 (macOS's default) treats "${arr[@]}" on a zero-element array as
+  # unbound under set -u, so branch on THINKING_LEVEL instead of expanding an
+  # possibly-empty THINKING_ARGS array.
+  if [ -n "$THINKING_LEVEL" ]; then
+    if dispatch_env "$GLEN_BIN" --profile "$PROFILE" send @new - --cwd "$TREE" --thinking "$THINKING_LEVEL" --wait 30s --json \
+      < "$RUN_DIR/prompt.md" > "$RUN_DIR/response.raw"; then RC=0; else RC="$?"; fi
+  else
+    if dispatch_env "$GLEN_BIN" --profile "$PROFILE" send @new - --cwd "$TREE" --wait 30s --json \
+      < "$RUN_DIR/prompt.md" > "$RUN_DIR/response.raw"; then RC=0; else RC="$?"; fi
+  fi
   load_envelope || stop failed 'invalid glen envelope' 4
   while [ "$RC" -eq 10 ] || [ "$RC" -eq 130 ]; do
     [ -n "$JOB" ] || stop failed 'running glen result has no job handle' 4

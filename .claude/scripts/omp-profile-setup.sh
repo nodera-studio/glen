@@ -166,7 +166,9 @@ omp_run() {
     cd "$cwd" || exit 1
     cwd="$(pwd -P)"
     if [ "$layer" = sandbox ]; then
-      launcher="$(/bin/bash "$ENGINE_ROOT/.claude/scripts/omp-engine.sh" launcher "$ENGINE_ROOT" "$cwd")" || exit 1
+      # Fix cycle 5, decision 1/LOW-2: the shared launcher cache, never the
+      # per-call sandbox run root ($cwd) the child can write to.
+      launcher="$(/bin/bash "$ENGINE_ROOT/.claude/scripts/omp-engine.sh" launcher "$ENGINE_ROOT")" || exit 1
       real_omp="$(command -v omp)" || exit 1
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
         -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
