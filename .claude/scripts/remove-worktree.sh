@@ -15,9 +15,12 @@
 #   4. Take ONE process snapshot and read the companion state from both stores
 #      ($CLAUDE_PLUGIN_DATA/state, default ~/.claude/plugins/data/codex-openai-codex/state, and
 #      ${TMPDIR:-/tmp}/codex-companion; refuse if neither exists, unless --force-no-state).
-#      Refuse if a live job (queued, or running with a live pid) has its workspaceRoot or cwd at
-#      or below the worktree, listing each job's cancel command; refuse if a task or task-worker
-#      process (fixed-argv --cwd, or process cwd) is at or below it.
+#      A job's per-job file is authoritative over the state.json index, across both stores.
+#      If a live job (queued, or running with a live companion task pid) has its workspaceRoot
+#      or cwd at or below the worktree, wait 15 s once, take a new snapshot, re-read both stores
+#      and refuse only if it is still live, listing each job's status, pid, the pid's snapshot
+#      command and its cancel command; refuse if a task or task-worker process (fixed-argv
+#      --cwd, or process cwd) is at or below it.
 #   5. SIGTERM every broker of the snapshot whose fixed-position --cwd is at or below the
 #      worktree, wait up to 10 s for all, SIGKILL the survivors. A pid whose pid, start time or
 #      command differs from the snapshot is skipped.
@@ -123,11 +126,21 @@ codex_jobs ${STATE_ROOTS[@]+"${STATE_ROOTS[@]}"} >"$JOBS"
 
 LIVE="$(live_jobs_at "$W")"
 if [ -n "$LIVE" ]; then
+  # The record may have raced the job's completion: re-check once from fresh state.
+  echo "remove-worktree: live Codex job record(s) in $W; re-checking in 15 s" >&2
+  sleep 15
+  snapshot_procs
+  codex_procs >"$PROCS"
+  codex_jobs ${STATE_ROOTS[@]+"${STATE_ROOTS[@]}"} >"$JOBS"
+  LIVE="$(live_jobs_at "$W")"
+fi
+if [ -n "$LIVE" ]; then
   {
     echo "remove-worktree: refuse: live Codex jobs in $W; cancel them first, then re-run:"
     echo "  COMPANION=<newest ~/.claude/plugins/cache/openai-codex/codex/<version>/scripts/codex-companion.mjs>"
-    while IFS="$SEP" read -r root id ws; do
-      echo "  # job $id ($root)"
+    while IFS="$SEP" read -r root id ws st pid; do
+      cmd="$(awk -F "$SEP" -v p="$pid" 'p != "" && $1 == p { print $3; exit }' "$SNAP" | cut -c1-200)"
+      echo "  # job $id ($root): status $st, pid ${pid:-none}: ${cmd:-not in the snapshot}"
       echo "  $(cancel_hint "$root" "$id" "$ws")"
     done <<<"$LIVE"
   } >&2
