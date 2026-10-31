@@ -142,6 +142,16 @@
           }
         ]
       }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": ".claude/hooks/secret-paste-warn.sh"
+          }
+        ]
+      }
     ]
   },
   "statusLine": {

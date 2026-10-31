@@ -21,6 +21,7 @@ deliberately per hook:
 | `capture-before-merge.sh` | `PreToolUse` (`Bash`, on `gh pr merge`) | hard block | Blocks a PR merge until a Mnemosyne `memory_store` call referencing the PR/branch exists in-session |
 | `guard-claude-md-name.sh` | `PreToolUse` (`Write`) | hard block | Write tool only (shell redirects and `mv` are covered by the prompts, not this hook). Refuses a new file whose basename is `claude.md` in any case, except `<repo>/CLAUDE.md`, `<repo>/.claude/CLAUDE.md` (per checkout or worktree), `~/.claude/CLAUDE.md` and any `CLAUDE.md` that already exists on disk: Claude Code loads any such file as a nested `CLAUDE.md` on macOS's case-insensitive filesystem. Name per-engine output `<engine>-review.md` / `<engine>-plan.md` |
 | `shellcheck-on-edit.sh` | `PostToolUse` (`Edit\|Write`) | warn-don't-block | Lints edited shell scripts if shellcheck is installed |
+| `secret-paste-warn.sh` | `UserPromptSubmit` | hard block (warns by blocking) | Stops a prompt that looks like it carries a credential (GitHub, Anthropic, OpenAI, AWS, Slack, Google, Stripe live key, PEM private key, JWT) before it reaches the model, with `suppressOriginalPrompt` so the text stays out of the block message. The reason names the label and length, never the value. Bypass: start the message with `[allow-secret]`. Fails open without jq. Smoke test: `scripts/tests/secret-paste-smoke.sh` |
 
 Not wired in glen:
 
