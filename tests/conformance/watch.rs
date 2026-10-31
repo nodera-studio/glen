@@ -645,7 +645,7 @@ const PALETTE: [PaletteRow; 8] = [
     ("muted", 0x505050, 0xB4B5BD, 239, 250, None),
     ("border", 0xDADADA, 0x45474D, 253, 238, Some(8)),
     ("accent", 0x5E6AD2, 0x7170FF, 62, 63, Some(4)),
-    ("accent_2", 0x12A594, 0x12A594, 36, 36, Some(6)),
+    ("accent_2", 0x0E7C70, 0x12A594, 23, 36, Some(6)),
     ("success", 0x007F3D, 0x00CA50, 29, 41, Some(2)),
     ("warning", 0xA66300, 0xFF9300, 130, 208, Some(3)),
     ("danger", 0xDC2626, 0xFF565F, 160, 203, Some(1)),
