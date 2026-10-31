@@ -520,12 +520,15 @@ fn ac209_new_session_and_profile() {
         3,
     );
     assert_eq!(outside["error"]["details"]["reason"], "outside_cwd");
-    envelope(
+    // W8-ERR-8: a missing --cwd is a usage error (exit 2, reason missing_cwd), not not_found.
+    let missing = envelope(
         &b.glen(&["send", "@new", "hi", "--cwd", "/missing-glen-dir", "--json"])
             .output()
             .unwrap(),
-        3,
+        2,
     );
+    assert_eq!(missing["error"]["code"], "usage");
+    assert_eq!(missing["error"]["details"]["reason"], "missing_cwd");
     assert!(!b.omp.glen_home.exists());
 }
 #[test]
