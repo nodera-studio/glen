@@ -189,9 +189,10 @@ asked.
 
 ## Review use (review-implementation)
 
-The triple-engine review (`/review-implementation`, `/implement` Role 2) uses ONE Codex
+The triple-engine review (`/review-implementation`, or `/implement` Role 2 when omp
+is ready or risk is high) uses ONE Codex
 engine — the native `codex review --base <BASE>` (or `--uncommitted`) reviewer — run by
-the review orchestrator alongside the Claude comprehensive reviewer and CodeRabbit, then
+the review orchestrator alongside the Claude comprehensive reviewer and omp (via glen), then
 folded by the synthesizer. No N-pass voting, no shuffled diffs.
 
 ## Fallback (only if `codex:codex-rescue` is unavailable)

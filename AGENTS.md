@@ -34,6 +34,9 @@ Design and the omp surfaces it builds on: [`docs/design.md`](docs/design.md).
   profiles under `~/.omp/profiles/<name>/agent`).
 - Never write to an omp session's `.jsonl` file. omp owns it; glen reads it, and sends through
   omp (RPC or the glen bridge extension) so omp does the writing.
+- Named profiles have their own auth; foreign user sources (such as Claude plugins) are opt-in
+  via `enabledProviders`, or enabled by a set `CLAUDE_CONFIG_DIR`; `PI_CONFIG_DIR` is a directory
+  name joined under `$HOME`, not an absolute path.
 
 ## Commands
 
@@ -95,3 +98,13 @@ the `codex:codex-rescue` agent (direct `codex exec` is blocked by a hook). Codex
 at `high` effort and reaches Mnemosyne through the same token as Claude Code. `gpt-6.1-sol` needs
 Codex CLI 0.166 or newer: older CLIs get "model is not supported when using Codex with a ChatGPT
 account".
+
+## omp as a harness engine
+
+The third reviewer and optional debug investigator use profile `glen-harness` on Cursor.
+Configure it with `.claude/scripts/omp-profile-setup.sh`.
+Engine sessions are read-only under omp's approval policy and read containment
+(`.claude/omp/glen-harness.yml`). Agents never write the owner's default `~/.omp/agent`
+config. Claude Code's `permissions.deny` rules are best-effort typing guardrails;
+default-profile protection relies on explicit `--profile glen-harness` in harness scripts,
+setup's fingerprint check, and the OS sandbox (see `.claude/skills/omp/SKILL.md`).

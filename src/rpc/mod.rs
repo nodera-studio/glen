@@ -89,6 +89,9 @@ pub fn omp_command(job: &Job) -> Command {
         job.profile_flag.as_deref(),
         &job.cwd,
     );
+    if let Some(t) = &job.thinking_flag {
+        command.args(["--thinking", t]);
+    }
     if job.route == Route::Rpc
         && let Some(file) = &job.session_file
     {

@@ -73,7 +73,15 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         store,
         mut child,
         created,
-    } = submit(cli, env, opened.as_ref(), cwd, text, args.deliver())?;
+    } = submit(
+        cli,
+        env,
+        opened.as_ref(),
+        cwd,
+        text,
+        args.deliver(),
+        args.thinking.as_deref(),
+    )?;
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
         ctx.mode == Mode::Human && ctx.stderr_tty,
@@ -138,6 +146,7 @@ pub(crate) fn submit(
     cwd: PathBuf,
     text: String,
     deliver: DeliverAs,
+    thinking: Option<&str>,
 ) -> Result<Submitted, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     if text.trim().is_empty() {
@@ -291,6 +300,10 @@ pub(crate) fn submit(
             .as_deref()
             .map(str::trim)
             .map(str::to_owned),
+        thinking_flag: thinking
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+            .map(str::to_owned),
         owners_dir: paths.session_owners_dir,
         job_timeout_ms: timeout.as_millis() as u64,
         deadline_at: deadline.to_string(),
@@ -298,6 +311,25 @@ pub(crate) fn submit(
     let store = JobStore::new(home.clone());
     store.create_for_send(&job, env)?;
     store.prune(now);
+    if live.is_some()
+        && let Some(level) = thinking.map(str::trim).filter(|t| !t.is_empty())
+    {
+        let handle = job.session_handle.as_deref().unwrap_or("<handle>");
+        // `glen thinking` takes explicit levels only; never suggest `auto` to it.
+        let advice = if level == "auto" {
+            format!(
+                "`auto` cannot be set on a running session; run `glen thinking {handle} <level>` with an explicit level instead"
+            )
+        } else {
+            format!("run `glen thinking {handle} {level}` instead")
+        };
+        route_warnings.push(Warning {
+            code: "ignored_flag".into(),
+            message: format!(
+                "--thinking has no effect on the live route (the session is already running); {advice}"
+            ),
+        });
+    }
     route_warnings.extend(warning);
     if !route_warnings.is_empty() {
         let mut s = store.read_status(&id)?;
@@ -409,7 +441,8 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "-"]).unwrap();
         let cwd = send_cwd(None, None, &env).unwrap();
-        let mut submitted = submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp).unwrap();
+        let mut submitted =
+            submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp, None).unwrap();
         // The worker child is this unit-test binary, not a live omp process.
         if submitted.child.try_wait().unwrap().is_none() {
             submitted.child.kill().unwrap();
@@ -430,9 +463,17 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "text"]).unwrap();
         for text in [" \n".to_string(), "x".repeat(rpc::MAX_MESSAGE_BYTES + 1)] {
-            let e = submit(&cli, &env, None, tree.path().into(), text, DeliverAs::Auto)
-                .err()
-                .unwrap();
+            let e = submit(
+                &cli,
+                &env,
+                None,
+                tree.path().into(),
+                text,
+                DeliverAs::Auto,
+                None,
+            )
+            .err()
+            .unwrap();
             assert_eq!(e.code, ErrorCode::Usage);
             assert!(!home.exists());
         }

@@ -154,6 +154,7 @@ fn job(session: &str) -> Job {
         live_socket: None,
         live_pid: None,
         profile_flag: None,
+        thinking_flag: None,
         owners_dir: "/fixtures/owners".into(),
         job_timeout_ms: 90_000,
         deadline_at: "2026-10-30T12:01:13Z".into(),
