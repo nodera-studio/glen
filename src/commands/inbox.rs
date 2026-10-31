@@ -62,6 +62,9 @@ fn human(r: &Reply, ctx: &OutputCtx) -> String {
 struct Read {
     records: Vec<(String, Reply, u64, u64)>,
     ends: Vec<(String, Cursor)>,
+    /// Under `--cwd`, the batch ends of replies no catalog or registry entry can place in a
+    /// project (orphans). They are never returned, only marked read (decision 10).
+    orphan_ends: Vec<(String, Cursor)>,
     skipped: usize,
     outside_cwd: bool,
 }
@@ -97,7 +100,7 @@ impl Scope {
             classified: HashSet::new(),
             selector: selector.map(str::to_owned),
             matched: None,
-            last_refresh: std::time::Instant::now() - RESCAN_COOLDOWN,
+            last_refresh: std::time::Instant::now(),
         };
         scope.refresh(home, env)?;
         Ok(scope)
@@ -157,13 +160,26 @@ fn collect(
     cursors: Option<&HashMap<String, Cursor>>,
     env: &Env,
     scope: Option<&mut Scope>,
+    with_orphans: bool,
 ) -> Result<Read, GlenError> {
     validate_filter(filter)?;
     let mut read = Read {
         records: vec![],
         ends: vec![],
+        orphan_ends: vec![],
         skipped: 0,
         outside_cwd: false,
+    };
+    let start = |stem: &str| {
+        cursors
+            .and_then(|c| c.get(stem).copied())
+            .unwrap_or_else(|| {
+                if all {
+                    Cursor::default()
+                } else {
+                    inbox::cursor(home, stem)
+                }
+            })
     };
     let mut sessions = inbox::sessions(home, filter);
     if let Some(scope) = scope {
@@ -190,20 +206,35 @@ fn collect(
             }));
         }
         let had_matches = !sessions.is_empty();
-        sessions.retain(|(stem, _)| scope.included.contains(&stem.to_lowercase()));
+        let orphans;
+        (sessions, orphans) = sessions
+            .into_iter()
+            .partition(|(stem, _)| scope.included.contains(&stem.to_lowercase()));
         read.outside_cwd = filter.is_some() && had_matches && sessions.is_empty();
+        // Decision 10: an orphan reply is read the way the unscoped inbox reads it, so a scoped
+        // call marks it read too, but it is never returned under --cwd (AC-1011). `-f` passes
+        // `with_orphans: false`: there an orphan is usually a session not persisted yet, which
+        // a later rescan places in a project and then streams. When the outside_cwd warning
+        // fires, its "drop --cwd" hint must still find the replies unread.
+        if with_orphans && !read.outside_cwd {
+            for (stem, path) in orphans {
+                if scope.classified.contains(&stem.to_lowercase()) {
+                    continue; // a foreign project's session, not an orphan
+                }
+                let batch =
+                    inbox::read_new(&path, start(&stem)).map_err(|e| GlenError::read(&path, e))?;
+                read.orphan_ends.push((
+                    stem,
+                    Cursor {
+                        offset: batch.end,
+                        ino: batch.ino,
+                    },
+                ));
+            }
+        }
     }
     for (stem, path) in sessions {
-        let from = cursors
-            .and_then(|c| c.get(&stem).copied())
-            .unwrap_or_else(|| {
-                if all {
-                    Cursor::default()
-                } else {
-                    inbox::cursor(home, &stem)
-                }
-            });
-        let batch = inbox::read_new(&path, from).map_err(|e| GlenError::read(&path, e))?;
+        let batch = inbox::read_new(&path, start(&stem)).map_err(|e| GlenError::read(&path, e))?;
         read.skipped += batch.skipped;
         read.ends.push((
             stem.clone(),
@@ -246,8 +277,40 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         None,
         env,
         scope.as_mut(),
+        true,
     )?;
     let total = read.records.len();
+    // Only cursors this call actually moves are committed and counted as `marked_read`:
+    // `--all` re-reads from 0, so its batch ends are often the saved cursors (W8-DOC-7).
+    let moves = if a.peek {
+        vec![]
+    } else {
+        read.ends
+            .into_iter()
+            .filter(|(stem, c)| {
+                let saved = inbox::cursor(&home, stem);
+                c.offset > 0 && (c.offset != saved.offset || c.ino != saved.ino)
+            })
+            .collect::<Vec<_>>()
+    };
+    // Decision 10: orphan replies under --cwd are committed with the rest, but they are not
+    // returned, so they do not count toward `marked_read`.
+    let orphan_moves = if a.peek {
+        vec![]
+    } else {
+        read.orphan_ends
+            .into_iter()
+            .filter(|(stem, c)| {
+                let saved = inbox::cursor(&home, stem);
+                c.offset > 0 && (c.offset != saved.offset || c.ino != saved.ino)
+            })
+            .collect::<Vec<_>>()
+    };
+    // Probe the cursor write before printing anything, so a read-only GLEN_HOME is the one
+    // error envelope (exit 6 `sandboxed` in Codex) and not `ok:true` (W8-ERR-1).
+    if let Some((stem, _)) = moves.first().or(orphan_moves.first()) {
+        inbox::probe_writable(&home).map_err(|e| mark_error(env, stem, e))?;
+    }
     let sessions = read
         .records
         .iter()
@@ -272,7 +335,7 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         )
     };
     let mut outcome = Outcome::new(
-        json!({"total":total,"marked_read":!a.peek&&total>0,"skipped_lines":read.skipped,"messages":read.records.iter().map(|(_,r,_,_)|message(r)).collect::<Vec<_>>()}),
+        json!({"total":total,"marked_read":!moves.is_empty(),"skipped_lines":read.skipped,"messages":read.records.iter().map(|(_,r,_,_)|message(r)).collect::<Vec<_>>()}),
         human,
     );
     if read.outside_cwd
@@ -286,15 +349,10 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
             ),
         });
     }
-    if !a.peek {
-        let ends = read
-            .ends
-            .into_iter()
-            .filter(|(_, c)| c.offset > 0)
-            .collect::<Vec<_>>();
+    if !moves.is_empty() || !orphan_moves.is_empty() {
         let env = env.clone();
         outcome.after_output = Some(Box::new(move || {
-            for (stem, cursor) in ends {
+            for (stem, cursor) in moves.into_iter().chain(orphan_moves) {
                 inbox::mark(&home, &stem, cursor).map_err(|e| mark_error(&env, &stem, e))?;
             }
             Ok(())
@@ -353,6 +411,7 @@ pub fn follow(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode 
             Some(&cursors),
             env,
             scope.as_mut(),
+            false,
         ) {
             Ok(r) => r,
             Err(e) => return stream.fail(e),

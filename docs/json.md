@@ -7,13 +7,14 @@ not the prose of diagnostic messages. `tests/json_contract.rs` compares these sh
 ## Modes and streams
 
 A TTY gets human output; other stdout gets compact JSON. `--json` and `--human` override this choice.
-Explicit JSON on a TTY is pretty printed. JSON stdout contains the result and stderr is empty.
+Explicit JSON on a TTY is pretty printed. JSON stdout contains the result and stderr is empty, with one
+exception: a deferred `inbox` cursor write that fails after its envelope was printed (see `glen inbox`).
 `--help` and `--version` always print text. `completions` defaults to raw shell script, including on a pipe;
 add `--json` for its envelope. Its errors without `--json` go to stderr as human text.
 
 Success is `{"v":1,"ok":true,"data":{…}}`. Errors are `{"v":1,"ok":false,"error":{"code":"…","message":"…"}}`.
 Error `hint` and `details` are optional. Optional top-level `warnings` is an array of `{code,message}`.
-`ok:true` applies to exits 0, 10, 11 and 130. A spilled success replaces `data` with
+`ok:true` applies to exits 0, 10, 11 and 130, except that same deferred `inbox` failure. A spilled success replaces `data` with
 `spilled:{path,bytes,format}`: open that absolute path to read the full envelope (0600, exact byte count).
 `GLEN_MAX_OUTPUT` defaults to 24000 bytes on a non-TTY; 0 disables spilling. Streams never spill.
 
@@ -647,10 +648,23 @@ List jobs, newest first. Absent glen home gives an empty list without creating i
 Replies omp sent with `glen_reply`, oldest first. Reading marks them read unless `--peek`; `--all` includes read ones.
 Missing glen home or inbox gives an empty list without creating it. `-f` streams NDJSON `message` events.
 
+Marking read writes a cursor under GLEN_HOME after the envelope is on stdout. glen first checks, before printing
+anything, that it can write that cursor. When it cannot, the call prints only the error envelope and leaves every
+message unread: inside Codex's sandbox (`CODEX_SANDBOX` or `CODEX_SANDBOX_NETWORK_DISABLED=1`) that is exit 6
+`no_route` with `details.reason:"sandboxed"` and `details.glen_home_writable:false`, otherwise exit 1 `io`.
+A write that still fails after the check (the disk fills, a permission changes in between) cannot replace the
+envelope already printed: the call exits with that error's own code (6 or 1) and writes `glen: <message>` to stderr,
+so `ok:true` with a non-zero exit means the cursors did not move and the messages will come back.
+
+With `--cwd`, only replies of sessions in that project are returned. A reply that no session or registry places in
+any project (an orphan) is never returned under `--cwd`, but a non-`--peek` call marks it read, as the unscoped
+inbox does. Two exceptions keep it unread: `-f`, which streams it once its session appears in the project, and a
+call that warns `outside_cwd`, whose hint is to drop `--cwd`.
+
 | Field | Meaning |
 |---|---|
 | `total` | messages returned |
-| `marked_read` | true when this call advanced the read cursors |
+| `marked_read` | true when this call moved the read cursor of at least one returned session; false with `--peek`, when nothing new was returned, and when only orphan cursors moved |
 | `skipped_lines` | malformed inbox lines skipped |
 | `messages` | reply records plus session_handle and job_handle (null without a job) |
 
