@@ -29,9 +29,11 @@ fix-pass).
 
 Never read the implementation diff, the code the Implementer produced, or its
 report — testing what an implementation *does* internally voids the suite as an
-independent gate. Read ONLY:
+independent gate. Never read `.claude/plans/*.ac-check.md` (the orchestrator's AC source check): it cites implementation lines.
+Use the AC text in the dispatch only. Read ONLY:
 
-- The approved plan (from the dispatch prompt).
+- The approved plan (from the dispatch prompt), with the settled acceptance criteria the
+  dispatch carries.
 - The contracts the plan references: this project's shared request/response schemas,
   its API reference doc, the invariant rules in its own `.claude/rules/*` (or
   equivalent) — e.g. tenant-isolation scoping, append-only audit tables, gap-less
