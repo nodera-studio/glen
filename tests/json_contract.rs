@@ -14,6 +14,99 @@ struct Example {
     ndjson: bool,
     values: Vec<Value>,
 }
+// libc supplies POSIX regexes on both supported OSes, without a new dev dependency.
+struct SourcePattern(libc::regex_t);
+impl SourcePattern {
+    fn new(pattern: &str) -> Self {
+        let pattern = std::ffi::CString::new(pattern).expect("source pattern has no NUL");
+        let mut compiled = std::mem::MaybeUninit::uninit();
+        // SAFETY: regcomp initializes the valid, writable regex_t slot on success;
+        // pattern is a live NUL-terminated string, and we check the return code.
+        let result = unsafe {
+            libc::regcomp(
+                compiled.as_mut_ptr(),
+                pattern.as_ptr(),
+                libc::REG_EXTENDED | libc::REG_NOSUB,
+            )
+        };
+        assert_eq!(result, 0, "cannot compile source pattern {pattern:?}");
+        // SAFETY: successful regcomp initialized this regex_t.
+        Self(unsafe { compiled.assume_init() })
+    }
+    fn is_match(&self, source: &str) -> bool {
+        let source = std::ffi::CString::new(source).expect("Rust source has no NUL");
+        // SAFETY: the compiled regex and source are live. REG_NOSUB needs no match
+        // slots, so a null pointer with a zero match count is valid.
+        let result = unsafe { libc::regexec(&self.0, source.as_ptr(), 0, std::ptr::null_mut(), 0) };
+        assert!(
+            result == 0 || result == libc::REG_NOMATCH,
+            "source regex failed: {result}"
+        );
+        result == 0
+    }
+}
+impl Drop for SourcePattern {
+    fn drop(&mut self) {
+        // SAFETY: this value owns a successfully compiled regex and frees it once.
+        unsafe { libc::regfree(&mut self.0) };
+    }
+}
+#[test]
+fn every_no_route_site_names_a_reason() {
+    let constructors = SourcePattern::new(
+        r#"(GlenError::new|Failure::new)\([[:space:]]*(ErrorCode::NoRoute|"no_route")"#,
+    );
+    let literals = SourcePattern::new(r#"code:[[:space:]]*"no_route""#);
+    for source in [
+        "GlenError::new(\n ErrorCode::NoRoute,",
+        "Failure::new(\n \"no_route\",",
+    ] {
+        assert!(
+            constructors.is_match(source),
+            "scan must recognize multiline constructors"
+        );
+    }
+    assert!(literals.is_match("code:\n \"no_route\""));
+    assert!(!constructors.is_match("GlenError::no_route(reason, message)"));
+    let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+    let mut inspected = 0;
+    while let Some(dir) = pending.pop() {
+        for entry in
+            fs::read_dir(&dir).unwrap_or_else(|error| panic!("read {}: {error}", dir.display()))
+        {
+            let path = entry.expect("source directory entry").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let source = fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+                assert!(
+                    !constructors.is_match(&source) && !literals.is_match(&source),
+                    "{} constructs no_route without its typed reason",
+                    path.display()
+                );
+                inspected += 1;
+            }
+        }
+    }
+    assert!(inspected > 0);
+    let reasons = include_str!("../docs/json.md")
+        .lines()
+        .find_map(|line| line.strip_prefix("Allowed `no_route` reasons: "))
+        .expect("Error details documents the allowed reasons")
+        .split('`')
+        .skip(1)
+        .step_by(2)
+        .collect::<Vec<_>>();
+    assert_eq!(reasons.len(), glen::error::NoRouteReason::ALL.len());
+    assert_eq!(
+        reasons.into_iter().collect::<BTreeSet<_>>(),
+        glen::error::NoRouteReason::ALL
+            .into_iter()
+            .map(|reason| reason.as_str())
+            .collect::<BTreeSet<_>>()
+    );
+}
 fn examples() -> BTreeMap<String, Example> {
     let mut map = BTreeMap::new();
     let mut lines = include_str!("../docs/json.md").lines();
@@ -411,7 +504,28 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(6));
-    all.insert("error.no_route.sandboxed".into(), vec![json(&out)]);
+    let mut sandboxed = json(&out);
+    // W10 fixes2 decision 1 + cycle-3 Codex P2 (design.md:449): on Linux the refusal adds
+    // exactly `lease:"unknown"` to the documented details.
+    if cfg!(target_os = "linux") {
+        let details = sandboxed["error"]["details"].as_object_mut().unwrap();
+        assert_eq!(details.remove("lease"), Some(serde_json::json!("unknown")));
+    }
+    all.insert("error.no_route.sandboxed".into(), vec![sandboxed]);
+    let scoped = OmpBox::new();
+    let out = scoped.glen(
+        &[
+            "show",
+            "e27c0de",
+            "--cwd",
+            scoped.beta().to_str().unwrap(),
+            "--json",
+        ],
+        &scoped.alpha(),
+    );
+    assert_eq!(out.status.code(), Some(3));
+    assert_eq!(json(&out)["error"]["details"]["reason"], "outside_cwd");
+    all.insert("error.not_found.outside_cwd".into(), vec![json(&out)]);
     all
 }
 #[test]

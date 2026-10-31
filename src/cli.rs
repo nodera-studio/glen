@@ -165,6 +165,8 @@ pub enum Tools {
 pub struct ShowArgs {
     #[arg(help = "session handle or @latest")]
     pub session: String,
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "resolve the session in this project directory")]
+    pub cwd: Option<PathBuf>,
     #[arg(long, help = "include model thinking")]
     pub thinking: bool,
     #[arg(
@@ -181,6 +183,8 @@ pub struct ShowArgs {
 pub struct TailArgs {
     #[arg(help = "session handle or @latest")]
     pub session: String,
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "resolve the session in this project directory")]
+    pub cwd: Option<PathBuf>,
     #[arg(
         short = 'n',
         long,
@@ -228,7 +232,7 @@ pub struct SendArgs {
         long,
         value_name = "DIR",
         value_hint = clap::ValueHint::DirPath,
-        help = "with @new: the new session’s directory; with @latest: the project to pick from"
+        help = "with @new: the new session’s directory; otherwise: the project to resolve the session in"
     )]
     pub cwd: Option<PathBuf>,
     #[arg(
@@ -292,6 +296,8 @@ pub struct JobsArgs {
 }
 #[derive(Debug, Args)]
 pub struct InboxArgs {
+    #[arg(long, value_name = "DIR", value_hint = clap::ValueHint::DirPath, help = "show messages from this project directory")]
+    pub cwd: Option<PathBuf>,
     #[arg(long, help = "a session id or hex tail")]
     pub session: Option<String>,
     #[arg(long, help = "do not mark messages read")]

@@ -10,9 +10,39 @@ pub use envelope::{Outcome, emit, emit_error};
 use std::{
     ffi::OsString,
     io::{self, IsTerminal, Write},
+    os::fd::AsFd,
     path::PathBuf,
     process::ExitCode,
 };
+// Rust's standard stdio writers silently ignore EBADF. Write directly to the
+// locked descriptor so read-only stdout/stderr still report a failed write.
+// Unbuffered on purpose (W10 decision 12, skipped): envelopes and stream events are
+// rendered into one buffer, written, then flushed, so a `BufWriter` saves no syscalls and
+// adds a drop-time flush that would swallow EPIPE before an `after_output` commit.
+struct StdioWriter<T>(T);
+impl<T: AsFd> Write for StdioWriter<T> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        rustix::io::write(&self.0, bytes).map_err(Into::into)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        // Descriptor writes are unbuffered.
+        Ok(())
+    }
+}
+pub(crate) fn stdout_writer() -> Box<dyn Write> {
+    Box::new(StdioWriter(io::stdout().lock()))
+}
+pub(crate) fn stderr_writer() -> Box<dyn Write> {
+    Box::new(StdioWriter(io::stderr().lock()))
+}
+/// A closed stdout keeps the command's outcome; other output failures are io errors.
+pub fn stdout_failure_exit(e: &io::Error, outcome: ExitCode) -> ExitCode {
+    if e.kind() == io::ErrorKind::BrokenPipe {
+        outcome
+    } else {
+        ExitCode::from(1)
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
     Human,
@@ -285,23 +315,21 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
         };
         let mut stream = anstream::AutoStream::new(
             if e.use_stderr() {
-                Box::new(io::stderr().lock()) as Box<dyn Write>
+                stderr_writer()
             } else {
-                Box::new(io::stdout().lock()) as Box<dyn Write>
+                stdout_writer()
             },
             choice,
         );
-        return ExitCode::from(
-            if stream
-                .write_all(rendered.as_bytes())
-                .and_then(|_| stream.flush())
-                .is_ok()
-            {
-                e.exit_code() as u8
-            } else {
-                1
-            },
-        );
+        let outcome = ExitCode::from(e.exit_code() as u8);
+        return match stream
+            .write_all(rendered.as_bytes())
+            .and_then(|_| stream.flush())
+        {
+            Ok(()) => outcome,
+            Err(_) if e.use_stderr() => ExitCode::from(1),
+            Err(error) => stdout_failure_exit(&error, outcome),
+        };
     }
     {
         let rendered = e.render().to_string();
@@ -317,7 +345,7 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
                 .unwrap_or_else(|| plain.lines().next().unwrap_or("invalid arguments"))
         };
         let value = serde_json::json!({"v":1,"ok":false,"error":{"code":"usage","message":message,"details":{"text":plain}}});
-        let mut out = anstream::AutoStream::new(io::stdout().lock(), anstream::ColorChoice::Never);
+        let mut out = anstream::AutoStream::new(stdout_writer(), anstream::ColorChoice::Never);
         let result = serde_json::to_vec(&value)
             .map_err(io::Error::other)
             .and_then(|mut bytes| {
@@ -325,11 +353,11 @@ pub fn clap_error(mut e: clap::Error, argv: &[OsString], env: &Env, term: &Termi
                 out.write_all(&bytes)
             })
             .and_then(|_| out.flush());
-        ExitCode::from(if result.is_ok() {
-            ErrorCode::Usage.exit_code()
-        } else {
-            1
-        })
+        let outcome = ExitCode::from(ErrorCode::Usage.exit_code());
+        match result {
+            Ok(()) => outcome,
+            Err(error) => stdout_failure_exit(&error, outcome),
+        }
     }
 }
 #[cfg(test)]

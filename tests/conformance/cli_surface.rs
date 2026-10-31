@@ -222,7 +222,6 @@ fn a9_invalid_arguments_are_usage_errors() {
     let invalid: &[&[&str]] = &[
         &["send", "abc1234", "hi", "--steer", "--follow-up"],
         &["send", "abc1234", "hi", "--as", "steer", "--steer"],
-        &["send", "abc1234", "hi", "--cwd", "/tmp"],
         &["show"],
         &["tail"],
         &["send", "abc1234"],

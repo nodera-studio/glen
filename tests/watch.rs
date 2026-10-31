@@ -700,6 +700,25 @@ fn resizing_switches_narrow_wide_and_too_small_layouts() {
     b.clean();
 }
 
+/// F11: crossterm registers its SIGWINCH handler on the first event poll, which the input
+/// thread makes. A resize that lands before that thread runs (forced here with a 1 s delay, as
+/// a loaded CI host can) was lost: the next draw filled the resized screen with the old layout
+/// and the wide layout never came.
+#[test]
+fn a_resize_before_the_input_thread_runs_still_switches_the_layout() {
+    let b = OmpBox::new();
+    let mut cmd = command(&b, &["watch", "e27c0de"]);
+    cmd.env("GLEN_WATCH_TEST_INPUT_DELAY_MS", "1000");
+    let mut pty = Pty::start(cmd, 60, 20);
+    pty.wait_for("e27c0de ·", START);
+    pty.wait_for("sessions", START);
+    let offset = pty.bytes().len();
+    pty.resize(120, 40);
+    pty.wait_from(offset, "pending", DATA);
+    pty.quit();
+    b.clean();
+}
+
 fn signal_exit(signal: Signal, code: i32) {
     let b = OmpBox::new();
     for controlling in terminal_modes() {

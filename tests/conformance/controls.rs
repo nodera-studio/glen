@@ -2162,6 +2162,21 @@ fn ac363_ac364_a_job_route_deadline_leaves_an_unknown_outcome_and_the_request_ne
         10,
     ));
     lb.wait_log("the job's omp start", |r| !starts(r).is_empty());
+    // The worker's startup loop polls controls every TICK and answers an expired request at
+    // once (AC-364), removing it. Freeze the worker so the request the caller leaves behind
+    // can be inspected before the worker gets to it, instead of racing that tick.
+    struct Frozen(i64);
+    impl Drop for Frozen {
+        fn drop(&mut self) {
+            signal(self.0, Signal::CONT);
+        }
+    }
+    let worker =
+        lb.wait_status(&j, "the worker pid", LONG, |s| s["worker_pid"].is_u64())["worker_pid"]
+            .as_i64()
+            .unwrap();
+    signal(worker, Signal::STOP);
+    let frozen = Frozen(worker);
 
     let sent = now_ms();
     let out = ctl(&lb, &["model", A.handle, "fake/fake-2", "--timeout", "2s"]).run();
@@ -2195,6 +2210,7 @@ fn ac363_ac364_a_job_route_deadline_leaves_an_unknown_outcome_and_the_request_ne
         "deadline_ms is the 2 s command deadline: {deadline} vs sent {sent}"
     );
 
+    drop(frozen);
     release(&ready);
     let done = poll_until("the worker's answer to the expired request", LONG, || {
         done_files(&dir).into_iter().find_map(|p| read_json(&p))

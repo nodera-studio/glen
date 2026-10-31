@@ -15,7 +15,7 @@ use crate::{
 use serde_json::{Value, json};
 pub fn run(cli: &Cli, args: &ShowArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let spinner = Spinner::start(ctx.mode == Mode::Human && ctx.stderr_tty, "reading session");
-    let o = open::open(cli, env, &args.session)?;
+    let o = open::open_in(cli, env, &args.session, args.cwd.as_deref())?;
     let branch = o.session.active_branch();
     let mut data = Value::Null;
     let mut human = String::new();

@@ -620,8 +620,11 @@ fn cycle1_uninstall_error_keeps_removed_target_and_earlier_warnings() {
 #[test]
 fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() {
     let b = RpcBox::new();
+    // AC-1028 (W10 fix cycle 2 decision 1): on Linux any marker hides omp's lease, so only a
+    // new session is sent over RPC there; resuming an existing one refuses as sandboxed.
+    let linux = cfg!(target_os = "linux");
     let out = b
-        .glen(&["send", "e27c0de", "hi"])
+        .glen(&["send", if linux { "@new" } else { "e27c0de" }, "hi"])
         .env("CODEX_SANDBOX", "")
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
         .output()
@@ -629,6 +632,16 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
     let v = data(&out);
     assert_eq!(v["status"], "completed");
     b.wait_worker_gone(v["job"]["id"].as_str().unwrap());
+    if linux {
+        let out = b
+            .glen(&["send", "e27c0de", "hi"])
+            .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(6), "{out:?}");
+        assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
+        assert_eq!(json(&out)["error"]["details"]["lease"], "unknown");
+    }
     let out = b
         .glen(&["doctor"])
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
@@ -638,7 +651,11 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
     assert_eq!(v["checks"][11]["status"], "info");
     assert_eq!(
         v["checks"][11]["detail"],
-        "network disabled by the host; escalated commands still work"
+        if linux {
+            "network disabled by the host; on Linux glen will not resume an existing session over RPC here (exit 6 sandboxed); the live route and new sessions still work"
+        } else {
+            "network disabled by the host; escalated commands still work"
+        }
     );
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o500)).unwrap();
     // A fresh home child makes the denied operation occur during job creation.

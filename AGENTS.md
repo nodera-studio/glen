@@ -45,10 +45,11 @@ cargo build                                         # debug build
 cargo run -- doctor                                 # check omp, paths and glen home
 cargo run -- <args>                                 # run the CLI
 cargo test                                          # all tests
+scripts/flake-check.sh [RUNS] [-- cargo-test-args]     # repeat tests under CPU load (default: 20; Node >=22.6)
 cargo clippy --all-targets -- -D warnings           # lint (warnings fail CI)
 cargo fmt --all                                     # format
 node --experimental-strip-types --test extension/glen/test/*.test.ts  # extension tests (also cargo test)
-shellcheck -s sh install.sh scripts/package-release.sh  # lint the installer and packager
+shellcheck -s sh install.sh scripts/package-release.sh scripts/flake-check.sh  # lint shell scripts
 gh workflow run release.yml --ref main              # release workflow dry run: builds, publishes nothing
 ```
 
