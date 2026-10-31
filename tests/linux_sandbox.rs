@@ -1,0 +1,349 @@
+//! bwrap-based simulation of the Linux Codex sandbox: a read-only root plus, for the
+//! network-isolation scenarios, a separate network namespace (`--unshare-net`). Proves the
+//! EROFS/sandboxed mapping (item 5/9) and the network-namespace lease rule (item 18, AC-1028)
+//! against a real kernel, never the actual Codex sandbox. Run only by the `linux-sandbox` CI
+//! job (`cargo test --locked --test linux_sandbox -- --ignored --test-threads=1`); every test
+//! is `#[ignore]` so a normal `cargo test` never needs bwrap.
+#![cfg(target_os = "linux")]
+mod common;
+
+use common::{A_ID, LiveBox, RpcBox};
+use std::{
+    process::{Command, Output, Stdio},
+    sync::{OnceLock, mpsc},
+    time::Duration,
+};
+
+/// `bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent [--unshare-net] [--bind W W]…
+/// -- <program> <args>`. Carries the harness command's own program/args/envs (via
+/// `env_clear()` + `get_envs()`), plus `PATH=/usr/bin:/bin` so `bash`/coreutils resolve. Never
+/// `--unshare-pid`: glen's live-endpoint liveness check uses the host pid
+/// (`src/live/registry.rs`), which a pid namespace would hide.
+fn bwrap(cmd: &Command, net: bool, writable: &[&std::path::Path]) -> Output {
+    preflight();
+    let mut c = Command::new("bwrap");
+    c.arg("--ro-bind")
+        .arg("/")
+        .arg("/")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--die-with-parent");
+    if !net {
+        c.arg("--unshare-net");
+    }
+    for w in writable {
+        c.arg("--bind").arg(w).arg(w);
+    }
+    c.arg("--").arg(cmd.get_program());
+    c.args(cmd.get_args());
+    c.env_clear();
+    for (k, v) in cmd.get_envs() {
+        if let Some(v) = v {
+            c.env(k, v);
+        }
+    }
+    c.env("PATH", "/usr/bin:/bin");
+    if let Some(dir) = cmd.get_current_dir() {
+        c.current_dir(dir);
+    }
+    run_with_timeout(c, Duration::from_secs(30))
+}
+/// `bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net -- <program>` (the raw shape
+/// used by scenarios that run something other than `glen`, e.g. s10's bash probe).
+fn bwrap_raw(c: Command, net: bool, writable: &[&std::path::Path]) -> Output {
+    preflight();
+    let mut wrapped = Command::new("bwrap");
+    wrapped
+        .arg("--ro-bind")
+        .arg("/")
+        .arg("/")
+        .arg("--dev")
+        .arg("/dev")
+        .arg("--proc")
+        .arg("/proc")
+        .arg("--die-with-parent");
+    if !net {
+        wrapped.arg("--unshare-net");
+    }
+    for w in writable {
+        wrapped.arg("--bind").arg(w).arg(w);
+    }
+    wrapped.arg("--").arg(c.get_program());
+    wrapped.args(c.get_args());
+    wrapped.env_clear();
+    for (k, v) in c.get_envs() {
+        if let Some(v) = v {
+            wrapped.env(k, v);
+        }
+    }
+    wrapped.env("PATH", "/usr/bin:/bin");
+    run_with_timeout(wrapped, Duration::from_secs(30))
+}
+fn run_with_timeout(mut c: Command, timeout: Duration) -> Output {
+    let child = c
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap_or_else(|e| panic!("cannot spawn bwrap: {e}"));
+    let pid = child.id();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(child.wait_with_output());
+    });
+    match rx.recv_timeout(timeout) {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => panic!("bwrap command failed to run: {e}"),
+        Err(_) => {
+            if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
+                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+            }
+            panic!("bwrap command did not finish within {timeout:?}");
+        }
+    }
+}
+/// Fails loudly (never skips) when bwrap cannot start at all.
+fn preflight() {
+    static CHECKED: OnceLock<()> = OnceLock::new();
+    CHECKED.get_or_init(|| {
+        let out = Command::new("bwrap")
+            .arg("--ro-bind")
+            .arg("/")
+            .arg("/")
+            .arg("true")
+            .output()
+            .unwrap_or_else(|e| panic!("cannot run bwrap: {e}"));
+        assert!(
+            out.status.success(),
+            "bwrap --ro-bind / / true failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    });
+}
+fn json(out: &Output) -> serde_json::Value {
+    serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "invalid JSON: {e}; stdout {:?} stderr {:?}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        )
+    })
+}
+fn exit_code(out: &Output) -> i32 {
+    out.status.code().unwrap_or(-1)
+}
+
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s1_erofs_spill() {
+    let rb = RpcBox::new();
+    let mut c = rb.glen(&["ls", "--all", "--json"]);
+    c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
+        .env("GLEN_MAX_OUTPUT", "1");
+    // No writable bind: GLEN_HOME lives under the ro-bound root, so any write is EROFS.
+    let out = bwrap(&c, true, &[]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 6, "{v}");
+    assert_eq!(v["error"]["code"], "no_route", "{v}");
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s2_erofs_without_markers() {
+    let rb = RpcBox::new();
+    let mut c = rb.glen(&["ls", "--all", "--json"]);
+    c.env("GLEN_MAX_OUTPUT", "1");
+    let out = bwrap(&c, true, &[]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 1, "{v}: the accepted gap (item 9)");
+    assert_eq!(v["error"]["code"], "io", "{v}");
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s3_live_send_readonly_home() {
+    let mut lb = LiveBox::new();
+    lb.start_ext(A_ID, "ok", &[]);
+    let mut c = lb
+        .rpc
+        .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
+    c.env("CODEX_SANDBOX", "linux-ci");
+    let out = bwrap(&c, true, &[]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 6, "{v}");
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s4_live_send_writable_home() {
+    let mut lb = LiveBox::new();
+    lb.start_ext(A_ID, "ok", &[]);
+    let mut c = lb
+        .rpc
+        .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
+    c.env("CODEX_SANDBOX", "linux-ci");
+    let writable = lb.rpc.omp.tmp.path().to_path_buf();
+    let out = bwrap(&c, true, &[&writable]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 0, "{v}");
+    assert_eq!(v["data"]["route"], "live", "{v}");
+    assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s5_network_off() {
+    let rb = RpcBox::new();
+    let mut c = rb.glen(&["send", "e27c0de", "hi", "--json"]);
+    c.env("CODEX_SANDBOX", "linux-ci")
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+    let writable = rb.omp.tmp.path().to_path_buf();
+    let out = bwrap(&c, false, &[&writable]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 6, "{v}");
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["network"], false, "{v}");
+    assert!(
+        !rb.job_dir("ignored").parent().unwrap().exists(),
+        "no jobs/ entry"
+    );
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s6_reads_and_inbox() {
+    let rb = RpcBox::new();
+    let writable = rb.omp.tmp.path().to_path_buf();
+    for args in [
+        vec!["ls", "--json"],
+        vec!["show", "e27c0de", "--json"],
+        vec!["tail", "e27c0de", "-n", "5", "--json"],
+        vec!["inbox", "--peek", "--json"],
+    ] {
+        let mut c = rb.glen(&args);
+        c.env("CODEX_SANDBOX", "linux-ci")
+            .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+        let out = bwrap(&c, true, &[&writable]);
+        assert_eq!(exit_code(&out), 0, "{args:?}: {}", json(&out));
+    }
+    let mut c = rb.glen(&["inbox", "--json"]);
+    c.env("CODEX_SANDBOX", "linux-ci")
+        .env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+    // No writable bind this time: marking a message read needs a GLEN_HOME write.
+    let out = bwrap(&c, true, &[]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 6, "{v}");
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s7_lease_across_netns() {
+    let rb = RpcBox::new();
+    let mut held = rb.hold_lease("e27c0de");
+    let outside = rb.omp.glen(&["ls", "--all", "--json"], &rb.omp.alpha());
+    let v = json(&outside);
+    let row = v["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["handle"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("e27c0de")
+        })
+        .unwrap_or_else(|| panic!("row missing: {v}"));
+    assert_eq!(row["state"], "live", "outside the sandbox: {v}");
+    let mut c = rb.glen(&["ls", "--all", "--json"]);
+    let writable = rb.omp.tmp.path().to_path_buf();
+    c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+    let inside = bwrap(&c, false, &[&writable]);
+    let iv = json(&inside);
+    let irow = iv["data"]["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["handle"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("e27c0de")
+        })
+        .unwrap_or_else(|| panic!("row missing: {iv}"));
+    assert_ne!(
+        irow["state"], "live",
+        "a host-namespace lease must not be visible inside --unshare-net: {iv}"
+    );
+    let _ = held.kill();
+    let _ = held.wait();
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s8_hidden_lease_refuses_rpc() {
+    let rb = RpcBox::new();
+    let mut held = rb.hold_lease("e27c0de");
+    let mut c = rb.glen(&["send", "e27c0de", "hi", "--json"]);
+    c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+    let writable = rb.omp.tmp.path().to_path_buf();
+    let out = bwrap(&c, false, &[&writable]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 6, "{v}");
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["lease"], "unknown", "{v}");
+    assert!(
+        !rb.job_dir("ignored").parent().unwrap().exists(),
+        "no jobs/ entry"
+    );
+    assert!(
+        rb.fake_log().is_empty(),
+        "fake omp was never started: {:?}",
+        rb.fake_log()
+    );
+    let _ = held.kill();
+    let _ = held.wait();
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s9_live_route_across_netns() {
+    let mut lb = LiveBox::new();
+    lb.start_ext(A_ID, "ok", &[]);
+    let mut c = lb
+        .rpc
+        .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
+    c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
+    let writable = lb.rpc.omp.tmp.path().to_path_buf();
+    let out = bwrap(&c, false, &[&writable]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 0, "{v}");
+    assert_eq!(v["data"]["route"], "live", "{v}");
+    assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
+}
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s10_network_is_isolated() {
+    use std::{io::Read, net::TcpListener};
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut buf = [0u8; 1];
+            let _ = stream.read(&mut buf);
+        }
+    });
+    let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
+    let outside = Command::new("bash").arg("-c").arg(&probe).output().unwrap();
+    assert!(
+        outside.status.success(),
+        "the host can reach its own listener: {}",
+        String::from_utf8_lossy(&outside.stderr)
+    );
+    let mut inside_cmd = Command::new("bash");
+    inside_cmd.arg("-c").arg(&probe);
+    let inside = bwrap_raw(inside_cmd, false, &[]);
+    assert!(
+        !inside.status.success(),
+        "a TCP connect inside --unshare-net must fail: {inside:?}"
+    );
+}

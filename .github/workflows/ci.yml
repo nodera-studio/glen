@@ -37,6 +37,28 @@ jobs:
           key: omp-git-v1-${{ hashFiles('Cargo.lock') }}
           lookup-only: true
 
+  linux-sandbox:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-sandbox
+          cache-on-failure: true
+      - name: bubblewrap (fails, never skips)
+        run: |
+          sudo apt-get update && sudo apt-get install -y bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          bwrap --version
+          bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net -- \
+            sh -c 'touch "$HOME/.glen-ro-probe" 2>&1 | grep -q "Read-only file system"'
+      - run: cargo build --locked --bins --examples
+      - run: cargo test --locked --test linux_sandbox -- --ignored --test-threads=1
+
   site:
     runs-on: ubuntu-latest
     defaults:
