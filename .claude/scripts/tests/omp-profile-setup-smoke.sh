@@ -30,6 +30,10 @@ export SMOKE_OMP_BASE="$WORK/bin/omp-base"
 cat > "$WORK/bin/omp" <<'EOF'
 #!/bin/bash
 set -eu
+# The launcher's unsandboxed daemon-scope hash (Bun runtime mode).
+if [ "${BUN_BE_BUN:-}" = 1 ]; then printf '0123456789abcdef'; exit 0; fi
+# Fix cycle 6: no omp call may inherit a native-cache override.
+[ -z "${PI_NATIVES_DIR:-}" ] || exit 95
 if [ "$*" = '--profile glen-harness toks glen-native-warmup --json' ]; then
   [ "$HOME" = "$FAKE_OMP_TEST_HOME" ] || exit 99
   [ "${FAKE_OMP_SANDBOX_ACTIVE:-0}" = 0 ] || exit 98
@@ -446,6 +450,7 @@ export SMOKE_DB_OMP="$WORK/bin/omp"
 cat > "$WORK/db-bin/omp" <<'EOF'
 #!/bin/bash
 set -euo pipefail
+if [ "${BUN_BE_BUN:-}" = 1 ]; then printf '0123456789abcdef'; exit 0; fi
 if [ "$*" = '--profile glen-harness models cursor --json' ]; then
   database="$FAKE_OMP_TEST_HOME/${PI_CONFIG_DIR:-.omp}/agent/${FAKE_OMP_DB_FILE:-agent.db}"
   case "$FAKE_OMP_DB_CHANGE" in
@@ -523,6 +528,44 @@ for sidecar in agent.db-wal agent.db-shm; do
     assert "$sidecar $change test keeps every omp call scoped" all_scoped
   done
 done
+
+# Fix cycle 6, Codex P2: an owner-customized mcp.json that merely mentions
+# "mnemosyne" is a conflict; an older template-shaped one is still managed.
+for mcp_case in extra-server literal-token template-shaped; do
+  new_fixture
+  ready_assets
+  case "$mcp_case" in
+    extra-server)
+      jq '.mcpServers.other = {type:"http",url:"http://localhost:9/mcp"}' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
+    literal-token)
+      jq '.mcpServers.mnemosyne.headers.Authorization = "Bearer literal-owner-value"' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
+    template-shaped)
+      jq '.mcpServers.mnemosyne.url = "${MNEMOSYNE_MEMORY_URL:-http://localhost:7777/mcp}"' "$REPO_ROOT/.claude/omp/mcp.json" > "$TEST_AGENT/mcp.json" ;;
+  esac
+  cp "$TEST_AGENT/mcp.json" "$CASE_DIR/mcp-before"
+  setup_run "$SETUP"
+  if [ "$mcp_case" = template-shaped ]; then
+    assert_exit 'template-shaped mcp.json is still managed' 0
+    assert 'template-shaped mcp.json is replaced by the template' cmp -s "$REPO_ROOT/.claude/omp/mcp.json" "$TEST_AGENT/mcp.json"
+  else
+    assert_exit "owner mcp.json with $mcp_case is a conflict" 1
+    assert_contains "owner mcp.json $mcp_case conflict names the file" "Conflict at $TEST_AGENT/mcp.json" "$STDERR"
+    assert "owner mcp.json $mcp_case is left untouched" cmp -s "$CASE_DIR/mcp-before" "$TEST_AGENT/mcp.json"
+    assert "owner mcp.json $mcp_case conflict never prints its contents" test "$(grep -c 'literal-owner-value\|localhost:9/' "$STDERR" "$STDOUT" | awk -F: '{s+=$2} END {print s+0}')" -eq 0
+    assert "owner mcp.json $mcp_case conflict precedes config changes" jq -es 'all(.[]; .argv[2:4] != ["config","set"])' "$FAKE_OMP_LOG"
+  fi
+done
+
+# Fix cycle 6, Codex P2: a caller's PI_NATIVES_DIR never reaches the warmup
+# or the sandboxed calls; the fake omp exits 95 if it sees one.
+new_fixture
+ready_assets
+run env HOME="$TEST_HOME" TMPDIR="$CASE_DIR/tmp" PI_CONFIG_DIR="$TEST_CONFIG_DIR" \
+  XDG_DATA_HOME="$CASE_DIR/xdg-data" XDG_STATE_HOME="$CASE_DIR/xdg-state" XDG_CACHE_HOME="$CASE_DIR/xdg-cache" \
+  PI_NATIVES_DIR="$CASE_DIR/custom-natives" GLEN_BIN="$WORK/bin/glen" /bin/bash "$SETUP" --dry-run
+assert_exit 'setup with a caller PI_NATIVES_DIR override succeeds' 0
+assert 'setup warms the default native cache despite the override' test -f "$TEST_HOME/.omp/natives/prewarmed"
+assert 'setup never fills the override native cache' test ! -e "$CASE_DIR/custom-natives"
 
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]

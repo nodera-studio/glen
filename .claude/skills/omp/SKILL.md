@@ -18,17 +18,17 @@ the `glen-harness` profile. It has no supervisor or plan-judge role.
 
 The owner runs `omp --profile glen-harness login cursor`, then
 `.claude/scripts/omp-profile-setup.sh`, then `.claude/scripts/omp-profile-setup.sh --check`.
-Cursor login detection and the predicted `mcp__mnemosyne_memory_*` tool names await
-the owner's live login. Setup picks the first id present in the live Cursor model list from
+The live Mnemosyne tool names (`mcp__mnemosyne_memory_*`, including the write tools
+`memory_store`, `memory_update` and `memory_delete` the policy denies) were confirmed in the
+Step 11 acceptance run. Setup picks the first id present in the live Cursor model list from
 an ordered ladder, each entry with its own startup thinking level: `cursor/gemini-4-argon`
 at medium, then `cursor/gemini-3.8-flash` at medium, then `cursor/grok-4.7` at high. It
 writes `modelRoles.default` as `<id>:<level>` (omp 18.14.0 honours this suffix itself,
 `config/model-resolver.ts` `splitThinkingSuffix`; host-verified against the session
 transcript's own `thinkingLevel` field, not the model's self-reported, unreliable answer).
-The engine's per-dispatch `--thinking <level>` on each `glen send` (mirrored in
-`omp-engine.sh`'s own `MODEL_LADDER`/`THINKING_LADDER`, shared with setup's from
-`.claude/omp/model-ladder.sh`) is belt and braces on top of the persisted default, not the
-only mechanism. If none of the three ids is present, omp is unavailable, with a reason
+The engine repeats exactly that persisted suffix as a per-dispatch `--thinking <level>` on
+each `glen send`, as belt and braces on top of the persisted default, and passes no
+`--thinking` when the persisted value has no suffix. If none of the three ids is present, omp is unavailable, with a reason
 naming all three. `--model cursor/<id>` selects another model and requires that exact id; it
 does not use the ladder, and setup never appends a thinking-level suffix for it.
 
@@ -83,7 +83,16 @@ harness invocation, setup's default-profile fingerprint, and the OS sandbox.
 The macOS `sandbox-exec` launcher contains reads of other processes' sibling directories
 under `$TMPDIR`; containment does not rely solely on file permissions. Any omp invocation
 can write shared, cross-profile state in `~/.omp/natives/` and `~/.omp/run/`; the
-default-profile fingerprint excludes both. Setup's `--dry-run` makes no config changes, but
+default-profile fingerprint excludes both. Inside the sandbox only `~/.omp/run/session-owners`
+(lease files) is readable and writable; `~/.omp/run/daemons` (broker tokens and launch specs
+that an unsandboxed broker trusts) is neither, and of the harness profile's own `run/daemons`
+only this run's presence directory is (fix cycle 6). The launcher creates the runtime
+directories the policy protects (`agent/sessions`, `logs`, `cache`, `run`, that scope, and
+`session-owners`) before it starts omp, refusing symlinks, and points `TMPDIR` at the run
+root's private `tmp/`. A sandboxed child cannot rename or remove another harness session's
+directory, but it can still delete individual session files in it: omp itself replaces
+session files by rename, so a file-level deny would break it. That residual is limited to
+the harness profile's transcripts. Setup's `--dry-run` makes no config changes, but
 querying config still initializes databases and caches on disk under `glen-harness`.
 
 **The engine is unavailable on Linux in v0.1.0.** bwrap cannot isolate abstract Unix sockets
@@ -95,10 +104,12 @@ the repo for a later Landlock-based version.
 **Outbound network is restricted to TCP port 443, the Mnemosyne MCP's own loopback port, and
 the mDNSResponder Unix socket** (fix cycles 4-5), not to the Cursor API host specifically. The
 Mnemosyne port is derived at launch from the profile's own `mcp.json` URL field (fix cycle 5,
-decision 2): a loopback host (`localhost`/`127.0.0.1`/`::1`) on any port is allowed; a
+decision 2): a loopback host (`localhost`, `127.0.0.1`, or bracketed `[::1]`, any letter case
+in scheme and host) on any port is allowed; a
 non-loopback host must already be on 443, or the launcher refuses to start rather than grant it
 an unbounded outbound host. Only the URL is parsed; headers and tokens are never read, logged or
-carried into the generated profile. Two residuals remain, accepted by the owner: any HTTPS host
+carried into the generated profile; when no rule can be derived, the launcher says so on
+stderr, without the URL, and Mnemosyne is unreachable for that run. Two residuals remain, accepted by the owner: any HTTPS host
 on the public internet is reachable from inside the sandbox (not just Cursor's), and `agent.db`
 (the Cursor credential store) stays readable by the sandboxed omp process, since omp needs it to
 authenticate. Neither is mitigated further in v0.1.0.

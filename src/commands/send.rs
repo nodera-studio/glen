@@ -311,10 +311,23 @@ pub(crate) fn submit(
     let store = JobStore::new(home.clone());
     store.create_for_send(&job, env)?;
     store.prune(now);
-    if live.is_some() && thinking.is_some() {
+    if live.is_some()
+        && let Some(level) = thinking.map(str::trim).filter(|t| !t.is_empty())
+    {
+        let handle = job.session_handle.as_deref().unwrap_or("<handle>");
+        // `glen thinking` takes explicit levels only; never suggest `auto` to it.
+        let advice = if level == "auto" {
+            format!(
+                "`auto` cannot be set on a running session; run `glen thinking {handle} <level>` with an explicit level instead"
+            )
+        } else {
+            format!("run `glen thinking {handle} {level}` instead")
+        };
         route_warnings.push(Warning {
             code: "ignored_flag".into(),
-            message: "--thinking has no effect on the live route (the session is already running); run `glen thinking <handle> <level>` instead".into(),
+            message: format!(
+                "--thinking has no effect on the live route (the session is already running); {advice}"
+            ),
         });
     }
     route_warnings.extend(warning);

@@ -128,6 +128,28 @@ resolve_launcher() {
       return 1
       ;;
   esac
+  # Fix cycle 6 (Claude MED-1 / Codex P1): compare the resolved directory with
+  # every root the sandboxed child can write to, also resolved: the whole omp
+  # home (profile logs/cache/run, sessions, ~/.omp/run), every engine run and
+  # probe root, and any active run root.
+  local home_real writable writable_real
+  home_real="$(cd "$HOME" && pwd -P)" || { REASON='could not resolve HOME'; return 1; }
+  for writable in "$home_real/.omp" "$home_real/${PI_CONFIG_DIR:-.omp}" "${RUN_DIR:-}" "${OMP_SANDBOX_RUN_ROOT:-}"; do
+    [ -n "$writable" ] && [ -d "$writable" ] || continue
+    writable_real="$(cd "$writable" && pwd -P)" || { REASON='could not resolve a sandbox-writable root'; return 1; }
+    case "$dest/" in
+      "$writable_real"/*)
+        REASON="sandbox launcher must not resolve under sandbox-writable $writable_real"
+        return 1
+        ;;
+    esac
+  done
+  case "$dest/" in
+    */glen-omp-engine/*)
+      REASON='sandbox launcher must not resolve inside the engine run root'
+      return 1
+      ;;
+  esac
   chmod 0700 "$dest" || { REASON='could not secure sandbox launcher directory'; return 1; }
   check_no_group_other_write "$dest" || {
     REASON="unsafe sandbox launcher directory: $dest is not exclusively owned and writable by the current user"
@@ -166,20 +188,34 @@ resolve_launcher() {
     return 1
   fi
   final="$dest/$launcher.${hash:0:16}"
-  if [ -e "$final" ]; then
+  # Reuse only a regular file with exactly the fetched bytes (fix cycle 6,
+  # MED-1); replace anything else, including a symlink, under that name.
+  if [ -f "$final" ] && [ ! -L "$final" ] && cmp -s "$fetch_tmp" "$final"; then
     rm -f "$fetch_tmp"
-  elif ! mv "$fetch_tmp" "$final"; then
-    rm -f "$fetch_tmp"
-    REASON='could not install sandbox launcher'
-    return 1
+    touch "$final" 2>/dev/null || true
+  else
+    if [ -e "$final" ] || [ -L "$final" ]; then
+      rm -f "$final" 2>/dev/null || { rm -f "$fetch_tmp"; REASON='could not replace a mismatched sandbox launcher'; return 1; }
+    fi
+    if ! mv "$fetch_tmp" "$final"; then
+      rm -f "$fetch_tmp"
+      REASON='could not install sandbox launcher'
+      return 1
+    fi
   fi
+  [ -f "$final" ] && [ ! -L "$final" ] || { REASON='sandbox launcher is not a regular file'; return 1; }
   check_no_group_other_write "$final" || {
     REASON='unsafe sandbox launcher file permissions after creation'
     return 1
   }
   LAUNCHER_BIN="$final"
-  for stale in "$dest/$launcher".*; do
-    [ -e "$stale" ] && [ "$stale" != "$final" ] || continue
+  # Another worktree's engine may be about to exec its own version from this
+  # cache (Claude LOW-4): prune only launchers and abandoned fetch files that
+  # nothing has used for a day. Reuse refreshes the mtime above.
+  for stale in "$dest/$launcher".* "$dest/.$launcher.fetch".*; do
+    [ -e "$stale" ] || [ -L "$stale" ] || continue
+    [ "$stale" != "$final" ] || continue
+    [ -n "$(find "$stale" -prune -mtime +0 2>/dev/null)" ] || continue
     rm -f "$stale"
   done
 }
@@ -282,7 +318,11 @@ capture() {
           .cacheRead += ($m.usage.cacheRead // 0) | .cacheWrite += ($m.usage.cacheWrite // 0) |
           .totalTokens += ($m.usage.totalTokens // 0) | .cost_total += ($m.usage.cost.total // 0)))}
       ' "$SESSION_PATH")" || return 1
-    MODEL="$(printf '%s' "$meta" | jq -r .model)"
+    # The transcript records a bare model id; report it as provider/id, the
+    # same form probe and setup use (Step 11 acceptance, item 2).
+    MODEL="$(printf '%s' "$meta" | jq -r '
+      if .model != "" and .provider != "" and (.model | contains("/") | not)
+      then .provider + "/" + .model else .model end')"
     PROVIDER="$(printf '%s' "$meta" | jq -r .provider)"
     USAGE="$(printf '%s' "$meta" | jq -c .usage)"
   fi
@@ -333,15 +373,6 @@ finish() {
 }
 trap finish EXIT
 trap interrupted INT TERM
-# Sourced only after the EXIT trap is registered (fix cycle 5, decision 10):
-# a missing/broken ladder file must still produce the normal JSON failure
-# envelope through `finish`, not a bare, uncaught `set -e` exit. The engine
-# never writes config; it only maps the resolved modelRoles.default back to
-# the level setup chose when it selected that id. $0, not BASH_SOURCE[0]:
-# consistent with omp-profile-setup.sh's sibling line, robust to a test
-# running this script's text through `bash -c "$text" ...`.
-# shellcheck source=.claude/omp/model-ladder.sh
-. "$(cd "$(dirname "$0")/../omp" && pwd -P)/model-ladder.sh"
 
 # The disabled probe must not pay for repository/tool discovery in a fresh TMPDIR.
 # Keep its JSON identical to other skips.
@@ -504,23 +535,33 @@ probe_checks() {
   [ "$rc" -eq 0 ] || stop skipped 'modelRoles.default config check failed' 3
   MODEL="$(printf '%s' "$value" | jq -er '.value.default | select(type == "string" and length > 0)')" || \
     stop skipped 'modelRoles.default config check failed' 3
-  # Item 10 (fix cycle 4): setup persists "<id>:<level>" (omp honours this
-  # suffix itself); strip it before matching the ladder or reporting MODEL.
-  # Only strip a trailing :<level> that is one of omp's own levels (fix cycle
-  # 5, LOW-1): a bare %%:* cut would also mangle a model id that happened to
-  # contain a colon for an unrelated reason.
+  # Item 10 (fix cycle 4): setup persists "<id>:<level>" on the ladder path
+  # (omp honours this suffix itself) and a bare id for an explicit --model.
+  # The per-dispatch --thinking repeats exactly that persisted level, and is
+  # omitted when there is none (fix cycle 6, Claude MED-2 / Codex P2): ladder
+  # membership of the id says nothing about what setup saved. Only a trailing
+  # :<level> that is one of omp's own levels counts as a suffix.
+  THINKING_LEVEL=''
   case "$MODEL" in
     *:off | *:minimal | *:low | *:medium | *:high | *:xhigh | *:max | *:auto)
+      THINKING_LEVEL="${MODEL##*:}"
       MODEL="${MODEL%:*}"
       ;;
   esac
-  THINKING_LEVEL="$(thinking_level_for "$MODEL")" || THINKING_LEVEL=''
   STATUS=ready REASON='' EXIT_CODE=0
 }
 
 fingerprint_source() {
-  { git -C "$1" status --porcelain=v1 -z || return 1; git -C "$1" diff HEAD || return 1; } |
-    shasum -a 256 | awk '{print $1}'
+  # Untracked files' bytes too (fix cycle 6, Codex P2): status names them and
+  # diff HEAD omits them, so an untracked edit mid-capture changed neither.
+  {
+    git -C "$1" status --porcelain=v1 -z || return 1
+    git -C "$1" diff HEAD || return 1
+    git -C "$1" ls-files -z --others --exclude-standard | while IFS= read -r -d '' path; do
+      printf '%s\0' "$path"
+      if [ -L "$1/$path" ]; then readlink "$1/$path"; elif [ -f "$1/$path" ]; then shasum -a 256 < "$1/$path"; fi
+    done
+  } | shasum -a 256 | awk '{print $1}'
 }
 validate_snapshot_links() {
   # Check every link without following directory links during traversal. abs_path

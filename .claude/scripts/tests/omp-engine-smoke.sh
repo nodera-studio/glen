@@ -101,6 +101,15 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
     printf 'read-only fixture\n' > "$sandbox_base/home/.omp/profiles/glen-harness/agent/$name"
   done
   printf 'native fixture\n' > "$sandbox_base/home/.omp/natives/x"
+  # Fix cycle 6, HIGH-1: shared and profile daemon state the child must
+  # neither read nor plant, next to the lease files it needs.
+  mkdir -p "$sandbox_base/home/.omp/run/daemons/abc" "$sandbox_base/home/.omp/run/session-owners" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/run/daemons/0123456789abcdef/daemons/x" \
+    "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions/other-slug" "$sandbox_base/run/staged/daemons/x"
+  printf 'token fixture\n' > "$sandbox_base/home/.omp/run/daemons/abc/broker.token"
+  printf 'spec fixture\n' > "$sandbox_base/home/.omp/profiles/glen-harness/run/daemons/0123456789abcdef/daemons/x/spec.json"
+  printf 'planted spec\n' > "$sandbox_base/run/staged/daemons/x/spec.json"
+  printf 'session fixture\n' > "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions/other-slug/s.jsonl"
 
   # Prewarm and sandboxed startup must resolve the same HOME-based native cache.
   # Clear caller overrides for both, rather than warming a separate XDG location.
@@ -167,6 +176,21 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
     assert_contains "sandbox permits runtime subtree $path" \
       "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/$path\")" "$WORK/sandbox-writes"
   done
+  # Fix cycle 6, HIGH-1: only the lease directory of shared ~/.omp/run.
+  assert 'sandbox grants no read or write on all of shared ~/.omp/run' test \
+    "$(grep -Fc "(subpath \"$sandbox_base/home/.omp/run\")" "$generated_profile" || true)" -eq 0
+  assert_contains 'sandbox grants writes to session-owner leases' \
+    "(subpath \"$sandbox_base/home/.omp/run/session-owners\")" "$WORK/sandbox-writes"
+  assert_contains 'sandbox denies writes to profile daemon records' \
+    "(subpath \"$sandbox_base/home/.omp/profiles/glen-harness/run/daemons\")" "$WORK/sandbox-write-denies"
+  assert_contains 'sandbox denies reads of profile daemon records' \
+    "(deny file-read* (subpath \"$sandbox_base/home/.omp/profiles/glen-harness/run/daemons\"))" "$generated_profile"
+  assert 'sandbox without an omp binary grants no daemon scope' test \
+    "$(grep -Ec '/run/daemons/[0-9a-f]{16}/clients' "$generated_profile" || true)" -eq 0
+  assert_contains 'sandbox denies removing a session directory itself' \
+    "(deny file-write-unlink (regex #\"^$expected_agent_regex/sessions/[^/]+\$\"))" "$generated_profile"
+  assert_contains 'sandbox maps no code from the run root' \
+    "(deny file-map-executable (subpath \"$sandbox_base/run\"))" "$generated_profile"
   assert_contains 'sandbox outbound restricted to TCP 443' '(allow network-outbound (remote tcp "*:443"))' "$generated_profile"
   assert 'sandbox outbound grants no bare IP filter' test "$(grep -Fc '(allow network-outbound (remote ip))' "$generated_profile" || true)" -eq 0
   assert_contains 'sandbox explicitly permits DNS Unix socket' '(allow network-outbound (literal "/private/var/run/mDNSResponder"))' "$generated_profile"
@@ -209,6 +233,68 @@ if [ "$(uname -s)" = Darwin ] && command -v sandbox-exec >/dev/null 2>&1; then
   run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
   assert_exit 'sandbox refuses a non-loopback, non-443 Mnemosyne MCP host' 1
   assert_contains 'non-loopback refusal names the reason' 'neither loopback nor on 443' "$STDERR"
+  unset sandbox_agent
+
+  # Fix cycle 6 (Claude LOW-2 / Codex P2): bracketed IPv6 loopback and any
+  # letter case derive the rule; an unparsable URL says so, without the URL.
+  for mnemosyne_case in 'ipv6 http://[::1]:9192/mcp 9192' 'upper HTTP://LocalHost:9193/mcp 9193' 'userinfo http://u@127.0.0.1:9194/mcp -'; do
+    # shellcheck disable=SC2086 # intentional word splitting of the case.
+    set -- $mnemosyne_case
+    mkdir -p "$sandbox_base/home/mnemosyne-$1/profiles/glen-harness/agent"
+    jq -cn --arg url "$2" '{mcpServers:{mnemosyne:{type:"http",url:$url}}}' \
+      > "$sandbox_base/home/mnemosyne-$1/profiles/glen-harness/agent/mcp.json"
+    sandbox_agent="$sandbox_alias/home/mnemosyne-$1/profiles/glen-harness/agent"
+    run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+    case_profile="$(grep -Fl -- "$sandbox_base/home/mnemosyne-$1/profiles/glen-harness/agent" "$sandbox_base/run"/omp-sandbox.*)"
+    assert_exit "sandbox runs with a $1 Mnemosyne URL" 0
+    if [ "$3" = - ]; then
+      assert "sandbox derives no rule from a $1 Mnemosyne URL" test \
+        "$(grep -Fc '(allow network-outbound (remote tcp "localhost:' "$case_profile" || true)" -eq 0
+      assert_contains "sandbox notes the missing Mnemosyne rule for a $1 URL" 'no Mnemosyne network rule derived' "$STDERR"
+      assert "sandbox note never prints the $1 URL" test "$(grep -Fc '127.0.0.1:9194' "$STDERR" || true)" -eq 0
+    else
+      assert_contains "sandbox derives the loopback rule from a $1 Mnemosyne URL" \
+        "(allow network-outbound (remote tcp \"localhost:$3\"))" "$case_profile"
+    fi
+    unset sandbox_agent
+  done
+
+  # Fix cycle 5 decision 5 / cycle 6 LOW-3: a path an SBPL regex literal
+  # cannot carry is refused before any policy is written.
+  for odd_case in 'quote "' 'backslash \'; do
+    odd_name="${odd_case#* }"
+    mkdir -p "$sandbox_base/home/odd${odd_name}dir/profiles/glen-harness/agent"
+    sandbox_agent="$sandbox_alias/home/odd${odd_name}dir/profiles/glen-harness/agent"
+    run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+    assert_exit "sandbox refuses an agent path with a ${odd_case% *}" 1
+    assert_contains "sandbox ${odd_case% *} refusal names the reason" 'SBPL regex literal cannot carry' "$STDERR"
+    assert "sandbox ${odd_case% *} refusal runs nothing" test ! -s "$STDOUT"
+    unset sandbox_agent
+  done
+
+  # Fix cycle 6, MED-3: a fresh profile without its runtime directories gets
+  # them from the launcher; a symlinked one is refused before omp starts.
+  mkdir -p "$sandbox_base/home/fresh/profiles/glen-harness/agent"
+  sandbox_agent="$sandbox_alias/home/fresh/profiles/glen-harness/agent"
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  assert_exit 'sandbox starts on a fresh profile without runtime directories' 0
+  for path in agent/sessions logs cache run run/daemons; do
+    assert "launcher creates fresh-profile $path" test -d "$sandbox_base/home/fresh/profiles/glen-harness/$path" -a ! -L "$sandbox_base/home/fresh/profiles/glen-harness/$path"
+  done
+  assert 'launcher creates the shared lease directory' test -d "$sandbox_base/home/.omp/run/session-owners"
+  assert 'launcher creates the private TMPDIR in the run root' test -d "$sandbox_base/run/tmp"
+  if [ "$sandbox_runtime" -eq 1 ]; then
+    run_sandbox sandbox_call /bin/mkdir "$sandbox_base/home/fresh/profiles/glen-harness/agent/sessions/new-slug"
+    assert_exit 'sandbox child can create a session directory on a fresh profile' 0
+  fi
+  unset sandbox_agent
+  mkdir -p "$sandbox_base/home/symlinked/profiles/glen-harness/agent" "$sandbox_base/elsewhere-logs"
+  ln -s "$sandbox_base/elsewhere-logs" "$sandbox_base/home/symlinked/profiles/glen-harness/logs"
+  sandbox_agent="$sandbox_alias/home/symlinked/profiles/glen-harness/agent"
+  run_sandbox sandbox_call /bin/cat "$sandbox_base/run/readable"
+  assert_exit 'sandbox refuses a symlinked runtime directory' 1
+  assert_contains 'symlinked runtime directory refusal names the reason' 'refusing symlinked runtime directory' "$STDERR"
+  assert 'symlinked runtime directory refusal runs nothing' test ! -s "$STDOUT"
   unset sandbox_agent
 
   # Verify the SQLite CLI/query itself even when nested Seatbelt is unavailable.
@@ -315,13 +401,51 @@ PY
       assert_exit 'sandbox refuses planting a symlink in a writable directory' 1
       assert 'sandbox refused symlink never actually appears' test ! -L "$planted"
     done
-    for renamed_pair in       "$sandbox_base/home/.omp/profiles/glen-harness/agent/sessions sessions.bak"       "$sandbox_base/home/.omp/profiles/glen-harness/logs logs.bak"; do
+    harness_profile="$sandbox_base/home/.omp/profiles/glen-harness"
+    for renamed_pair in "$harness_profile/agent/sessions sessions.bak" "$harness_profile/logs logs.bak" \
+      "$harness_profile/cache cache.bak" "$harness_profile/run run.bak" "$harness_profile/agent agent.bak" \
+      "$harness_profile profile.bak" "$sandbox_base/home/.omp/run/session-owners owners.bak"; do
       # shellcheck disable=SC2086 # intentional word splitting of the pair.
       set -- $renamed_pair
       run_sandbox sandbox_call /bin/mv "$1" "$2"
-      assert_exit 'sandbox refuses renaming a runtime directory away' 1
-      assert 'sandbox refused rename leaves the directory in place' test -d "$1"
+      assert_exit "sandbox refuses renaming ${1##*/} away" 1
+      assert "sandbox refused rename leaves ${1##*/} in place" test -d "$1"
     done
+    # Claude LOW-7: another session's directory cannot be moved out of
+    # sessions/, while files inside it stay writable for omp itself.
+    run_sandbox sandbox_call /bin/mv "$harness_profile/agent/sessions/other-slug" "$sandbox_base/run/stolen-session"
+    assert_exit 'sandbox refuses moving a session directory out of sessions/' 1
+    assert 'refused session move leaves the directory in place' test -f "$harness_profile/agent/sessions/other-slug/s.jsonl"
+    run_sandbox sandbox_call /usr/bin/tee "$harness_profile/agent/sessions/other-slug/s.jsonl.tmp" <<< 'session write'
+    assert_exit 'sandbox still writes files inside a session directory' 0
+
+    # Fix cycle 6, HIGH-1: broker tokens and daemon records stay out of reach;
+    # lease files stay writable.
+    run_sandbox sandbox_call /bin/cat "$sandbox_base/home/.omp/run/daemons/abc/broker.token"
+    assert_exit 'sandbox denies reading a shared broker token' 1
+    assert_contains 'shared broker token read is EPERM' 'Operation not permitted' "$STDERR"
+    for denied in "$sandbox_base/home/.omp/run/daemons/abc/spec.json" "$sandbox_base/home/.omp/run/planted" \
+      "$harness_profile/run/daemons/0123456789abcdef/daemons/x/spec.json" "$harness_profile/run/daemons/planted"; do
+      run_sandbox sandbox_call /usr/bin/tee "$denied" <<< 'planted'
+      assert "sandbox denies daemon-state write ${denied#"$sandbox_base/home/"}" test "$CODE" -ne 0
+    done
+    assert_eq 'sandbox leaves the profile daemon spec intact' \
+      "$(cat "$harness_profile/run/daemons/0123456789abcdef/daemons/x/spec.json")" 'spec fixture'
+    run_sandbox sandbox_call /bin/cat "$harness_profile/run/daemons/0123456789abcdef/daemons/x/spec.json"
+    assert_exit 'sandbox denies reading a profile daemon spec' 1
+    run_sandbox sandbox_call /bin/mv "$sandbox_base/run/staged" "$harness_profile/run/daemons/fedcba9876543210"
+    assert_exit 'sandbox refuses renaming a staged scope into the daemons tree' 1
+    assert 'refused staged scope never appears' test ! -e "$harness_profile/run/daemons/fedcba9876543210"
+    run_sandbox sandbox_call /usr/bin/tee "$sandbox_base/home/.omp/run/session-owners/fixture.lock" <<< ''
+    assert_exit 'sandbox allows writing a session-owner lease' 0
+
+    # Step 11 acceptance root cause: omp's RPC output spool lands in TMPDIR,
+    # which must be the writable run root's private tmp/.
+    run_sandbox sandbox_call /usr/bin/printenv TMPDIR
+    assert_eq 'sandbox child TMPDIR is the run root tmp' "$(cat "$STDOUT")" "$sandbox_base/run/tmp"
+    run_sandbox sandbox_call /usr/bin/mktemp -d -t omp-rpc-output
+    assert_exit 'sandbox child can create a temp directory in TMPDIR' 0
+    assert 'sandbox temp directory lands in the run root tmp' grep -Fq "$sandbox_base/run/tmp/" "$STDOUT"
 
     if [ -n "$socket_python" ]; then
       # S5 (fix cycle 4) restricts process-exec* to the literal resolved
@@ -433,6 +557,17 @@ EOF
     real_profiles=("$sandbox_base/run"/omp-sandbox.*)
     sed -n '/^(allow file-read\*/,/^)/p' "${real_profiles[0]}" > "$WORK/real-omp-reads"
     sed -n '/^(allow file-write\*/,/^)/p' "${real_profiles[0]}" > "$WORK/real-omp-writes"
+    # Fix cycle 6, HIGH-1: real omp gets exactly its own presence scope,
+    # keyed the way omp keys it (wyhash of the physical cwd).
+    expected_scope="$(cd / && env -i BUN_BE_BUN=1 HOME=/var/empty GLEN_SCOPE_DIR="$sandbox_base/run" "$real_omp" -e \
+      'process.stdout.write(Bun.hash.wyhash(process.env.GLEN_SCOPE_DIR).toString(16).padStart(16, "0"))' < /dev/null 2>/dev/null || true)"
+    assert 'real omp scope hash is 16 hex digits' grep -Eqx '[0-9a-f]{16}' <<< "$expected_scope"
+    assert_contains 'sandbox grants real omp its own presence directory' \
+      "(allow file-write* (subpath \"$sandbox_base/home/.omp/profiles/glen-harness/run/daemons/$expected_scope/clients\"))" "${real_profiles[0]}"
+    assert 'sandbox grants real omp exactly one presence directory' test \
+      "$(grep -Ec 'allow file-write\* \(subpath "[^"]*/run/daemons/[0-9a-f]{16}/clients"\)\)' "${real_profiles[0]}" || true)" -eq 1
+    assert 'launcher precreates the real omp presence directory' \
+      test -d "$sandbox_base/home/.omp/profiles/glen-harness/run/daemons/$expected_scope/clients"
     assert_contains 'sandbox reads the same native cache populated by prewarm' "(subpath \"$natives_dir\")" "$WORK/real-omp-reads"
     assert 'sandbox keeps the populated native cache read-only' test "$(grep -Fc "$natives_dir" "$WORK/real-omp-writes" || true)" -eq 0
     if [ "$sandbox_runtime" -eq 1 ]; then
@@ -596,17 +731,26 @@ assert 'probe disabled status' jq -e '.status == "skipped"' "$STDOUT"
 assert_contains 'probe disabled reason' GLEN_OMP_ENGINE "$STDOUT"
 assert "probe disabled takes under two seconds (${elapsed}ms)" test "$elapsed" -lt 2000
 
+# Codex P2 / Claude LOW-1: on real Linux, probe_checks refuses before any
+# profile or run-root check, so those reasons are macOS-only expectations.
+if [ "$(uname -s)" = Darwin ]; then
+  missing_profile_reason='profile is not set up'
+  # shellcheck disable=SC2016 # The engine's diagnostic deliberately names HOME literally.
+  home_root_reason='run root under $HOME'
+else
+  missing_profile_reason='unavailable: linux abstract-socket isolation not supported'
+  home_root_reason="$missing_profile_reason"
+fi
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
 assert_exit 'probe missing profile exit' 3
-assert_contains 'probe missing profile reason' 'profile is not set up' "$STDOUT"
+assert_contains 'probe missing profile reason' "$missing_profile_reason" "$STDOUT"
 assert 'probe missing profile creates no run root or jobs' test ! -e "$WORK/tmp/glen-omp-engine"
 
 mkdir -p "$WORK/home/.omp/profiles/glen-harness/agent" "$WORK/home/.omp/natives" "$WORK/home/tmproot"
 printf 'tools:\n  approvalMode: always-ask\n' > "$WORK/home/.omp/profiles/glen-harness/agent/config.yml"
 run env HOME="$WORK/home" PI_CONFIG_DIR=.omp TMPDIR="$WORK/home/tmproot" GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
 assert_exit 'probe run root under home exit' 3
-# shellcheck disable=SC2016 # The engine's diagnostic deliberately names HOME literally.
-assert_contains 'probe run root under home reason' 'run root under $HOME' "$STDOUT"
+assert_contains 'probe run root under home reason' "$home_root_reason" "$STDOUT"
 assert 'probe fast paths invoke neither glen nor omp' test ! -e "$SMOKE_UNEXPECTED_CALL"
 
 SRC="$WORK/source" DEST="$WORK/snapshot"
@@ -800,6 +944,16 @@ run env GLEN_OMP_ENGINE_TEST_MUTATE='if [ ! -e .race-once ]; then printf "once\n
 assert_exit 'capture one race recaptures successfully' 0
 assert_contains 'capture one race retains new source content' once "$WORK/race-once/modified.txt"
 assert_eq 'capture one race final status' "$(jq -r .status "$STDOUT")" ok
+# Fix cycle 6, Codex P2: an edit to an existing untracked file mid-capture
+# changes the fingerprint too, so the snapshot never keeps stale bytes.
+# The marker lives outside SRC: a new untracked name would change status by itself.
+# shellcheck disable=SC2016 # Expanded by the snapshot subprocess, not this shell.
+run env SMOKE_RACE_MARKER="$WORK/race-untracked-marker" \
+  GLEN_OMP_ENGINE_TEST_MUTATE='if [ ! -e "$SMOKE_RACE_MARKER" ]; then printf "untracked race\n" >> untracked.txt; : > "$SMOKE_RACE_MARKER"; fi' \
+  /bin/bash "$ENGINE" snapshot "$SRC" "$WORK/race-untracked"
+assert_exit 'capture untracked race recaptures successfully' 0
+assert_contains 'capture untracked race retains new untracked content' 'untracked race' "$WORK/race-untracked/untracked.txt"
+assert_contains 'capture untracked race logs the recapture' 'source changed during capture; recapturing once' "$STDERR"
 # shellcheck disable=SC2016 # Expanded by the snapshot subprocess, not this shell.
 run env SMOKE_MUTATION_MARKER="$WORK/direct-mutation" GLEN_OMP_ENGINE_TEST_MUTATE=': > "$SMOKE_MUTATION_MARKER"' \
   /bin/bash "$ENGINE" snapshot "$SRC" "$WORK/direct-mutation-snapshot"
@@ -820,7 +974,22 @@ assert_eq 'policy source label' "$(sed -n '1p' "$STDOUT")" main
 assert_eq 'policy content comes from main' "$(sed '1d' "$STDOUT")" \
   "$(git -C "$POLICY_REPO" show main:.claude/omp/glen-harness.yml)"
 
-if [ "$(uname -s)" = Darwin ]; then launcher_name=omp-sandboxed.sh; else launcher_name=omp-sandboxed-linux.sh; fi
+# Fix cycle 6 (Claude LOW-1 / Codex P2): launcher resolution, the
+# environment boundary and every probe/dispatch below need macOS
+# sandbox-exec; resolve_launcher and probe_checks refuse real Linux outright.
+if [ "$(uname -s)" != Darwin ]; then
+  mkdir "$WORK/launcher-linux"
+  run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-linux"
+  assert_exit 'Linux launcher resolution refuses' 4
+  assert_contains 'Linux launcher refusal names the reason' 'unavailable: linux abstract-socket isolation not supported' "$STDERR"
+  assert 'Linux launcher refusal returns no launcher path' test ! -s "$STDOUT"
+  run env HOME="$WORK/home" PI_CONFIG_DIR=.omp GLEN_OMP_ENGINE=on /bin/bash "$ENGINE" probe
+  assert_exit 'Linux probe with a set-up profile still refuses' 3
+  assert_contains 'Linux probe with a set-up profile names the reason' 'unavailable: linux abstract-socket isolation not supported' "$STDOUT"
+  assert 'Linux probe never calls glen or omp' test ! -e "$SMOKE_UNEXPECTED_CALL"
+  printf 'NOTE launcher, probe and dispatch suites skipped: Darwin with sandbox-exec required\n'
+else
+launcher_name=omp-sandboxed.sh
 printf '#!/bin/bash\nexit 99\n' > "$POLICY_REPO/.claude/omp/$launcher_name"
 mkdir "$WORK/launcher-main" "$WORK/launcher-fallback"
 run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-main"
@@ -859,6 +1028,56 @@ assert_exit 'launcher dir symlinked into a run directory is refused' 4
 assert_contains 'symlinked run directory refusal names the reason' 'per-dispatch run directory' "$STDERR"
 assert 'symlinked run directory refusal returns no launcher path' test ! -s "$STDOUT"
 
+# Fix cycle 6 (Claude MED-1 / Codex P1): every sandbox-writable root counts
+# after resolution, not only run-* names: profile siblings, shared ~/.omp/run,
+# an engine probe root, and an active run root of any name, also via symlink.
+containment_home="$WORK/containment-home"
+mkdir -p "$containment_home/.omp/profiles/glen-harness/logs" "$containment_home/.omp/profiles/glen-harness/cache" \
+  "$containment_home/.omp/run" "$WORK/containment-tmp/glen-omp-engine/probe.fixture" "$WORK/containment-active/omp.fixture"
+ln -s "$containment_home/.omp/profiles/glen-harness/logs" "$WORK/containment-logs-link"
+ln -s "$WORK/containment-active/omp.fixture" "$WORK/containment-active-link"
+for containment_case in "profile-logs $containment_home/.omp/profiles/glen-harness/logs" \
+  "profile-cache $containment_home/.omp/profiles/glen-harness/cache" "shared-run $containment_home/.omp/run" \
+  "logs-symlink $WORK/containment-logs-link" "probe-root $WORK/containment-tmp/glen-omp-engine/probe.fixture" \
+  "active-root-symlink $WORK/containment-active-link"; do
+  label="${containment_case%% *}" target="${containment_case#* }"
+  run env HOME="$containment_home" OMP_SANDBOX_RUN_ROOT="$WORK/containment-active/omp.fixture" \
+    /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$target"
+  assert_exit "launcher refuses a $label destination" 4
+  assert_contains "launcher $label refusal names a writable root" 'sandbox launcher must not resolve' "$STDERR"
+  assert "launcher $label refusal returns no launcher path" test ! -s "$STDOUT"
+done
+run env HOME="$containment_home" TMPDIR="$containment_home/.omp/profiles/glen-harness/cache" \
+  /bin/bash "$ENGINE" launcher "$POLICY_REPO"
+assert_exit 'launcher refuses a default cache under a TMPDIR inside the profile' 4
+
+# A cached launcher is reused only as a regular file with the same bytes.
+mkdir "$WORK/launcher-reuse"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-reuse"
+reuse_launcher="$(cat "$STDOUT")"
+chmod 0700 "$reuse_launcher"
+printf '#!/bin/bash\necho tampered\n' > "$reuse_launcher"
+chmod 0500 "$reuse_launcher"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-reuse"
+assert_exit 'launcher replaces a tampered cached file' 0
+assert 'replaced launcher has the main bytes again' cmp -s "$WORK/main-launcher" "$reuse_launcher"
+rm -f "$reuse_launcher"
+ln -s "$WORK/main-launcher" "$reuse_launcher"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-reuse"
+assert_exit 'launcher replaces a symlink at the cached name' 0
+assert 'replaced launcher is a regular file, not a symlink' test -f "$reuse_launcher" -a ! -L "$reuse_launcher"
+# Claude LOW-4: a fresh sibling (another worktree's version) survives;
+# only a day-old one is pruned.
+printf 'other version\n' > "$WORK/launcher-reuse/omp-sandboxed.sh.0000000000000000"
+printf 'old version\n' > "$WORK/launcher-reuse/omp-sandboxed.sh.1111111111111111"
+printf 'abandoned fetch\n' > "$WORK/launcher-reuse/.omp-sandboxed.sh.fetch.old"
+touch -t 202001010000 "$WORK/launcher-reuse/omp-sandboxed.sh.1111111111111111" "$WORK/launcher-reuse/.omp-sandboxed.sh.fetch.old"
+run /bin/bash "$ENGINE" launcher "$POLICY_REPO" "$WORK/launcher-reuse"
+assert_exit 'launcher resolution with stale siblings succeeds' 0
+assert 'fresh sibling launcher is kept for a concurrent engine' test -f "$WORK/launcher-reuse/omp-sandboxed.sh.0000000000000000"
+assert 'day-old sibling launcher is pruned' test ! -e "$WORK/launcher-reuse/omp-sandboxed.sh.1111111111111111"
+assert 'abandoned fetch file is pruned' test ! -e "$WORK/launcher-reuse/.omp-sandboxed.sh.fetch.old"
+
 # Use a synthetic token. Never print envcheck output or any variable values.
 (
   export CLAUDE_CONFIG_DIR=smoke PI_PY=smoke PI_JS=smoke PI_CODING_AGENT_DIR=smoke
@@ -886,6 +1105,8 @@ export SMOKE_SESSION="$WORK/session.jsonl" SMOKE_SEND_ARGV="$WORK/send-argv"
 printf '%s\n' '{"type":"message","message":{"role":"assistant","model":"fixture","provider":"cursor","usage":{"input":1,"output":1}}}' > "$SMOKE_SESSION"
 cat > "$WORK/bin/omp" <<'EOF'
 #!/bin/sh
+# The launcher's unsandboxed daemon-scope hash (Bun runtime mode).
+if [ "${BUN_BE_BUN:-}" = 1 ]; then printf '0123456789abcdef'; exit 0; fi
 [ "${SMOKE_SANDBOX_ACTIVE:-}" = 1 ] || exit 98
 if [ -e /dev/fd/3 ]; then printf 'open\n' >> "$SMOKE_OMP_FDS"; exit 99; fi
 printf 'closed\n' >> "$SMOKE_OMP_FDS"
@@ -961,10 +1182,9 @@ assert 'probe reports launcher source' jq -e '.launcher_source == "main" or .lau
 # Exercise both bounded_omp branches, independent of which timeout tools the
 # host installed. The private PATH still points at the same fd-aware fake omp.
 mkdir "$WORK/no-timeout-bin" "$WORK/with-timeout-bin"
-for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp cp chmod cat readlink sandbox-exec shasum sha256sum awk; do
+for tool in date dirname git jq mkdir stat id mktemp perl rm uname find env omp cp chmod cat readlink sandbox-exec shasum sha256sum awk cmp touch tr mv; do
   if command -v "$tool" >/dev/null 2>&1; then ln -s "$(command -v "$tool")" "$WORK/no-timeout-bin/$tool"; fi
 done
-if [ "$(uname -s)" != Darwin ]; then ln -s "$WORK/bin/bwrap" "$WORK/no-timeout-bin/bwrap"; fi
 cat > "$WORK/with-timeout-bin/timeout" <<'EOF'
 #!/bin/sh
 : > "$SMOKE_TIMEOUT_USED"
@@ -1052,9 +1272,7 @@ assert_eq 'unsafe run roots invoke no omp probes or jobs' "$(wc -l < "$SMOKE_OMP
 
 # Fix cycle 5, decision 8: this whole section exercises macOS's
 # sandbox-exec-specific dispatch path (resolve_launcher/probe_checks both
-# refuse Linux unconditionally, before reaching any of this), so it is
-# gated to Darwin like the other sandbox-exec-only blocks in this file.
-if [ "$(uname -s)" = Darwin ]; then
+# refuse Linux unconditionally), so it stays inside the Darwin gate above.
 # Full dispatch integration. Clock/sleep wrappers exercise the real retry/deadline
 # branches without sleeping a minute or adding a production-only test hook.
 DISPATCH_SRC="$WORK/dispatch-source" DISPATCH_BIN="$WORK/dispatch-bin"
@@ -1203,22 +1421,31 @@ for terminal in ok failed; do
   fi
 done
 
-# Items 11 and 7: an on-ladder model gets its own paired level, including the
-# grok rung's "high" (not medium, the ladder's first entry).
-for ladder_case in argon grok; do
+# Items 11 and 7, fix cycle 6 MED-2: --thinking repeats exactly the persisted
+# suffix, including the grok rung's "high" and a suffix that differs from
+# the ladder, and is omitted for a bare id even when that id is on the ladder
+# (setup --model cursor/grok-4.7 persists no suffix).
+for ladder_case in argon grok override bare; do
   case "$ladder_case" in
-    argon) ladder_model=cursor/gemini-4-argon expected_level=medium ;;
-    grok) ladder_model=cursor/grok-4.7 expected_level=high ;;
+    argon) ladder_model=cursor/gemini-4-argon:medium expected_level=medium ;;
+    grok) ladder_model=cursor/grok-4.7:high expected_level=high ;;
+    override) ladder_model=cursor/gemini-4-argon:low expected_level=low ;;
+    bare) ladder_model=cursor/grok-4.7 expected_level='' ;;
   esac
   dispatch_fixture "ladder-$ladder_case"
   dispatch_step send 0 "$DONE"
   SMOKE_MODEL_ROLES_DEFAULT="$ladder_model" dispatch_run
-  assert_exit "ladder model $ladder_model dispatch succeeds" 0
-  # shellcheck disable=SC2016 # jq binds $level through --arg.
-  assert "ladder model $ladder_model sends its own thinking level" jq -es \
-    --arg level "$expected_level" \
-    'any(.[]; (.argv | index("--thinking")) as $i | $i != null and .argv[$i+1] == $level)' \
-    "$STATE/calls.jsonl"
+  assert_exit "model role $ladder_model dispatch succeeds" 0
+  if [ -n "$expected_level" ]; then
+    # shellcheck disable=SC2016 # jq binds $level through --arg.
+    assert "model role $ladder_model sends its persisted thinking level" jq -es \
+      --arg level "$expected_level" \
+      'length > 0 and all(.[]; (.argv | index("--thinking")) as $i | $i != null and .argv[$i+1] == $level)' \
+      "$STATE/calls.jsonl"
+  else
+    assert "model role $ladder_model sends no --thinking at all" jq -es \
+      'length > 0 and all(.[]; (.argv | index("--thinking")) == null)' "$STATE/calls.jsonl"
+  fi
 done
 
 dispatch_fixture running-no-job
@@ -1377,9 +1604,6 @@ assert_exit 'production snapshot skip propagates' 3
 assert_eq 'production snapshot skip status' "$(jq -r .status "$STDOUT")" skipped
 assert_tree 'production snapshot skip cleans tree' removed
 assert 'production snapshot skip never dispatches' test ! -s "$STATE/calls.jsonl"
-
-else
-  printf 'NOTE dispatch integration suite skipped: Darwin with sandbox-exec required\n'
 fi
 printf '%s assertions, %s failures\n' "$CASES" "$FAILURES"
 [ "$FAILURES" -eq 0 ]

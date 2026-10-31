@@ -507,8 +507,24 @@ fn w9_thinking_flag_on_live_route_warns_ignored() {
     assert_eq!(v["warnings"][0]["code"], "ignored_flag");
     let message = v["warnings"][0]["message"].as_str().unwrap();
     assert!(message.contains("--thinking"));
-    assert!(message.contains("glen thinking <handle> <level>"));
+    assert!(message.contains("glen thinking "));
+    assert!(message.contains(" high` instead"));
+    assert!(!message.contains("<handle>"));
     assert!(!message.contains("/effort"));
+    b.rpc.wait_worker_gone(job_id(&v["data"]));
+}
+#[test]
+fn w9_thinking_auto_on_live_route_never_suggests_auto() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let o = send(&b, &["--thinking", "auto"]);
+    assert!(o.status.success());
+    let v = json(&o);
+    assert_eq!(v["warnings"][0]["code"], "ignored_flag");
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("`auto` cannot be set on a running session"));
+    assert!(message.contains("<level>` with an explicit level"));
+    assert!(!message.contains(" auto` instead"));
     b.rpc.wait_worker_gone(job_id(&v["data"]));
 }
 #[test]

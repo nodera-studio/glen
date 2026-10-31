@@ -171,15 +171,17 @@ omp_run() {
       launcher="$(/bin/bash "$ENGINE_ROOT/.claude/scripts/omp-engine.sh" launcher "$ENGINE_ROOT")" || exit 1
       real_omp="$(command -v omp)" || exit 1
       env -u CLAUDE_CONFIG_DIR -u COPILOT_CUSTOM_INSTRUCTIONS_DIRS -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE \
+        -u PI_CODING_AGENT_DIR -u OMP_CODING_AGENT_DIR -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR \
         HOME="$PROFILE_HOME" OMP_REAL_BIN="$real_omp" OMP_SANDBOX_RUN_ROOT="$cwd" \
         OMP_PROFILE_AGENT_DIR="$AGENT_DIR" "$launcher" "$@" 3>&-
     elif [ "$layer" = overlay ]; then
+      # PI_NATIVES_DIR is dropped on every layer (fix cycle 6, Codex P2): the
+      # warmup must fill ~/.omp/natives, the only native cache the sandbox reads.
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" PI_CONFIG_FILES="$OVERLAY" omp "$@"
+        -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR HOME="$PROFILE_HOME" PI_CONFIG_FILES="$OVERLAY" omp "$@"
     else
       env -u CLAUDE_CONFIG_DIR -u PI_PY -u PI_JS -u PI_CONFIG_FILES \
-        -u OMP_PROFILE -u PI_PROFILE HOME="$PROFILE_HOME" omp "$@"
+        -u OMP_PROFILE -u PI_PROFILE -u PI_NATIVES_DIR HOME="$PROFILE_HOME" omp "$@"
     fi
   )
 }
@@ -203,7 +205,20 @@ asset_guard() {
     die "Conflict at $target. Owner action: resolve the owner-authored file manually, then rerun."
   fi
 }
-asset_guard "$MCP_SOURCE" "$MCP_TARGET" '"mnemosyne"'
+# A differing mcp.json counts as setup-managed only when it has the shape any
+# template version wrote (fix cycle 6, Codex P2): the mnemosyne server alone,
+# and every URL/header value still a ${MNEMOSYNE_...} template rather than a
+# literal the owner filled in. A merely present "mnemosyne" key is not enough.
+mcp_guard() {
+  [ -e "$MCP_TARGET" ] && ! cmp -s "$MCP_SOURCE" "$MCP_TARGET" || return 0
+  jq -e '
+    (.mcpServers | type == "object" and keys == ["mnemosyne"]) and
+    (.mcpServers.mnemosyne | type == "object" and (.url | type == "string" and test("\\$\\{MNEMOSYNE_")) and
+      ((.headers // {}) | type == "object" and all(.[]; type == "string" and test("\\$\\{MNEMOSYNE_"))))
+  ' "$MCP_TARGET" >/dev/null 2>&1 ||
+    die "Conflict at $MCP_TARGET. Owner action: resolve the owner-authored file manually, then rerun."
+}
+mcp_guard
 asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"
 
 # Resolve the default before syncing settings or installing assets. Primary login

@@ -24,8 +24,10 @@ tools:
     mcp__mnemosyne_memory_get_recent: allow
     mcp__mnemosyne_memory_get_entity: allow
     mcp__mnemosyne_memory_decision_chain: allow
-    mcp__mnemosyne_memory_edit: deny
-    mcp__mnemosyne_memory_reflect: deny
+    # The live write tools (Step 11 acceptance, item 4).
+    mcp__mnemosyne_memory_store: deny
+    mcp__mnemosyne_memory_update: deny
+    mcp__mnemosyne_memory_delete: deny
   restrictedFolders: ["~"]
 bash:
   enabled: false

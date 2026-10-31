@@ -94,8 +94,15 @@ readonly_filters="$(readonly_agent_filters)" || die 'could not inspect read-only
 # otherwise touches headers or tokens.
 mnemosyne_network_rule() {
   local mcp_file="$PROFILE_AGENT_DIR/mcp.json" url host port scheme var_name var_default
-  [ -f "$mcp_file" ] && command -v jq >/dev/null 2>&1 || return 0
-  url="$(jq -r '.mcpServers.mnemosyne.url // empty' "$mcp_file" 2>/dev/null)" || return 0
+  # Never print the URL itself: only say that no rule could be derived.
+  local note='omp-sandboxed: note: no Mnemosyne network rule derived from mcp.json; Mnemosyne will be unreachable in this run'
+  local url_re='^([A-Za-z][A-Za-z0-9+.-]*)://(\[[0-9A-Fa-f:.]+\]|[^]/:?#@[]+)(:([0-9]+))?([/?#].*)?$'
+  [ -f "$mcp_file" ] || return 0
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '%s (jq not on PATH)\n' "$note" >&2
+    return 0
+  fi
+  url="$(jq -r '.mcpServers.mnemosyne.url // empty' "$mcp_file" 2>/dev/null)" || { printf '%s\n' "$note" >&2; return 0; }
   [ -n "$url" ] || return 0
   # mcp.json ships the literal "${VAR:-default}" template text; omp expands
   # it at its own runtime, so expand it here the same way, reading only the
@@ -106,15 +113,21 @@ mnemosyne_network_rule() {
     var_default="${BASH_REMATCH[2]}"
     eval "url=\"\${$var_name:-\$var_default}\""
   fi
-  [[ "$url" =~ ^(https?)://([^/:]+)(:([0-9]+))?(/.*)?$ ]] || return 0
-  scheme="${BASH_REMATCH[1]}"
-  host="${BASH_REMATCH[2]}"
+  # Bracketed IPv6 authorities ([::1]) and any scheme/host letter case parse
+  # too (fix cycle 6, Claude LOW-2 / Codex P2); anything else gets the note.
+  [[ "$url" =~ $url_re ]] || { printf '%s\n' "$note" >&2; return 0; }
+  scheme="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+  host="$(printf '%s' "${BASH_REMATCH[2]}" | tr '[:upper:]' '[:lower:]')"
   port="${BASH_REMATCH[4]}"
+  case "$scheme" in
+    http | https) ;;
+    *) printf '%s\n' "$note" >&2; return 0 ;;
+  esac
   if [ -z "$port" ]; then
     if [ "$scheme" = https ]; then port=443; else port=80; fi
   fi
   case "$host" in
-    localhost | 127.0.0.1 | ::1) ;;
+    localhost | 127.0.0.1 | '[::1]') ;;
     *)
       [ "$port" = 443 ] || die "Mnemosyne MCP host $host is neither loopback nor on 443; refusing rather than granting an unbounded outbound host"
       return 0
@@ -126,6 +139,62 @@ mnemosyne_network_rule() {
   printf '(allow network-outbound (remote tcp "localhost:%s"))\n' "$port"
 }
 mnemosyne_rule="$(mnemosyne_network_rule)" || die 'could not derive the Mnemosyne MCP outbound rule'
+
+# omp 18.14.0 registers each process's presence under
+# <profile>/run/daemons/<wyhash(cwd)>/clients (launch/presence.ts:37-45), and
+# a failure there is fatal (main.ts:2336-2401). The policy grants exactly this
+# one scope (fix cycle 6, HIGH-1): granting the daemons tree would let the
+# child plant broker records, and a directory renamed into place carries its
+# children past any per-path deny (host-verified). The hash is computed here,
+# unsandboxed, by omp's own Bun runtime, from / with an empty environment so
+# no bunfig.toml or .env from the reviewed tree or the run root is read.
+daemon_scope_for() {
+  local scope
+  case "${OMP_REAL_BIN_RESOLVED##*/}" in omp) ;; *) return 0 ;; esac
+  # shellcheck disable=SC2016 # JavaScript, not shell.
+  scope="$(cd / && env -i BUN_BE_BUN=1 HOME=/var/empty GLEN_SCOPE_DIR="$1" "$OMP_REAL_BIN_RESOLVED" -e \
+    'process.stdout.write(Bun.hash.wyhash(process.env.GLEN_SCOPE_DIR).toString(16).padStart(16, "0"))' \
+    < /dev/null 2> /dev/null)" || scope=''
+  if [[ "$scope" =~ ^[0-9a-f]{16}$ ]]; then
+    printf '%s' "$scope"
+  else
+    printf 'omp-sandboxed: warning: could not derive the daemon presence scope; omp may refuse to start\n' >&2
+  fi
+}
+CWD_REAL="$(pwd -P)" || die 'could not resolve the working directory'
+DAEMON_SCOPE="$(daemon_scope_for "$CWD_REAL")"
+
+# The policy denies creating, renaming or replacing these directories (below),
+# so a fresh profile could never create them from inside the sandbox (fix
+# cycle 6, MED-3). Create them here, unsandboxed, refusing symlinks, parents
+# first (umask 077 makes every new one private).
+ensure_dir() {
+  [ ! -L "$1" ] || die "refusing symlinked runtime directory $1"
+  mkdir -p "$1" 2>/dev/null || die "could not create runtime directory $1"
+  [ -d "$1" ] && [ ! -L "$1" ] || die "runtime path is not a directory: $1"
+}
+OWNERS_DIR="$REAL_HOME/.omp/run/session-owners"
+DAEMONS_DIR="$PROFILE_ROOT/run/daemons"
+runtime_dirs=("$PROFILE_AGENT_DIR/sessions" "$PROFILE_ROOT/logs" "$PROFILE_ROOT/cache" "$PROFILE_ROOT/run"
+  "$DAEMONS_DIR" "$REAL_HOME/.omp/run" "$OWNERS_DIR" "$RUN_ROOT_REAL/tmp")
+[ -z "$DAEMON_SCOPE" ] || runtime_dirs+=("$DAEMONS_DIR/$DAEMON_SCOPE" "$DAEMONS_DIR/$DAEMON_SCOPE/clients")
+for dir in "${runtime_dirs[@]}"; do ensure_dir "$dir"; done
+# omp spools RPC output it cannot deliver yet under os.tmpdir()
+# (modes/rpc/rpc-output.ts:72) and exits when that fails (Step 11 acceptance:
+# EPERM on mkdtemp under the caller's TMPDIR). Give it a private one inside
+# the writable run root.
+export TMPDIR="$RUN_ROOT_REAL/tmp"
+# A native-cache override outside ~/.omp/natives would load nothing under the
+# read grant below; warmup and the sandbox must agree (fix cycle 6, Codex P2).
+unset PI_NATIVES_DIR
+owners_sb="$(sbpl_path "$OWNERS_DIR")"
+daemons_sb="$(sbpl_path "$DAEMONS_DIR")"
+scope_rules=''
+if [ -n "$DAEMON_SCOPE" ]; then
+  scope_rules="(allow file-read* (literal \"$daemons_sb\") (subpath \"$daemons_sb/$DAEMON_SCOPE\"))
+(allow file-write* (subpath \"$daemons_sb/$DAEMON_SCOPE/clients\"))
+(deny file-write* (literal \"$daemons_sb/$DAEMON_SCOPE/clients\"))"
+fi
 profile="$(mktemp "$RUN_ROOT_REAL/omp-sandbox.XXXXXX")"
 cat > "$profile" <<EOF
 (version 1)
@@ -169,12 +238,15 @@ cat > "$profile" <<EOF
   (subpath "$profile_sb/run")
   ;; Shared native cache: populated unsandboxed by setup, then read-only here.
   (subpath "$home_sb/.omp/natives")
-  ;; Fix cycle 5, decision 9 (LOW-7): the deny log showed a real dispatch
-  ;; reading ~/.omp/run/session-owners for lease state (non-fatal when
-  ;; denied, but a read grant keeps the lease check accurate instead of
-  ;; silently degrading). Shared owner lock/JSON data, no executable code.
-  (subpath "$home_sb/.omp/run")
+  ;; Session ownership leases (flock sidecars, session/session-storage.ts:1295),
+  ;; shared by every profile. Only this directory of ~/.omp/run (fix cycle 6,
+  ;; HIGH-1): its daemons/ tree holds broker tokens and launch specs.
+  (subpath "$owners_sb")
 )
+;; Project daemon scopes hold broker tokens and launch specs that an
+;; unsandboxed broker trusts on recovery (launch/broker.ts:1423-1470). Only
+;; this run's own scope is readable (re-allowed below).
+(deny file-read* (subpath "$daemons_sb"))
 ;; S4 fix-cycle-4 allowlist (host-verified via a real send, 2026-10-31): omp's
 ;; own state databases and their WAL/SHM/journal siblings, plus sessions/ and
 ;; logs/, are the only agent-directory writes a real dispatch needs. Nothing
@@ -188,9 +260,8 @@ cat > "$profile" <<EOF
   (subpath "$profile_sb/logs")
   (subpath "$profile_sb/cache")
   (subpath "$profile_sb/run")
-  ;; Shared owner leases/daemon state: observed lock/JSON data, no executable
-  ;; code. This is a documented property, not an execute-bit rule SBPL enforces.
-  (subpath "$home_sb/.omp/run")
+  ;; Session ownership lease files only, never the rest of ~/.omp/run.
+  (subpath "$owners_sb")
   ;; Standard stdio sinks. Real pty writes may be denied; glen uses pipes/files.
   (literal "/dev/null")
   (literal "/dev/tty")
@@ -215,8 +286,25 @@ cat > "$profile" <<EOF
   (literal "$profile_sb/logs")
   (literal "$profile_sb/cache")
   (literal "$profile_sb/run")
+  (literal "$owners_sb")
+  ;; Broker records and tokens; this run's own presence directory is
+  ;; re-allowed below.
+  (subpath "$daemons_sb")
 $readonly_filters
 )
+;; No code is mapped from the run root, which now holds TMPDIR. omp stages its
+;; Apple Foundation Models bridge there (pi-natives applefm/mod.rs:192) and,
+;; once loaded, that bridge segfaults under this policy (host-verified, fix
+;; cycle 6); with mapping denied, dlopen fails and omp reports the provider
+;; unavailable, as it did when TMPDIR was unwritable.
+(deny file-map-executable (subpath "$run_sb"))
+;; Fix cycle 6, Claude LOW-7: a session directory itself cannot be renamed or
+;; removed (rename needs file-write-unlink on its source, host-verified), so
+;; the child cannot move another harness session's directory into its run
+;; root. omp's own rename-over of session files (session-storage.ts:1004,1143)
+;; happens one level deeper and stays allowed.
+(deny file-write-unlink (regex #"^$agent_regex/sessions/[^/]+\$"))
+$scope_rules
 ;; Fix cycle 5, decision 4 (Claude MED-2): deny creating a symlink anywhere
 ;; writable. A planted symlink in an allowed path (for example
 ;; agent/sessions/x -> ~/.ssh) would fail to write inside this sandbox
@@ -243,9 +331,9 @@ $mnemosyne_rule
 ;; diagnosticd, FSEvents, PowerManagement, securityd.xpc, SecurityServer) are
 ;; all non-fatal telemetry/identity probes omp tolerates failing. Explicitly
 ;; never allowed: com.apple.coreservices.launchservicesd and the
-;; com.apple.pasteboard.* family (SBPL global-name has no wildcard, so there
-;; is no single deny clause for the family; neither was requested in any
-;; trial, and (deny default) already covers both).
+;; com.apple.pasteboard.* family. (deny default) already covers both, so no
+;; explicit clause is needed (global-name-prefix could name the family);
+;; neither was requested in any trial.
 ;; Bun JavaScript engine CPU/host feature detection.
 (allow sysctl-read)
 ;; Host-verified (log stream, 2026-10-31): dscacheutil/Bun's getaddrinfo denied
