@@ -25,7 +25,7 @@ check('external scripts / modulepreload', Number(/<script\b[^>]*\bsrc\s*=|<link\
 check('inline scripts gzip bytes', gzip(scripts), 8*1024);
 check('terminal player gzip bytes', gzip(player), 5632);
 const forbidden = /(?:\bfrom\s*|\bimport\s*(?:\(\s*)?|\brequire\s*\(\s*)["'](?:framer-motion|usehooks-ts|lucide-react|torph|@radix-ui\/[^"']*|class-variance-authority|next-useragent)(?:\/[^"']*)?["']|<motion\./;
-const cliHex = /#(?:505050|B4B5BD|DADADA|45474D|5E6AD2|7170FF|12A594|007F3D|00CA50|A66300|FF9300|DC2626|FF565F|4069FD|94ADFF)\b/i;
+const cliHex = /#(?:505050|B4B5BD|DADADA|45474D|5E6AD2|7170FF|12A594|0E7C70|007F3D|00CA50|A66300|FF9300|DC2626|FF565F|4069FD|94ADFF)\b/i;
 for (const file of walk('src').filter(f=>/\.(?:ts|tsx|astro|mjs)$/.test(f))) {
  const content = readFileSync(file,'utf8');
  if (forbidden.test(content)) { check(`forbidden motion source: ${file}`,1,0); }

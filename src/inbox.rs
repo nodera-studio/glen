@@ -83,6 +83,27 @@ pub fn read_new(path: &Path, from: Cursor) -> io::Result<Batch> {
     }
     Ok(b)
 }
+/// Checks, before any output, that `mark` will be able to write a cursor (W8-ERR-1). When
+/// `inbox/.read` exists it gets `mark`'s own `ensure_dir`; when it does not, the probe goes in
+/// `inbox/`, where `mark` would create it, so a call that later fails to print leaves no
+/// `.read` behind. The probe file starts with `.` so `sessions` never lists it.
+pub fn probe_writable(home: &GlenHome) -> io::Result<()> {
+    let dir = if fs::symlink_metadata(home.root.join("inbox/.read")).is_ok() {
+        home.ensure_dir("inbox/.read")?
+    } else {
+        home.ensure_dir("inbox")?
+    };
+    let probe = dir.join(format!(".probe.{}.tmp", std::process::id()));
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    drop(options.open(&probe)?);
+    fs::remove_file(&probe)
+}
 pub fn mark(home: &GlenHome, stem: &str, cursor: Cursor) -> io::Result<()> {
     let dir = home.ensure_dir("inbox/.read")?;
     let b =

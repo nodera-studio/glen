@@ -170,3 +170,110 @@ fn ac121_human() {
     }
     sb.clean();
 }
+
+#[test]
+fn cwd_scopes_handles_ids_prefixes_and_every_listed_handle() {
+    let sb = OmpBox::new();
+    let alpha = sb.alpha();
+    let beta = sb.beta();
+    for arg in ["e27c0de", common::A_ID, "01a0f6b1"] {
+        let good = sb.glen(
+            &["show", arg, "--cwd", alpha.to_str().unwrap(), "--json"],
+            &beta,
+        );
+        assert_eq!(data(&good)["session"]["id"], common::A_ID);
+        let outside = sb.glen(
+            &["show", arg, "--cwd", beta.to_str().unwrap(), "--json"],
+            &alpha,
+        );
+        assert_eq!(outside.status.code(), Some(3), "{outside:?}");
+        let error = &json(&outside)["error"];
+        assert_eq!(error["code"], "not_found");
+        assert_eq!(error["details"]["reason"], "outside_cwd");
+        assert_eq!(error["details"]["cwd"], beta.to_str().unwrap());
+        assert!(error["hint"].as_str().unwrap().contains("alpha"));
+        assert!(outside.stderr.is_empty());
+    }
+    let listed = data(&sb.glen(
+        &["ls", "--cwd", alpha.to_str().unwrap(), "-n", "0", "--json"],
+        &beta,
+    ));
+    let rows = listed["sessions"].as_array().unwrap();
+    assert!(!rows.is_empty());
+    for row in rows {
+        let out = sb.glen(
+            &[
+                "show",
+                row["handle"].as_str().unwrap(),
+                "--cwd",
+                alpha.to_str().unwrap(),
+                "--json",
+            ],
+            &beta,
+        );
+        assert!(out.status.success(), "{out:?}");
+    }
+    sb.clean();
+}
+
+#[test]
+fn cwd_makes_a_globally_ambiguous_suffix_unique_and_limits_candidates() {
+    use std::fs;
+    let sb = OmpBox::new();
+    let a = "a0000000-0000-7000-8000-00001abcdef0";
+    let b = "b0000000-0000-7000-8000-00002abcdef0";
+    let c = "c0000000-0000-7000-8000-00003abcdef0";
+    for (id, bucket, cwd) in [(a, "-work-alpha", sb.alpha()), (b, "-work-beta", sb.beta())] {
+        fs::write(
+            sb.agent
+                .join("sessions")
+                .join(bucket)
+                .join(format!("{id}.jsonl")),
+            format!("{}\n", j!({"type":"session","version":3,"id":id,"cwd":cwd})),
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        sb.glen(&["show", "abcdef0", "--json"], &sb.alpha())
+            .status
+            .code(),
+        Some(4)
+    );
+    for (dir, id) in [(sb.alpha(), a), (sb.beta(), b)] {
+        let out = sb.glen(
+            &["show", "abcdef0", "--cwd", dir.to_str().unwrap(), "--json"],
+            &sb.alpha(),
+        );
+        assert_eq!(data(&out)["session"]["id"], id);
+    }
+    fs::write(
+        sb.agent
+            .join("sessions/-work-alpha")
+            .join(format!("{c}.jsonl")),
+        format!(
+            "{}\n",
+            j!({"type":"session","version":3,"id":c,"cwd":sb.alpha()})
+        ),
+    )
+    .unwrap();
+    let out = sb.glen(
+        &[
+            "show",
+            "abcdef0",
+            "--cwd",
+            sb.alpha().to_str().unwrap(),
+            "--json",
+        ],
+        &sb.beta(),
+    );
+    assert_eq!(out.status.code(), Some(4));
+    let value = json(&out);
+    let candidates = value["error"]["details"]["candidates"].as_array().unwrap();
+    assert_eq!(candidates.len(), 2);
+    assert!(
+        candidates
+            .iter()
+            .all(|candidate| candidate["id"] == a || candidate["id"] == c)
+    );
+    sb.clean();
+}

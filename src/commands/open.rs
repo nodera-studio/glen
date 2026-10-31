@@ -64,16 +64,49 @@ pub(crate) fn load_snapshot(
     Ok((session, metadata))
 }
 pub(crate) fn open(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, false, true)
+    open_mode(cli, env, arg, false, true, None)
 }
 pub(crate) fn open_follow(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, true, true)
+    open_mode(cli, env, arg, true, true, None)
 }
 pub(crate) fn open_unprobed(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, false, false)
+    open_mode(cli, env, arg, false, false, None)
+}
+pub(crate) fn open_in(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    scope: Option<&Path>,
+) -> Result<Opened, GlenError> {
+    match scope {
+        None => open(cli, env, arg),
+        Some(_) => open_mode(cli, env, arg, false, true, scope),
+    }
+}
+pub(crate) fn open_follow_in(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    scope: Option<&Path>,
+) -> Result<Opened, GlenError> {
+    match scope {
+        None => open_follow(cli, env, arg),
+        Some(_) => open_mode(cli, env, arg, true, true, scope),
+    }
+}
+pub(crate) fn open_unprobed_in(
+    cli: &Cli,
+    env: &Env,
+    arg: &str,
+    scope: Option<&Path>,
+) -> Result<Opened, GlenError> {
+    match scope {
+        None => open_unprobed(cli, env, arg),
+        Some(_) => open_mode(cli, env, arg, false, false, scope),
+    }
 }
 pub(crate) fn open_watch(cli: &Cli, env: &Env, arg: &str) -> Result<Opened, GlenError> {
-    open_mode(cli, env, arg, true, false)
+    open_mode(cli, env, arg, true, false, None)
 }
 fn open_mode(
     cli: &Cli,
@@ -81,6 +114,7 @@ fn open_mode(
     arg: &str,
     complete_only: bool,
     probe: bool,
+    scope: Option<&Path>,
 ) -> Result<Opened, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     // Paths need no assigned handles during resolution. Include an external
@@ -93,7 +127,7 @@ fn open_mode(
     if !explicit_path {
         catalog.assign_handles(None);
     }
-    let path = handle::resolve(arg, &catalog, env)?;
+    let path = handle::resolve_in(arg, &catalog, env, scope)?;
     if !path.exists()
         && let Some(summary) = catalog
             .sessions
@@ -121,10 +155,15 @@ fn open_mode(
         } else {
             None
         };
-        let state = if extension.as_ref().is_some_and(|s| s.busy) {
-            State::Busy
-        } else {
-            State::Live
+        // An answering endpoint is authoritative, exactly as in `ls::infer_row`; the hidden
+        // lease only matters when no endpoint answered (fixes2 decision 4).
+        let state = match &extension {
+            Some(s) if s.busy => State::Busy,
+            Some(_) => State::Live,
+            None if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) => {
+                State::Unknown
+            }
+            None => State::Live,
         };
         return Ok(Opened {
             session,
@@ -181,7 +220,16 @@ fn open_mode(
         None
     };
     let state = extension.as_ref().map_or_else(
-        || lease::infer_state(&lease, summary.in_flight),
+        || {
+            // Display stays consistent with the routing refusal (orchestrator decision item
+            // 2): a probed lease this host cannot trust is shown as unknown, not its raw
+            // probed value.
+            if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) {
+                State::Unknown
+            } else {
+                lease::infer_state(&lease, summary.in_flight)
+            }
+        },
         |s| if s.busy { State::Busy } else { State::Live },
     );
     if !catalog.handles.contains_key(&session.header.id) {
@@ -323,6 +371,81 @@ mod assignment_tests {
             let opened = open(&cli, &env, arg).unwrap();
             assert_eq!(opened.handle, expected);
             handle::ASSIGN_CALLS.with(|count| assert_eq!(count.get(), 1));
+        }
+    }
+    /// Orchestrator decision item 2: display stays consistent with the routing refusal.
+    /// Forces the lease-hidden seam, so this is deterministic on every host OS.
+    #[test]
+    fn a_hidden_lease_displays_as_unknown_state() {
+        let tree = tempfile::tempdir().unwrap();
+        let agent = tree.path().join("agent");
+        let bucket = agent.join("sessions/bucket");
+        fs::create_dir_all(&bucket).unwrap();
+        let inside = bucket.join("inside.jsonl");
+        fs::write(&inside, fixtures::bytes('A')).unwrap();
+        let env = Env::for_test(
+            Some(tree.path()),
+            tree.path(),
+            &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())],
+        );
+        let cli = Cli::try_parse_from(["glen", "show", "e27c0de"]).unwrap();
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        let opened = open(&cli, &env, "e27c0de").unwrap();
+        crate::sandbox::force_lease_hidden_for_test(None);
+        assert_eq!(opened.state, State::Unknown);
+    }
+    /// Fixes2 decision 4: for a session that has only a live endpoint (no transcript yet), an
+    /// answering endpoint wins over a hidden lease, mapped exactly as `ls` maps it.
+    #[cfg(unix)]
+    #[test]
+    fn an_answering_endpoint_outranks_a_hidden_lease_for_a_not_yet_persisted_session() {
+        use std::io::{BufRead, BufReader, Write};
+        use std::os::unix::net::UnixListener;
+        let id = "00000000-0000-7000-8000-000001234567";
+        for (busy, expected) in [(false, State::Live), (true, State::Busy)] {
+            let tree = tempfile::tempdir().unwrap();
+            let agent = tree.path().join("agent");
+            fs::create_dir_all(agent.join("sessions")).unwrap();
+            let env = Env::for_test(
+                Some(tree.path()),
+                tree.path(),
+                &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())],
+            );
+            let sock_dir = tempfile::Builder::new()
+                .prefix("gshow-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let socket = sock_dir.path().join("s");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let home = crate::glen_home::resolve(&env).unwrap();
+            home.ensure_dir("run/live").unwrap();
+            let registry =
+                serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"socket":socket});
+            fs::write(crate::live::registry::path(&home, id), registry.to_string()).unwrap();
+            let peer = std::thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .unwrap();
+                let mut line = String::new();
+                BufReader::new(&stream).read_line(&mut line).unwrap();
+                let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+                writeln!(
+                    &stream,
+                    "{}",
+                    serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":id,"busy":busy,"state":"ready"}})
+                )
+                .unwrap();
+            });
+            let cli = Cli::try_parse_from(["glen", "show", "1234567"]).unwrap();
+            crate::sandbox::force_lease_hidden_for_test(Some(true));
+            let opened = open(&cli, &env, "1234567");
+            crate::sandbox::force_lease_hidden_for_test(None);
+            peer.join().unwrap();
+            let opened = opened.unwrap();
+            assert!(opened.not_yet_persisted);
+            assert!(opened.extension.is_some(), "the endpoint answered");
+            assert_eq!(opened.state, expected, "busy={busy}");
         }
     }
 }

@@ -39,8 +39,12 @@ pub fn request(
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64
     );
-    let bytes =
-        serde_json::to_vec(&request).map_err(|e| OpError::new(ops::INTERNAL, e.to_string()))?;
+    let bytes = ops::request_bytes(&request).map_err(|e| {
+        OpError::new(
+            ops::INTERNAL,
+            format!("cannot serialize control request: {e}"),
+        )
+    })?;
     write_private_atomic(&path, &bytes).map_err(|e| {
         OpError::new(
             ops::INTERNAL,

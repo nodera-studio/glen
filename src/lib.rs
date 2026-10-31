@@ -61,6 +61,7 @@ pub fn run() -> ExitCode {
 pub mod live;
 pub mod ops;
 
+pub(crate) mod atomic_swap;
 pub mod extension;
 
 pub mod inbox;

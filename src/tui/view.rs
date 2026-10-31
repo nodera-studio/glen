@@ -1683,7 +1683,7 @@ pub(crate) mod tests {
         );
         app.focus = Focus::Prompt;
         app.narrow_tab = Pane::Transcript;
-        app.prompt.notice=Some(GlenError::new(ErrorCode::NoRoute,"This deliberately long message explains why delivery failed and wraps onto two rows in a narrow viewport without spilling over the layout.").with_hint("run glen install-extension, then restart the omp session; safe \x1b").into());
+        app.prompt.notice=Some(GlenError::no_route(crate::error::NoRouteReason::LiveOwner,"This deliberately long message explains why delivery failed and wraps onto two rows in a narrow viewport without spilling over the layout.").with_hint("run glen install-extension, then restart the omp session; safe \x1b").into());
         app.jobs.active_total = 2;
         app.jobs.rows.push(JobRow {
             id: "job".into(),
@@ -2512,9 +2512,12 @@ pub(crate) mod tests {
         let mut app = scene(palette(ColorDepth::TrueColor, Theme::Dark));
         app.jobs.rows.clear();
         app.inbox.records.clear();
-        let error: ErrView = GlenError::new(ErrorCode::NoRoute, "no route for this session")
-            .with_hint("install the extension")
-            .into();
+        let error: ErrView = GlenError::no_route(
+            crate::error::NoRouteReason::LiveOwner,
+            "no route for this session",
+        )
+        .with_hint("install the extension")
+        .into();
         app.sends[0].phase = SendPhase::Refused(error.clone());
         app.prompt.notice = Some(error);
         assert!(activity_lines(&app).is_empty());
@@ -2981,11 +2984,7 @@ pub(crate) mod tests {
 #[cfg(test)]
 mod refinements {
     use super::*;
-    use crate::{
-        error::{ErrorCode, GlenError},
-        render::palette::Theme,
-        tui::theme::TuiTheme,
-    };
+    use crate::{error::GlenError, render::palette::Theme, tui::theme::TuiTheme};
     use ratatui::{Terminal, backend::TestBackend};
     use std::time::Duration;
     #[test]
@@ -3004,7 +3003,7 @@ mod refinements {
         app.jobs.rows[0].status.status = JobState::Failed;
         app.jobs.rows[0].finished_at = Some(app.now);
         app.jobs.rows[0].done = Some(Done::Failed(
-            GlenError::new(ErrorCode::NoRoute, "no route")
+            GlenError::no_route(crate::error::NoRouteReason::LiveOwner, "no route")
                 .with_hint("a hint")
                 .into(),
         ));

@@ -1,4 +1,4 @@
-use super::{Mode, OutputCtx, envelope::error_value};
+use super::{Mode, OutputCtx, envelope::error_value, stdout_failure_exit};
 use crate::{
     error::{GlenError, Warning},
     render::{palette::Token, sanitize, style::Painter},
@@ -10,7 +10,7 @@ use std::{
 };
 pub struct EventStream {
     json: bool,
-    failed: bool,
+    failure: Option<io::ErrorKind>,
     out: Box<dyn Write>,
     err: Box<dyn Write>,
     err_painter: Painter,
@@ -21,7 +21,7 @@ impl EventStream {
         Self::with_writers(
             ctx.mode == Mode::Json,
             Box::new(anstream::AutoStream::new(
-                io::stdout().lock(),
+                super::stdout_writer(),
                 if ctx.stdout_color || ctx.mode == Mode::Json {
                     Always
                 } else {
@@ -29,7 +29,7 @@ impl EventStream {
                 },
             )),
             Box::new(anstream::AutoStream::new(
-                io::stderr().lock(),
+                super::stderr_writer(),
                 if ctx.stderr_color { Always } else { Never },
             )),
             ctx.err_painter.clone(),
@@ -48,17 +48,36 @@ impl EventStream {
     ) -> Self {
         Self {
             json,
-            failed: false,
+            failure: None,
             out,
             err,
             err_painter: painter,
         }
     }
+    fn writable(&self) -> io::Result<()> {
+        match self.failure {
+            Some(kind) => Err(kind.into()),
+            None => Ok(()),
+        }
+    }
+    fn failure_exit(&self, outcome: ExitCode) -> ExitCode {
+        self.failure
+            .map_or(outcome, |kind| stdout_failure_exit(&kind.into(), outcome))
+    }
+    pub fn write_exit(&self) -> ExitCode {
+        match self.failure {
+            Some(kind) => stdout_failure_exit(&kind.into(), ExitCode::SUCCESS),
+            None => ExitCode::from(1),
+        }
+    }
     fn line(&mut self, v: &Value) -> io::Result<()> {
+        self.writable()?;
         let mut b = serde_json::to_vec(v).map_err(io::Error::other)?;
         b.push(b'\n');
         let result = self.out.write_all(&b).and_then(|_| self.out.flush());
-        self.failed |= result.is_err();
+        if let Err(e) = &result {
+            self.failure.get_or_insert(e.kind());
+        }
         result
     }
     pub fn event(&mut self, kind: &str, mut fields: Map<String, Value>) -> io::Result<()> {
@@ -70,22 +89,32 @@ impl EventStream {
         self.line(&Value::Object(fields))
     }
     pub fn text(&mut self, s: &str) -> io::Result<()> {
+        self.writable()?;
         if self.json {
             return Ok(());
         }
         let result = writeln!(self.out, "{s}").and_then(|_| self.out.flush());
-        self.failed |= result.is_err();
+        if let Err(e) = &result {
+            self.failure.get_or_insert(e.kind());
+        }
         result
     }
     pub fn diagnostic(&mut self, s: &str) -> io::Result<()> {
-        writeln!(
+        self.writable()?;
+        let result = writeln!(
             self.err,
             "{}",
             self.err_painter.paint(Token::Muted, &sanitize(s))
-        )?;
-        self.err.flush()
+        )
+        .and_then(|()| self.err.flush());
+        if result.is_err() {
+            // A broken stderr is always a failure, unlike a closed stdout reader.
+            self.failure.get_or_insert(io::ErrorKind::Other);
+        }
+        result
     }
     pub fn warnings(&mut self, ws: &[Warning]) -> io::Result<()> {
+        self.writable()?;
         for w in ws {
             if self.json {
                 self.event(
@@ -96,34 +125,40 @@ impl EventStream {
                     ]),
                 )?
             } else {
-                writeln!(
+                let result = writeln!(
                     self.err,
                     "{} {}",
                     self.err_painter
                         .paint(Token::Warning, &self.err_painter.bold("warning:")),
                     sanitize(&w.message)
-                )?;
-                self.err.flush()?
+                )
+                .and_then(|()| self.err.flush());
+                if result.is_err() {
+                    self.failure.get_or_insert(io::ErrorKind::Other);
+                }
+                result?;
             }
         }
         Ok(())
     }
     pub fn end(mut self, code: u8) -> ExitCode {
-        if self.failed {
-            return ExitCode::from(1);
+        let outcome = ExitCode::from(code);
+        if self.failure.is_some() {
+            return self.failure_exit(outcome);
         }
         if self
             .event("end", Map::from_iter([("ok".into(), json!(true))]))
             .is_err()
         {
-            ExitCode::from(1)
+            self.failure_exit(outcome)
         } else {
             ExitCode::from(code)
         }
     }
     pub fn fail(mut self, e: GlenError) -> ExitCode {
-        if self.failed {
-            return ExitCode::from(1);
+        let outcome = ExitCode::from(e.code.exit_code());
+        if self.failure.is_some() {
+            return self.failure_exit(outcome);
         }
         let result = if self.json {
             self.line(&error_value(&e, &[]))
@@ -131,11 +166,11 @@ impl EventStream {
             (locationless_error(&mut self.err, &self.err_painter, &e))
                 .and_then(|_| self.err.flush())
         };
-        ExitCode::from(if result.is_ok() {
-            e.code.exit_code()
-        } else {
-            1
-        })
+        match result {
+            Ok(()) => outcome,
+            Err(error) if self.json => stdout_failure_exit(&error, outcome),
+            Err(_) => ExitCode::from(1),
+        }
     }
 }
 fn locationless_error(err: &mut dyn Write, p: &Painter, e: &GlenError) -> io::Result<()> {
@@ -158,7 +193,10 @@ fn locationless_error(err: &mut dyn Write, p: &Painter, e: &GlenError) -> io::Re
 mod tests {
     use super::*;
     use crate::render::palette::{ColorDepth, Theme};
-    use std::{cell::RefCell, rc::Rc};
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
     #[derive(Clone, Default)]
     struct Sink(Rc<RefCell<Vec<u8>>>);
     impl Write for Sink {
@@ -215,23 +253,175 @@ mod tests {
         assert_eq!(v["ok"], false);
         assert_eq!(v["error"]["code"], "not_found");
     }
-    struct Failing;
+    struct Failing {
+        kind: io::ErrorKind,
+        flush_failure: bool,
+        calls: Rc<Cell<usize>>,
+    }
     impl Write for Failing {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            Err(io::ErrorKind::BrokenPipe.into())
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.calls.set(self.calls.get() + 1);
+            if self.flush_failure {
+                Ok(bytes.len())
+            } else {
+                Err(self.kind.into())
+            }
         }
         fn flush(&mut self) -> io::Result<()> {
-            Ok(())
+            if self.flush_failure {
+                Err(self.kind.into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+    fn failing_stream(
+        kind: io::ErrorKind,
+        flush_failure: bool,
+    ) -> (EventStream, Rc<Cell<usize>>, Sink) {
+        let calls = Rc::new(Cell::new(0));
+        let err = Sink::default();
+        let stream = EventStream::with_writers(
+            true,
+            Box::new(Failing {
+                kind,
+                flush_failure,
+                calls: calls.clone(),
+            }),
+            Box::new(err.clone()),
+            Painter::new(ColorDepth::None, Theme::Dark),
+        );
+        (stream, calls, err)
+    }
+    #[test]
+    fn broken_pipe_and_other_errors_keep_only_the_broken_pipes_outcome() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+            for flush in [false, true] {
+                for code in [0, 10, 11, 130] {
+                    let (s, calls, err) = failing_stream(kind, flush);
+                    assert_eq!(
+                        s.end(code),
+                        ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                            code
+                        } else {
+                            1
+                        })
+                    );
+                    assert_eq!(calls.get(), 1);
+                    assert!(err.0.borrow().is_empty());
+                }
+                let (s, calls, err) = failing_stream(kind, flush);
+                assert_eq!(
+                    s.fail(GlenError::new(crate::error::ErrorCode::NotFound, "gone")),
+                    ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                        3
+                    } else {
+                        1
+                    })
+                );
+                assert_eq!(calls.get(), 1);
+                assert!(err.0.borrow().is_empty());
+            }
         }
     }
     #[test]
-    fn broken_pipe() {
-        let s = EventStream::with_writers(
-            true,
-            Box::new(Failing),
-            Box::new(Vec::<u8>::new()),
-            Painter::new(ColorDepth::None, Theme::Dark),
-        );
-        assert_eq!(s.end(0), ExitCode::from(1));
+    fn first_failure_stops_all_output_and_suppresses_the_end_event() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+            for flush in [false, true] {
+                let (mut s, calls, err) = failing_stream(kind, flush);
+                assert!(s.event("message", Map::new()).is_err());
+                assert_eq!(
+                    s.write_exit(),
+                    ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                        0
+                    } else {
+                        1
+                    })
+                );
+                assert!(s.event("message", Map::new()).is_err());
+                assert!(s.text("later").is_err());
+                assert!(s.diagnostic("must not print").is_err());
+                assert!(
+                    s.warnings(&[Warning {
+                        code: "test".into(),
+                        message: "must not print".into()
+                    }])
+                    .is_err()
+                );
+                assert_eq!(
+                    s.end(0),
+                    ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                        0
+                    } else {
+                        1
+                    })
+                );
+                assert_eq!(calls.get(), 1);
+                assert!(err.0.borrow().is_empty());
+
+                let (mut s, calls, err) = failing_stream(kind, flush);
+                assert!(s.event("item", Map::new()).is_err());
+                assert_eq!(
+                    s.fail(GlenError::new(crate::error::ErrorCode::NotFound, "gone")),
+                    ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                        3
+                    } else {
+                        1
+                    })
+                );
+                assert_eq!(calls.get(), 1);
+                assert!(err.0.borrow().is_empty());
+            }
+        }
+    }
+    #[test]
+    fn failed_stderr_diagnostics_and_warnings_exit_one_even_for_broken_pipe() {
+        for warning in [false, true] {
+            let out = Sink::default();
+            let mut s = EventStream::with_writers(
+                false,
+                Box::new(out.clone()),
+                Box::new(Failing {
+                    kind: io::ErrorKind::BrokenPipe,
+                    flush_failure: false,
+                    calls: Rc::new(Cell::new(0)),
+                }),
+                Painter::new(ColorDepth::None, Theme::Dark),
+            );
+            let result = if warning {
+                s.warnings(&[Warning {
+                    code: "test".into(),
+                    message: "warning".into(),
+                }])
+            } else {
+                s.diagnostic("following")
+            };
+            assert!(result.is_err());
+            assert_eq!(s.write_exit(), ExitCode::from(1));
+            assert_eq!(s.end(0), ExitCode::from(1));
+            assert!(out.0.borrow().is_empty());
+        }
+    }
+    #[test]
+    fn human_text_failures_also_stop_diagnostics_and_keep_the_outcome() {
+        for kind in [io::ErrorKind::BrokenPipe, io::ErrorKind::Other] {
+            for flush in [false, true] {
+                let (mut s, calls, err) = failing_stream(kind, flush);
+                s.json = false;
+                assert!(s.text("message").is_err());
+                let failed_calls = calls.get();
+                assert!(s.diagnostic("following").is_err());
+                assert_eq!(
+                    s.end(11),
+                    ExitCode::from(if kind == io::ErrorKind::BrokenPipe {
+                        11
+                    } else {
+                        1
+                    })
+                );
+                assert_eq!(calls.get(), failed_calls);
+                assert!(err.0.borrow().is_empty());
+            }
+        }
     }
 }

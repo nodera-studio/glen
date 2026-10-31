@@ -325,8 +325,8 @@ fn ac319_a_failed_write_advances_no_cursor() {
         out.assert_no_panic();
         assert_eq!(
             out.code(),
-            1,
-            "§A10: a closed stdout exits 1\n{}",
+            0,
+            "AC-1001/AC-1003: a closed stdout keeps the successful inbox outcome's exit 0\n{}",
             out.ctx()
         );
         assert!(
@@ -455,8 +455,8 @@ fn ac320_a_broken_pipe_stops_following_and_marks_nothing_further() {
     assert!(!err.contains("panicked"), "{err}");
     assert_eq!(
         status.code(),
-        Some(1),
-        "§A10: a closed stdout ends the stream with exit 1; stderr: {err}"
+        Some(0),
+        "AC-1003: a closed stdout ends the stream with exit 0; stderr: {err}"
     );
     let d = inbox(&sb, &["--peek"]);
     assert_eq!(

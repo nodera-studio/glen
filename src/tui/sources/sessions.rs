@@ -262,7 +262,7 @@ impl Reader {
             {
                 summary = tail.refined.clone();
             }
-            let inferred = ls::infer_row(&mut summary, endpoint, |_| lease);
+            let inferred = ls::infer_row(&mut summary, endpoint, &ctx.env, |_| lease);
             if let Some(tail) = self.tails.get_mut(path) {
                 tail.held = matches!(inferred.lease, Lease::Held);
                 tail.refined = summary.clone();

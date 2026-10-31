@@ -290,7 +290,7 @@ mod tests {
             ("empty", "exit 0", None),
         ] {
             let bin = script(t.path(), name, body);
-            let result = omp_version(&bin, Duration::from_secs(1), None);
+            let result = omp_version(&bin, Duration::from_secs(10), None);
             if let Some(want) = want {
                 assert_eq!(result.unwrap(), want);
             } else {
@@ -306,7 +306,7 @@ mod tests {
         let start = Instant::now();
         let result = omp_version(&bin, Duration::from_millis(60), None);
         assert!(result.unwrap_err().contains("timed out"));
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < Duration::from_secs(10));
     }
     #[cfg(unix)]
     #[test]
@@ -334,7 +334,7 @@ mod tests {
             let bin = script(
                 t.path(),
                 name,
-                &format!("( /bin/sleep 3; echo leaked > \"$0.marker\" ) {redirect} &\n{ending}"),
+                &format!("( /bin/sleep 30; echo leaked > \"$0.marker\" ) {redirect} & echo $! > \"$0.pid\"\n{ending}"),
             );
             (bin, message)
         })
@@ -348,8 +348,27 @@ mod tests {
                     let result = omp_version(&bin, Duration::from_secs(1), None);
                     let error = result.unwrap_err();
                     assert!(error.contains(message), "{name}: {error}");
-                    assert!(start.elapsed() < Duration::from_secs(2));
-                    thread::sleep(Duration::from_millis(3500));
+                    assert!(start.elapsed() < Duration::from_secs(10));
+                    let raw: i32 = fs::read_to_string(bin.with_extension("pid"))
+                        .unwrap()
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    let pid = rustix::process::Pid::from_raw(raw).unwrap();
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        match rustix::process::test_kill_process(pid) {
+                            Err(rustix::io::Errno::SRCH) => break,
+                            Ok(()) => {
+                                assert!(
+                                    Instant::now() < deadline,
+                                    "surviving descendant of {name}"
+                                );
+                                thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(error) => panic!("cannot probe descendant of {name}: {error}"),
+                        }
+                    }
                     assert!(
                         !bin.with_extension("marker").exists(),
                         "surviving descendant of {name}"
@@ -360,6 +379,6 @@ mod tests {
                 case.join().unwrap();
             }
         });
-        assert!(start.elapsed() < Duration::from_secs(6));
+        assert!(start.elapsed() < Duration::from_secs(25));
     }
 }

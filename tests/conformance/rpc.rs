@@ -958,13 +958,15 @@ fn ac209_new_defaults_to_glens_cwd_and_makes_a_relative_cwd_absolute() {
 }
 
 #[test]
-fn ac209_cwd_applies_only_to_new_and_latest_and_must_be_a_directory() {
+fn ac209_cwd_scopes_existing_targets_and_new_requires_a_directory() {
     let rb = RpcBox::new();
-    failed(
+    let outside = failed(
         &rb.glen(["send", A.handle, "hi", "--cwd", "/tmp", "--json"])
             .run(),
-        "usage",
+        "not_found",
     );
+    assert_eq!(outside["details"]["reason"], "outside_cwd");
+    assert_eq!(outside["details"]["cwd"], "/tmp");
     let missing = rb.bx.root.join("nope");
     failed(
         &rb.glen(["send", "@new", "hi", "--cwd", &s(&missing), "--json"])
@@ -980,6 +982,39 @@ fn ac209_cwd_applies_only_to_new_and_latest_and_must_be_a_directory() {
     );
     assert!(!rb.bx.glen_home.exists(), "no job for a refused --cwd");
     assert!(rb.starts().is_empty());
+
+    // AC-1012: a handle is accepted within its project, and the existing header
+    // cwd wins even when a distinct directory encodes to that same bucket.
+    let scope = rb.bx.home.join("work-alpha");
+    fs::create_dir(&scope).unwrap();
+    let id = uuid(0xac_1012);
+    let file = rb.bx.add(
+        "-work-alpha",
+        "2026-10-06T11:00:00.000Z",
+        &id,
+        Some(&s(&rb.bx.alpha)),
+        &[user("aa001012", None, "2026-10-06T11:00:01.000Z", "hi")],
+    );
+    let sent = data_of(
+        &rb.glen([
+            "send",
+            &id,
+            "hi",
+            "--cwd",
+            &s(&scope),
+            "--wait",
+            "20s",
+            "--json",
+        ])
+        .run(),
+        0,
+    );
+    assert_eq!(sent["session"]["id"], id);
+    assert_omp_argv(&rb.starts()[0]["argv"], Some(&file), None);
+    assert!(same_file(
+        Path::new(rb.starts()[0]["cwd"].as_str().unwrap()),
+        &rb.bx.alpha
+    ));
 
     // @latest --cwd DIR picks the newest session of DIR's bucket: E in -work-beta.
     let d = data_of(
@@ -997,8 +1032,8 @@ fn ac209_cwd_applies_only_to_new_and_latest_and_must_be_a_directory() {
         0,
     );
     assert_eq!(d["session"]["id"], E.id, "{d}");
-    assert_omp_argv(&rb.starts()[0]["argv"], Some(&rb.bx.path(&E)), None);
-    let cwd = rb.starts()[0]["cwd"].as_str().unwrap().to_owned();
+    assert_omp_argv(&rb.starts()[1]["argv"], Some(&rb.bx.path(&E)), None);
+    let cwd = rb.starts()[1]["cwd"].as_str().unwrap().to_owned();
     assert!(
         same_file(Path::new(&cwd), &rb.bx.beta),
         "§A7: E's header cwd does not exist, so omp runs in --cwd DIR, not {cwd}"
@@ -1753,7 +1788,11 @@ fn ac222_send_failures_before_the_job_leave_no_glen_home() {
         (vec!["send", "c0de", "hi"], None, "ambiguous"),
         (vec!["send", A.handle, "   "], None, "usage"),
         (vec!["send", A.handle, ""], None, "usage"),
-        (vec!["send", A.handle, "hi", "--cwd", "/tmp"], None, "usage"),
+        (
+            vec!["send", A.handle, "hi", "--cwd", "/tmp"],
+            None,
+            "not_found",
+        ),
         (
             vec!["send", "@new", "hi", "--cwd", &missing],
             None,
