@@ -13,8 +13,8 @@ use std::time::SystemTime;
 pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let store = JobStore::new(glen_home::resolve(env)?);
     let now = jiff::Timestamp::now();
-    let mut rows: Vec<_> = store
-        .for_session(args.session.as_deref(), args.active)
+    let (rows, warnings) = store.for_session_reporting(args.session.as_deref(), args.active);
+    let mut rows: Vec<_> = rows
         .into_iter()
         .map(|(_, job, status)| (job, status))
         .collect();
@@ -38,7 +38,7 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                 .collect();
             v["text_preview"] = json!(preview);
             v["error"] = json!(s.error);
-            v["forked"] = json!(s.forked);
+            v["forked"] = forked_view(s);
             v
         })
         .collect::<Vec<_>>();
@@ -179,7 +179,14 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                 .join("\n")
         )
     };
-    Ok(Outcome::new(json!({"total":total,"jobs":data}), human))
+    let mut outcome = Outcome::new(json!({"total":total,"jobs":data}), human);
+    outcome.warnings = warnings;
+    Ok(outcome)
+}
+/// The same `{from,to,to_handle}` shape as `glen wait` (W8-DOC-10).
+fn forked_view(s: &crate::jobs::Status) -> serde_json::Value {
+    let forked = s.forked.as_ref();
+    json!(forked.map(|f| json!({"from":f.from,"to":f.to,"to_handle":session_handle(&f.to)})))
 }
 #[cfg(test)]
 mod tests {

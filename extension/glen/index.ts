@@ -12,7 +12,7 @@ export const OPS = ["hello", "state", "send", "abort", "list_models", "set_model
 export const RESERVED_OPS: string[] = [];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxInstructions: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
-type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number; abortWaitMs?: number };
+type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number; abortWaitMs?: number; uid?: number | null };
 type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; lastTextAssistant: any; settled: boolean };
 type Endpoint = { compacting: boolean; server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
 const ENDPOINTS = new Map<number, Endpoint>();
@@ -29,6 +29,30 @@ export function parseReplyArgs(params: any): { text: string; final: boolean } {
     if (typeof params?.text !== "string" || !params.text.trim() || Buffer.byteLength(params.text) > LIMITS.maxReply) throw new Error("glen_reply: text must be a non-empty string of at most 65536 bytes");
     if (params.final !== undefined && typeof params.final !== "boolean") throw new Error("glen_reply: final must be a boolean");
     return { text: params.text, final: params.final ?? false };
+}
+// GLEN_HOME and its runtime directories must be real directories owned by this user with no
+// group/other write bits (W8-SEC-3, the same rule glen enforces in Rust). Missing ones pass.
+export function unsafeDir(dir: string, uid: number | null | undefined): string | null {
+    let st: fs.Stats;
+    try { st = fs.lstatSync(dir); } catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") return null; throw err; }
+    if (!st.isDirectory()) return `${dir} is not a directory`;
+    if (uid !== null && uid !== undefined && st.uid !== uid) return `${dir} is owned by uid ${st.uid}, not ${uid}`;
+    if ((st.mode & 0o022) !== 0) return `${dir} is writable by group or other (mode ${(st.mode & 0o777).toString(8)})`;
+    return null;
+}
+function unsafeHome(home: string, uid: number | null | undefined): string | null {
+    for (const dir of [home, path.join(home, "run"), path.join(home, "run/live")]) { const problem = unsafeDir(dir, uid); if (problem) return problem; }
+    return null;
+}
+// One NDJSON record per call. A torn tail (an append cut off before its newline) is terminated
+// first so the new record never merges into it (W8-ERR-4, as glen's Rust append_line does).
+export function appendLine(file: string, line: string) {
+    const fd = fs.openSync(file, "a+", 0o600);
+    try {
+        const size = fs.fstatSync(fd).size, last = Buffer.alloc(1);
+        const torn = size > 0 && fs.readSync(fd, last, 0, 1, size - 1) === 1 && last[0] !== 0x0a;
+        fs.appendFileSync(fd, (torn ? "\n" : "") + line + "\n");
+    } finally { fs.closeSync(fd); }
 }
 function quietly(fn: () => void) { try { fn(); } catch { /* best effort cleanup/trace */ } }
 function unlink(file: string) { quietly(() => fs.unlinkSync(file)); }
@@ -318,7 +342,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
                     if (!isPlainToken(id)) throw new Error("invalid session id");
                     const home = e?.home ?? resolveGlenHome(deps.env, BAKED_GLEN_HOME, deps.homedir);
                     fs.mkdirSync(path.join(home, "inbox"), { recursive: true, mode: 0o700 });
-                    fs.appendFileSync(path.join(home, "inbox", `${id}.ndjson`), JSON.stringify(record) + "\n", { mode: 0o600 });
+                    appendLine(path.join(home, "inbox", `${id}.ndjson`), JSON.stringify(record));
                 } catch (err) { failure = err; }
                 let streamed = false;
                 for (const r of active) { if (event(r, "reply", { reply: record })) streamed = true; }
@@ -347,7 +371,13 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
         if (!isPlainToken(id)) return;
         const socket = path.join(home, "run/live", `${deps.pid}.sock`);
         if (Buffer.byteLength(socket) >= sunPathMax(deps.platform)) { notify(ctx, "glen: GLEN_HOME is too long for a unix socket; live delivery is off"); return; }
-        fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 }); sweep(home, deps); unlink(socket);
+        const uid = deps.uid !== undefined ? deps.uid : (process.getuid?.() ?? null);
+        try {
+            let problem = unsafeHome(home, uid);
+            if (!problem) { fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 }); problem = unsafeHome(home, uid); }
+            if (problem) { notify(ctx, `glen: refusing GLEN_HOME: ${problem}; point GLEN_HOME at a private directory you own (mkdir -m 700); live delivery is off`); return; }
+        } catch (err) { notify(ctx, `glen: cannot check GLEN_HOME: ${String(err)}; live delivery is off`); return; }
+        sweep(home, deps); unlink(socket);
         const server = net.createServer(conn => { try { connection(e, conn); } catch { conn.destroy(); } });
         server.on("error", err => trace(e, "server_error", { reason: String(err) }));
         const e: Endpoint = { compacting: false, server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanHasActivity: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
