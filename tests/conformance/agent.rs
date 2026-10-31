@@ -2738,15 +2738,19 @@ fn ac409_unreadable_files_are_skipped() {
 // ---------------------------------------------------------------------------------------------
 
 /// A `sandboxed` refusal: exit 6 `no_route`, exact details, a hint pointing outside the sandbox.
-fn assert_sandboxed(out: &Out, sandbox: Option<&str>, network: bool) -> Value {
+/// Cross-wave migration, W10 fixes2 decision 1 + cycle-3 Codex P2 (design.md:449): on Linux a
+/// Codex marker hides omp's lease, so the refusal of an `existing` session's resume also carries
+/// exactly `lease:"unknown"`, whichever sandbox check fired. macOS is unchanged.
+fn assert_sandboxed(out: &Out, sandbox: Option<&str>, network: bool, existing: bool) -> Value {
     let err = failed(out, "no_route");
     let d = &err["details"];
-    assert_eq!(
-        keyset(d),
-        set(&["reason", "sandbox", "network"]),
-        "{}",
-        out.ctx()
-    );
+    let hidden = cfg!(target_os = "linux") && existing;
+    let mut keys = vec!["reason", "sandbox", "network"];
+    if hidden {
+        keys.push("lease");
+        assert_eq!(d["lease"], "unknown", "AC-1028: {}", out.ctx());
+    }
+    assert_eq!(keyset(d), set(&keys), "{}", out.ctx());
     assert_eq!(d["reason"], "sandboxed", "{}", out.ctx());
     assert_eq!(
         d["sandbox"],
@@ -2790,7 +2794,7 @@ fn ac410_an_offline_sandbox_refuses_send_with_reason_details_and_hint() {
                 .env("CODEX_SANDBOX", sandbox)
                 .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
                 .run();
-            assert_sandboxed(&out, Some(sandbox), false);
+            assert_sandboxed(&out, Some(sandbox), false, target != "@new");
             assert!(
                 !rb.bx.glen_home.exists(),
                 "GLEN_HOME was created\n{}",
@@ -2811,7 +2815,7 @@ fn ac410_the_offline_refusal_precedes_omp_lookup_the_lease_probe_and_the_lock() 
         &OFFLINE,
     )
     .run();
-    assert_sandboxed(&out, Some("seatbelt"), false);
+    assert_sandboxed(&out, Some("seatbelt"), false, false);
     let control = rb
         .glen(["send", "@new", "hi", "--json"])
         .env("GLEN_OMP_BIN", "/nonexistent/omp")
@@ -2822,7 +2826,7 @@ fn ac410_the_offline_refusal_precedes_omp_lookup_the_lease_probe_and_the_lock() 
     let rb = RpcBox::new();
     let _lease = hold_lease(&rb.bx.owners(), A.id);
     let out = envs(rb.glen(["send", A.handle, "hi", "--json"]), &OFFLINE).run();
-    assert_sandboxed(&out, Some("seatbelt"), false);
+    assert_sandboxed(&out, Some("seatbelt"), false, true);
     assert!(!rb.bx.glen_home.exists());
     assert_nothing_started(&rb, &out.ctx());
 
@@ -2834,7 +2838,7 @@ fn ac410_the_offline_refusal_precedes_omp_lookup_the_lease_probe_and_the_lock() 
         &OFFLINE,
     )
     .run();
-    assert_sandboxed(&out, Some("seatbelt"), false);
+    assert_sandboxed(&out, Some("seatbelt"), false, true);
     assert_nothing_started(&rb, &out.ctx());
 }
 
@@ -2866,7 +2870,7 @@ fn ac410_the_offline_refusal_follows_argument_target_and_message_validation() {
     let out = rb.glen_stdin(&["send", A.handle, "-", "--json"], &OFFLINE, b"");
     failed(&out, "usage");
     let out = rb.glen_stdin(&["send", A.handle, "-", "--json"], &OFFLINE, b"hello");
-    assert_sandboxed(&out, Some("seatbelt"), false);
+    assert_sandboxed(&out, Some("seatbelt"), false, true);
     assert!(!rb.bx.glen_home.exists());
     assert_nothing_started(&rb, "validation");
 }
@@ -2876,7 +2880,7 @@ fn ac410_a_network_enabled_sandbox_refuses_rpc_and_new_jobs() {
     for target in [A.handle, "@new", "@latest"] {
         let rb = RpcBox::new();
         let out = envs(rb.glen(["send", target, "hi", "--json"]), &NETWORKED).run();
-        assert_sandboxed(&out, Some("seatbelt"), true);
+        assert_sandboxed(&out, Some("seatbelt"), true, target != "@new");
         assert!(
             !rb.bx.glen_home.exists(),
             "GLEN_HOME was created\n{}",
@@ -2892,7 +2896,7 @@ fn ac410_a_network_enabled_sandbox_refuses_rpc_and_new_jobs() {
         &NETWORKED,
     )
     .run();
-    assert_sandboxed(&out, Some("seatbelt"), true);
+    assert_sandboxed(&out, Some("seatbelt"), true, true);
     assert_nothing_started(&rb, &out.ctx());
 }
 
@@ -3695,8 +3699,17 @@ fn ac412_contract_no_route_and_sandboxed() {
     assert_contract("error.no_route", &out.json());
     drop(lease);
     let out = envs(rb.glen(["send", A.handle, "hi", "--json"]), &OFFLINE).run();
-    assert_sandboxed(&out, Some("seatbelt"), false);
-    assert_contract("error.no_route.sandboxed", &out.json());
+    assert_sandboxed(&out, Some("seatbelt"), false, true);
+    // W10 fixes2 decision 1 + cycle-3 Codex P2 (design.md:449): on Linux the envelope is the
+    // documented one plus `lease:"unknown"`, which assert_sandboxed has just checked exactly.
+    let mut real = out.json();
+    if cfg!(target_os = "linux") {
+        real["error"]["details"]
+            .as_object_mut()
+            .unwrap()
+            .remove("lease");
+    }
+    assert_contract("error.no_route.sandboxed", &real);
 }
 
 #[test]

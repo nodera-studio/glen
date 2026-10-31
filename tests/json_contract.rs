@@ -504,7 +504,14 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(6));
-    all.insert("error.no_route.sandboxed".into(), vec![json(&out)]);
+    let mut sandboxed = json(&out);
+    // W10 fixes2 decision 1 + cycle-3 Codex P2 (design.md:449): on Linux the refusal adds
+    // exactly `lease:"unknown"` to the documented details.
+    if cfg!(target_os = "linux") {
+        let details = sandboxed["error"]["details"].as_object_mut().unwrap();
+        assert_eq!(details.remove("lease"), Some(serde_json::json!("unknown")));
+    }
+    all.insert("error.no_route.sandboxed".into(), vec![sandboxed]);
     let scoped = OmpBox::new();
     let out = scoped.glen(
         &[

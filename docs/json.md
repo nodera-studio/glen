@@ -1014,6 +1014,9 @@ and the absolute scope directory. File paths bypass project filtering and remain
 }
 ```
 
+On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to resume an existing session adds
+`"lease": "unknown"` to these details, whichever sandbox check refused first; `@new` never carries it.
+
 <!-- contract: error.no_route.sandboxed -->
 ```json
 {
