@@ -248,6 +248,24 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         scope.as_mut(),
     )?;
     let total = read.records.len();
+    // Only cursors this call actually moves are committed and counted as `marked_read`:
+    // `--all` re-reads from 0, so its batch ends are often the saved cursors (W8-DOC-7).
+    let moves = if a.peek {
+        vec![]
+    } else {
+        read.ends
+            .into_iter()
+            .filter(|(stem, c)| {
+                let saved = inbox::cursor(&home, stem);
+                c.offset > 0 && (c.offset != saved.offset || c.ino != saved.ino)
+            })
+            .collect::<Vec<_>>()
+    };
+    // Probe the cursor write before printing anything, so a read-only GLEN_HOME is the one
+    // error envelope (exit 6 `sandboxed` in Codex) and not `ok:true` (W8-ERR-1).
+    if let Some((stem, _)) = moves.first() {
+        inbox::probe_writable(&home).map_err(|e| mark_error(env, stem, e))?;
+    }
     let sessions = read
         .records
         .iter()
@@ -272,7 +290,7 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         )
     };
     let mut outcome = Outcome::new(
-        json!({"total":total,"marked_read":!a.peek&&total>0,"skipped_lines":read.skipped,"messages":read.records.iter().map(|(_,r,_,_)|message(r)).collect::<Vec<_>>()}),
+        json!({"total":total,"marked_read":!moves.is_empty(),"skipped_lines":read.skipped,"messages":read.records.iter().map(|(_,r,_,_)|message(r)).collect::<Vec<_>>()}),
         human,
     );
     if read.outside_cwd
@@ -286,15 +304,10 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
             ),
         });
     }
-    if !a.peek {
-        let ends = read
-            .ends
-            .into_iter()
-            .filter(|(_, c)| c.offset > 0)
-            .collect::<Vec<_>>();
+    if !moves.is_empty() {
         let env = env.clone();
         outcome.after_output = Some(Box::new(move || {
-            for (stem, cursor) in ends {
+            for (stem, cursor) in moves {
                 inbox::mark(&home, &stem, cursor).map_err(|e| mark_error(&env, &stem, e))?;
             }
             Ok(())

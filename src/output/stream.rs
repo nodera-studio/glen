@@ -17,12 +17,20 @@ pub struct EventStream {
 }
 impl EventStream {
     pub fn new(ctx: &OutputCtx) -> Self {
+        Self::for_mode(ctx, ctx.mode == Mode::Json)
+    }
+    /// Always NDJSON, whatever the mode. The stdout writer must then bypass anstream's
+    /// stripping too, or DEL in message text is lost under `--human` (W8-ERR-6).
+    pub fn ndjson(ctx: &OutputCtx) -> Self {
+        Self::for_mode(ctx, true)
+    }
+    fn for_mode(ctx: &OutputCtx, json: bool) -> Self {
         use anstream::ColorChoice::{Always, Never};
         Self::with_writers(
-            ctx.mode == Mode::Json,
+            json,
             Box::new(anstream::AutoStream::new(
                 super::stdout_writer(),
-                if ctx.stdout_color || ctx.mode == Mode::Json {
+                if ctx.stdout_color || json {
                     Always
                 } else {
                     Never
@@ -34,11 +42,6 @@ impl EventStream {
             )),
             ctx.err_painter.clone(),
         )
-    }
-    pub fn ndjson(ctx: &OutputCtx) -> Self {
-        let mut s = Self::new(ctx);
-        s.json = true;
-        s
     }
     pub fn with_writers(
         json: bool,
@@ -72,7 +75,7 @@ impl EventStream {
     }
     fn line(&mut self, v: &Value) -> io::Result<()> {
         self.writable()?;
-        let mut b = serde_json::to_vec(v).map_err(io::Error::other)?;
+        let mut b = super::envelope::to_json_vec(v, false)?;
         b.push(b'\n');
         let result = self.out.write_all(&b).and_then(|_| self.out.flush());
         if let Err(e) = &result {
@@ -241,6 +244,22 @@ mod tests {
                 &json!({"v":1,"event":"end","ok":true})
             );
         }
+    }
+    /// W8-SEC-5: NDJSON lines escape C1 and bidi controls and decode unchanged.
+    #[test]
+    fn ndjson_escapes_c1_and_bidi_controls() {
+        let out = Sink::default();
+        let mut s = stream(out.clone());
+        let text = "A\u{7f}B\u{85}C\u{9b}D\u{202e}E\u{2066}F";
+        s.event("message", Map::from_iter([("text".into(), json!(text))]))
+            .unwrap();
+        let bytes = out.0.borrow();
+        let line = std::str::from_utf8(&bytes).unwrap();
+        for raw in ['\u{7f}', '\u{85}', '\u{9b}', '\u{202e}', '\u{2066}'] {
+            assert!(!line.contains(raw), "{line}");
+        }
+        assert!(line.contains("\\u009b"), "{line}");
+        assert_eq!(serde_json::from_str::<Value>(line).unwrap()["text"], text);
     }
     #[test]
     fn failure() {

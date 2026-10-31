@@ -206,15 +206,107 @@ fn ac325_rpc_reply_nulls() {
     assert!(r.get("request_id").unwrap().is_null());
 }
 
+/// W8-ERR-1 re-derived this test: an unwritable cursor is now caught before any output, so
+/// the failure is the one JSON error envelope on stdout (stderr stays empty), not `ok:true`
+/// followed by a stderr line.
 #[test]
-fn mark_read_failure_is_reported_on_stderr_and_leaves_messages_unread() {
+fn mark_read_failure_is_an_error_envelope_and_leaves_messages_unread() {
     let b = OmpBox::new();
     append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
     fs::write(b.glen_home.join("inbox/.read"), "blocked").unwrap();
     let o = inbox(&b, &[]);
     assert_eq!(o.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&o.stderr).contains(&format!("cannot mark inbox {A} read")));
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let v = common::json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["code"], "io");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&format!("cannot mark inbox {A} read")),
+        "{v}"
+    );
     assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 1);
+}
+
+/// W8-ERR-1: inside Codex's sandbox an unwritable GLEN_HOME is exit 6 `sandboxed`, and the
+/// messages stay unread. `.read` does not exist yet, so the probe must catch a read-only
+/// `inbox/` where `mark` would create it.
+#[test]
+fn sandboxed_mark_read_failure_is_exit_six_and_leaves_messages_unread() {
+    if rustix::process::geteuid().is_root() {
+        return; // root ignores the read-only mode this test relies on
+    }
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
+    let dir = b.glen_home.join("inbox");
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+    let o = b
+        .command(&["inbox", "--json"], &b.alpha())
+        .env("CODEX_SANDBOX", "seatbelt")
+        .output()
+        .unwrap();
+    fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(o.status.code(), Some(6), "{o:?}");
+    assert!(o.stderr.is_empty(), "{o:?}");
+    let v = common::json(&o);
+    assert_eq!(v["ok"], false);
+    assert_eq!(v["error"]["details"]["reason"], "sandboxed", "{v}");
+    assert_eq!(v["error"]["details"]["glen_home_writable"], false, "{v}");
+    assert!(!dir.join(".read").exists());
+    assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "no probe file left");
+    let d = data(&inbox(&b, &["--peek"]));
+    assert_eq!(d["total"], 1);
+    assert_eq!(d["messages"][0]["text"], "keep");
+}
+
+/// W8-DOC-7: `marked_read` is true only when a cursor moves; `--all` after everything was
+/// read returns the old messages without moving anything.
+#[test]
+fn marked_read_is_false_when_no_cursor_moves() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "one", "2026-10-30T00:00:00Z"));
+    append(&b, B, &record(B, "two", "2026-10-30T00:00:01Z"));
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(d["marked_read"], true);
+    let cursor = b.glen_home.join("inbox/.read").join(A);
+    let before = fs::read(&cursor).unwrap();
+    let d = data(&inbox(&b, &["--all"]));
+    assert_eq!(d["total"], 2);
+    assert_eq!(d["marked_read"], false);
+    assert_eq!(fs::read(&cursor).unwrap(), before);
+    let d = data(&inbox(&b, &[]));
+    assert_eq!(
+        (d["total"].clone(), d["marked_read"].clone()),
+        (j!(0), j!(false))
+    );
+    append(&b, B, &record(B, "three", "2026-10-30T00:00:02Z"));
+    let d = data(&inbox(&b, &["--all"]));
+    assert_eq!(d["total"], 3);
+    assert_eq!(d["marked_read"], true);
+    assert_eq!(data(&inbox(&b, &[]))["total"], 0);
+}
+
+/// W8-ERR-6: follow mode is NDJSON even under `--human`, so DEL in a message survives.
+#[test]
+fn human_follow_keeps_del_bytes_in_ndjson() {
+    let b = OmpBox::new();
+    append(&b, A, &record(A, "A\u{7f}B\u{85}C", "2026-10-30T00:00:00Z"));
+    let mut c = b
+        .command(&["--human", "inbox", "-f", "--peek", "--all"], &b.alpha())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut line = String::new();
+    BufReader::new(c.stdout.take().unwrap())
+        .read_line(&mut line)
+        .unwrap();
+    c.kill().unwrap();
+    c.wait().unwrap();
+    let v: Value = serde_json::from_str(&line).unwrap();
+    assert_eq!(v["message"]["text"], "A\u{7f}B\u{85}C", "{line:?}");
 }
 
 #[test]
