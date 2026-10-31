@@ -481,7 +481,7 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 - **W3** live route: the bundled extension, install-extension, endpoint-first routing, inbox, talk-back from the TUI.
 - **W3b** session controls: abort/stop, models, model/provider, thinking and idle compaction; one router/executor over live, owning job and unowned RPC.
 - **W4** agent surface: SKILL.md (two variants), install-skill, extended doctor, completions polish, acceptance runs with Claude Code and Codex.
-- **W5** visible `glen watch` TUI: sessions, persisted-entry transcripts, a send prompt, job activity and peek-only replies; shared follower/submit cores, worker threads, TestBackend snapshots and real-binary pty tests. Session controls remain gated on W3b.
+- **W5** visible `glen watch` TUI: sessions, persisted-entry transcripts, a send prompt, job activity and peek-only replies; shared follower/submit cores, worker threads, TestBackend snapshots and real-binary pty tests. Session controls (`m` model, `T` thinking, `C` compact, `^x` abort) dispatch through W3b's `src/ctl` routing. Picking the current model or level again changes nothing. A second SIGINT, SIGTERM or SIGHUP during quit restores the terminal and exits at once. Two identical signals that the kernel merges before glen's handler runs count as one, because standard POSIX signals are not queued, so press Ctrl-C again to force an exit.
 - **W6** site: `site/`, static Astro in the Nodex-redesign look; a CSS-compiled terminal demo; morphin islands; palette from `src/render/palette.json`; CI job `site`.
 - **W7** deploy + release workflow: §A18.
 - **W8** audits + release v0.1.0.
