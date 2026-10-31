@@ -83,6 +83,58 @@ fn append(p: &std::path::Path, s: &str) {
     f.flush().unwrap();
 }
 #[test]
+fn tail_follow_with_a_closed_stdout_exits_0_silently() {
+    for close_after_backlog in [false, true] {
+        let sb = OmpBox::new();
+        let mut command = sb.command(&["tail", "e27c0de", "-f", "--json"], &sb.alpha());
+        if close_after_backlog {
+            command.stdout(Stdio::piped());
+        } else {
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            command.stdout(Stdio::from(writer));
+        }
+        let mut child = command.stderr(Stdio::piped()).spawn().unwrap();
+        if close_after_backlog {
+            let stdout = child.stdout.take().unwrap();
+            let (tx, rx) = mpsc::channel();
+            let reader = thread::spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                for index in 0..6 {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    let event: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(event["event"], if index == 0 { "session" } else { "item" });
+                }
+                drop(reader);
+                tx.send(()).unwrap();
+            });
+            if let Err(error) = rx.recv_timeout(Duration::from_secs(10)) {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("tail backlog did not arrive: {error}: {output:?}");
+            }
+            reader.join().unwrap();
+            append(
+                &sb.session('A'),
+                &message("10000010", "10000009", "after reader closed"),
+            );
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() >= deadline {
+                child.kill().unwrap();
+                let output = child.wait_with_output().unwrap();
+                panic!("tail did not stop after EPIPE: {output:?}");
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+    }
+}
+#[test]
 fn ac116_tail_documents() {
     let sb = OmpBox::new();
     let d = data(&sb.glen(&["tail", "e27c0de", "-n", "2"], &sb.alpha()));
@@ -371,7 +423,7 @@ fn follow_never_spills_and_broken_pipe() {
     let start = Instant::now();
     loop {
         if let Some(s) = child.try_wait().unwrap() {
-            assert_eq!(s.code(), Some(1));
+            assert_eq!(s.code(), Some(0));
             break;
         }
         if start.elapsed() > Duration::from_secs(3) {
@@ -576,4 +628,83 @@ fn rejected_in_place_reload_stays_rejected_after_regrowth() {
     assert_eq!(f.event()["event"], "rewritten");
     assert_eq!(f.event()["item"]["id"], "original-restored");
     assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+}
+
+#[test]
+fn cwd_scopes_latest_and_follow_but_never_rebases_explicit_paths() {
+    let sb = OmpBox::new();
+    let alpha = sb.alpha();
+    let beta = sb.beta();
+    let foreign = beta.join("nested");
+    fs::create_dir(&foreign).unwrap();
+    let a = sb.session('A');
+    let relative = format!(
+        "../../../agent/sessions/-work-alpha/{}",
+        a.file_name().unwrap().to_str().unwrap()
+    );
+    for command in ["show", "tail"] {
+        let latest = sb.glen(
+            &[
+                command,
+                "@latest",
+                "--cwd",
+                beta.to_str().unwrap(),
+                "--json",
+            ],
+            &alpha,
+        );
+        assert_eq!(
+            data(&latest)["session"]["path"],
+            sb.session('E').to_str().unwrap()
+        );
+        for arg in [a.to_str().unwrap(), &relative] {
+            let out = sb.glen(
+                &[command, arg, "--cwd", foreign.to_str().unwrap(), "--json"],
+                &alpha,
+            );
+            assert_eq!(data(&out)["session"]["id"], common::A_ID);
+        }
+    }
+    let outside = sb.glen(
+        &[
+            "tail",
+            "0a3f417",
+            "-f",
+            "--cwd",
+            alpha.to_str().unwrap(),
+            "--json",
+        ],
+        &beta,
+    );
+    assert_eq!(outside.status.code(), Some(3));
+    assert_eq!(json(&outside)["error"]["details"]["reason"], "outside_cwd");
+    let mut following = Following::start(
+        &sb,
+        &[
+            "tail",
+            "@latest",
+            "-f",
+            "--cwd",
+            beta.to_str().unwrap(),
+            "--json",
+        ],
+    );
+    assert_eq!(
+        following.event()["session"]["path"],
+        sb.session('E').to_str().unwrap()
+    );
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(following.child.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    assert_eq!(
+        common::poll(Duration::from_secs(10), || following
+            .child
+            .try_wait()
+            .unwrap())
+        .code(),
+        Some(130)
+    );
+    sb.clean();
 }

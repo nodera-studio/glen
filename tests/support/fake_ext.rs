@@ -464,6 +464,11 @@ fn main() -> io::Result<()> {
     while !stop.load(Ordering::Relaxed) {
         match listener.accept() {
             Ok((stream, _)) => {
+                // BSD accept inherits O_NONBLOCK from the polling listener.
+                if let Err(e) = stream.set_nonblocking(false) {
+                    eprintln!("fake_ext blocking accepted socket: {e}");
+                    continue;
+                }
                 let peer = peer.clone();
                 std::thread::spawn(move || {
                     if let Err(e) = peer.serve(stream) {

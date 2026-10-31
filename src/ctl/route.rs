@@ -7,7 +7,7 @@ use crate::{
     cli::Cli,
     commands::open::Opened,
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason, Warning},
     glen_home,
     jobs::{self, Forked, JobId, JobStore, liveness, lock},
     live::{
@@ -314,7 +314,12 @@ fn unavailable(opened: &Opened, probe: &Lease, paths: &paths::OmpPaths) -> GlenE
         ),
         _ => format!("session {} is open in another omp process", opened.handle),
     };
-    GlenError::new(ErrorCode::NoRoute, message).with_hint(live::route::lease_held_hint(paths))
+    let reason = if matches!(probe, Lease::Unknown { .. }) {
+        NoRouteReason::UnknownLease
+    } else {
+        NoRouteReason::LiveOwner
+    };
+    GlenError::no_route(reason, message).with_hint(live::route::lease_held_hint(paths))
 }
 pub(crate) fn route(
     cli: &Cli,
@@ -324,7 +329,8 @@ pub(crate) fn route(
     deadline: Instant,
     stop: Arc<AtomicBool>,
 ) -> Result<(Target, Vec<Warning>), GlenError> {
-    crate::sandbox::refuse_unreachable(env, cli.command.name())?;
+    crate::sandbox::refuse_unreachable(env, cli.command.name())
+        .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
     let home = glen_home::resolve(env)?;
     let store = JobStore::new(home.clone());
     let id = &opened.session.header.id;
@@ -341,7 +347,7 @@ pub(crate) fn route(
         match endpoint {
             live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, id) {
-                    return Err(GlenError::new(ErrorCode::NoRoute,format!("session {} is open in a live omp session and a glen RPC job is still running on it",opened.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",opened.handle)));
+                    return Err(GlenError::no_route(NoRouteReason::RpcJobRunning,format!("session {} is open in a live omp session and a glen RPC job is still running on it",opened.handle)).with_hint(format!("wait for that job (`glen jobs --active --session {}`), then send again",opened.handle)));
                 }
                 if !hello.ops.iter().any(|op| op == op_name) {
                     let ctx = super::ErrCtx {
@@ -379,8 +385,8 @@ pub(crate) fn route(
                         return Err(error);
                     }
                 }
-                return Err(GlenError::new(
-                    ErrorCode::NoRoute,
+                return Err(GlenError::no_route(
+                    NoRouteReason::UnhealthyEndpoint,
                     format!(
                         "session {} has a glen live endpoint that cannot take controls ({reason})",
                         opened.handle
@@ -390,10 +396,18 @@ pub(crate) fn route(
             }
             _ => (),
         }
-        crate::sandbox::refuse_rpc(env, cli.command.name())?;
-        if lock::is_held(&home, id) {
+        crate::sandbox::refuse_rpc(env, cli.command.name())
+            .map_err(|e| crate::sandbox::with_hidden_lease(env, e))?;
+        // A hidden lease refuses before any lock wait or lease probe; only a control for a
+        // running glen job still reaches that job (design.md §A13, W10 clarification).
+        if !lock::is_held(&home, id) {
+            crate::sandbox::refuse_hidden_lease(env)?;
+        } else {
             let holder = owner(&store, id, deadline, &stop);
             stopped(deadline, &stop, opened)?;
+            if !matches!(holder, Owner::Job(_)) {
+                crate::sandbox::refuse_hidden_lease(env)?;
+            }
             match holder {
                 Owner::Job(job) => return Ok((job_target(store, job, id, deadline, stop), vec![])),
                 Owner::Free => continue,
@@ -453,8 +467,8 @@ pub(crate) fn route(
             return Ok((Target::Idle, vec![]));
         }
         if opened.not_yet_persisted {
-            return Err(GlenError::new(
-                ErrorCode::NoRoute,
+            return Err(GlenError::no_route(
+                NoRouteReason::EndpointGone,
                 "the live session has not persisted a transcript and its endpoint went away",
             )
             .with_hint("restart that omp session and run `glen ls`"));
@@ -480,6 +494,8 @@ pub(crate) fn route(
             cwd,
             deadline,
             stop.clone(),
+            env,
+            cli.command.name(),
         ) {
             Ok(client) => return Ok((Target::Rpc(client), vec![])),
             Err(OpenError::Busy) => {
@@ -543,7 +559,10 @@ pub(crate) fn route_models(
             ));
         }
         let probe = lease::probe(&paths.session_owners_dir, id);
-        if !matches!(probe, Lease::Free) {
+        // A hidden lease (Linux under a Codex marker) is unknown whatever it probes as.
+        if !matches!(probe, Lease::Free)
+            || crate::sandbox::lease_hidden(env, cfg!(target_os = "linux"))
+        {
             warnings.push(Warning {
                 code: "session_unreachable".into(),
                 message: live::route::lease_held_hint(&paths),

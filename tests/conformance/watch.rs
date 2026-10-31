@@ -645,7 +645,7 @@ const PALETTE: [PaletteRow; 8] = [
     ("muted", 0x505050, 0xB4B5BD, 239, 250, None),
     ("border", 0xDADADA, 0x45474D, 253, 238, Some(8)),
     ("accent", 0x5E6AD2, 0x7170FF, 62, 63, Some(4)),
-    ("accent_2", 0x12A594, 0x12A594, 36, 36, Some(6)),
+    ("accent_2", 0x0E7C70, 0x12A594, 23, 36, Some(6)),
     ("success", 0x007F3D, 0x00CA50, 29, 41, Some(2)),
     ("warning", 0xA66300, 0xFF9300, 130, 208, Some(3)),
     ("danger", 0xDC2626, 0xFF565F, 160, 203, Some(1)),
@@ -2661,8 +2661,13 @@ fn ac506_scrolled_up_new_items_keep_the_viewport_and_count_as_n_new() {
     for _ in 0..5 {
         t.key(b"k");
     }
-    t.wait_for("the G follows row", UI, |v| {
+    // Wait for all five lines of scroll, not the first: the indicator shows after one `k`, and
+    // a snapshot taken before glen has drawn the other four moves under the assertion below.
+    // Rows repeat every three lines, so the item number pins the count.
+    t.wait_for("the G follows row five lines up", UI, |v| {
         indicator(v).is_some_and(|(_, s)| s == "G follows")
+            && pane_lines(v).iter().rev().nth(1).map(String::as_str)
+                == Some("  item 0058 short line")
     });
     let v = t.screen().clone();
     let (y, _) = indicator(&v).unwrap();

@@ -114,15 +114,40 @@ run `reset` in the shell. Watch does not handle suspend/resume in this release.
 <!-- W3:start -->
 ## Live sessions (`glen install-extension`)
 
-Coming in a later release.
-<!-- filled by W3 -->
+`glen send` reaches a session that is not open anywhere by resuming it in a short-lived omp RPC
+process. For a session that is open in the omp TUI, install glen's omp extension:
+
+```sh
+glen install-extension
+glen install-extension --dry-run
+glen install-extension --uninstall
+```
+
+It writes one file, `<agent dir>/extensions/glen/index.ts` (`~/.omp/agent` by default,
+`--profile NAME` for a profile), and changes nothing else in omp. Restart the omp TUI afterwards.
+An open session then takes `glen send` and the session controls over its live endpoint, and the
+omp model gets a `glen_reply` tool: its replies come back in `data.replies` and in `glen inbox`.
+A newer, edited or foreign file is left alone unless you pass `--force`.
 <!-- W3:end -->
 
 <!-- W4:start -->
 ## Use from your coding agent (`glen install-skill`)
 
-Coming in a later release.
-<!-- filled by W4 -->
+```sh
+glen install-skill
+glen install-skill --codex --project
+glen install-skill --uninstall
+```
+
+This installs the glen skill for Claude Code (`~/.claude/skills/glen/SKILL.md`, or under
+`$CLAUDE_CONFIG_DIR`) and Codex (`~/.agents/skills/glen/SKILL.md`). `--claude` or `--codex`
+picks one agent; `--project` writes into this directory's `.claude/skills` and `.agents/skills`
+instead. The skill teaches the agent the loop (`ls`, `show`, `send`, `wait`, `inbox`), the exit
+codes and the sandbox rules, and lets it run `glen` commands without asking each time.
+
+Headless Claude Code needs the skill itself allowed: `claude -p --permission-mode dontAsk` denies
+a skill that is not on the allow list, so pass `--allowedTools "Skill(glen)"`. The skill's own
+`allowed-tools: Bash(glen *)` grants the glen commands once the skill has loaded.
 <!-- W4:end -->
 
 ## Website

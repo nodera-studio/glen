@@ -2,7 +2,7 @@
 //! interrupt the turn when observation is cancelled or reaches its deadline.
 use super::client::{self, ClientError, ConnectError, Frame};
 use crate::{
-    error::Warning,
+    error::{NoRouteReason, Warning},
     jobs::{Forked, JobError, JobResult, Reply, State},
     ops::SendArgs,
     rpc::{
@@ -275,8 +275,8 @@ pub(crate) fn run(w: &mut Worker) -> Result<(), Failure> {
             Failure::new("timeout", "the glen job deadline passed before delivery")
         }
         ClientError::Connect(ConnectError::Missing | ConnectError::Refused) => {
-            let mut f = Failure::new(
-                "no_route",
+            let mut f = Failure::no_route(
+                NoRouteReason::EndpointGone,
                 format!(
                     "the live endpoint of session {} went away before glen delivered the message",
                     w.job.session_handle.as_deref().unwrap_or("?")
@@ -286,7 +286,10 @@ pub(crate) fn run(w: &mut Worker) -> Result<(), Failure> {
             f
         }
         ClientError::Connect(ConnectError::PathTooLong) => {
-            let mut f = Failure::new("no_route", "live socket path too long");
+            let mut f = Failure::no_route(
+                NoRouteReason::UnhealthyEndpoint,
+                "live socket path too long",
+            );
             f.hint = Some(super::route::hint(super::route::Unhealthy::PathTooLong));
             f
         }
@@ -363,6 +366,16 @@ mod tests {
     use super::*;
     use crate::jobs::{JobId, JobStore, Status};
     use std::sync::{Arc, atomic::AtomicBool};
+    #[test]
+    fn oversized_live_socket_is_an_unhealthy_endpoint_refusal() {
+        let (_tmp, mut worker) = worker();
+        worker.job.live_socket =
+            Some(format!("/{}", "x".repeat(super::super::SUN_PATH_MAX)).into());
+        let error = run(&mut worker).unwrap_err();
+        assert_eq!(error.code, "no_route");
+        assert_eq!(error.details.unwrap()["reason"], "unhealthy_endpoint");
+        assert!(error.hint.unwrap().contains("GLEN_HOME"));
+    }
     fn worker() -> (tempfile::TempDir, Worker) {
         let t = tempfile::tempdir().unwrap();
         let store = JobStore::new(crate::glen_home::GlenHome {

@@ -173,6 +173,58 @@ impl Op {
         json!({"v":PROTOCOL,"id":id,"op":self.name(),"args":args})
     }
 }
+/// Serialize a request envelope with its correlation id before potentially large args.
+/// Preserve every field, including control inbox deadlines and future additions.
+pub(crate) fn request_bytes(request: &Value) -> Result<Vec<u8>, serde_json::Error> {
+    use serde::ser::SerializeMap;
+    let Some(object) = request.as_object() else {
+        return serde_json::to_vec(request);
+    };
+    let mut serializer = serde_json::Serializer::new(Vec::new());
+    let mut map = serde::Serializer::serialize_map(&mut serializer, Some(object.len()))?;
+    if let Some(id) = object.get("id") {
+        map.serialize_entry("id", id)?;
+    }
+    for (key, value) in object {
+        if key != "id" {
+            map.serialize_entry(key, value)?;
+        }
+    }
+    map.end()?;
+    Ok(serializer.into_inner())
+}
+#[cfg(test)]
+mod request_wire_tests {
+    use super::*;
+
+    #[test]
+    fn id_precedes_large_args_and_all_envelope_fields_round_trip() {
+        let op = Op::Send(SendArgs {
+            text: "x".repeat(1024 * 1024),
+            deliver_as: crate::jobs::Deliver::Auto,
+            job_id: None,
+            expect_session_id: None,
+        });
+        let request = op.request_for("quoted\"\\id", Some("expected\"session"));
+        let bytes = request_bytes(&request).unwrap();
+        assert!(bytes.starts_with(b"{\"id\":"));
+        let id = serde_json::Deserializer::from_slice(&bytes[6..4096])
+            .into_iter::<String>()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, "quoted\"\\id");
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), request);
+        assert_eq!(request["args"]["expect_session_id"], "expected\"session");
+
+        let mut inbox = request;
+        inbox.as_object_mut().unwrap().remove("id");
+        inbox["deadline_ms"] = json!(12345);
+        inbox["future_field"] = json!({"value":"kept"});
+        let bytes = request_bytes(&inbox).unwrap();
+        assert_eq!(serde_json::from_slice::<Value>(&bytes).unwrap(), inbox);
+    }
+}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct OpError {
     pub code: String,

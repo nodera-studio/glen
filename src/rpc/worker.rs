@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, NoRouteReason, Warning},
     glen_home,
     jobs::{
         Deliver, Forked, Job, JobError, JobId, JobResult, JobStore, Route, State, Status, liveness,
@@ -42,6 +42,12 @@ pub(crate) struct Failure {
     pub(crate) details: Option<Value>,
 }
 impl Failure {
+    pub(crate) fn no_route(reason: NoRouteReason, message: impl Into<String>) -> Self {
+        Self {
+            details: Some(json!({"reason":reason.as_str()})),
+            ..Self::new(ErrorCode::NoRoute.as_str(), message)
+        }
+    }
     pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             state: State::Failed,
@@ -981,71 +987,83 @@ fn endpoint_check(
     let Some(id) = id else {
         return Ok(());
     };
-    let fallback = || -> Failure {
-        let mut failure = Failure::new(
-            "no_route",
-            format!(
-                "session {} was opened in a live omp session after glen’s check",
-                handle.unwrap_or(id)
-            ),
-        );
-        failure.hint = Some("send again; glen will deliver through the live session".into());
-        failure
-    };
-    match crate::live::route::find(home, id, crate::live::HELLO_PROBE) {
-        crate::live::route::Endpoint::Unhealthy {
-            kind, io: Some(e), ..
-        } => {
-            let env = Env::from_process();
-            let mapped = match kind {
-                crate::live::route::Unhealthy::Unresponsive => {
-                    crate::sandbox::map_socket_failure(&env, "connect omp socket", &e)
-                }
-                crate::live::route::Unhealthy::Unreadable
-                    if crate::sandbox::restricted(&env, &e) =>
-                {
-                    Some(crate::sandbox::map_home_write(&env, "send", e))
-                }
-                _ => None,
-            };
-            match mapped {
-                Some(err) => {
-                    let mut failure = Failure::new("no_route", err.message);
+    endpoint_result(
+        crate::live::route::find(home, id, crate::live::HELLO_PROBE),
+        handle.unwrap_or(id),
+        &Env::from_process(),
+    )
+}
+fn endpoint_result(
+    endpoint: crate::live::route::Endpoint,
+    handle: &str,
+    env: &Env,
+) -> Result<(), Failure> {
+    match endpoint {
+        crate::live::route::Endpoint::Unhealthy { kind, io, .. } => {
+            if let Some(e) = io {
+                let mapped = match kind {
+                    crate::live::route::Unhealthy::Unresponsive => {
+                        crate::sandbox::map_socket_failure(env, "connect omp socket", &e)
+                    }
+                    crate::live::route::Unhealthy::Unreadable
+                        if crate::sandbox::restricted(env, &e) =>
+                    {
+                        Some(crate::sandbox::map_home_write(env, "send", e))
+                    }
+                    _ => None,
+                };
+                if let Some(err) = mapped {
+                    let mut failure = Failure::no_route(NoRouteReason::Sandboxed, err.message);
                     failure.hint = err.hint;
                     failure.details = err.details.map(|d| *d);
-                    Err(failure)
+                    return Err(failure);
                 }
-                None => Err(fallback()),
             }
+            let mut failure = Failure::no_route(
+                NoRouteReason::UnhealthyEndpoint,
+                format!("session {handle} was opened in a live omp session after glen’s check"),
+            );
+            failure.hint = Some("send again; glen will deliver through the live session".into());
+            Err(failure)
         }
-        crate::live::route::Endpoint::Unhealthy { .. }
-        | crate::live::route::Endpoint::Live { .. } => Err(fallback()),
+        crate::live::route::Endpoint::Live { .. } => {
+            let mut failure = Failure::no_route(
+                NoRouteReason::EndpointAppeared,
+                format!("session {handle} was opened in a live omp session after glen’s check"),
+            );
+            failure.hint = Some("send again; glen will deliver through the live session".into());
+            Err(failure)
+        }
         _ => Ok(()),
     }
 }
+
 fn route_probe(lease: Lease, handle: &str, env: &Env) -> Result<(), Failure> {
-    let message = match lease {
+    // Checked before every lease value, including Free: on Linux under any Codex marker the
+    // lease may be hidden by the sandbox's network namespace, so even "free" cannot be trusted.
+    if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &lease) {
+        let mut failure = Failure::no_route(NoRouteReason::Sandboxed, e.message);
+        failure.hint = e.hint;
+        failure.details = e.details.map(|d| *d);
+        return Err(failure);
+    }
+    let (reason, message) = match lease {
         Lease::Free => return Ok(()),
-        Lease::Held => {
-            format!("before spawning omp: session {handle} is open in another omp process")
-        }
+        Lease::Held => (
+            NoRouteReason::LiveOwner,
+            format!("before spawning omp: session {handle} is open in another omp process"),
+        ),
         unknown @ Lease::Unknown { .. } => {
-            if let Some(e) = crate::sandbox::map_probe_failure(env, "send", &unknown) {
-                return Err(Failure {
-                    state: State::Failed,
-                    code: "no_route",
-                    error_message: e.message,
-                    hint: e.hint,
-                    details: e.details.map(|d| *d),
-                });
-            }
             let r = lease::state_detail(&unknown).unwrap_or_default();
-            format!(
-                "before spawning omp: cannot tell whether another omp process owns session {handle} ({r})"
+            (
+                NoRouteReason::UnknownLease,
+                format!(
+                    "before spawning omp: cannot tell whether another omp process owns session {handle} ({r})"
+                ),
             )
         }
     };
-    let mut f = Failure::new("no_route", message);
+    let mut f = Failure::no_route(reason, message);
     f.hint=Some("close that omp session and retry; sending into a running session needs the glen omp extension (a later glen version)".into());
     Err(f)
 }
@@ -1608,6 +1626,9 @@ mod tests {
             std::path::Path::new("/"),
             &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
         );
+        // The raw-errno mapping is the non-hidden path (macOS); on Linux the marker hides the
+        // lease first (W10 fix cycle 2 decision 1; see the next test).
+        crate::sandbox::force_lease_hidden_for_test(Some(false));
         for errno in [libc::EPERM, libc::EACCES, libc::EROFS] {
             let error = route_probe(
                 Lease::Unknown {
@@ -1622,15 +1643,39 @@ mod tests {
             assert_eq!(error.details.unwrap()["reason"], "sandboxed");
             assert!(error.hint.unwrap().contains("outside the sandbox"));
         }
+        crate::sandbox::force_lease_hidden_for_test(None);
+    }
+    #[test]
+    fn route_probe_refuses_even_a_free_lease_when_hidden() {
+        crate::sandbox::force_lease_hidden_for_test(Some(true));
+        let env = Env::for_test(
+            None,
+            std::path::Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        let error = route_probe(Lease::Free, "e27c0de", &env).unwrap_err();
+        assert_eq!(error.code, "no_route");
+        let details = error.details.unwrap();
+        assert_eq!(details["reason"], "sandboxed");
+        assert_eq!(details["lease"], "unknown");
+        crate::sandbox::force_lease_hidden_for_test(None);
+        // The real rule (W10 fix cycle 2 decision 1): any marker on Linux, never elsewhere.
+        assert_eq!(
+            route_probe(Lease::Free, "e27c0de", &env).is_err(),
+            cfg!(target_os = "linux")
+        );
     }
     #[test]
     fn review11_refusal_identifies_pre_spawn_phase() {
-        for lease in [
-            Lease::Held,
-            Lease::Unknown {
-                reason: "denied".into(),
-                errno: None,
-            },
+        for (lease, reason) in [
+            (Lease::Held, "live_owner"),
+            (
+                Lease::Unknown {
+                    reason: "denied".into(),
+                    errno: None,
+                },
+                "unknown_lease",
+            ),
         ] {
             let e = route_probe(
                 lease,
@@ -1641,6 +1686,7 @@ mod tests {
             assert_eq!(e.code, "no_route");
             assert!(e.error_message.starts_with("before spawning omp:"));
             assert!(e.error_message.contains("e27c0de"));
+            assert_eq!(e.details.unwrap()["reason"], reason);
         }
         assert!(
             route_probe(
@@ -1650,6 +1696,70 @@ mod tests {
             )
             .is_ok()
         );
+    }
+    #[test]
+    fn endpoint_check_distinguishes_appeared_unhealthy_and_sandboxed() {
+        use crate::live::route::{Endpoint, Unhealthy};
+        let outside = Env::for_test(None, std::path::Path::new("/"), &[]);
+        let reg = serde_json::from_value(json!({"v":1,"pid":1,"session_id":"s","socket":"/tmp/s"}))
+            .unwrap();
+        let appeared = endpoint_result(
+            Endpoint::Live {
+                reg: Box::new(reg),
+                hello: Box::default(),
+            },
+            "e27c0de",
+            &outside,
+        )
+        .unwrap_err();
+        assert_eq!(appeared.code, "no_route");
+        assert_eq!(appeared.details.unwrap()["reason"], "endpoint_appeared");
+        assert!(appeared.hint.unwrap().contains("send again"));
+        for (kind, io) in [
+            (Unhealthy::PathTooLong, None),
+            (
+                Unhealthy::Unresponsive,
+                Some(std::io::Error::from_raw_os_error(libc::ETIMEDOUT)),
+            ),
+            (
+                Unhealthy::Unreadable,
+                Some(std::io::Error::from_raw_os_error(libc::EPERM)),
+            ),
+        ] {
+            let error = endpoint_result(
+                Endpoint::Unhealthy {
+                    reason: "unavailable".into(),
+                    kind,
+                    io,
+                },
+                "e27c0de",
+                &outside,
+            )
+            .unwrap_err();
+            assert_eq!(error.details.unwrap()["reason"], "unhealthy_endpoint");
+        }
+        let sandbox = Env::for_test(
+            None,
+            std::path::Path::new("/"),
+            &[("CODEX_SANDBOX_NETWORK_DISABLED", "1")],
+        );
+        for kind in [Unhealthy::Unresponsive, Unhealthy::Unreadable] {
+            let error = endpoint_result(
+                Endpoint::Unhealthy {
+                    reason: "denied".into(),
+                    kind,
+                    io: Some(std::io::Error::from_raw_os_error(libc::EPERM)),
+                },
+                "e27c0de",
+                &sandbox,
+            )
+            .unwrap_err();
+            assert_eq!(error.details.as_ref().unwrap()["reason"], "sandboxed");
+            assert_eq!(error.details.as_ref().unwrap()["network"], false);
+            assert!(error.hint.is_some());
+        }
+        assert!(endpoint_result(Endpoint::None, "e27c0de", &outside).is_ok());
+        assert!(endpoint_result(Endpoint::Stale("gone".into()), "e27c0de", &outside).is_ok());
     }
     #[test]
     fn review9_completed_result_cancellation_table() {

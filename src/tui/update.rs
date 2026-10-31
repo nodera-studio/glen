@@ -1180,8 +1180,8 @@ mod tests {
         }
     }
     fn error() -> ErrView {
-        GlenError::new(
-            ErrorCode::NoRoute,
+        GlenError::no_route(
+            crate::error::NoRouteReason::LiveOwner,
             "job j1234567 failed: session is open in another omp process",
         )
         .with_hint("install the extension")

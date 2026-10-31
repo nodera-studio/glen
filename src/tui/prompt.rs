@@ -4,7 +4,11 @@ use crate::{
     cli::DeliverAs,
     render::{sanitize, text},
 };
+use std::cell::RefCell;
 use unicode_segmentation::UnicodeSegmentation;
+
+/// The last `display` result and the (text, cursor, width) it was laid out for.
+type Layout = (String, usize, u16, Vec<String>, (u16, u16));
 
 #[derive(Clone, Debug)]
 pub struct Prompt {
@@ -17,6 +21,9 @@ pub struct Prompt {
     pub notice: Option<ErrView>,
     /// Restore the unsent input after navigating past the most recent history entry.
     history_draft: Option<(String, usize)>,
+    /// One frame asks for the layout several times (areas, viewport, input); a full grapheme
+    /// pass over a 512 KiB prompt each time made a single frame cost seconds.
+    layout: RefCell<Option<Layout>>,
 }
 impl Default for Prompt {
     fn default() -> Self {
@@ -29,6 +36,7 @@ impl Default for Prompt {
             locked: None,
             notice: None,
             history_draft: None,
+            layout: RefCell::new(None),
         }
     }
 }
@@ -230,6 +238,18 @@ impl Prompt {
     }
     /// Visual body lines and cursor (column, row), reserving the `❯ ` prefix.
     pub fn display(&self, width: u16) -> (Vec<String>, (u16, u16)) {
+        if let Some((text, cursor, w, lines, at)) = &*self.layout.borrow()
+            && (*w, *cursor) == (width, self.cursor)
+            && *text == self.text
+        {
+            return (lines.clone(), *at);
+        }
+        let (lines, at) = self.lay_out(width);
+        *self.layout.borrow_mut() =
+            Some((self.text.clone(), self.cursor, width, lines.clone(), at));
+        (lines, at)
+    }
+    fn lay_out(&self, width: u16) -> (Vec<String>, (u16, u16)) {
         let prefix = text::width("❯ ").min(usize::from(width));
         let available = usize::from(width).saturating_sub(prefix).max(1);
         let mut lines = vec![String::new()];
@@ -473,5 +493,42 @@ mod display_regressions {
         p.clear();
         p.insert("a\n\nb");
         assert_eq!(p.display(20).0, ["a", "", "b"]);
+    }
+    #[test]
+    fn cached_layout_follows_every_text_cursor_and_width_change() {
+        let mut p = Prompt::default();
+        p.insert("abcdef");
+        let check = |p: &Prompt, width| {
+            assert_eq!(p.display(width), p.lay_out(width));
+            assert_eq!(p.display(width), p.lay_out(width), "a cache hit");
+        };
+        check(&p, 6);
+        p.insert("g");
+        check(&p, 6);
+        p.edit(Edit::Backspace);
+        check(&p, 6);
+        p.edit(Edit::Left);
+        check(&p, 6);
+        p.edit(Edit::Home);
+        check(&p, 6);
+        check(&p, 4);
+        check(&p, 20);
+        // Same length and cursor, different text: a key on length alone would go stale.
+        p.text = "uvwxyz".into();
+        assert_eq!(p.display(20).0, ["uvwxyz"]);
+        p.cursor = 3;
+        check(&p, 20);
+        p.load(
+            Draft {
+                text: "a\nb".into(),
+                cursor: 1,
+                ..Draft::default()
+            },
+            &[],
+        );
+        check(&p, 20);
+        p.clear();
+        check(&p, 20);
+        assert_eq!(p.display(20), (vec![String::new()], (2, 0)));
     }
 }

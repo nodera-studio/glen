@@ -1,6 +1,10 @@
-//! A closed or failing stdout: no panic, no second document, exit 1 (AC-029; §A10).
+//! W10 AC-1001/AC-1002 amend AC-029: EPIPE keeps the outcome's exit code;
+//! other stdout failures and failed stderr writes exit 1 without a panic or second document.
 
-use std::process::Stdio;
+use std::{
+    fs::File,
+    process::{Command, Stdio},
+};
 
 use crate::support::*;
 
@@ -11,87 +15,113 @@ fn closed_stdout() -> Stdio {
     Stdio::from(writer)
 }
 
-fn assert_failed_write(out: &Out) {
+fn assert_silent_exit(out: &Out, expected: i32) {
     out.assert_no_panic();
-    out.assert_exit(1);
-    let err = out.err();
-    assert!(
-        !err.contains("\"v\"") && !err.trim_start().starts_with('{'),
-        "no second JSON document on stderr\n{}",
-        out.ctx()
-    );
-}
-
-#[test]
-fn ac029_closed_stdout_in_json_mode() {
-    let sb = Sandbox::new();
-    let out = sb
-        .glen(["doctor", "--json"])
-        .fake_omp()
-        .stdout(closed_stdout())
-        .run();
-    assert_failed_write(&out);
+    out.assert_exit(expected);
     assert!(
         out.stderr.is_empty(),
-        "JSON mode keeps stderr empty\n{}",
+        "EPIPE must not produce stderr text or a second JSON document\n{}",
         out.ctx()
     );
 }
 
 #[test]
-fn ac029_closed_stdout_in_human_mode() {
+fn ac1001_closed_stdout_in_json_and_human_modes_keeps_success() {
     let sb = Sandbox::new();
-    let out = sb
-        .glen(["doctor", "--human"])
-        .fake_omp()
-        .stdout(closed_stdout())
-        .run();
-    assert_failed_write(&out);
-}
-
-#[test]
-fn ac029_closed_stdout_while_reporting_an_error() {
-    let sb = Sandbox::new();
-    for args in [vec!["watch"], vec!["doctor"]] {
-        let out = sb.glen(&args).stdout(closed_stdout()).run();
-        assert_failed_write(&out);
+    for mode in ["--json", "--human"] {
+        let out = sb
+            .glen(["doctor", mode])
+            .fake_omp()
+            .stdout(closed_stdout())
+            .run();
+        assert_silent_exit(&out, 0);
     }
 }
 
 #[test]
-fn ac029_closed_stdout_for_raw_completions() {
+fn ac1001_closed_stdout_for_raw_completions_keeps_success() {
     let sb = Sandbox::new();
     let out = sb
         .glen(["completions", "bash"])
         .stdout(closed_stdout())
         .run();
-    assert_failed_write(&out);
+    assert_silent_exit(&out, 0);
 }
 
 #[test]
-fn ac029_closed_stdout_for_help_usage_and_version_does_not_panic() {
+fn ac1001_closed_stdout_for_help_version_and_ls_keeps_success() {
     let sb = Sandbox::new();
-    for args in [vec!["--help"], vec!["--version"], vec!["bogus"]] {
+    for args in [vec!["--help"], vec!["--version"], vec!["ls"]] {
         let out = sb.glen(&args).stdout(closed_stdout()).run();
-        out.assert_no_panic();
+        assert_silent_exit(&out, 0);
     }
 }
 
-/// AC-029 is unconditional ("IF writing to stdout fails … SHALL exit 1"); this pins it for
-/// clap-rendered help, version and usage output too.
 #[test]
-fn ac029_closed_stdout_for_help_usage_and_version_exits_1() {
+fn ac1001_closed_stdout_keeps_failure_outcomes() {
     let sb = Sandbox::new();
-    for args in [vec!["--help"], vec!["--version"], vec!["bogus"]] {
+    // PATH is empty: doctor has no omp. Non-interactive watch is a usage failure.
+    for (args, expected) in [(vec!["bogus"], 2), (vec!["doctor"], 5), (vec!["watch"], 2)] {
         let out = sb.glen(&args).stdout(closed_stdout()).run();
+        assert_silent_exit(&out, expected);
+    }
+}
+
+#[test]
+fn ac1002_readonly_stdout_exits_one_without_a_second_document() {
+    let sb = Sandbox::new();
+    for args in [vec!["doctor", "--json"], vec!["ls"]] {
+        let file = tempfile::NamedTempFile::new().expect("stdout file");
+        // File::open is read-only: writes fail EBADF on both Linux and macOS.
+        let stdout = File::open(file.path()).expect("open read-only stdout");
+        let out = sb.glen(&args).fake_omp().stdout(Stdio::from(stdout)).run();
         out.assert_no_panic();
         out.assert_exit(1);
+        out.assert_stderr_empty();
+        assert_eq!(
+            file.as_file().metadata().expect("stat stdout file").len(),
+            0
+        );
     }
 }
 
 #[test]
-fn ac029_closed_stdout_for_ls() {
+fn ac1002_human_usage_keeps_two_when_stderr_succeeds_despite_closed_stdout() {
     let sb = Sandbox::new();
-    let out = sb.glen(["ls"]).stdout(closed_stdout()).run();
-    assert_failed_write(&out);
+    let out = sb.glen(["bogus", "--human"]).stdout(closed_stdout()).run();
+    out.assert_no_panic();
+    out.assert_exit(2);
+    let err = out.err();
+    assert!(
+        err.starts_with("error:"),
+        "human usage on stderr\n{}",
+        out.ctx()
+    );
+    assert!(
+        err.contains("Usage:"),
+        "usage text on stderr\n{}",
+        out.ctx()
+    );
+}
+
+#[test]
+fn ac1002_human_usage_with_both_pipes_closed_exits_one() {
+    let sb = Sandbox::new();
+    // Run captures stderr itself. Redirect it to the closed stdout in the shell,
+    // then exec glen, retaining the harness's bounded wait and isolated environment.
+    let mut command = Command::new("/bin/sh");
+    command
+        .args(["-c", "exec \"$1\" bogus --human 2>&1", "closed-stderr", BIN])
+        .env_clear()
+        .env("HOME", &sb.home)
+        .env("GLEN_HOME", &sb.glen_home)
+        .env("PATH", &sb.empty_bin)
+        .current_dir(&sb.cwd)
+        .stdin(Stdio::null());
+    let out = Run::from_command(command, "bogus --human (both pipes closed)".into())
+        .stdout(closed_stdout())
+        .run();
+    out.assert_no_panic();
+    out.assert_exit(1);
+    assert!(out.stderr.is_empty(), "{}", out.ctx());
 }
