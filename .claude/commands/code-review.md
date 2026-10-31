@@ -11,6 +11,17 @@ This is intentionally lean (the omp third engine runs in `/review-implementation
 in `/implement`'s triple-engine block); for the
 exhaustive multi-pass audit use `/review-implementation` instead.
 
+- **Run it as a workflow** (`.claude/docs/Workflow-Fanout.md`): the two engines in parallel,
+  then one fresh read-only verifier per must-fix finding, which REPRODUCEs it (re-traces the
+  cited `file:line`, or runs the failing case) before the vote. A must-fix that does not
+  reproduce drops to a note. The 2-vote merge in step 3 is unchanged.
+- **Linux-only code waits for CI.** When the diff adds or changes `cfg(target_os = "linux")`,
+  `bwrap`, `unshare`, `netns`, `renameat2`, `omp-sandboxed-linux.sh` or a Linux job in
+  `.github/workflows/`, wait for the draft PR's Linux CI first (`check (ubuntu-latest)` and
+  `linux-sandbox`; `gh pr checks <pr>`), and give both engines the run id and any failing
+  logs. With no run, the Claude pass reports "Linux-only code unverified: CI run required",
+  which blocks the gate.
+
 Optional scope hint: $ARGUMENTS
 
 Steps:

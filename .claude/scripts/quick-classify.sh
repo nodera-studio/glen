@@ -29,6 +29,15 @@ base="$(git merge-base HEAD origin/main 2>/dev/null || git rev-parse HEAD 2>/dev
 
 changed="$( { git diff --name-only "$base"; git ls-files --others --exclude-standard; } 2>/dev/null | sort -u )" || { echo "escalate: git diff failed" >&2; exit 4; }
 
+# Linux-only code is verified only by a CI run, so it never takes the quick path. Scan the
+# tracked diff and the untracked files. No `grep -q`: under pipefail an early exit would
+# SIGPIPE the writer and turn a match into a pipeline failure.
+linux_only='target_os *= *"linux"|bwrap|unshare|netns|renameat2'
+if { git diff "$base"; git ls-files -z --others --exclude-standard | xargs -0 -r grep -hsIE "$linux_only" --; } 2>/dev/null \
+    | grep -E "$linux_only" >/dev/null; then
+  echo "escalate: Linux-only code: review needs a CI run" >&2; exit 3
+fi
+
 protected='^(Cargo\.toml|Cargo\.lock|\.github/|lefthook\.yml|AGENTS\.md|CLAUDE\.md|\.claude/(settings\.json|hooks/|CLAUDE\.md))'
 hit="$(printf '%s\n' "$changed" | grep -E "$protected" | head -1 || true)"
 if [ -n "$hit" ]; then

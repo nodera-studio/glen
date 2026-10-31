@@ -24,6 +24,8 @@ relevant log lines, and suspect files — no investigator conclusions yet.
 Dispatch the mandatory Claude and Codex pair in parallel + the optional omp investigator,
 `bash .claude/scripts/omp-engine.sh debug --brief target/reports/omp-debug-brief.md --out target/reports/omp-debug.md`
 (background Bash, only when `bash .claude/scripts/omp-engine.sh probe` exits 0).
+The investigator arms may run as one workflow (`.claude/docs/Workflow-Fanout.md`); the
+adversary stays a separate dispatch after them.
 
 <rules>
 - Dual-engine is mandatory — always dispatch both the Claude agent AND Codex.
