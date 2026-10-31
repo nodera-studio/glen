@@ -26,7 +26,7 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo clippy --all-targets --locked -- -D warnings
       - if: runner.os == 'Linux'
-        run: (command -v shellcheck || sudo apt-get install -y shellcheck) && shellcheck --version && shellcheck -s sh install.sh scripts/package-release.sh
+        run: (command -v shellcheck || sudo apt-get install -y shellcheck) && shellcheck --version && shellcheck -s sh install.sh scripts/package-release.sh scripts/flake-check.sh
       - run: cargo test --locked
       # Publish the populated git checkout for release jobs, once on main.
       # Check for an existing key without downloading over the checkout again.
