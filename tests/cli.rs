@@ -41,6 +41,14 @@ fn public_help() {
     );
 }
 #[test]
+fn send_help_documents_thinking_flag() {
+    let o = glen(&["send", "--help"], &[]);
+    assert!(o.status.success());
+    let s = String::from_utf8(o.stdout).unwrap();
+    assert!(s.contains("--thinking <LEVEL>"));
+    assert!(s.contains("omp's startup reasoning effort"));
+}
+#[test]
 fn hidden_commands() {
     // `watch` is the only command still hidden after W3 and W4.
     let o = glen(&["watch"], &[]);

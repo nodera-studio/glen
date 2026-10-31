@@ -402,6 +402,10 @@ The tail item example is a shape catalogue: one example per item kind (and per a
 ## `glen send`
 
 Send once. Exits 10 and 130 leave the job running; never resend to poll. Use `wait`.
+`--thinking <LEVEL>` passes omp's startup reasoning effort (off, low, medium, high, auto,
+xhigh, max) through unchanged to the spawned omp process; omp validates it. omp 18.14.0 has
+no profile-level thinking default, so the harness engine (`omp-engine.sh`) passes this on
+every dispatch, mapped from the chosen model's ladder entry.
 
 | Field | Meaning |
 |---|---|

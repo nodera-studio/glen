@@ -83,6 +83,10 @@ cat > "$profile" <<EOF
   ;; Runtime device nodes and timezone database.
   (subpath "/dev")
   (subpath "/private/var/db/timezone")
+  ;; DNS config files Bun's getaddrinfo (and dscacheutil) consult.
+  (literal "/private/etc/hosts")
+  (literal "/private/etc/resolv.conf")
+  (literal "/private/etc/services")
   ;; The physical, self-contained omp executable.
   (literal "$bin_sb")
   ;; Agent contents are readable; the later write-deny stanza protects config,
@@ -134,6 +138,18 @@ $readonly_filters
 (allow mach-lookup)
 ;; Bun JavaScript engine CPU/host feature detection.
 (allow sysctl-read)
+;; Host-verified (log stream, 2026-10-31): dscacheutil/Bun's getaddrinfo denied
+;; file-read-metadata on /var and /etc (ancestors of the literal DNS config
+;; paths above) and ipc-posix-shm-read-data on the notification-center shared
+;; memory DNS-config-change notifications use; without these, name resolution
+;; silently returns nothing (no fatal error, just an empty/failed lookup).
+(allow file-read-metadata
+  (literal "/var")
+  (literal "/etc")
+  (literal "/private/var")
+  (literal "/private/etc")
+)
+(allow ipc-posix-shm-read-data (ipc-posix-name "apple.shm.notification_center"))
 EOF
 
 # The run directory owns the generated policy's lifetime, including retained jobs.
