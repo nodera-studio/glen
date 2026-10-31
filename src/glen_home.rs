@@ -48,7 +48,95 @@ impl GlenHome {
             builder.mode(0o700);
         }
         builder.create(&path)?;
+        // SEC-3: glen never chmods an existing directory, but it refuses to trust one another
+        // user could write to. The GlenError rides inside the io::Error so callers that map
+        // through `sandbox::map_home_write` keep its `invalid_env` code and hint.
+        self.verify_private(Path::new(sub))
+            .map_err(io::Error::other)?;
         Ok(path)
+    }
+    /// SEC-3: checks the root and every existing directory under it on the path to `rel`.
+    /// Each must be a real directory (not a symlink) owned by the effective uid with no
+    /// group/other write bits; a missing component ends the walk (nothing deeper exists).
+    pub fn verify_private(&self, rel: &Path) -> Result<(), GlenError> {
+        #[cfg(unix)]
+        {
+            use std::{os::unix::fs::MetadataExt, path::Component};
+            let euid = rustix::process::geteuid().as_raw();
+            let refuse = |path: &Path, why: String| {
+                GlenError::new(
+                    ErrorCode::InvalidEnv,
+                    format!("refusing GLEN_HOME directory {}: {why}", path.display()),
+                )
+                .with_hint("point GLEN_HOME at a private directory you own (mkdir -m 700)")
+                .with_detail("path", path.to_string_lossy().into_owned())
+            };
+            let mut path = self.root.clone();
+            let mut rest = rel.components();
+            loop {
+                let meta = match fs::symlink_metadata(&path) {
+                    Ok(m) => m,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+                    Err(e) => {
+                        return Err(GlenError::new(
+                            ErrorCode::Io,
+                            format!("cannot inspect {}: {e}", path.display()),
+                        ));
+                    }
+                };
+                if meta.file_type().is_symlink() {
+                    return Err(refuse(&path, "it is a symlink".into()));
+                }
+                if !meta.is_dir() {
+                    return Err(refuse(&path, "it is not a directory".into()));
+                }
+                if meta.uid() != euid {
+                    return Err(refuse(
+                        &path,
+                        format!(
+                            "it is owned by uid {}, not the current uid {euid}",
+                            meta.uid()
+                        ),
+                    ));
+                }
+                if meta.mode() & 0o022 != 0 {
+                    return Err(refuse(
+                        &path,
+                        format!(
+                            "it is group- or other-writable (mode {:o})",
+                            meta.mode() & 0o7777
+                        ),
+                    ));
+                }
+                match rest.next() {
+                    Some(Component::Normal(c)) => path.push(c),
+                    Some(Component::CurDir) => continue,
+                    Some(_) => {
+                        return Err(GlenError::new(
+                            ErrorCode::Internal,
+                            format!("GLEN_HOME subpath must be relative: {}", rel.display()),
+                        ));
+                    }
+                    None => return Ok(()),
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = rel;
+            Ok(())
+        }
+    }
+}
+/// Recovers the SEC-3 refusal carried inside an `ensure_dir` io error; any other error is
+/// handed back unchanged.
+pub fn take_refusal(err: io::Error) -> Result<GlenError, io::Error> {
+    if !err.get_ref().is_some_and(|e| e.is::<GlenError>()) {
+        return Err(err);
+    }
+    match err.into_inner().map(|e| e.downcast::<GlenError>()) {
+        Some(Ok(e)) => Ok(*e),
+        _ => unreachable!("checked above"),
     }
 }
 pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -152,6 +240,9 @@ mod tests {
             );
         }
     }
+    // SEC-3 re-derives this test: an existing root is still never chmodded (design.md:199),
+    // and a 0755 root owned by the current user is still accepted, but a 0777 root is now
+    // refused with invalid_env instead of trusted.
     #[cfg(unix)]
     #[test]
     fn existing_root_mode_unchanged() {
@@ -167,6 +258,82 @@ mod tests {
             0o755
         );
         assert_eq!(mode_is_private(t.path()), Some(false));
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o777)).unwrap();
+        let err = take_refusal(h.ensure_dir("jobs").unwrap_err()).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEnv);
+        assert_eq!(err.code.exit_code(), 2);
+        assert!(err.message.contains(&t.path().display().to_string()));
+        assert!(err.hint.unwrap().contains("mkdir -m 700"));
+        assert_eq!(
+            fs::metadata(t.path()).unwrap().permissions().mode() & 0o777,
+            0o777,
+            "glen never chmods an existing home"
+        );
+        fs::set_permissions(t.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn writable_or_symlinked_subdirectories_are_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = GlenHome {
+            root: t.path().join("glen"),
+        };
+        h.ensure_dir("run/live").unwrap();
+        h.verify_private(Path::new("run/live")).unwrap();
+        // A missing component ends the walk: nothing deeper can exist.
+        h.verify_private(Path::new("jobs/abc")).unwrap();
+        fs::set_permissions(h.root.join("run"), fs::Permissions::from_mode(0o777)).unwrap();
+        for rel in ["run/live", "run/locks", "run"] {
+            let err = h.verify_private(Path::new(rel)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::InvalidEnv, "{rel}");
+            assert!(err.message.contains("group- or other-writable"), "{rel}");
+        }
+        let err = take_refusal(h.ensure_dir("run/locks").unwrap_err()).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEnv);
+        fs::set_permissions(h.root.join("run"), fs::Permissions::from_mode(0o700)).unwrap();
+        h.ensure_dir("run/locks").unwrap();
+        // The inbox (or any subdirectory) as a symlink to a directory the user owns.
+        let elsewhere = t.path().join("elsewhere");
+        fs::create_dir(&elsewhere).unwrap();
+        fs::set_permissions(&elsewhere, fs::Permissions::from_mode(0o700)).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, h.root.join("inbox")).unwrap();
+        let err = take_refusal(h.ensure_dir("inbox").unwrap_err()).unwrap();
+        assert_eq!(err.code, ErrorCode::InvalidEnv);
+        assert!(err.message.contains("symlink"));
+        // A root that is a symlink is refused too.
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&h.root, &link).unwrap();
+        let err = GlenHome { root: link }
+            .verify_private(Path::new("run"))
+            .unwrap_err();
+        assert!(err.message.contains("symlink"));
+        // A plain file is not a directory.
+        fs::write(h.root.join("out"), b"x").unwrap();
+        let err = h.verify_private(Path::new("out")).unwrap_err();
+        assert!(err.message.contains("not a directory"));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_owned_by_another_uid_is_refused() {
+        use std::os::unix::fs::MetadataExt;
+        // `/` is owned by root; meaningful only when the tests do not run as root.
+        let euid = rustix::process::geteuid().as_raw();
+        if fs::metadata("/").unwrap().uid() == euid {
+            return;
+        }
+        let err = GlenHome { root: "/".into() }
+            .verify_private(Path::new(""))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidEnv);
+        assert!(err.message.contains("owned by uid"));
+    }
+    #[test]
+    fn non_refusal_io_errors_pass_through() {
+        let e = take_refusal(io::Error::from(io::ErrorKind::PermissionDenied)).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        let e = take_refusal(io::Error::other("plain")).unwrap_err();
+        assert_eq!(e.to_string(), "plain");
     }
     #[test]
     fn concurrent_atomic_writes_do_not_share_temp_files() {
