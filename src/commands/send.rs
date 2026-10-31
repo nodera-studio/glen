@@ -314,7 +314,7 @@ pub(crate) fn submit(
     if live.is_some() && thinking.is_some() {
         route_warnings.push(Warning {
             code: "ignored_flag".into(),
-            message: "--thinking has no effect on the live route (the session is already running); send \"/effort <level>\" as a message to change it in-session instead".into(),
+            message: "--thinking has no effect on the live route (the session is already running); run `glen thinking <handle> <level>` instead".into(),
         });
     }
     route_warnings.extend(warning);

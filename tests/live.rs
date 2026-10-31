@@ -505,12 +505,10 @@ fn w9_thinking_flag_on_live_route_warns_ignored() {
     assert!(o.status.success());
     let v = json(&o);
     assert_eq!(v["warnings"][0]["code"], "ignored_flag");
-    assert!(
-        v["warnings"][0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("--thinking")
-    );
+    let message = v["warnings"][0]["message"].as_str().unwrap();
+    assert!(message.contains("--thinking"));
+    assert!(message.contains("glen thinking <handle> <level>"));
+    assert!(!message.contains("/effort"));
     b.rpc.wait_worker_gone(job_id(&v["data"]));
 }
 #[test]
