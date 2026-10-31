@@ -31,8 +31,39 @@ deny() {
 OMP_OK_PROFILE='glen-harness'
 # shellcheck disable=SC2016 # the $(mktemp -d) and $HOME are literal advice text
 OMP_PROFILE_REASON='omp probes use a throwaway home: HOME="$(mktemp -d)" omp … (omp joins PI_CONFIG_DIR onto $HOME, so an absolute PI_CONFIG_DIR still writes under ~), or the approved glen-harness profile. Never create another ~/.omp/profiles/<name> (owner rule).'
-# a profile name with surrounding quotes removed
-unquote() { printf '%s' "$1" | tr -d "\"'"; }
+# a profile name with surrounding quotes (and a subshell's closing paren) removed
+unquote() { printf '%s' "$1" | tr -d "\"')"; }
+REAL_HOME="${HOME:-}"
+[ -n "$REAL_HOME" ] || REAL_HOME=/nonexistent-home
+# the command word of a segment behind `(` and the wrappers env (VAR=v, -i, -u N), timeout
+# (-s S, -k K, the duration), nice (-n N), command, nohup, exec, time, builtin
+cmd_word() {
+  printf '%s' "$1" | awk '{
+    i = 1
+    while (i <= NF) {
+      w = $i; sub(/^\(+/, "", w)
+      if (w == "" || w ~ /^[A-Za-z_][A-Za-z0-9_]*=/) { i++; continue }
+      if (w == "env") { i++; while (i <= NF && $i ~ /^-/) { if ($i == "-u") i++; i++ }; continue }
+      if (w == "timeout") { i++; while (i <= NF && $i ~ /^-/) { if ($i == "-s" || $i == "-k") i++; i++ }; i++; continue }
+      if (w == "nice") { i++; if ($i == "-n") i += 2; else if ($i ~ /^-/) i++; continue }
+      if (w == "command" || w == "nohup" || w == "exec" || w == "time" || w == "builtin") { i++; while (i <= NF && $i ~ /^-/) i++; continue }
+      print w; exit
+    }
+  }'
+}
+# omp_profile_check SEG: deny a --profile in SEG, or OMP_PROFILE= / PI_PROFILE= anywhere in the
+# command (an `export` earlier in the chain counts), other than glen-harness. Empty = default.
+omp_profile_check() {
+  local names name
+  names=$( { printf '%s' "$1" | grep -oE -- '--profile[= ]+[^[:space:]]+' | sed -E 's/^--profile[= ]+//'
+             printf '%s' "$CMD" | grep -oE '(^|[^A-Za-z0-9_])(OMP|PI)_PROFILE=[^[:space:];&|]*' | sed -E 's/^.*_PROFILE=//'; } 2>/dev/null)
+  while IFS= read -r name; do
+    name=$(unquote "$name")
+    if [ -n "$name" ] && [ "$name" != "$OMP_OK_PROFILE" ]; then
+      deny "$OMP_PROFILE_REASON"
+    fi
+  done <<< "$names"
+}
 
 # split on pipes and ; & && || so each segment is inspected on its own
 # (|| [ -n "$seg" ] handles the final newline-less segment; tr is BSD/GNU-portable)
@@ -40,6 +71,13 @@ while IFS= read -r seg || [ -n "$seg" ]; do
   [ -z "$seg" ] && continue
   base=$(printf '%s' "$seg" | sed -E 's/^[[:space:]]*//; s/^([A-Za-z_][A-Za-z0-9_]*=[^ ]* +)+//' | awk '{print $1}')
   base=$(basename "$base" 2>/dev/null)
+
+  # omp behind a wrapper (timeout, env, a subshell), or inside `sh|bash|zsh -c '…'`
+  inner=$(basename "$(cmd_word "$seg")" 2>/dev/null)
+  if [ "$inner" = omp ] || { case "$inner" in sh|bash|zsh|dash) true ;; *) false ;; esac \
+       && printf '%s' "$seg" | grep -qE "(^|[[:space:](\"'/])omp([[:space:]\"']|\$)"; }; then
+    omp_profile_check "$seg"
+  fi
 
   # shell reads of real secret files (not .env.example) -> secrets MCP
   if printf '%s' "$seg" | grep -qE '\.env(\.[a-z._-]+)?' \
@@ -93,20 +131,12 @@ while IFS= read -r seg || [ -n "$seg" ]; do
         deny "Don't search for files with 'find'. Use 'rg --files | rg <pattern>' (fast, respects .gitignore) for literal file lookups, or the codebase MCP for conceptual 'where does X live'. Operational find (-exec / -delete / -mtime …) is fine."
       fi
       ;;
-    omp)
-      # --profile in this segment; OMP_PROFILE= / PI_PROFILE= anywhere in the command (an
-      # `export` earlier in the chain counts). An empty value is the default profile.
-      names=$( { printf '%s' "$seg" | grep -oE -- '--profile[= ]+[^[:space:]]+' | sed -E 's/^--profile[= ]+//'
-                 printf '%s' "$CMD" | grep -oE '(^|[^A-Za-z0-9_])(OMP|PI)_PROFILE=[^[:space:];&|]*' | sed -E 's/^.*_PROFILE=//'; } 2>/dev/null)
-      while IFS= read -r name; do
-        name=$(unquote "$name")
-        if [ -n "$name" ] && [ "$name" != "$OMP_OK_PROFILE" ]; then
-          deny "$OMP_PROFILE_REASON"
-        fi
-      done <<< "$names"
-      ;;
     mkdir|cp|mv|rsync|ln)
-      names=$(printf '%s' "$seg" | grep -oE '\.omp/profiles/[^/[:space:]]+' | sed -E 's#^\.omp/profiles/##' 2>/dev/null)
+      # only the real home's profiles (~, $HOME, ${HOME} or its literal path); a throwaway
+      # HOME such as "$T/.omp/profiles/x" is what the advice asks for, so it stays allowed
+      # shellcheck disable=SC2016 # $HOME / ${HOME} are matched literally in the command text
+      names=$(printf '%s' "${seg//"$REAL_HOME"/\~}" \
+        | grep -oE '(~|\$HOME|\$\{HOME\})"?/\.omp/profiles/[^/[:space:]]+' | sed -E 's#^.*\.omp/profiles/##' 2>/dev/null)
       while IFS= read -r name; do
         name=$(unquote "$name")
         if [ -n "$name" ] && [ "$name" != "$OMP_OK_PROFILE" ]; then

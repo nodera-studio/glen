@@ -23,7 +23,10 @@ completion report (Step 4).
 ## Step 0 — Check the routing (before anything else)
 
 ```bash
-bash .claude/scripts/routing.sh implementation
+R=.claude/scripts/routing.sh   # a checkout cut before harness batch 10 lacks it: use the main checkout's
+[ -f "$R" ] || R="$(git rev-parse --path-format=absolute --git-common-dir)/../.claude/scripts/routing.sh"
+if [ -f "$R" ]; then bash "$R" implementation
+else echo claude; echo "source=missing-script decision=148655d9" >&2; fi   # neither has it: the 148655d9 default
 ```
 
 - It prints `claude`: continue.

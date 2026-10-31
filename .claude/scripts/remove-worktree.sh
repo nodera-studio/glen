@@ -16,11 +16,11 @@
 #      ($CLAUDE_PLUGIN_DATA/state, default ~/.claude/plugins/data/codex-openai-codex/state, and
 #      ${TMPDIR:-/tmp}/codex-companion; refuse if neither exists, unless --force-no-state).
 #      A job's per-job file is authoritative over the state.json index, across both stores.
-#      If a live job (queued, or running with a live companion task pid) has its workspaceRoot
+#      If a live job (queued, or running with a live companion task or review pid) has its workspaceRoot
 #      or cwd at or below the worktree, wait 15 s once, take a new snapshot, re-read both stores
 #      and refuse only if it is still live, listing each job's status, pid, the pid's snapshot
-#      command and its cancel command; refuse if a task or task-worker process (fixed-argv
-#      --cwd, or process cwd) is at or below it.
+#      command and its cancel command; refuse if a task, task-worker or review process
+#      (fixed-argv --cwd, or process cwd) is at or below it.
 #   5. SIGTERM every broker of the snapshot whose fixed-position --cwd is at or below the
 #      worktree, wait up to 10 s for all, SIGKILL the survivors. A pid whose pid, start time or
 #      command differs from the snapshot is skipped.

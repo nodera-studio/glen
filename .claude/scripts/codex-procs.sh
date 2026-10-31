@@ -9,9 +9,11 @@
 #   broker       node .../app-server-broker.mjs serve --endpoint E --cwd C --pid-file P
 #   task-worker  node .../codex-companion.mjs task-worker --cwd C --job-id J
 #   task         node .../codex-companion.mjs task ...   (argv beyond "task" is never read)
+#   review       node .../codex-companion.mjs review|adversarial-review ...   (likewise; the kind
+#                is the verb. A foreground review records its own pid as the job's pid.)
 # Jobs come from the companion's own state, in both stores companion 1.0.6 uses (load_roots),
 # merged into one record per job id in which the per-job file is authoritative (codex_jobs). A
-# running job is live only while its pid is a companion task or task-worker of PROCS.
+# running job is live only while its pid is a companion task, task-worker or review of PROCS.
 #
 # Callers set SNAP (snapshot file), PROCS (codex_procs output) and JOBS (codex_jobs output).
 
@@ -83,7 +85,8 @@ codex_procs() {
     elif [ $# -eq 7 ] && [ "${2##*/}" = codex-companion.mjs ] && [ "$3" = task-worker ] \
       && [ "$4" = --cwd ] && [ "$6" = --job-id ]; then
       kind=task-worker cwd="$5" job="$7"
-    elif [ "${2##*/}" = codex-companion.mjs ] && { [ "$3" = task ] || [ "$3" = task-worker ]; }; then
+    elif [ "${2##*/}" = codex-companion.mjs ] && { [ "$3" = task ] || [ "$3" = task-worker ] \
+      || [ "$3" = review ] || [ "$3" = adversarial-review ]; }; then
       kind="$3" cwd="" job=""
     else
       continue
@@ -113,7 +116,9 @@ load_roots() {
 # "root SEP id SEP status SEP workspaceRoot SEP cwd SEP pid". Pass 1 reads every state.json index
 # entry; pass 2 overlays every jobs/<id>.json (oldest mtime first), which the companion writes
 # before the index. A field the per-job file sets wins outright, null included; an index value
-# only fills a field the file lacks. root is the store holding the authoritative record.
+# only fills a field the file lacks. Between index entries for one id (several stores), a
+# terminal one (completed, failed, cancelled) is never replaced by a running or queued one: the
+# companion writes terminal states last. root is the store holding the authoritative record.
 codex_jobs() {
   [ $# -gt 0 ] || return 0
   node - "$@" <<'EOF'
@@ -130,6 +135,7 @@ const fields = (j) => {
   else if (has(j, "cwd")) f.cwd = j.cwd;
   return f;
 };
+const terminal = (s) => s === "completed" || s === "failed" || s === "cancelled";
 const index = new Map(), files = new Map();
 const fileList = [];
 for (const root of process.argv.slice(2)) {
@@ -139,7 +145,10 @@ for (const root of process.argv.slice(2)) {
     const dir = path.join(root, d);
     const state = read(path.join(dir, "state.json"));
     for (const j of (state && Array.isArray(state.jobs) ? state.jobs : [])) {
-      if (j && typeof j.id === "string") index.set(j.id, { ...(index.get(j.id) || {}), ...fields(j), root });
+      if (!j || typeof j.id !== "string") continue;
+      const prev = index.get(j.id) || {};
+      if (terminal(prev.status) && !terminal(j.status)) continue;
+      index.set(j.id, { ...prev, ...fields(j), root });
     }
     let names = [];
     try { names = fs.readdirSync(path.join(dir, "jobs")).filter((f) => f.endsWith(".json")); } catch {}
@@ -165,8 +174,9 @@ EOF
 
 # live_jobs_at PATH: live jobs whose workspaceRoot or cwd is at or below PATH,
 # "root SEP id SEP workspaceRoot SEP status SEP pid". Live means queued, or running with a pid
-# that is a task or task-worker record of $PROCS (a task-worker's --job-id must be this job's id
-# or empty). Any other process with that pid is a reused pid, and the record is stale.
+# that is a task, review, adversarial-review or task-worker record of $PROCS (a task-worker's
+# --job-id must be this job's id or empty). Any other process with that pid is a reused pid, and
+# the record is stale.
 live_jobs_at() {
   local root id st ws cwd pid p c
   while IFS="$SEP" read -r root id st ws cwd pid; do
@@ -174,7 +184,7 @@ live_jobs_at() {
       queued) ;;
       running)
         if [ -z "$pid" ] || ! awk -F "$SEP" -v p="$pid" -v j="$id" \
-          '$2 == p && ($1 == "task" || ($1 == "task-worker" && ($4 == "" || $4 == j))) { f = 1 } END { exit !f }' \
+          '$2 == p && ($1 == "task" || $1 == "review" || $1 == "adversarial-review" || ($1 == "task-worker" && ($4 == "" || $4 == j))) { f = 1 } END { exit !f }' \
           "$PROCS"; then continue; fi
         ;;
       *) continue ;;
@@ -190,8 +200,8 @@ live_jobs_at() {
   done <"$JOBS"
 }
 
-# tasks_at PATH: task and task-worker processes whose fixed-argv cwd or process cwd is at or
-# below PATH, "kind SEP pid SEP cwd".
+# tasks_at PATH: task, task-worker and review processes whose fixed-argv cwd or process cwd is at
+# or below PATH, "kind SEP pid SEP cwd".
 tasks_at() {
   local kind pid cwd job pcwd c
   while IFS="$SEP" read -r kind pid cwd job pcwd; do

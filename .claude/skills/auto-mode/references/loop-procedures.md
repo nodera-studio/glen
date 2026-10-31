@@ -218,6 +218,10 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
 7. **Triage + fix.** **Merge main at the start of every fix cycle**, before briefing any fix
    (CI, review or conformance), with `WT` = the wave's checkout:
    `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit origin/main`. Never rebase.
+   - Who merges: when a CI-owner agent (marker above) works in `$WT`, it merges main as its
+     first fix step and you do not. Otherwise you merge, and only when
+     `git -C "$WT" status --short` is empty; with uncommitted edits, have their agent commit
+     or stash first.
    - A conflict goes to integration routing (`bash .claude/scripts/routing.sh integration`),
      recorded as in Shared seams item 4 below.
    - After a non-trivial merge, re-run `bash .claude/scripts/quality-gate.sh` and

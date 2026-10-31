@@ -58,6 +58,9 @@ Resolve it first (a non-zero exit is a blocker: report its stderr line, never gu
 ```bash
 bash .claude/scripts/routing.sh implementation   # claude → impl-coder-claude, codex → impl-coder-codex
 bash .claude/scripts/routing.sh ui               # the agent for a design-heavy UI change
+# No .claude/scripts/routing.sh in this checkout (cut before harness batch 10): run the main
+# checkout's, "$(git rev-parse --path-format=absolute --git-common-dir)/../.claude/scripts/routing.sh";
+# neither has it: implementation=claude, ui=impl-coder-ui (the 148655d9 default).
 ```
 
 A design-heavy UI change goes to the agent `routing.sh ui` names (`orchestrator.md` → UI

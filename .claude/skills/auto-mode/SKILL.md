@@ -96,7 +96,8 @@ Per wave, in order — this sequence is the spine of the mode:
    events to it (references → step 6).
 7. **Triage + fix** — start every fix cycle (CI, review or conformance) by merging main
    into the wave checkout: `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit
-   origin/main`, never a rebase; a conflict goes to `routing.sh integration`; after a
+   origin/main`, never a rebase (a CI-owner agent merges in its own checkout; you merge only
+   into a clean `$WT`); a conflict goes to `routing.sh integration`; after a
    non-trivial merge re-run `quality-gate.sh` and `cargo test --locked`, and name the merged
    SHA in the fix brief (references → step 7). Then CI red or a comment with a real defect →
    fix, push, poll again; keep tests + docs in sync.

@@ -16,11 +16,14 @@
 # convention + Stop-hook capture + nightly distiller are the backstop.
 #
 # Owner waiver: in the MAIN session only (hook input without `agent_id`), a genuine
-# owner chat message (type "user", not isMeta, plain text only, not starting with `<`,
-# so tool results, task notifications and system reminders never count) that says
-# e.g. "no memory for PR #42" and names this PR waives the memory requirement. The
-# hook then emits additionalContext asking for the waiver to be logged in the state
-# file's decision log, and NO permissionDecision: `gh pr merge` stays prompt-gated.
+# owner chat message waives the memory requirement when it says e.g. "no memory for
+# PR #42" and names this PR. Genuine means type "user", not isMeta, not a compaction
+# summary (isCompactSummary: model-written, it paraphrases agent and tool output),
+# origin.kind and turnOrigin "human" when present, plain text only, not starting with
+# `<` (tool results, task notifications and system reminders never count). The hook
+# then returns permissionDecision "ask" plus additionalContext asking for the waiver to
+# be logged in the state file's decision log: the owner confirms the merge in a prompt
+# even under bypassPermissions (settings.json has no `ask` rule for `gh pr merge`).
 set -uo pipefail
 command -v jq >/dev/null 2>&1 || exit 0
 INPUT=$(cat 2>/dev/null) || exit 0
@@ -48,13 +51,16 @@ waived() {
   [ -z "$agent" ] || return 1
   # Captured, not piped into `grep -q`: under pipefail an early grep exit could SIGPIPE jq.
   hits=$(tail -n 6000 "$TRANSCRIPT" 2>/dev/null | jq -r --arg pr "$PR" '
-    select(.type == "user" and ((.isMeta // false) == false))
+    select(.type == "user" and ((.isMeta // false) == false)
+      and ((.isCompactSummary // false) == false)
+      and ((.origin.kind? // "human") == "human")
+      and ((.turnOrigin // "human") == "human"))
     | .message.content
     | if type == "string" then [.]
       elif type == "array" and length > 0 and all(.[]; type == "object" and .type == "text") then map(.text // "")
       else empty end
     | map(select((sub("^\\s+"; "") | startswith("<")) | not)) | join("\n")
-    | select(test("\\b(no|skip|without|don.?t (store|need))[^.\\n]{0,40}(memory|memories|capture)"; "i"))
+    | select(test("\\b(no|skip( the)?|without( a| the)?)\\s+(memory|memories|capture)\\b|\\bdon.?t\\s+(store|need)\\s+(a |the |any )?(memory|memories|capture)\\b"; "i"))
     | select(test("(#|PR |/pull/)" + $pr + "([^0-9]|$)"; "i"))
   ' 2>/dev/null) || true
   [ -n "$hits" ]
@@ -62,7 +68,8 @@ waived() {
 
 waive() {
   jq -n --arg c "capture-before-merge: waived by the owner's message for PR #$PR; record the waiver in the state file's decision log" \
-    '{hookSpecificOutput:{hookEventName:"PreToolUse",additionalContext:$c}}' 2>/dev/null
+    --arg r "capture-before-merge: the owner waived the memory for PR #$PR in chat; confirm the merge" \
+    '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"ask",permissionDecisionReason:$r,additionalContext:$c}}' 2>/dev/null
   exit 0
 }
 
