@@ -656,15 +656,14 @@ A write that still fails after the check (the disk fills, a permission changes i
 envelope already printed: the call exits with that error's own code (6 or 1) and writes `glen: <message>` to stderr,
 so `ok:true` with a non-zero exit means the cursors did not move and the messages will come back.
 
-With `--cwd`, only replies of sessions in that project are returned. A reply that no session or registry places in
-any project (an orphan) is never returned under `--cwd`, but a non-`--peek` call marks it read, as the unscoped
-inbox does. Two exceptions keep it unread: `-f`, which streams it once its session appears in the project, and a
-call that warns `outside_cwd`, whose hint is to drop `--cwd`.
+With `--cwd`, only replies of sessions in that project are returned and marked read. A reply that no session or
+registry places in any project (an orphan) is left out and stays unread; `-f` streams it once its session appears
+in the project.
 
 | Field | Meaning |
 |---|---|
 | `total` | messages returned |
-| `marked_read` | true when this call moved the read cursor of at least one returned session; false with `--peek`, when nothing new was returned, and when only orphan cursors moved |
+| `marked_read` | true when this call moved the read cursor of at least one returned session; false with `--peek` and when nothing new was returned |
 | `skipped_lines` | malformed inbox lines skipped |
 | `messages` | reply records plus session_handle and job_handle (null without a job) |
 

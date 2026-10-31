@@ -387,13 +387,8 @@ fn fixture_session_id(b: &OmpBox, key: char) -> String {
         .id
 }
 
-/// Decision 10 re-derived the orphan half of this test: a reply no catalog or registry entry
-/// places in a project (`B`, and `registry-unknown`, whose registry has no cwd) is still left
-/// out under `--cwd`, but a non-peek scoped call now marks it read, as the unscoped inbox
-/// does. A foreign project's reply (`beta`) stays unread, and so does an orphan when the
-/// `outside_cwd` warning tells the caller to drop `--cwd` to see it.
 #[test]
-fn cwd_inbox_intersects_session_filters_leaves_foreign_replies_unread_and_marks_orphans_read() {
+fn cwd_inbox_intersects_session_filters_and_leaves_foreign_and_orphan_replies_unread() {
     let b = OmpBox::new();
     let beta = fixture_session_id(&b, 'E');
     let registry_alpha = "registry-alpha";
@@ -449,39 +444,12 @@ fn cwd_inbox_intersects_session_filters_leaves_foreign_replies_unread_and_marks_
             .iter()
             .all(|message| message["session_id"] == A || message["session_id"] == registry_alpha)
     );
-    let read_dir = b.glen_home.join("inbox/.read");
-    assert!(!read_dir.exists(), "--peek under --cwd marks nothing");
-    let orphan_only = inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--session", "ffff"]);
-    assert_eq!(data(&orphan_only)["total"], 0);
-    assert_eq!(
-        common::json(&orphan_only)["warnings"][0]["code"],
-        "outside_cwd"
-    );
-    assert!(
-        !read_dir.join(B).exists(),
-        "the outside_cwd hint must still find the orphan unread"
-    );
-    let scoped = data(&inbox(&b, &flags));
-    assert_eq!(scoped["total"], 2);
-    assert_eq!(scoped["marked_read"], true);
-    for id in [A, registry_alpha, B, registry_unknown] {
-        assert!(read_dir.join(id).exists(), "{id} is marked read");
+    assert_eq!(data(&inbox(&b, &flags))["total"], 2);
+    for id in [&beta, B, registry_unknown] {
+        assert!(!b.glen_home.join("inbox/.read").join(id).exists());
     }
-    assert!(!read_dir.join(&beta).exists());
     let remaining = data(&inbox(&b, &["--peek"]));
-    assert_eq!(remaining["total"], 1);
-    assert_eq!(remaining["messages"][0]["session_id"], beta.as_str());
-    // Only an orphan moves: nothing is returned, so `marked_read` stays false, yet the orphan
-    // is committed.
-    let before = fs::read(read_dir.join(B)).unwrap();
-    append(&b, B, &record(B, "orphan two", "2026-10-30T00:00:01Z"));
-    let scoped = data(&inbox(&b, &flags));
-    assert_eq!(
-        (scoped["total"].clone(), scoped["marked_read"].clone()),
-        (j!(0), j!(false))
-    );
-    assert_ne!(fs::read(read_dir.join(B)).unwrap(), before);
-    assert_eq!(data(&inbox(&b, &["--peek"]))["total"], 1);
+    assert_eq!(remaining["total"], 3);
     let outside = inbox(&b, &["--cwd", alpha.to_str().unwrap(), "--session", &beta]);
     assert_eq!(data(&outside)["total"], 0);
     assert_eq!(common::json(&outside)["warnings"][0]["code"], "outside_cwd");
