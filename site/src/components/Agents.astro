@@ -6,7 +6,7 @@ import {site} from '../data/site';
 const codes=[
  {code:'0',state:'success' as const,label:'reply',meaning:'The reply is in the output.'},
  {code:'10',state:'warning' as const,label:'running',meaning:'Still running. Run glen wait <job> later.'},
- {code:'6',state:'warning' as const,label:'needs extension',meaning:'Install the extension, then restart the open omp session.'},
+ {code:'6',state:'warning' as const,label:'refused',meaning:'Read error.hint and details.reason; often: install the extension and restart omp.'},
  {code:'7',state:'danger' as const,label:'failed',meaning:'The job failed; details.status says why.'},
  {code:'11',state:'focus' as const,label:'moved',meaning:'omp moved the session. Use the new handle.'},
 ];

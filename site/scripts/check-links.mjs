@@ -1,8 +1,9 @@
 // Link check for the built site and the root README, run before every deploy.
 //   node scripts/check-links.mjs           offline: dist exists; while releaseAvailable is false no
-//                                          installer URL or /releases/latest anywhere in dist; raw and
-//                                          blob/tree URLs into this repo's main resolve in the checkout;
-//                                          README relative links resolve.
+//                                          installer URL or /releases/latest anywhere in dist, and no
+//                                          version chip that reads as released; raw and blob/tree URLs
+//                                          into this repo's main resolve in the checkout; README
+//                                          relative links resolve.
 //   node scripts/check-links.mjs --online  the same, then every other absolute URL must answer < 400
 //                                          (GET, redirects followed, 3 attempts). CI runs it on main
 //                                          pushes; `npm run deploy` runs it before wrangler.
@@ -13,6 +14,8 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 const siteDir = fileURLToPath(new URL('..', import.meta.url));
 const TARGETS = ['aarch64-apple-darwin', 'x86_64-apple-darwin', 'x86_64-unknown-linux-musl', 'aarch64-unknown-linux-musl'];
 const UNRELEASED = [/raw\.githubusercontent\.com\/nodera-studio\/glen/, /\/releases\/latest/];
+// What site.ts's versionLabel adds to a version chip before the first release.
+const COMING_SOON = /\bcoming soon\b/;
 const BINARY = /\.(?:png|jpe?g|gif|webp|avif|ico|woff2?|ttf|otf)$/i;
 
 const entities = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ' };
@@ -32,6 +35,10 @@ export function collectUrls(html) {
  for (const m of html.matchAll(/<code\b[^>]*>([\s\S]*?)<\/code>/gi)) out.push(...urlsIn(decodeEntities(m[1].replace(/<[^>]*>/g, ''))));
  return [...new Set(out)];
 }
+
+/** Version chips: the page's text nodes that open with a version tag ("v0.1.0", "v0.1.0 · …"), entity-decoded. @param {string} html */
+export const versionChips = html => [...html.replace(/<(script|style)\b[\s\S]*?<\/\1\s*>/gi, '').matchAll(/>([^<]+)</g)]
+ .map(m => decodeEntities(m[1]).replace(/\s+/g, ' ').trim()).filter(text => /^v\d+\.\d+\.\d+\b/.test(text));
 
 /** Absolute URLs in Markdown: link targets and bare URLs in code. @param {string} md */
 export function markdownUrls(md) {
@@ -76,6 +83,7 @@ export function offline({ dist, root, readme, releaseAvailable, siteOrigin }) {
  for (const file of files) {
   const text = readFileSync(file, 'utf8');
   if (!releaseAvailable) for (const re of UNRELEASED) if (re.test(text)) rows.push({ url: `${relative(dist, file)}: ${re.source.replace(/\\/g, '')}`, status: 'before the first release', ok: false });
+  if (!releaseAvailable && file.endsWith('.html')) for (const chip of versionChips(text)) if (!COMING_SOON.test(chip)) rows.push({ url: `${relative(dist, file)}: version chip "${chip}"`, status: 'reads as released before the first release', ok: false });
   if (file.endsWith('.html')) for (const url of collectUrls(text)) if (!urls.has(url)) urls.set(url, relative(dist, file));
  }
  if (readme && existsSync(readme)) {

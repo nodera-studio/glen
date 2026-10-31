@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { collectUrls, classify, markdownUrls, markdownPaths, offline, status } from './check-links.mjs';
+import { collectUrls, classify, markdownUrls, markdownPaths, offline, status, versionChips } from './check-links.mjs';
+import { site, versionLabel } from '../src/data/site.ts';
 
 test('collectUrls finds href, src and <code> URLs, entity-decoded, and ignores xmlns', () => {
  const html = `<svg xmlns="http://www.w3.org/2000/svg"></svg>
@@ -57,6 +58,28 @@ test('offline: before the first release, an installer URL or /releases/latest an
  assert.equal(failures(r).length, 2, failures(r).join('\n'));
  assert.ok(failures(r).some(u => u.startsWith('index.html')) && failures(r).some(u => u.startsWith('_astro/Island.js')));
  assert.deepEqual(failures(offline({ ...f, releaseAvailable: true })), []);
+});
+
+test('versionChips: text nodes that open with a version tag, entity-decoded, outside scripts and styles', () => {
+ const html = `<span class="version-chip">v0.1.0</span><p class="release-chip"><span aria-hidden="true"></span>v0.1.0 &#183; works
+  with omp 18.14.0</p><p>Binaries arrive with the v0.1.0 release.</p><span>Tested with omp 18.14.0</span>
+  <script>const v = '<b>v9.9.9</b>'</script><style>.x::after{content:'>v9.9.9<'}</style>`;
+ assert.deepEqual(versionChips(html), ['v0.1.0', 'v0.1.0 · works with omp 18.14.0']);
+});
+
+// W8-DOC-15: the header, hero and footer chips said v0.1.0 before any release existed.
+test('offline: before the first release, a version chip that reads as released fails', () => {
+ const released = versionLabel({ ...site, releaseAvailable: true }), unreleased = versionLabel({ ...site, releaseAvailable: false });
+ assert.equal(released, `v${site.version}`);
+ assert.equal(unreleased, `v${site.version} · coming soon`);
+ const chips = label => `<span class="version-chip">${label}</span><p class="release-chip"><span aria-hidden="true"></span>${label} · works with omp 18.14.0</p>`;
+ const early = fixture(chips(released));
+ writeFileSync(join(early.dist, '404.html'), `<footer><span>Tested with omp 18.14.0</span><span>${released}</span></footer>`);
+ assert.deepEqual(failures(offline({ ...early, releaseAvailable: false })), [
+  `404.html: version chip "${released}"`, `index.html: version chip "${released}"`, `index.html: version chip "${released} · works with omp 18.14.0"`,
+ ]);
+ assert.deepEqual(failures(offline({ ...early, releaseAvailable: true })), []);
+ assert.deepEqual(failures(offline({ ...fixture(chips(unreleased)), releaseAvailable: false })), []);
 });
 
 test('offline: repo-main URLs and README paths must exist in the checkout; dist pages must exist', () => {
