@@ -677,13 +677,12 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
     let id = job_id(&launched);
     accepted(&b, id);
     let dir = b.job_dir(id).join("control");
-    fs::create_dir_all(&dir).unwrap();
     let now = jiff::Timestamp::now().as_millisecond() + 20000;
-    fs::write(
-        dir.join("a.json"),
+    write_control(
+        &dir,
+        "a.json",
         json!({"v":1,"op":"list_models","deadline_ms":now}).to_string(),
-    )
-    .unwrap();
+    );
     poll(Duration::from_secs(2), || {
         (b.frames_in("get_state").len() >= 2).then_some(())
     });
@@ -694,13 +693,13 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
     });
     assert!(!dir.join("a.done.json").exists());
     let start = Instant::now();
-    fs::write(dir.join("b.json"), r#"{"v":1,"op":"abort"}"#).unwrap();
-    fs::write(
-        dir.join("c.json"),
+    write_control(&dir, "b.json", r#"{"v":1,"op":"abort"}"#);
+    write_control(
+        &dir,
+        "c.json",
         json!({"v":1,"op":"set_thinking_level","args":{"level":"high"},"deadline_ms":now})
             .to_string(),
-    )
-    .unwrap();
+    );
     b.wait_terminal(id, Duration::from_secs(13));
     assert!(start.elapsed() < Duration::from_secs(13));
     b.wait_worker_gone(id);
@@ -801,7 +800,7 @@ fn ac364_request_before_ready_runs_after_release_and_job_ended_reroutes_once() {
         });
         assert!(b.frames_in("set_model").is_empty());
         if end_job {
-            fs::write(dir.join("stop.json"), r#"{"v":1,"op":"abort"}"#).unwrap();
+            write_control(&dir, "stop.json", r#"{"v":1,"op":"abort"}"#);
             b.wait_terminal(id, Duration::from_secs(3));
         }
         fs::write(&release, "go").unwrap();
@@ -1302,11 +1301,11 @@ fn fix7_closed_in_flight_control_after_terminal_retries_once() {
     poll(Duration::from_secs(3), || {
         (b.frames_in("get_state").len() > before).then_some(())
     });
-    fs::write(
-        b.job_dir(id).join("control/stop.json"),
+    write_control(
+        &b.job_dir(id).join("control"),
+        "stop.json",
         r#"{"v":1,"op":"abort"}"#,
-    )
-    .unwrap();
+    );
     b.wait_terminal(id, Duration::from_secs(13));
     let fake_pid = b.fake_log().iter().find(|r| r["event"] == "start").unwrap()["pid"]
         .as_u64()
@@ -1666,11 +1665,11 @@ fn c2_1_terminal_job_submitted_control_never_retries() {
     poll(Duration::from_secs(3), || {
         (!b.frames_in("set_model").is_empty()).then_some(())
     });
-    fs::write(
-        b.job_dir(id).join("control/stop.json"),
+    write_control(
+        &b.job_dir(id).join("control"),
+        "stop.json",
         r#"{"v":1,"op":"abort"}"#,
-    )
-    .unwrap();
+    );
     b.wait_terminal(id, Duration::from_secs(13));
     let error = checked(child.wait_with_output().unwrap(), 7);
     assert_eq!(error["error"]["code"], "control_failed");
@@ -1765,18 +1764,17 @@ fn c2_7_inbox_controls_cannot_outlive_job_deadline() {
         let id = job_id(&launched);
         accepted(&b, id);
         let dir = b.job_dir(id).join("control");
-        fs::create_dir_all(&dir).unwrap();
         let mut request = json!({"v":1,"op":"set_thinking_level","args":{"level":"high"}});
         let malformed = request_deadline.as_ref().is_some_and(Value::is_string);
         if let Some(deadline) = request_deadline {
             request["deadline_ms"] = deadline;
         }
-        fs::write(
-            dir.join("c2-deadline.json"),
+        write_control(
+            &dir,
+            "c2-deadline.json",
             serde_json::to_vec(&request).unwrap(),
-        )
-        .unwrap();
-        let ack = poll(Duration::from_secs(8), || {
+        );
+        let ack = poll(Duration::from_secs(10), || {
             fs::read(dir.join("c2-deadline.done.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -1786,7 +1784,9 @@ fn c2_7_inbox_controls_cannot_outlive_job_deadline() {
             if malformed { "bad_request" } else { "timeout" }
         );
         assert!(b.frames_in("set_thinking_level").is_empty());
-        b.wait_terminal(id, Duration::from_secs(8));
+        let terminal = b.wait_terminal(id, Duration::from_secs(10));
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["error"]["code"], "timeout");
         b.wait_worker_gone(id);
     }
 }

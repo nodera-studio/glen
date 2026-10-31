@@ -1,8 +1,31 @@
 #![allow(dead_code)]
 use std::{
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{Command, Output},
 };
+/// Publish a complete request; the worker skips the staging dotfile while polling.
+pub fn write_control(dir: &Path, name: &str, body: impl AsRef<[u8]>) {
+    use std::{
+        io::Write,
+        os::unix::fs::{DirBuilderExt, OpenOptionsExt},
+    };
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .unwrap();
+    let staging = dir.join(format!(".{name}.staging"));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&staging)
+        .unwrap();
+    file.write_all(body.as_ref()).unwrap();
+    drop(file);
+    std::fs::rename(staging, dir.join(name)).unwrap();
+}
 pub fn glen(args: &[&str], vars: &[(&str, &str)]) -> Output {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");

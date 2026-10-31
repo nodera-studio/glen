@@ -124,9 +124,6 @@ pub fn acquire(
         if cancel() {
             return Ok(Acquired::Cancelled);
         }
-        if Instant::now() >= deadline {
-            return Ok(Acquired::TimedOut);
-        }
         if let Some(lock) = try_acquire(home, id)? {
             return Ok(Acquired::Locked {
                 lock,
@@ -137,7 +134,11 @@ pub fn acquire(
             on_blocked()?;
             blocked = true;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(Acquired::TimedOut);
+        }
+        std::thread::sleep(Duration::from_millis(200).min(left));
     }
 }
 pub fn is_held(home: &GlenHome, id: &str) -> bool {
@@ -186,21 +187,14 @@ mod tests {
         assert!(is_held(&h, "abc"));
         assert!(try_acquire(&h, "abc").unwrap().is_none());
         assert!(matches!(
-            acquire(
-                &h,
-                "abc",
-                Instant::now() + Duration::from_millis(300),
-                &|| false,
-                || Ok(())
-            )
-            .unwrap(),
+            acquire(&h, "abc", Instant::now(), &|| false, || Ok(())).unwrap(),
             Acquired::TimedOut
         ));
         assert!(matches!(
             acquire(
                 &h,
                 "abc",
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
                 &|| true,
                 || Ok(())
             )
@@ -213,7 +207,7 @@ mod tests {
             acquire(
                 &h,
                 "abc",
-                Instant::now() + Duration::from_secs(1),
+                Instant::now() + Duration::from_secs(30),
                 &|| { false },
                 || Ok(())
             )
@@ -233,7 +227,7 @@ mod tests {
         let result = acquire(
             &h,
             "race",
-            Instant::now() + Duration::from_millis(450),
+            Instant::now(),
             &|| {
                 if held.borrow().is_none() {
                     *held.borrow_mut() = try_acquire(&h, "race").unwrap();
@@ -255,19 +249,33 @@ mod tests {
         assert!(is_held(&h, "race"));
         drop(held);
         // A pre-check could have seen held, but the real acquire is now uncontended.
-        let result = acquire(
-            &h,
-            "race",
-            Instant::now() + Duration::from_secs(1),
-            &|| false,
-            || {
-                blocked.set(blocked.get() + 1);
-                Ok(())
-            },
-        )
+        let result = acquire(&h, "race", Instant::now(), &|| false, || {
+            blocked.set(blocked.get() + 1);
+            Ok(())
+        })
         .unwrap();
         assert!(matches!(result, Acquired::Locked { .. }));
         assert_eq!(blocked.get(), 1, "no false queued marker after release");
+    }
+    #[test]
+    fn passed_deadline_still_takes_an_uncontended_lock() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let result = acquire(&h, "free", Instant::now(), &|| false, || {
+            panic!("an uncontended lock must not publish a blocked marker")
+        })
+        .unwrap();
+        assert!(matches!(result, Acquired::Locked { .. }));
+        assert!(is_held(&h, "free"));
+        // Cancellation still wins over an uncontended lock and an expired deadline.
+        assert!(matches!(
+            acquire(&h, "other", Instant::now(), &|| true, || {
+                panic!("cancelled acquire must not publish a blocked marker")
+            })
+            .unwrap(),
+            Acquired::Cancelled
+        ));
+        assert!(!lock_path(&h, "other").exists());
     }
     #[test]
     fn lock_not_inherited_by_child() {

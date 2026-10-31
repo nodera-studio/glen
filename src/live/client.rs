@@ -164,6 +164,55 @@ fn unary_io(error: io::Error) -> ClientError {
         ClientError::Protocol(error.to_string())
     }
 }
+fn write_request(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    end: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Option<Vec<u8>>, ClientError> {
+    let mut offset = 0;
+    while offset < bytes.len() {
+        if cancelled() {
+            return Err(ClientError::Cancelled);
+        }
+        if Instant::now() >= end {
+            return Err(ClientError::Timeout);
+        }
+        match stream.write(&bytes[offset..]) {
+            Ok(0) => return Err(ClientError::Protocol("socket closed during send".into())),
+            Ok(n) => offset += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::BrokenPipe
+                        | io::ErrorKind::ConnectionReset
+                        | io::ErrorKind::NotConnected
+                ) =>
+            {
+                if cancelled() {
+                    return Err(ClientError::Cancelled);
+                }
+                // Do not read ahead: open_send's reader still needs subsequent frames.
+                return read_line(&mut BufReader::with_capacity(1, stream))
+                    .map(Some)
+                    .map_err(|_| {
+                        ClientError::Protocol(
+                            "endpoint closed the connection before reading the request".into(),
+                        )
+                    });
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::TimedOut
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(ClientError::Protocol(e.to_string())),
+        }
+    }
+    Ok(None)
+}
 fn unary_inner(path: &Path, op: &Op, end: Instant) -> Result<Value, ClientError> {
     let mut stream = connect(path).map_err(ClientError::Connect)?;
     let id = uuid::Uuid::now_v7().to_string();
@@ -173,15 +222,22 @@ fn unary_inner(path: &Path, op: &Op, end: Instant) -> Result<Value, ClientError>
                 .max(Duration::from_millis(1)),
         ))
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
-    let bytes = format!("{}\n", op.request(&id));
-    stream.write_all(bytes.as_bytes()).map_err(unary_io)?;
+    let mut bytes = crate::ops::request_bytes(&op.request(&id))
+        .map_err(|e| ClientError::Protocol(format!("cannot serialize endpoint request: {e}")))?;
+    bytes.push(b'\n');
     stream
         .set_read_timeout(Some(
             end.saturating_duration_since(Instant::now())
                 .max(Duration::from_millis(1)),
         ))
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
-    let line = read_line(&mut BufReader::new(stream)).map_err(unary_io)?;
+    let pre_read = write_request(&mut stream, &bytes, end, &|| false)?;
+    #[cfg(test)]
+    unary_tests::after_write(path);
+    let line = match pre_read {
+        Some(line) => line,
+        None => read_line(&mut BufReader::new(stream)).map_err(unary_io)?,
+    };
     match parse_frame(&line).map_err(ClientError::Protocol)? {
         Frame::Response {
             id: Some(got),
@@ -246,13 +302,18 @@ pub fn unary_for(
                 return Err(ClientError::Timeout);
             }
             stream.set_write_timeout(Some(left)).map_err(unary_io)?;
-            writeln!(stream, "{request}").map_err(unary_io)?;
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(ClientError::Timeout);
-            }
             stream.set_read_timeout(Some(left)).map_err(unary_io)?;
-            let line = read_line(&mut BufReader::new(stream)).map_err(unary_io)?;
+            let mut bytes = crate::ops::request_bytes(&request).map_err(|e| {
+                ClientError::Protocol(format!("cannot serialize endpoint request: {e}"))
+            })?;
+            bytes.push(b'\n');
+            let pre_read = write_request(&mut stream, &bytes, end, &|| {
+                thread_stop.load(Ordering::SeqCst)
+            })?;
+            let line = match pre_read {
+                Some(line) => line,
+                None => read_line(&mut BufReader::new(stream)).map_err(unary_io)?,
+            };
             match parse_frame(&line).map_err(ClientError::Protocol)? {
                 Frame::Response {
                     id: Some(got),
@@ -371,32 +432,31 @@ pub fn open_send(
     stream
         .set_write_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
-    let bytes = format!("{}\n", Op::Send(args).request(id)).into_bytes();
-    let mut offset = 0;
-    while offset < bytes.len() {
-        if cancelled() {
-            return Err(ClientError::Cancelled);
-        }
-        if Instant::now() >= end {
-            return Err(ClientError::Timeout);
-        }
-        match stream.write(&bytes[offset..]) {
-            Ok(0) => return Err(ClientError::Protocol("socket closed during send".into())),
-            Ok(n) => offset += n,
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    io::ErrorKind::TimedOut
-                        | io::ErrorKind::WouldBlock
-                        | io::ErrorKind::Interrupted
-                ) => {}
-            Err(e) => return Err(ClientError::Protocol(e.to_string())),
-        }
+    let mut bytes = crate::ops::request_bytes(&Op::Send(args).request(id))
+        .map_err(|e| ClientError::Protocol(format!("cannot serialize endpoint request: {e}")))?;
+    bytes.push(b'\n');
+    stream
+        .set_read_timeout(Some(
+            end.saturating_duration_since(Instant::now())
+                .min(Duration::from_secs(1))
+                .max(Duration::from_millis(1)),
+        ))
+        .map_err(|e| ClientError::Protocol(e.to_string()))?;
+    let pre_read = write_request(&mut stream, &bytes, end, cancelled)?;
+    // macOS rejects timeout changes after a fast peer has answered and closed.
+    if let Err(e) = stream.set_read_timeout(None)
+        && e.raw_os_error() != Some(libc::EINVAL)
+    {
+        return Err(ClientError::Protocol(e.to_string()));
     }
     let reader = stream
         .try_clone()
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
     let (tx, rx) = mpsc::channel();
+    if let Some(line) = pre_read {
+        tx.send(parse_frame(&line))
+            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+    }
     std::thread::spawn(move || {
         let mut reader = BufReader::new(reader);
         loop {
@@ -471,6 +531,195 @@ mod tests {
 mod unary_tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+    use std::{path::PathBuf, sync::Mutex};
+
+    #[test]
+    fn partial_large_write_drains_the_peers_answer_without_reading_ahead() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let bytes = crate::ops::request_bytes(
+            &Op::Send(SendArgs {
+                text: "x".repeat(1024 * 1024),
+                deliver_as: crate::jobs::Deliver::Auto,
+                job_id: None,
+                expect_session_id: None,
+            })
+            .request("large"),
+        )
+        .unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut prefix = [0; 4096];
+            peer.read_exact(&mut prefix).unwrap();
+            let id = serde_json::Deserializer::from_slice(&prefix[6..])
+                .into_iter::<String>()
+                .next()
+                .unwrap()
+                .unwrap();
+            writeln!(
+                peer,
+                "{}",
+                serde_json::json!({"v":1,"id":id,"ok":true,"data":{"answer":42}})
+            )
+            .unwrap();
+            writeln!(
+                peer,
+                "{}",
+                serde_json::json!({"v":1,"id":id,"event":"error"})
+            )
+            .unwrap();
+        });
+        let line = write_request(
+            &mut client,
+            &bytes,
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(parse_frame(&line).unwrap(), Frame::Response { ok: true, data, .. } if data["answer"] == 42)
+        );
+        assert!(
+            matches!(read_frame(&mut BufReader::new(&client)).unwrap(), Frame::Event { kind, .. } if kind == "error")
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn write_request_drains_only_one_line_and_preserves_closed_transport_errors() {
+        for answer in [
+            Some(b"{\"v\":1}\nsecond\n".as_slice()),
+            None,
+            Some(b"partial".as_slice()),
+        ] {
+            let (mut client, mut peer) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .unwrap();
+            client
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            if let Some(answer) = answer {
+                peer.write_all(answer).unwrap();
+            }
+            drop(peer);
+            let result = write_request(
+                &mut client,
+                b"request\n",
+                Instant::now() + Duration::from_secs(10),
+                &|| false,
+            );
+            if answer.is_some_and(|bytes| bytes.ends_with(b"\n")) {
+                assert_eq!(result.unwrap(), Some(b"{\"v\":1}\n".to_vec()));
+                assert_eq!(
+                    read_line(&mut BufReader::new(&client)).unwrap(),
+                    b"second\n"
+                );
+            } else {
+                assert!(
+                    matches!(result, Err(ClientError::Protocol(ref message)) if message == "endpoint closed the connection before reading the request")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn write_request_cancel_and_deadline_do_not_write_or_drain() {
+        let (mut client, mut peer) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        assert!(matches!(
+            write_request(&mut client, b"request\n", Instant::now(), &|| true),
+            Err(ClientError::Cancelled)
+        ));
+        assert!(matches!(
+            write_request(&mut client, b"request\n", Instant::now(), &|| false),
+            Err(ClientError::Timeout)
+        ));
+        assert!(
+            matches!(peer.read(&mut [0]), Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
+        );
+        // If cancellation arrives during a failed write, do not start the drain read.
+        drop(peer);
+        let checks = std::cell::Cell::new(0);
+        let cancelled = || {
+            checks.set(checks.get() + 1);
+            checks.get() > 1
+        };
+        assert!(matches!(
+            write_request(
+                &mut client,
+                b"request\n",
+                Instant::now() + Duration::from_secs(10),
+                &cancelled
+            ),
+            Err(ClientError::Cancelled)
+        ));
+        assert_eq!(checks.get(), 2);
+    }
+
+    // Match by path so concurrently running client tests never consume this hook.
+    static AFTER_WRITE: Mutex<Option<(PathBuf, Receiver<()>)>> = Mutex::new(None);
+    pub(super) fn after_write(path: &Path) {
+        let hook = {
+            let mut hook = AFTER_WRITE.lock().unwrap();
+            if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, closed)) = hook {
+            closed.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+    }
+
+    #[test]
+    fn unary_reads_a_reply_after_peer_closed_before_the_read() {
+        let tmp = tempfile::Builder::new()
+            .prefix("gf5-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        *AFTER_WRITE.lock().unwrap() = Some((path.clone(), closed_rx));
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let line = read_line(&mut BufReader::new(&stream)).unwrap();
+            let request: Value = serde_json::from_slice(&line).unwrap();
+            writeln!(
+                stream,
+                "{}",
+                serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"answer":42}})
+            )
+            .unwrap();
+            drop(stream);
+            closed_tx.send(()).unwrap();
+        });
+        let answer = unary(&path, &Op::State, Duration::from_secs(10)).unwrap();
+        assert_eq!(answer["answer"], 42);
+        peer.join().unwrap();
+        assert!(AFTER_WRITE.lock().unwrap().is_none());
+    }
     #[test]
     fn unary_response_ids_malformed_and_total_timeout() {
         for scenario in ["ok", "garbage", "wrong_id", "timeout"] {
