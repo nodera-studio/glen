@@ -73,7 +73,13 @@ struct Scope {
     classified: HashSet<String>,
     selector: Option<String>,
     matched: Option<HashSet<String>>,
+    last_refresh: std::time::Instant,
 }
+/// Below this, a stem not yet in `classified` (an orphan reply, or a session not persisted
+/// yet) does not force another full catalog rescan: AC-1011 already keeps it eligible for
+/// the next one, and a few seconds' delay before a brand-new session's first reply is
+/// classified is an acceptable trade against rescanning every 250ms poll forever (MED-006).
+const RESCAN_COOLDOWN: Duration = Duration::from_secs(3);
 impl Scope {
     fn new(
         cli: &Cli,
@@ -91,11 +97,18 @@ impl Scope {
             classified: HashSet::new(),
             selector: selector.map(str::to_owned),
             matched: None,
+            last_refresh: std::time::Instant::now() - RESCAN_COOLDOWN,
         };
         scope.refresh(home, env)?;
         Ok(scope)
     }
+    /// True once per `RESCAN_COOLDOWN`, so a caller gates a rescan at a bounded rate instead
+    /// of on every poll.
+    fn due_for_refresh(&self) -> bool {
+        self.last_refresh.elapsed() >= RESCAN_COOLDOWN
+    }
     fn refresh(&mut self, home: &GlenHome, env: &Env) -> Result<(), GlenError> {
+        self.last_refresh = std::time::Instant::now();
         let mut catalog = Catalog::read(&self.sessions_dir)?;
         // An unwritten registry without a cwd cannot place a session in a project.
         // Persisted sessions still get their classification from their bucket.
@@ -155,13 +168,15 @@ fn collect(
     let mut sessions = inbox::sessions(home, filter);
     if let Some(scope) = scope {
         let all = filter.map(|_| inbox::sessions(home, None));
-        // Rescan at most once per poll, retaining classifications for known ids.
-        // Unknown ids remain eligible for a later scan if their transcript arrives.
-        if all
-            .as_deref()
-            .unwrap_or(&sessions)
-            .iter()
-            .any(|(stem, _)| !scope.classified.contains(&stem.to_lowercase()))
+        // Rescan at most once per RESCAN_COOLDOWN while any stem remains unclassified
+        // (MED-006), retaining classifications for known ids. Unknown ids remain eligible
+        // for a later scan if their transcript arrives.
+        if scope.due_for_refresh()
+            && all
+                .as_deref()
+                .unwrap_or(&sessions)
+                .iter()
+                .any(|(stem, _)| !scope.classified.contains(&stem.to_lowercase()))
         {
             scope.refresh(home, env)?;
         }
@@ -394,5 +409,36 @@ mod tests {
         assert_eq!(prefix.wrote(30), None);
         assert_eq!(prefix.wrote(10), Some(10));
         assert_eq!(prefix.wrote(20), Some(30));
+    }
+    /// MED-006: a scope created just now is not due for another rescan, and `refresh` itself
+    /// resets the cooldown, so a caller gating on `due_for_refresh` never rescans twice in a
+    /// tight loop even while a stem stays unclassified.
+    #[test]
+    fn due_for_refresh_gates_at_the_cooldown_and_resets_on_refresh() {
+        let tree = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: tree.path().join("glen"),
+        };
+        let sessions_dir = tree.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let env = Env::for_test(None, tree.path(), &[]);
+        let mut scope = Scope {
+            bucket: "b".into(),
+            cwd: tree.path().to_path_buf(),
+            sessions_dir,
+            included: HashSet::new(),
+            classified: HashSet::new(),
+            selector: None,
+            matched: None,
+            last_refresh: std::time::Instant::now(),
+        };
+        assert!(!scope.due_for_refresh(), "just refreshed, not due yet");
+        scope.last_refresh -= RESCAN_COOLDOWN;
+        assert!(scope.due_for_refresh());
+        scope.refresh(&home, &env).unwrap();
+        assert!(
+            !scope.due_for_refresh(),
+            "refresh() must reset the cooldown"
+        );
     }
 }
