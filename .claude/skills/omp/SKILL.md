@@ -21,13 +21,16 @@ The owner runs `omp --profile glen-harness login cursor`, then
 Cursor login detection and the predicted `mcp__mnemosyne_memory_*` tool names await
 the owner's live login. Setup picks the first id present in the live Cursor model list from
 an ordered ladder, each entry with its own startup thinking level: `cursor/gemini-4-argon`
-at medium, then `cursor/gemini-3.8-flash` at medium, then `cursor/grok-4.7` at high. It writes
-the chosen id to `modelRoles.default` and passes the matching thinking level on every
-dispatch (there is no profile-level thinking default in omp 18.14.0, only per-level token
-budgets, so the engine passes `--thinking <level>` on each `glen send`, mirrored in
-`omp-engine.sh`'s own `MODEL_LADDER`/`THINKING_LADDER`). If none of the three ids is present,
-omp is unavailable, with a reason naming all three. `--model cursor/<id>` selects another
-model and requires that exact id; it does not use the ladder or its thinking level.
+at medium, then `cursor/gemini-3.8-flash` at medium, then `cursor/grok-4.7` at high. It
+writes `modelRoles.default` as `<id>:<level>` (omp 18.14.0 honours this suffix itself,
+`config/model-resolver.ts` `splitThinkingSuffix`; host-verified against the session
+transcript's own `thinkingLevel` field, not the model's self-reported, unreliable answer).
+The engine's per-dispatch `--thinking <level>` on each `glen send` (mirrored in
+`omp-engine.sh`'s own `MODEL_LADDER`/`THINKING_LADDER`, shared with setup's from
+`.claude/omp/model-ladder.sh`) is belt and braces on top of the persisted default, not the
+only mechanism. If none of the three ids is present, omp is unavailable, with a reason
+naming all three. `--model cursor/<id>` selects another model and requires that exact id; it
+does not use the ladder, and setup never appends a thinking-level suffix for it.
 
 ## How to invoke
 
@@ -77,12 +80,23 @@ harness invocation, setup's default-profile fingerprint, and the OS sandbox.
 
 ## Risks
 
-The macOS `sandbox-exec` and Linux `bwrap` launchers contain reads of other processes'
-sibling directories under `$TMPDIR`; containment does not rely solely on file permissions.
-Any omp invocation can write shared, cross-profile state in `~/.omp/natives/` and
-`~/.omp/run/`; the default-profile fingerprint excludes both. Setup's `--dry-run` makes
-no config changes, but querying config still initializes databases and caches on disk
-under `glen-harness`.
+The macOS `sandbox-exec` launcher contains reads of other processes' sibling directories
+under `$TMPDIR`; containment does not rely solely on file permissions. Any omp invocation
+can write shared, cross-profile state in `~/.omp/natives/` and `~/.omp/run/`; the
+default-profile fingerprint excludes both. Setup's `--dry-run` makes no config changes, but
+querying config still initializes databases and caches on disk under `glen-harness`.
+
+**The engine is unavailable on Linux in v0.1.0.** bwrap cannot isolate abstract Unix sockets
+while still letting the sandboxed process reach Cursor over the network, so there is no safe
+bwrap policy today. `probe` returns `unavailable: linux abstract-socket isolation not
+supported` and dispatch never runs or calls `omp-sandboxed-linux.sh`. That launcher stays in
+the repo for a later Landlock-based version.
+
+**Outbound network is restricted to TCP port 443 plus the mDNSResponder Unix socket**
+(fix cycle 4), not to the Cursor API host specifically. Two residuals remain, accepted by the
+owner: any HTTPS host on the public internet is reachable from inside the sandbox (not just
+Cursor's), and `agent.db` (the Cursor credential store) stays readable by the sandboxed omp
+process, since omp needs it to authenticate. Neither is mitigated further in v0.1.0.
 
 ## Results
 

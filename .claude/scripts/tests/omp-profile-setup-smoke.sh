@@ -14,7 +14,8 @@ ENGINE_FIXTURE="$WORK/engine-source"
 mkdir -p "$ENGINE_FIXTURE/.claude/scripts" "$ENGINE_FIXTURE/.claude/omp/skills/mnemosyne-glen"
 cp "$REPO_ROOT/.claude/scripts/omp-profile-setup.sh" "$REPO_ROOT/.claude/scripts/omp-engine.sh" "$ENGINE_FIXTURE/.claude/scripts/"
 cp "$REPO_ROOT/.claude/omp/omp-sandboxed.sh" "$REPO_ROOT/.claude/omp/omp-sandboxed-linux.sh" \
-  "$REPO_ROOT/.claude/omp/glen-harness.yml" "$REPO_ROOT/.claude/omp/mcp.json" "$ENGINE_FIXTURE/.claude/omp/"
+  "$REPO_ROOT/.claude/omp/glen-harness.yml" "$REPO_ROOT/.claude/omp/mcp.json" \
+  "$REPO_ROOT/.claude/omp/model-ladder.sh" "$ENGINE_FIXTURE/.claude/omp/"
 cp "$REPO_ROOT/.claude/omp/skills/mnemosyne-glen/SKILL.md" "$ENGINE_FIXTURE/.claude/omp/skills/mnemosyne-glen/"
 git -C "$ENGINE_FIXTURE" init -q --initial-branch=main
 git -C "$ENGINE_FIXTURE" add .
@@ -144,7 +145,7 @@ new_fixture() {
   : > "$FAKE_TOOL_CALLS"
   # Canned config responses keyed by the exact registered setting ID.
   cat > "$FAKE_OMP_STATE/overlay.json" <<'EOF'
-{"modelRoles":{"default":"cursor/gemini-4-argon","task":"cursor/task-model","custom":"cursor/custom-model"},"tools.approvalMode":"always-ask","tools.approval":{"write":"deny","glen_reply":"allow"},"tools.xdev":false,"tools.restrictedFolders":["~"],"fetch.enabled":false,"web_search.enabled":false,"bash.enabled":false,"eval.py":false,"eval.js":false,"browser.enabled":false,"lsp.enabled":false,"mcp.enableProjectConfig":false,"mcp.startupTimeoutMs":15000}
+{"modelRoles":{"default":"cursor/gemini-4-argon:medium","task":"cursor/task-model","custom":"cursor/custom-model"},"tools.approvalMode":"always-ask","tools.approval":{"write":"deny","glen_reply":"allow"},"tools.xdev":false,"tools.restrictedFolders":["~"],"fetch.enabled":false,"web_search.enabled":false,"bash.enabled":false,"eval.py":false,"eval.js":false,"browser.enabled":false,"lsp.enabled":false,"mcp.enableProjectConfig":false,"mcp.startupTimeoutMs":15000}
 EOF
   cp "$FAKE_OMP_STATE/overlay.json" "$FAKE_OMP_STATE/settings.json"
   printf '%s\n' '{"models":[{"selector":"cursor/gemini-4-argon"}]}' > "$FAKE_OMP_STATE/models.json"
@@ -174,7 +175,7 @@ jq '.modelRoles.default = "cursor/old" | .["tools.xdev"] = true' "$FAKE_OMP_STAT
 cp "$CASE_DIR/drift.json" "$FAKE_OMP_STATE/settings.json"
 setup_run "$SETUP"
 assert_exit 'full setup succeeds with record-only modelRoles CLI' 0
-assert 'full setup preserves other model roles' jq -e '.modelRoles == {default:"cursor/gemini-4-argon",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
+assert 'full setup preserves other model roles' jq -e '.modelRoles == {default:"cursor/gemini-4-argon:medium",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
 assert 'full setup applies other overlay settings' jq -e '.["tools.xdev"] == false' "$FAKE_OMP_STATE/settings.json"
 assert 'full setup queries bare modelRoles key' jq -es 'any(.[]; .argv == ["--profile","glen-harness","config","get","modelRoles","--json"])' "$FAKE_OMP_LOG"
 assert 'full setup sets bare modelRoles key with whole record' jq -es 'any(.[]; .argv[2:5] == ["config","set","modelRoles"] and (.argv[5] | fromjson | .task == "cursor/task-model"))' "$FAKE_OMP_LOG"
@@ -216,12 +217,12 @@ printf '%s\n' '{"models":[{"provider":"cursor","id":"gemini-3.8-flash"},{"select
 setup_run "$SETUP"
 assert_exit 'missing Argon falls back to Flash' 0
 assert 'fallback sets Flash and preserves other model roles' jq -e \
-  '.modelRoles == {default:"cursor/gemini-3.8-flash",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
+  '.modelRoles == {default:"cursor/gemini-3.8-flash:medium",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
 assert_contains 'fallback model decision is visible' 'chose cursor/gemini-3.8-flash from preference list' "$STDOUT"
 assert_contains 'Flash fallback also reports medium thinking' 'chose cursor/gemini-3.8-flash from preference list, thinking medium' "$STDOUT"
 assert 'fallback really writes chosen model' jq -es 'any(.[];
   .argv[2:5] == ["config","set","modelRoles"] and
-  (.argv[5] | fromjson | .default == "cursor/gemini-3.8-flash"))' "$FAKE_OMP_LOG"
+  (.argv[5] | fromjson | .default == "cursor/gemini-3.8-flash:medium"))' "$FAKE_OMP_LOG"
 # The subsequent check must display the same resolved model without any drift.
 setup_run "$SETUP" --check
 assert_exit 'fallback model check succeeds' 0
@@ -232,11 +233,11 @@ printf '%s\n' '{"models":[{"selector":"cursor/grok-4.7"},{"selector":"cursor/oth
 setup_run "$SETUP"
 assert_exit 'Argon and Flash both missing falls back to Grok at high' 0
 assert 'Grok fallback sets Grok and preserves other model roles' jq -e \
-  '.modelRoles == {default:"cursor/grok-4.7",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
+  '.modelRoles == {default:"cursor/grok-4.7:high",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
 assert_contains 'Grok fallback decision is visible' 'chose cursor/grok-4.7 from preference list, thinking high' "$STDOUT"
 assert 'Grok fallback really writes chosen model' jq -es 'any(.[];
   .argv[2:5] == ["config","set","modelRoles"] and
-  (.argv[5] | fromjson | .default == "cursor/grok-4.7"))' "$FAKE_OMP_LOG"
+  (.argv[5] | fromjson | .default == "cursor/grok-4.7:high"))' "$FAKE_OMP_LOG"
 
 new_fixture
 printf '%s\n' '{"models":[{"selector":"cursor/other"}]}' > "$FAKE_OMP_STATE/models.json"

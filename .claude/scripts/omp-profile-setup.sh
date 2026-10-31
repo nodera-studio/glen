@@ -4,9 +4,12 @@
 set -euo pipefail
 
 PROFILE=glen-harness
-# Ordered ladder: each model's own default thinking level, picked together.
-DEFAULT_MODEL_PREFERENCE=(cursor/gemini-4-argon cursor/gemini-3.8-flash cursor/grok-4.7)
-DEFAULT_THINKING_PREFERENCE=(medium medium high)
+# $0, not BASH_SOURCE[0]: a test negative control runs this script's text
+# through `bash -c "$text" "$0_override" ...`, where BASH_SOURCE is unset.
+# shellcheck source=.claude/omp/model-ladder.sh
+. "$(cd "$(dirname "$0")/../omp" && pwd -P)/model-ladder.sh"
+DEFAULT_MODEL_PREFERENCE=("${MODEL_LADDER[@]}")
+DEFAULT_THINKING_PREFERENCE=("${THINKING_LADDER[@]}")
 MODEL="${DEFAULT_MODEL_PREFERENCE[0]}"
 THINKING="${DEFAULT_THINKING_PREFERENCE[0]}"
 EXPLICIT_MODEL=0
@@ -247,6 +250,16 @@ elif [ "$EXPLICIT_MODEL" -eq 0 ] && [ "$CHECK" -eq 0 ]; then
   say "no live Cursor login yet; preference list unvalidated (using $MODEL)"
 fi
 
+# Item 10 (fix cycle 4): omp 18.14.0 honours a "<id>:<level>" suffix on a
+# model-role value (config/model-resolver.ts splitThinkingSuffix, sdk.ts:2155
+# defaultRoleSpec.explicitThinkingLevel) as a persisted default thinking
+# level; this is the only profile-level setting, so it is the primary
+# mechanism, with the engine's per-dispatch --thinking as belt and braces.
+# An explicit --model never gets a ladder level (matches SKILL.md): THINKING
+# only carries a real value along the ladder path.
+MODEL_ROLE_VALUE="$MODEL"
+[ "$EXPLICIT_MODEL" -eq 1 ] || MODEL_ROLE_VALUE="$MODEL:$THINKING"
+
 KEYS=(modelRoles tools.approvalMode tools.approval tools.xdev
   tools.restrictedFolders fetch.enabled web_search.enabled bash.enabled eval.py
   eval.js browser.enabled lsp.enabled mcp.enableProjectConfig mcp.startupTimeoutMs)
@@ -256,10 +269,10 @@ for key in "${KEYS[@]}"; do
   current="$(profile_omp profile config get "$key" --json | jq -cS .value)"
   if [ "$key" = modelRoles ]; then
     # The CLI registers only the whole record. Preserve all other model roles.
-    value_to_set="$(printf '%s' "$current" | jq -ecS --arg model "$MODEL" '
+    value_to_set="$(printf '%s' "$current" | jq -ecS --arg model "$MODEL_ROLE_VALUE" '
       if type == "object" then .default = $model else error("modelRoles must be a record") end')"
     current="$(printf '%s' "$current" | jq -cS .default)"
-    desired="$(jq -cn --arg model "$MODEL" '$model')"
+    desired="$(jq -cn --arg model "$MODEL_ROLE_VALUE" '$model')"
   else
     desired="$(profile_omp overlay config get "$key" --json | jq -cS .value)"
     value_to_set="$desired"
