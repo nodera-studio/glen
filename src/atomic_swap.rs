@@ -1,6 +1,6 @@
 //! `renameat2(RENAME_EXCHANGE)` / `renameatx_np(RENAME_SWAP)` publish, shared by
-//! `extension::write` and `skill::write`. Both callers pin a directory fd and keep
-//! their own private `Identity`, so this takes plain (dev, ino, digest) tuples.
+//! `install_guard::Guard` for the extension and the skill. The guard pins a directory fd and
+//! keeps its own private `Identity`, so this takes plain (dev, ino, digest) tuples.
 #[cfg(unix)]
 use std::{ffi::OsStr, fs, io};
 use xxhash_rust::xxh64::xxh64;
@@ -52,7 +52,7 @@ fn identity_at(
     // temp name is a random UUID, so unlikely, but never block with no timeout on it), the
     // open or the first read returns EAGAIN instead of hanging. Re-check with `fstat` on the
     // opened fd rather than trusting the earlier `statat`, same pattern as
-    // `extension::write::identity`.
+    // `install_guard::identity`.
     let fd = at::openat(
         dir,
         name,

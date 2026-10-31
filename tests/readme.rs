@@ -7,24 +7,45 @@ fn read(rel: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The README without the sections W3 and W4 fill in later.
-fn readme_outside_markers() -> String {
-    let mut text = read("README.md");
-    for wave in ["W3", "W4"] {
-        let (start, end) = (
-            format!("<!-- {wave}:start -->"),
-            format!("<!-- {wave}:end -->"),
+/// The text between a wave's `<!-- W*:start -->` and `<!-- W*:end -->` markers.
+fn marker_block(readme: &str, wave: &str) -> String {
+    let (start, end) = (
+        format!("<!-- {wave}:start -->"),
+        format!("<!-- {wave}:end -->"),
+    );
+    let a = readme
+        .find(&start)
+        .unwrap_or_else(|| panic!("README has no {start}"))
+        + start.len();
+    let b = readme[a..]
+        .find(&end)
+        .unwrap_or_else(|| panic!("README has no {end} after {start}"))
+        + a;
+    readme[a..b].to_string()
+}
+
+/// W8-DOC-1: v0.1.0 ships the live route and the skill, so their sections are filled in.
+#[test]
+fn readme_live_and_skill_sections_are_filled() {
+    let readme = read("README.md");
+    for (wave, needles) in [
+        ("W3", ["glen install-extension", "glen_reply", "glen inbox"]),
+        ("W4", ["glen install-skill", "--claude", "--codex"]),
+    ] {
+        let block = marker_block(&readme, wave);
+        assert!(
+            !block.contains("Coming in a later release"),
+            "README {wave} block still says it ships later"
         );
-        let a = text
-            .find(&start)
-            .unwrap_or_else(|| panic!("README has no {start}"));
-        let b = text[a..]
-            .find(&end)
-            .unwrap_or_else(|| panic!("README has no {end} after {start}"))
-            + a;
-        text.replace_range(a..b + end.len(), "");
+        for needle in needles {
+            assert!(block.contains(needle), "README {wave} block names {needle}");
+        }
     }
-    text
+    assert!(marker_block(&readme, "W4").contains("--project"));
+    assert!(
+        !readme.contains("Until the live route ships"),
+        "README still says the live route is unshipped"
+    );
 }
 
 /// Lines inside ``` fences.
@@ -62,9 +83,18 @@ fn readme_subcommands_exist_in_the_public_cli() {
         .get_subcommands()
         .map(|c| c.get_name().to_string())
         .collect();
-    let readme = readme_outside_markers();
+    // W8-DOC-1: the W3/W4 blocks are filled now, so their commands are checked too.
+    let readme = read("README.md");
     let used = subcommands(&code_lines(&readme));
-    for sub in ["ls", "show", "send", "wait"] {
+    for sub in [
+        "ls",
+        "show",
+        "send",
+        "wait",
+        "install-extension",
+        "install-skill",
+        "inbox",
+    ] {
         assert!(used.contains(sub), "the quick start must show glen {sub}");
     }
     let unknown: Vec<_> = used.difference(&public).collect();
