@@ -76,19 +76,23 @@ pub struct SessionLock {
     pub path: PathBuf,
 }
 pub fn try_acquire(home: &GlenHome, id: &str) -> io::Result<Option<SessionLock>> {
-    home.ensure_dir("run/locks").map_err(|e| {
-        io::Error::new(
-            e.kind(),
-            format!(
-                "cannot create {}: {e}",
-                home.root.join("run/locks").display()
+    home.ensure_dir("run/locks")
+        .map_err(|e| match crate::glen_home::take_refusal(e) {
+            // SEC-3: keep the invalid_env refusal intact for `sandbox::map_home_write`.
+            Ok(refusal) => io::Error::other(refusal),
+            Err(e) => io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot create {}: {e}",
+                    home.root.join("run/locks").display()
+                ),
             ),
-        )
-    })?;
+        })?;
     let path = lock_path(home, id);
+    // SEC-3: never follow a planted symlink, and only truncate a regular file we own.
     let fd = open(
         &path,
-        OFlags::RDWR | OFlags::CLOEXEC | OFlags::CREATE,
+        OFlags::RDWR | OFlags::CLOEXEC | OFlags::CREATE | OFlags::NOFOLLOW,
         Mode::from_raw_mode(0o600),
     )
     .map_err(|e| {
@@ -97,6 +101,24 @@ pub fn try_acquire(home: &GlenHome, id: &str) -> io::Result<Option<SessionLock>>
             format!("cannot open lock {}: {e}", path.display()),
         )
     })?;
+    let stat = rustix::fs::fstat(&fd).map_err(|e| {
+        io::Error::new(
+            io::Error::from(e).kind(),
+            format!("cannot stat lock {}: {e}", path.display()),
+        )
+    })?;
+    let euid = rustix::process::geteuid().as_raw();
+    if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::RegularFile
+        || stat.st_uid != euid
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "refusing lock {}: not a regular file owned by the current uid {euid}",
+                path.display()
+            ),
+        ));
+    }
     match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
         Ok(()) => Ok(Some(SessionLock { fd, path })),
         Err(Errno::WOULDBLOCK) => Ok(None),
@@ -276,6 +298,50 @@ mod tests {
             Acquired::Cancelled
         ));
         assert!(!lock_path(&h, "other").exists());
+    }
+    #[test]
+    fn sec3_symlinked_lock_is_refused_and_its_target_unchanged() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        h.ensure_dir("run/locks").unwrap();
+        let victim = t.path().join("victim.txt");
+        std::fs::write(&victim, b"VICTIM DATA").unwrap();
+        std::os::unix::fs::symlink(&victim, lock_path(&h, "s")).unwrap();
+        assert!(try_acquire(&h, "s").is_err());
+        assert!(acquire(&h, "s", Instant::now(), &|| false, || Ok(())).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"VICTIM DATA");
+        // A dangling symlink is not followed into a new file either.
+        let absent = t.path().join("absent.txt");
+        std::os::unix::fs::symlink(&absent, lock_path(&h, "d")).unwrap();
+        assert!(try_acquire(&h, "d").is_err());
+        assert!(!absent.exists());
+    }
+    #[test]
+    fn sec3_non_regular_lock_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        h.ensure_dir("run/locks").unwrap();
+        use std::os::unix::ffi::OsStrExt;
+        let fifo = std::ffi::CString::new(lock_path(&h, "f").as_os_str().as_bytes()).unwrap();
+        // SAFETY: `fifo` is a valid NUL-terminated path for the duration of the call.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let err = try_acquire(&h, "f").err().unwrap();
+        assert!(err.to_string().contains("not a regular file"), "{err}");
+    }
+    #[test]
+    fn sec3_untrusted_locks_dir_keeps_the_invalid_env_refusal() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        h.ensure_dir("run/locks").unwrap();
+        std::fs::set_permissions(
+            h.root.join("run/locks"),
+            std::fs::Permissions::from_mode(0o777),
+        )
+        .unwrap();
+        let err = crate::glen_home::take_refusal(try_acquire(&h, "s").err().unwrap()).unwrap();
+        assert_eq!(err.code, crate::error::ErrorCode::InvalidEnv);
+        assert!(!lock_path(&h, "s").exists());
     }
     #[test]
     fn lock_not_inherited_by_child() {
