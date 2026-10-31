@@ -866,6 +866,120 @@ fn ac356_queued_jobs_and_ac365_legacy_holder_fallback() {
     terminate_job(&b, second_id);
 }
 #[test]
+#[cfg(unix)]
+fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
+    use rustix::process::{Pid, Signal, kill_process};
+    struct Paused(Pid);
+    impl Paused {
+        fn new(pid: u32) -> Self {
+            let pid = Pid::from_raw(pid as i32).unwrap();
+            kill_process(pid, Signal::STOP).unwrap();
+            Self(pid)
+        }
+    }
+    impl Drop for Paused {
+        fn drop(&mut self) {
+            let _ = kill_process(self.0, Signal::CONT);
+        }
+    }
+    struct Abort(std::process::Child);
+    impl Drop for Abort {
+        fn drop(&mut self) {
+            if self.0.try_wait().unwrap().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let b = RpcBox::new();
+    let first = launch(&b);
+    let first_id = job_id(&first);
+    accepted(&b, first_id);
+    let second = checked(
+        command(&b, &["send", "e27c0de", "second", "--no-wait", "--json"])
+            .env(
+                "FAKE_OMP_RUN_RELEASE",
+                b.omp.tmp.path().join("second-release"),
+            )
+            .output()
+            .unwrap(),
+        10,
+    );
+    let second_id = job_id(&second);
+    poll(Duration::from_secs(3), || {
+        let status = b.job(second_id).1;
+        (status["waiting_for_lock"] == true && status["status"] == "queued").then_some(())
+    });
+    let worker = Paused::new(b.job(first_id).1["worker_pid"].as_u64().unwrap() as u32);
+    let mut abort = Abort(
+        command(&b, &["abort", "e27c0de", "--timeout", "15s", "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let requests = b.job_dir(first_id).join("control");
+    poll(Duration::from_secs(3), || {
+        fs::read_dir(&requests)
+            .ok()?
+            .filter_map(Result::ok)
+            .any(|entry| {
+                fs::read(entry.path())
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                    .is_some_and(|request| request["op"] == "abort")
+            })
+            .then_some(())
+    });
+    // execute() is waiting on j1's answer. Keep the caller descheduled until j2 has
+    // actually acquired the released lock, so a post-answer queue scan cannot see it.
+    let caller = Paused::new(abort.0.id());
+    drop(worker);
+    assert_eq!(
+        b.wait_terminal(first_id, Duration::from_secs(5))["status"],
+        "aborted"
+    );
+    accepted(&b, second_id);
+    assert!(abort.0.try_wait().unwrap().is_none());
+    drop(caller);
+    let status = poll(Duration::from_secs(3), || abort.0.try_wait().unwrap());
+    use std::io::Read;
+    let mut stdout = vec![];
+    let mut stderr = vec![];
+    abort
+        .0
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    abort
+        .0
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_end(&mut stderr)
+        .unwrap();
+    let result = checked(
+        Output {
+            status,
+            stdout,
+            stderr,
+        },
+        0,
+    );
+    assert_eq!(result["data"]["route"], "job");
+    assert_eq!(result["data"]["job_status"], "aborted");
+    assert_eq!(
+        result["data"]["queued_jobs"],
+        json!([b.job(second_id).0["handle"]])
+    );
+    assert!(warning(&result, "jobs_queued"));
+    b.wait_worker_gone(first_id);
+    terminate_job(&b, second_id);
+}
+
+#[test]
 fn ac363_ready_deadline_stops_without_mutation() {
     let b = RpcBox::new();
     let start = Instant::now();

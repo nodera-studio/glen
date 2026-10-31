@@ -312,6 +312,12 @@ fn run_control(
             job: job.as_deref(),
             ext_version: version.as_deref(),
         };
+        // Snapshot before the abort: once the running job ends, it releases the session lock and
+        // the next queued job starts, so a listing taken afterwards races that start.
+        let queued_before = match control {
+            Control::Abort => Some(queued_jobs(env, &opened.session.header.id, job.as_deref())?),
+            _ => None,
+        };
         let result = execute(&mut transport, &control, &context);
         let finished = transport.finish();
         if stop.load(Ordering::SeqCst) {
@@ -359,15 +365,7 @@ fn run_control(
         if opened.not_yet_persisted && matches!(control, Control::Model(_) | Control::Thinking(_)) {
             warnings.push(route::not_persisted());
         }
-        if matches!(control, Control::Abort) {
-            let store = JobStore::new(glen_home::resolve(env)?);
-            let queued: Vec<_> = store
-                .active_for_session(&opened.session.header.id)
-                .into_iter()
-                .filter(|(_, _, s)| s.status == State::Queued)
-                .filter(|(id, _, _)| Some(id.handle()).as_deref() != job.as_deref())
-                .map(|(id, _, _)| id.handle())
-                .collect();
+        if let Some(queued) = queued_before {
             if !queued.is_empty() {
                 warnings.push(Warning {
                     code: "jobs_queued".into(),
@@ -390,6 +388,21 @@ fn run_control(
         "the glen job ended again while applying a control",
     )
     .with_details(json!({"reason":"job_ended"})))
+}
+/// Handles of the session's glen jobs in status `queued`, other than `running`.
+fn queued_jobs(
+    env: &Env,
+    session_id: &str,
+    running: Option<&str>,
+) -> Result<Vec<String>, GlenError> {
+    let store = JobStore::new(glen_home::resolve(env)?);
+    Ok(store
+        .active_for_session(session_id)
+        .into_iter()
+        .filter(|(_, _, s)| s.status == State::Queued)
+        .map(|(id, _, _)| id.handle())
+        .filter(|handle| Some(handle.as_str()) != running)
+        .collect())
 }
 fn pair(model: &Value) -> String {
     if let (Some(provider), Some(id)) = (model["provider"].as_str(), model["id"].as_str()) {

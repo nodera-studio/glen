@@ -299,12 +299,29 @@ pub fn finish(mut child: Child, desc: &str, timeout: Duration) -> Out {
 
 /// Every complete record of a fake log, in append order (missing log → empty).
 pub fn records(path: &Path) -> Vec<Value> {
-    let Ok(text) = fs::read_to_string(path) else {
-        return Vec::new();
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return vec![],
+        Err(error) => panic!("cannot read fake records {}: {error}", path.display()),
     };
-    text.lines()
-        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
-        .collect()
+    let mut records = vec![];
+    let mut segments = bytes.split(|byte| *byte == b'\n').peekable();
+    while let Some(line) = segments.next() {
+        let trailing = segments.peek().is_none();
+        if trailing && line.is_empty() {
+            break;
+        }
+        match serde_json::from_slice(line) {
+            Ok(record) => records.push(record),
+            Err(_) if trailing => (), // An unfinished trailing write may not yet be JSON.
+            Err(error) => panic!(
+                "malformed complete fake record in {}: {error}; line: {:?}",
+                path.display(),
+                String::from_utf8_lossy(line)
+            ),
+        }
+    }
+    records
 }
 
 /// Frames of `kind` that crossed the wire in direction `dir` (`"in"` = glen → omp).
@@ -1074,4 +1091,41 @@ pub fn obj(pairs: &[(&str, Value)]) -> Value {
 
 pub fn jstr(s: &str) -> Value {
     json!(s)
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::*;
+
+    #[test]
+    fn complete_records_survive_an_unfinished_trailing_write() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("fake.ndjson");
+        fs::write(&path, b"{\"n\":1}\n{\"n\":2}\n{\"n\":").unwrap();
+        assert_eq!(records(&path), vec![json!({"n":1}), json!({"n":2})]);
+        fs::write(&path, b"{\"n\":1}\n{\"n\":2}").unwrap();
+        assert_eq!(records(&path), vec![json!({"n":1}), json!({"n":2})]);
+        fs::write(&path, b"{\"n\":1}\n{\"text\":\"\xf0\x9f").unwrap();
+        assert_eq!(records(&path), vec![json!({"n":1})]);
+        fs::write(&path, b"").unwrap();
+        assert!(records(&path).is_empty());
+        assert!(records(&temp.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn malformed_complete_records_panic_with_the_path_and_line() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("torn.ndjson");
+        for bytes in [b"{\"n\":1}\nTORN\n".as_slice(), b"TORN\n{\"n\":"] {
+            fs::write(&path, bytes).unwrap();
+            let panic = std::panic::catch_unwind(|| records(&path)).unwrap_err();
+            let message = panic.downcast_ref::<String>().unwrap();
+            assert!(
+                message.contains("malformed complete fake record"),
+                "{message}"
+            );
+            assert!(message.contains(path.to_str().unwrap()), "{message}");
+            assert!(message.contains("TORN"), "{message}");
+        }
+    }
 }

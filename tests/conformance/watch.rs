@@ -3673,7 +3673,7 @@ fn ac516_control_keys_dispatch_the_matching_control() {
         })
     });
     t.wait_for("model change completed", UI, |v| {
-        status_bar(v).contains("thinking")
+        status_bar(v).contains("→ other/fake-2")
     });
 
     t.key(b"T");
