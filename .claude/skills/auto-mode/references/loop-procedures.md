@@ -62,6 +62,18 @@ never stage it.
 
 - PR #NN last-seen comment: <ISO timestamp>
 
+## Checkpoints
+
+- Cadence: 60m            (or `none` when the goal asks for no checkpoints)
+- Last checkpoint: 2026-11-01T08:01:50Z (checkpoint-41)   (or `none` before the first)
+- Path: challenge/checkpoints/checkpoint-NN.md (the path the goal's DoD names)
+- Schedule: <cron job id from CronCreate> | none
+
+## Processes started
+
+| pid | started (ps lstart) | command | why | stopped |
+| --- | --- | --- | --- | --- |
+
 ## Blockers
 
 - <none, or the open blocker + exactly what you asked the user>
@@ -69,7 +81,15 @@ never stage it.
 ## Decision log
 
 - <date> <decision taken autonomously + basis (research/architect/codebase ref)>
+- <date> <fix-cycle decision> — Governing AC: AC-<id> "<verbatim>" | none (basis <path:line>) — <basis>
 ```
+
+Times in the state file are UTC ISO from `date -u +%Y-%m-%dT%H:%M:%SZ`. Under **Checkpoints**,
+`Last checkpoint: none` with a cadence is due at once, and the next checkpoint number is the
+parenthesised `checkpoint-NN` plus one (`checkpoint-01` when `none`). Every process the run
+starts in the background and leaves running (a preview server, a watcher) gets a
+**Processes started** row with its `ps -o lstart= -p <pid>`; `stopped` is filled when it is
+stopped (step 9, "Closing the run").
 
 ## The Mnemosyne board (glen's tracker)
 
@@ -120,6 +140,34 @@ stays the source of truth across compaction. Create one queue per goal
 persists a broken row that breaks `queue_get`); the id goes in the title. Move the item with
 `queue_item_update` as the wave moves: `in_progress` at bootstrap, `blocked` when flagged,
 `done` at wave close. Wave-end Notes may be referenced by `documentId`.
+
+## Run checkpoints
+
+When the goal's DoD asks for periodic checkpoints, fill **Checkpoints** in the state file at run
+start: the cadence, the path the DoD names, and the id of the `CronCreate` job that prompts you
+at that cadence (load `CronCreate` with ToolSearch first). A checkpoint is a state snapshot in
+the path's format (wave ledger, what landed, decisions, harness friction, blockers, the next
+hour, as in `challenge/checkpoints/checkpoint-40.md`), committed with the active branch and
+mirrored as a Note. Update `Last checkpoint` when you write one.
+
+- **On every wake** (a heartbeat, a CI poll, an agent's completion notification, the cron
+  prompt), run `bash .claude/scripts/checkpoint-due.sh` before anything else:
+  - exit 0 (due or overdue) → write the checkpoint it names first, then handle the event;
+  - exit 1 (not due) → schedule the next wake no later than the time it prints
+    (`ScheduleWakeup` delay = the smaller of about 20 min and the minutes it prints);
+  - exit 3 → the goal has no checkpoints;
+  - exit 2 → the **Checkpoints** section is malformed: fix it, then run the check again.
+- Why: checkpoint 40 covered 00:01Z–07:38Z because nothing checked lateness while the session
+  waited on long agents.
+- Checkpoints continue through landing, the release and the run close until status `done`
+  ("Closing the run").
+- **Untracked copies block `git pull --ff-only`.** A checkpoint (or any file) left untracked in
+  the main checkout blocks the pull once `origin/main` adds the same path. Before pulling in the
+  main checkout, for each untracked file `origin/main` adds
+  (`git diff --name-only --diff-filter=A HEAD origin/main`), compare it:
+  `git diff --no-index --quiet <file> <(git show origin/main:<file>)`. Identical → move the
+  untracked copy to the scratchpad, then pull. Different → stop and reconcile before pulling
+  (checkpoint 38).
 
 ## Resolving the goal into waves
 
@@ -175,10 +223,12 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    cancel path in `implementation/coder-codex.md` → "Cancelling a run"; TaskStop alone leaves
    Codex editing the worktree.
 4. **Pre-push check.**
-   `bash .claude/scripts/quality-gate.sh && cargo test --locked` (or `/run-ci`). Fix red
-   before pushing; a red CI cycle costs a two-runner round trip. The gate runs rustfmt and
-   clippy `-D warnings` and, on macOS, clippy again for `x86_64-unknown-linux-gnu`, which
-   host clippy skips (`cfg(target_os = "linux")`; W1's CI failed on an import unused there).
+   `bash .claude/scripts/quality-gate.sh && bash .claude/scripts/suite-lock.sh cargo test --locked`
+   (or `/run-ci`). Fix red before pushing; a red CI cycle costs a two-runner round trip. The
+   gate runs rustfmt and clippy `-D warnings` and, on macOS, clippy again for
+   `x86_64-unknown-linux-gnu`, which host clippy skips (`cfg(target_os = "linux")`; W1's CI
+   failed on an import unused there). Never run two test suites at once in one target dir: a
+   concurrent `cargo build --example` re-links the example binaries a running suite uses.
 5. **Open the PR into `main`.** `git push -u origin <branch>`, then `gh pr create --base
    main --title "W<n>: <summary>" --body <scope, tests, board issue (W<n> + document id)>`.
    Flip the issue → `in_review`. Record the PR number in the ledger.
@@ -195,12 +245,18 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    **Waiting on background work.** Whenever the session will idle longer than about 10 min on
    background agents, a workflow or CI, schedule a `ScheduleWakeup` heartbeat about every
    20 min. CI polling itself stays at about 270 s, as above.
-   - On each wake, compare against the previous wake, for every running agent:
+   - On each wake, run the checkpoint check first ("Run checkpoints" above). Then compare
+     against the previous wake, for every running agent:
      `git -C "$WT" status --short` and the last commit time (`git -C "$WT" log -1 --format=%cI`),
      the companion `status` where Codex runs, and the workflow and CI status.
    - Two wakes in a row with no change for an agent → run "Check before stopping an
      Implementer" (`implementation/orchestrator.md` → Role 1). Never use a wake as a reason to
      stop an agent by itself.
+   - Once a day, and at every wave start, read the nightly flake proof:
+     `gh run list --workflow flake-proof.yml --event schedule --limit 1 --json conclusion,headSha,url,createdAt`.
+     A red run (its `headSha` on `main`) becomes a flake-ledger line in the Harness friction log
+     and a tech-debt memory naming the failing tests from the run's summary. It never blocks a
+     merge or a wave.
    - Stop scheduling heartbeats once everything has reported.
 
    **CI-owner marker.** When a background agent owns a PR's CI loop (it polls and fixes that
@@ -230,8 +286,37 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    - Why: W9 was cut before W3b merged, so its live-route hint could not name `glen thinking`.
    - A merge changes the head SHA, so a SHA-bound proof (W10's flake proof) has to re-run on
      the new head.
+   - **Squash-merged base.** A branch cut from, or merged with, another wave's pre-squash
+     commit (Shared seams item 2) merges main with this recipe instead of the plain merge
+     (verified by `.claude/scripts/tests/squash-merge-recipe-smoke.sh`):
+
+     ```bash
+     # The branch was cut from, or merged, wave A's pre-squash commit CUT; main has A's squash SQ.
+     git -C "$WT" fetch origin "pull/<A>/head"                     # wave A's last tip, if not local
+     A_TIP="$(gh pr view <A> --json headRefOid -q .headRefOid)"
+     CUT="$(git -C "$WT" merge-base HEAD "$A_TIP")"
+     SQ="$(gh pr view <A> --json mergeCommit -q .mergeCommit.oid)"
+     # Exit 1 from a preview or the merge means conflicts; `|| …` keeps a `bash -e` shell going.
+     git -C "$WT" merge-tree --write-tree --name-only HEAD origin/main || true                   # preview: plain base
+     git -C "$WT" merge-tree --write-tree --name-only --merge-base="$CUT" HEAD origin/main || true  # preview: cut base
+     git -C "$WT" replace --graft "$SQ" "$SQ^" "$CUT"   # temporary: SQ gets CUT as a second parent
+     rc=0; git -C "$WT" merge --no-edit origin/main || rc=$?
+     git -C "$WT" replace -d "$SQ"                       # always, right away, before resolving
+     ```
+
+     - The graft makes `git merge` pick the right base and leaves a normal index for any
+       conflict left (`rc` 1), which goes to `routing.sh integration` as usual. The resulting
+       merge commit has the ordinary parents (HEAD, `origin/main`).
+     - `refs/replace` is shared by every worktree of the repo: run nothing else in the repo
+       between the graft and its deletion, and never push `refs/replace`.
+     - Why: W8, cut from W10's `042be28`, had 34 conflicts with the plain base and 13 with the
+       cut base (memory 0c598d5a).
 
    Then: CI red → fix the cause (never relax a lint or a test to go green).
+   Every fix-cycle decision, in the decision log and in fix briefs, quotes its governing AC:
+   `Governing AC: AC-<id> — "<text copied verbatim from the plan file>"` (one line per AC), or
+   `Governing AC: none — basis: <path:line> "<quoted line>"` (`implementation/orchestrator.md`
+   → Fix cycles).
    A review comment with a real defect → fix, push, reply on the thread. A comment that
    is wrong → reply with evidence (file:line, a test) and resolve it. Theoretical-only →
    one-line reply with the reason. A Linux-only failure (paths, `dirs` locations) cannot
@@ -258,19 +343,55 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
    worktree" below: cancel its Codex jobs, then `.claude/scripts/remove-worktree.sh`, which
    stops its brokers before removing it. Either way, finish with
    `bash .claude/scripts/sweep-codex-orphans.sh` and act on its task report: a finished job's
-   `task` process can outlive it in a worktree that still exists.
+   `task` process can outlive it in a worktree that still exists. Last, stop every
+   **Processes started** row the wave started (preview servers, watchers): confirm
+   `ps -o lstart=,command= -p <pid>` still matches the row's start time and command (a reused
+   pid is not yours), stop it, and fill the row's `stopped` with the time.
 10. **Advance** to the next wave without asking. 2–3 line status at wave boundaries only;
     silent during polling.
 
 A goal without a release is **done** once its last wave is merged, `done` and tagged
-`shipped:main`. Only a goal that asks for a release continues to step 11.
+`shipped:main`, then "Closing the run". Only a goal that asks for a release continues to
+step 11.
 
 11. **Release (release goals only).** Set status `landing`. Run the `release` skill:
     version-bump PR (`Cargo.toml` + `Cargo.lock`, `CHANGELOG.md` if present) → poll CI
     the same way → capture a memory referencing the bump PR → `gh pr merge --squash` →
     `git tag -a v0.x.y -m "glen v0.x.y"` on that `main` commit → `git push origin v0.x.y`.
     Then `document_tags_update` add `released:v0.x.y` to every goal issue (and the goal
-    module). Set status `done`.
+    module), then "Closing the run".
+
+## Closing the run
+
+Run this whenever a goal reaches `done`, with a release or without one, in this order. Status
+becomes `done` only at its last item.
+
+1. Keep checkpoints going ("Run checkpoints"); write the closing checkpoint into the closing PR.
+2. Stop what the run started: every live **Processes started** row (pid, lstart and command
+   still match), every run worktree through `remove-worktree.sh` ("Removing a worktree"), then
+   `bash .claude/scripts/sweep-codex-orphans.sh`, acting on its task report.
+3. Tech-debt memories: `memory_list` (`project: "glen"`, `sourceKind: "tech-debt"`, active). For
+   each whose fix merged this run, cite the fix `path:line` on `origin/main` and `memory_update`
+   it to `resolved`. Mark decisions this run reversed as `superseded`.
+4. Board: the goal module → `done` (`document_update` with its current fields, as in "The
+   Mnemosyne board"), and the run ledger queue's items `done`.
+5. Deliverables meant for `main` (audit reports under `.claude/reviews/`) go into the closing PR
+   after a gitleaks check, or the decision log says why not.
+6. Scratch: `bash .claude/scripts/clean-scratch.sh --dry-run 'glen-*'`, then the real run for the
+   entries this run created; list the rest for the owner.
+7. Delete the run's merged PR branches. `git branch -r --merged origin/main` cannot find them
+   (a squash merge leaves the branch unmerged) and lists `origin/main` itself, so take them from
+   the run ledger's PR numbers: `gh pr view <N> --repo nodera-studio/glen --json
+   state,headRefName -q 'select(.state == "MERGED") | .headRefName'` for each. Never delete
+   `main` or `HEAD`; for each other name that `git ls-remote --exit-code --heads origin <branch>`
+   still finds, `git push origin --delete <branch>`.
+8. Last, after the closing PR merges: `CronList`, then `CronDelete` the id under
+   **Checkpoints** → Schedule (load both with ToolSearch first), set `Cadence: none` and
+   `Schedule: none`, set status `done`, and stop scheduling heartbeats.
+
+Why: the v0.1.0 close left no checkpoints for 7.5 h, Codex brokers and an `astro preview`
+running, fixed debt memories active, the module open, and the hourly prompt firing after the
+run ended (`.claude/handoffs/v010-final-report.md`, checkpoint 41).
 
 ## Parallel work
 
@@ -283,6 +404,16 @@ Plan the batch as independent fix groups by file (no two groups edit the same fi
 it as a workflow: one implementer per group in its own worktree, one reviewer per group, and
 the group branches merged into the batch branch (`.claude/docs/Workflow-Fanout.md`). Steps 1–4
 describe the batch branch; each group worktree is cut and removed the same way.
+
+Group briefs are sections of the batch plan file. A change during the run is written there, at
+the top of the affected section, as `> REVISED <date -u +%Y-%m-%dT%H:%M:%SZ>: <what changed and
+what to do>` or `> REVOKED <ISO>: <decision> — <replacement>`, before any message; every group
+agent and the integrator record `shasum -a 256 <plan file>` when they start and re-hash it
+before each commit and merge, applying every new REVISED or REVOKED line first (and stopping to
+report when one contradicts work already committed). Group agents never read this file, so each
+group brief carries that instruction itself, or names `coder-claude.md` → Step 3, item 3. A batch acceptance check that names an
+open branch carries "once that branch is merged, run it against `origin/main`" (batch 10's W9
+`merge-tree` gate went stale once W9 squash-merged).
 
 1. `git worktree add .claude/worktrees/harness-<n> -b chore/harness-selfimprove-<n>
    origin/main` — an isolated worktree, so the wave checkout is untouched.
@@ -328,7 +459,8 @@ semantic merge at PR time. So, when planning waves to run in parallel:
    `git -C <second worktree> merge <first branch>`, then re-run the gate and tests there. Not
    at PR time. Re-merge any later commits on the first wave's branch (its fix rounds) the
    same way. Once the first wave is squash-merged, the second brings `main` in with
-   `git merge origin/main`, never a rebase, and only then opens or updates its PR.
+   `git merge origin/main` (for a wave that merged another wave's branch early, with step 7's
+   squash-merged base recipe), never a rebase, and only then opens or updates its PR.
 3. A shared surface list (the visible-command set, doctor checks, the conformance
    command-surface rows) has one owner wave per run. Only the owner edits it; another wave
    hands its entries to the owner's plan or adds them after the owner merges.
@@ -367,8 +499,13 @@ its absolute path, from the main checkout
    tip is in `origin/main` or on its fetched upstream. It refuses while a live job (queued, or
    running with a live companion task pid, in either companion state store) or a task process
    is in `$WT`, printing the cancel commands; else it
-   stops `$WT`'s brokers (TERM, wait, KILL), confirms nothing is left, then
-   `git worktree remove --force` and `git branch -D`. Never do these steps by hand or in
+   stops `$WT`'s brokers (TERM, wait, KILL), confirms nothing is left, copies every untracked
+   or ignored file under `$WT`'s
+   `.claude/{evidence,plans,research,handoffs,tech-debt,testing,reviews}/` to the same path in
+   the main checkout (a different file already there is never overwritten: the worktree's copy
+   goes under `.claude/evidence/from-worktrees/<worktree name>-<UTC stamp>/`; a failed copy
+   removes nothing), then `git worktree remove --force` and `git branch -D`. Everything else
+   uncommitted is discarded, so commit or push first. Never do these steps by hand or in
    another order.
 3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"`: stops this repo's brokers whose
    worktree is gone, with no live job or task process referencing it; lists suspected orphan
@@ -429,8 +566,8 @@ record the open question in the state file so a context refresh does not lose it
 
 ## Stop conditions
 
-- Finish line met → status `done`, final summary (waves shipped, PRs, issues (`W<n>` +
-  document id), anything deferred to tech debt). Goal without
+- Finish line met → "Closing the run" (status `done` at its last item), final summary (waves
+  shipped, PRs, issues (`W<n>` + document id), anything deferred to tech debt). Goal without
   a release: last wave merged + `shipped:main`. Release goal: tag pushed + issues tagged
   `released:v0.x.y`.
 - A wave PR red 3+ cycles with no path forward → stop that wave, flag the user.

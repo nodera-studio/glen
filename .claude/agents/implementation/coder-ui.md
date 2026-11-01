@@ -54,7 +54,9 @@ chrome-devtools, and compare it with each named design reference:
 - Never weaken a test to go green. Never `--no-verify`.
 - On a contradiction between the plan and the design reference, STOP and report it; do not
   pick silently.
+- Hash the plan and brief files (`shasum -a 256`) when you start and re-hash them right before
+  every commit; on a change, apply every REVISED or REVOKED line first, or stop and report if
+  one contradicts committed work (`coder-claude.md` → Step 3, item 3).
 - Report: files created/modified, tests, build state, the evidence path, the fidelity
-  verdict (matches, departures, remaining misses), deviations and blockers.
-</content>
-</invoke>
+  verdict (matches, departures, remaining misses), deviations, **Not done** (every plan step
+  or brief item not fully done, with its id and why; `none` when all are done) and blockers.

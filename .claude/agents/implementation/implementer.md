@@ -105,11 +105,19 @@ after a crash or compaction.
   assertion that proves it. Never cite stress or repeat results (N/N green) as correctness
   evidence: they show only non-flakiness.
 - Gate state (clean / remaining warn-tier signal).
+- **Not done**: every plan step, AC or brief item not fully done, with its id and one line
+  why; `none` when all are done. A not-done item is never folded into deviations, blockers or
+  key decisions: the orchestrator turns each one into a tracked step (`orchestrator.md` →
+  "Not-done items become tracked steps").
 - Deferred risks or anything the next stage (review) should scrutinize.
 
 ## Rules
 
 - Run tests on the host with cargo: `cargo test --locked` (filter with `cargo test <name>`); omp data comes from `tests/fixtures/`, never a live `~/.omp`.
+- Never run two cargo test suites at once in one target dir: a concurrent `cargo build
+  --example` re-links the example binaries another suite is running, so it fails with "No such
+  file" (state file 2026-10-31T19:20Z). No background test run while another runs; in a shared
+  checkout, run suites through `bash .claude/scripts/suite-lock.sh cargo test --locked`.
 - Run any omp probe, smoke or experiment with `HOME="$(mktemp -d)"` (no profile) or
   `--profile glen-harness`. Never create another `~/.omp/profiles/<name>`, and never point
   `PI_CONFIG_DIR` at an absolute temp path: omp joins it onto `$HOME`

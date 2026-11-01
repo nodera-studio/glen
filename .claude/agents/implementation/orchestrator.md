@@ -103,7 +103,9 @@ may still say "If W4 is merged…". Check each such conditional against the repo
 (`git log origin/main`, `gh pr view <N> --json state`, `rg`), rewrite it as an unconditional
 instruction in the plan file, and keep only those that cannot be resolved yet, labelled
 `CONDITIONAL — decided by: <the check>` (`plan/planner.md` → backward check). The Implementer
-must not spend Codex round trips on them.
+must not spend Codex round trips on them. A check or gate that names an open branch or PR (for
+example `git merge-tree --write-tree feat/x HEAD`) runs against `origin/main` instead once that
+branch is merged (`gh pr view <N> --json state` prints MERGED); rewrite it so in the plan.
 
 Store the plan file path — after successful implementation it is **archived, not
 deleted** (see "Mark Plan Complete").
@@ -202,6 +204,18 @@ reviewers) names it by absolute path in the main checkout, which any worktree re
 `MAIN="$(git rev-parse --path-format=absolute --git-common-dir)/.."` (plans under
 `$MAIN/.claude/plans/`), and says its absence from the worktree is expected; without that
 line, Implementers reported the plan "missing".
+
+**Revising a brief mid-run.** Running workflow agents cannot receive SendMessage, and a
+background agent reads a message only between tool calls. So a changed or revoked decision is
+written into the brief or plan file that agent was given first, at the top of the affected
+section, as `> REVISED <date -u +%Y-%m-%dT%H:%M:%SZ>: <what changed and what to do>` or
+`> REVOKED <ISO>: <decision> — <replacement>`, and only then sent by SendMessage where the agent
+can receive it. Every committer records `shasum -a 256 <brief file>` when it starts, re-hashes
+right before every commit (and before an integration merge), and on a change re-reads its
+section and applies every REVISED or REVOKED line before committing; if a revision contradicts
+work already committed, it stops and reports (`coder-claude.md` → Step 3). Checkpoints 33–34:
+group B coded a revoked decision, and the integrator caught it only because it re-read the
+brief (cost: commit `26afcdc`).
 
 **UI implementation routing.** Design-heavy UI (`site/`, landing pages, web (non-Rust) visual
 components) goes to the agent `bash .claude/scripts/routing.sh ui` names, not to the routed
@@ -311,7 +325,12 @@ scripts signal brokers only: they never cancel a job or signal a task or task-wo
    stops the brokers whose fixed-position `--cwd` is `$WT` or below it (TERM, wait, KILL; a pid
    whose pid, start time or command differs from the snapshot is skipped), confirms nothing is
    left (else exit 1, nothing removed), runs `git worktree remove --force` and, with `<branch>`,
-   `git branch -D`. Removal discards uncommitted changes, so commit or push first. With neither
+   `git branch -D`. Removal first copies untracked and ignored files under the worktree's
+   `.claude/{evidence,plans,research,handoffs,tech-debt,testing,reviews}/` to the same path in
+   the main checkout (an identical file is skipped; a differing one goes to
+   `$MAIN/.claude/evidence/from-worktrees/<worktree name>-<UTC stamp>/`, never overwriting; a
+   failed copy exits 1 and removes nothing), and discards everything else uncommitted, so
+   commit or push first. With neither
    state store it refuses; `--force-no-state` goes on without the job check.
 3. `bash "$MAIN/.claude/scripts/sweep-codex-orphans.sh"` (`--dry-run` to only list). It stops
    only brokers whose `--cwd` under `.claude/worktrees/` no longer exists, that no live job in
@@ -333,9 +352,11 @@ classifies each Codex failure, and is the **single committer** of Codex's work (
 exactly the files Codex reported and commits on its behalf). You do not commit Implementer
 output; you verify it.
 - **Deliberate second check.** Before Role 2, in the same worktree, re-run
-  `bash .claude/scripts/quality-gate.sh` and `cargo test --locked` yourself. It is cheap, and
-  it checks the host's report the way the host checks Codex's. Run this check for a Claude
-  Implementer too: its report is a claim like any other.
+  `bash .claude/scripts/quality-gate.sh` and `bash .claude/scripts/suite-lock.sh cargo test
+  --locked` yourself, only after the Implementer has returned (never while an agent runs in
+  that worktree: two suites in one target dir break each other, `implementer.md` → Rules). It
+  is cheap, and it checks the host's report the way the host checks Codex's. Run this check for
+  a Claude Implementer too: its report is a claim like any other.
 - **Stress is not correctness.** A stress or N-run green (`scripts/flake-check.sh`,
   `flake-proof.yml`) is evidence of non-flakiness only, never that a fix is right. Before
   Role 2, ask for a red → green test per fix: the test that failed on the old code and passes
@@ -386,6 +407,30 @@ deviation, and is restored: tracked with `git restore --source=HEAD --staged --w
 untracked with `tar -xzf "$SNAP/untracked.tgz" <f>`. Say in the Report what was restored and
 what could not be.
 
+**Not-done items become tracked steps.** W10 Steps 21 and 23 were reported "not done" and
+nobody owned them until four blind conformance tests failed (checkpoint 34). So after every
+Implementer return:
+
+- Build a `## Not-done ledger` section in the plan file (main checkout) from the report's
+  **Not done** field **and** every `<task status="pending">` the report did not explain:
+
+  ```markdown
+  ## Not-done ledger
+  | Item | From | Owner | Fix cycle | State | Record |
+  | --- | --- | --- | --- | --- | --- |
+  | Step 21 AC source check | Implementer report 2026-10-31T18:02Z | impl-coder-claude | fix 1 | open | |
+  ```
+
+  State is `open`, `fixed <sha>` or `deferred`.
+- Each row gets an owner and a fix cycle (a fresh Implementer brief, line-range where
+  possible), or an explicit deferral recorded in the state file's decision log (and a tech-debt
+  memory when it outlives the wave). A `deferred` row's Record names who decided and where it
+  is recorded (decision-log line, tech-debt memory id, or board comment).
+- Role 2 is not dispatched while a row is `open`. These fix cycles are Role 1 work and do not
+  count toward Role 2's 2-cycle cap; a row still open after two of them is deferred with a
+  record or reported to the user, never left open. Role 3 re-checks the ledger, and the Report
+  and the PR body list every `deferred` row.
+
 **One routed Implementer writes product code.** You (the orchestrator) write none. Do NOT
 dispatch separate coder / wiring / error-handling / test-writer / test-runner / verifier agents
 (those files were deleted); those concerns are fused into the Implementer `routing.sh
@@ -401,7 +446,9 @@ agent `routing.sh integration` names (it prints an engine, not an agent type: fo
 dispatch a fresh `subagent_type: "general-purpose"` with `model: "opus"`), recorded as a
 routing deviation and followed by the gate,
 tests and a scoped Claude ‖ Codex review of the resolved files (`loop-procedures.md` → "Shared
-seams").
+seams"). The integration agent's brief names the brief or plan file it works from and requires
+the re-hash before the merge commit ("Revising a brief mid-run"): on a changed hash it re-reads
+its section and applies every REVISED or REVOKED line first.
 
 **Slices, waves, and the budget guard.** A feature too large for one context is
 split at *slice boundaries*, never mid-loop. If the Implementer returns
@@ -486,8 +533,17 @@ ranges into Codex's prompt.
 Every fix cycle (review, conformance, visual or CI findings) follows these rules
 (`skills/auto-mode/references/loop-procedures.md` step 7 is the source):
 
+- **Quote the governing AC.** Every fix-cycle decision you write (a fix brief's scope, a
+  narrowed or widened rule, a dismissed finding, a SPEC CHANGE, a decision-log line) carries
+  `Governing AC: AC-<id> — "<text copied verbatim from the plan file>"` (one line per AC), or
+  `Governing AC: none — basis: <path:line> "<quoted line>"`, copied with the Read tool from the
+  plan file, never paraphrased or recalled. Reviewers and the conformance writer compare the
+  decision against that quote. Two W10 fix-cycle decisions (the narrowed netns rule, the
+  AC-1011 misread) failed review (checkpoint 33).
 - **Merge main first**, before briefing any fix, with `WT` = the wave's checkout:
-  `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit origin/main`. Never rebase. Merge
+  `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit origin/main`. Never rebase. A
+  branch cut from, or merged with, another wave's pre-squash commit merges main with the
+  recipe in `loop-procedures.md` step 7 → "Squash-merged base". Merge
   only when `git -C "$WT" status --short` is empty (else have the owning agent commit first),
   and not when a CI-owner agent works in `$WT` (it merges as its first fix step). A conflict
   goes to the agent `bash .claude/scripts/routing.sh integration` names (dispatched as in
@@ -530,7 +586,8 @@ Once Role 2 is green, check every acceptance criterion against the source before
    as `AC-id | class | path:line | reason | settled-by`, to `.claude/plans/<slug>.ac-check.md`
    in `$MAIN`, headed with the `git -C "$WT" rev-parse HEAD` that was checked.
 3. Settle every row that is not `consistent` or `omp-verified` before Role 3: either a
-   SPEC CHANGE (design doc and AC first, per "Spec ambiguity" below) or a fix brief. `missing`
+   SPEC CHANGE (design doc and AC first, per "Spec ambiguity" below) or a fix brief, each
+   carrying its `Governing AC:` line ("Fix cycles" → "Quote the governing AC"). `missing`
    always gets a fix brief. A fix from this check re-enters Role 2 scoped to the fixed files,
    then this check re-runs for those ACs. Unverifiable omp facts join the live-smoke list.
 4. If a later commit before the end of Role 3 changes a file a row cites, re-run the check for
@@ -566,7 +623,9 @@ Implementer wrote tests that match its own bug."
 
 **Spec ambiguity or a test that conflicts with the spec.** When the conformance writer
 flags an ambiguity, or a conformance test disagrees with the spec, settle it yourself:
-first clarify the design doc (`docs/design.md` or the plan's acceptance criteria), then
+first clarify the design doc (`docs/design.md` or the plan's acceptance criteria), with a
+`Governing AC:` line quoting the AC as it stood and as clarified ("Fix cycles" → "Quote the
+governing AC"), then
 resume the conformance writer (the suite's owner) to re-derive the assertion from the
 clarified text. The Implementer never edits conformance assertions. If a tracked test the
 Implementer wrote has to change to match the clarification, call that change out in the
@@ -617,7 +676,8 @@ Skip only when the diff changes no rendered output, and say so in the Report.
 
 **Check live-check and polish items before a fix brief.** Before you forward any item from
 this visual check, your own live check or a polish list into a fix brief, check it against the
-plan and `docs/design.md`. An item that contradicts the plan (e.g. its explicit verbatim
+plan and `docs/design.md`, and put its `Governing AC:` line in the brief ("Fix cycles" →
+"Quote the governing AC"). An item that contradicts the plan (e.g. its explicit verbatim
 layout) is not a fix. Either drop it (say so in the Report, with the plan line it conflicts
 with), or treat it as a spec change: mark it `SPEC CHANGE`, update the plan or design doc
 first, have the conformance writer re-derive the affected assertions, and only then brief the
@@ -668,7 +728,7 @@ cargo run -- <args>   # e.g. the new or changed subcommand, against the installe
 
 Present a completion summary: task, files created (one-line purpose each), files
 modified, tests added (count + coverage areas), docs updated, sandbox-vs-host discrepancies
-(Role 1 host re-verification), risks/notes (manual steps, env vars, migrations), and what to
+(Role 1 host re-verification), every `deferred` Not-done ledger row with its record, risks/notes (manual steps, env vars, migrations), and what to
 manually test in the running app.
 
 **Commit per logical unit.** Multi-wave plans: one commit per wave once that wave is
@@ -719,6 +779,13 @@ Plans are **kept after implementation** — they accumulate as project history. 
 - Every fix cycle merges `origin/main` first (never a rebase). A diff touching Linux-only code
   keeps the Role 2 gate open until CI has run on its head (draft PR, `check (ubuntu-latest)`).
   Wait longer than about 10 min only with a `ScheduleWakeup` heartbeat.
+- Every fix-cycle decision carries a `Governing AC:` line copied verbatim from the plan file
+  (or `none — basis: <path:line> "<quoted line>"`), never paraphrased.
+- After every Implementer return, its Not done items and unexplained pending `<task>` blocks
+  go into the plan's `## Not-done ledger`; each row is owned by a fix cycle or deferred with a
+  record, and Role 2 waits while any row is `open`.
+- A changed or revoked decision goes into the brief or plan file first (`> REVISED` /
+  `> REVOKED`), then by SendMessage; committers re-hash the brief before every commit.
 - codex-rescue briefs never name an output path; Codex returns its review as final-message
   text.
 - **Generative loop in ONE context (the routed Implementer's); discriminative checks in fresh

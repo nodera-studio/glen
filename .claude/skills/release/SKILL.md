@@ -28,7 +28,10 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
 
 1. **Preflight.**
    - `git fetch origin --tags && git switch main && git pull --ff-only`.
-   - `gh run list --branch main --limit 1` — the latest `ci` run on `main` must be green.
+   - `gh run list --workflow ci --branch main --limit 1 --json conclusion,headSha,url` — the
+     latest `ci` run on `main` must be green for the commit you will tag: `conclusion` is
+     `success` and `headSha` equals `git rev-parse origin/main`. Keep `--workflow ci`: without
+     it the newest run on `main` may be another workflow (the nightly flake proof, `release`).
    - Find the previous tag: `git describe --tags --abbrev=0 2>/dev/null` (none before the first
      release). List what ships: `git log <prev-tag>..origin/main --oneline` (or the whole history
      for the first release).
@@ -67,6 +70,23 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
      --limit 1` / `gh run watch <id>` and confirm it is green.
    - Confirm the 9 assets (4 `glen-<target>.tar.gz`, 4 `.sha256`, `SHA256SUMS`):
      `gh release view v<version> --json assets --jq '.assets[].name'`.
+   - Install smoke: download this machine's asset, check its checksum and run it.
+
+     ```bash
+     case "$(uname -sm)" in
+       "Darwin arm64") t=aarch64-apple-darwin ;;  "Darwin x86_64") t=x86_64-apple-darwin ;;
+       "Linux x86_64") t=x86_64-unknown-linux-musl ;;  "Linux aarch64") t=aarch64-unknown-linux-musl ;;
+     esac
+     D="$(mktemp -d)"
+     # One && chain: a failed download or checksum stops before anything is extracted or run.
+     gh release download "v<version>" --repo nodera-studio/glen --dir "$D" \
+       --pattern "glen-$t.tar.gz" --pattern "glen-$t.tar.gz.sha256" \
+       && (cd "$D" && shasum -a 256 -c "glen-$t.tar.gz.sha256") \
+       && tar -xzf "$D/glen-$t.tar.gz" -C "$D" && "$D/glen-$t/glen" --version   # prints: glen <version>
+     ```
+
+     `install.sh` itself is covered by the release workflow's `verify-install` job on both OSes
+     (`release.yml:131`); the `steer-bash` hook blocks `curl`, so do not run `curl … | sh` here.
    - Fallback only if the workflow cannot run: `gh release create v<version> --verify-tag
      --notes-file <file>` with the same notes as the PR body, then upload the assets by hand.
    - After the first release (v0.1.0): set `releaseAvailable: true` in `site/src/data/site.ts` in a
@@ -76,6 +96,20 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
      (`document_tags_update`, `mode: "add"`, on the Mnemosyne board of project Glen; read the
      issue with `document_get` first for its `revision`). Keep their `shipped:main` tag.
    - Delete the release branch: `git push origin --delete chore/release-v<version>`.
+8. **Post-release checklist.**
+   - The published release and its notes are checked: `gh release view v<version>` shows the
+     generated notes and the 9 assets.
+   - Every shipped board issue carries `released:v<version>` (Step 7).
+   - Resolve the tech-debt memories whose fixes shipped in this release (`memory_update`, status
+     `resolved`, with the fix `path:line`).
+   - Stop any preview server or Codex broker the release work started. Neither script below
+     stops `astro preview`, so first: for each pid of `pgrep -f 'astro preview'`, check its cwd
+     (`lsof -a -d cwd -p <pid> -Fn`) is under the release worktree and `kill <pid>` only then;
+     confirm with `pgrep -f 'astro preview'` again. Then remove the release worktree with
+     `bash .claude/scripts/remove-worktree.sh <absolute path>` and run
+     `bash .claude/scripts/sweep-codex-orphans.sh`.
+   - Under `/auto-mode`, continue with `.claude/skills/auto-mode/references/loop-procedures.md` →
+     "Closing the run" (checkpoints until the run ends, module close, schedule removal).
 
 ## Hard rules
 
@@ -83,6 +117,7 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
 - Annotated tags only (`git tag -a`), on the squash-merge commit on `main`.
 - Store the memory referencing the PR before `gh pr merge`.
 - Never delete, move or force-push a tag that has been pushed.
+- The release is not done until the Step 7 install smoke prints the new version.
 
 ## References
 

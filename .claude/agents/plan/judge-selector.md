@@ -85,6 +85,11 @@ summary:
   plan you return. One that cannot be resolved yet stays, labelled `CONDITIONAL — decided by:
   <the check>`. W5's unresolved "If W4 is merged" bullets cost the Implementer five Codex
   round trips.
+- **Open-branch gates.** A verification step, acceptance check or gate that names an open
+  branch, PR or worktree needs a fallback: once that branch is merged (`gh pr view <N> --json
+  state` prints `MERGED`), run the check against origin/main instead. A squash merge leaves
+  the branch tip off `main`, so the check goes stale (batch 10's W9 `merge-tree` gate). One
+  without the fallback scores against correctness; add the fallback in the plan you return.
 - **omp homes.** Every omp-running step names an allowed omp home (planner rule):
   `HOME="$(mktemp -d)"` or `--profile glen-harness`. A step that creates another profile, uses
   `~/.omp` itself, or isolates with a temp `PI_CONFIG_DIR` scores against correctness; rewrite
