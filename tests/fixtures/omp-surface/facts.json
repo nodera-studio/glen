@@ -1,0 +1,131 @@
+{
+  "v": 1,
+  "omp": "18.14.0",
+  "facts": [
+    {
+      "id": "rpc.cmd.negotiate_protocol",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"negotiate_protocol\""
+    },
+    {
+      "id": "rpc.ready.supported_versions",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"supportedProtocolVersions\""
+    },
+    {
+      "id": "rpc.cmd.set_host_tools",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"set_host_tools\""
+    },
+    {
+      "id": "rpc.cmd.set_event_filter",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"set_event_filter\""
+    },
+    {
+      "id": "rpc.cmd.get_state",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"get_state\""
+    },
+    {
+      "id": "rpc.cmd.get_available_models",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"get_available_models\""
+    },
+    {
+      "id": "rpc.cmd.get_available_thinking_levels",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"get_available_thinking_levels\""
+    },
+    {
+      "id": "rpc.event.prompt_result",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"prompt_result\""
+    },
+    {
+      "id": "rpc.event.session_settled",
+      "file": "packages/coding-agent/src/modes/rpc/wire/rpc-wire.schema.json",
+      "contains": "\"session_settled\""
+    },
+    {
+      "id": "rpc.server.set_host_tools",
+      "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+      "contains": "case \"set_host_tools\":"
+    },
+    {
+      "id": "rpc.server.stdin_eof_shutdown",
+      "file": "packages/coding-agent/src/modes/rpc/rpc-mode.ts",
+      "contains": "RPC client disconnected before host tool execution completed"
+    },
+    {
+      "id": "rpc.server.duplicate_tool_rule",
+      "file": "packages/coding-agent/src/session/session-tools.ts",
+      "contains": "conflicts with an existing tool"
+    },
+    {
+      "id": "cli.flag.no_ui",
+      "file": "packages/coding-agent/src/cli/args.ts",
+      "contains": "arg === \"--no-ui\""
+    },
+    {
+      "id": "cli.flag.no_session",
+      "file": "packages/coding-agent/src/cli/args.ts",
+      "contains": "arg === \"--no-session\""
+    },
+    {
+      "id": "cli.flag.no_extensions",
+      "file": "packages/coding-agent/src/cli/args.ts",
+      "contains": "arg === \"--no-extensions\""
+    },
+    {
+      "id": "cli.flag.profile",
+      "file": "packages/coding-agent/src/cli/args.ts",
+      "contains": "arg === \"--profile\""
+    },
+    {
+      "id": "lease.path_suffix",
+      "file": "packages/utils/src/file-lock.ts",
+      "contains": "return `${path.resolve(filePath)}.lock`;"
+    },
+    {
+      "id": "lease.acquire",
+      "file": "packages/coding-agent/src/session/session-storage.ts",
+      "contains": "export function tryAcquireSessionLease(sessionId: string)"
+    },
+    {
+      "id": "lease.name_token",
+      "file": "packages/coding-agent/src/session/session-storage.ts",
+      "contains": "/^[A-Za-z0-9_-]{1,128}$/"
+    },
+    {
+      "id": "dirs.session_owners",
+      "file": "packages/utils/src/dirs.ts",
+      "contains": "session-owners"
+    },
+    {
+      "id": "dirs.agent_dir_env",
+      "file": "packages/utils/src/dirs.ts",
+      "contains": "PI_CODING_AGENT_DIR"
+    },
+    {
+      "id": "session.leaf",
+      "file": "packages/coding-agent/src/session/session-entries.ts",
+      "contains": "activeLeafId"
+    },
+    {
+      "id": "session.continuation",
+      "file": "packages/coding-agent/src/session/session-listing.ts",
+      "contains": "findSessionContinuation"
+    },
+    {
+      "id": "session.version",
+      "file": "packages/coding-agent/src/session/session-entries.ts",
+      "contains": "export const CURRENT_SESSION_VERSION = 3;"
+    },
+    {
+      "id": "session.title_slot",
+      "file": "packages/coding-agent/src/session/session-entries.ts",
+      "contains": "export const SESSION_TITLE_SLOT_ENTRY_TYPE = \"title\";"
+    }
+  ]
+}

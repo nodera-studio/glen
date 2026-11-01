@@ -129,7 +129,7 @@ pub fn run(bin: &Path, profile: Option<&str>, cwd: &Path, budget: Duration) -> P
     std::thread::spawn(move || {
         let wants_stderr = handshake(stdout, stdin, deadline, &worker);
         // After the deadline run() no longer listens, so a late result has nowhere to go.
-        done_tx.send(wants_stderr).ok();
+        done_tx.send((wants_stderr, Instant::now())).ok();
     });
     let snapshot = || {
         shared
@@ -138,8 +138,8 @@ pub fn run(bin: &Path, profile: Option<&str>, cwd: &Path, budget: Duration) -> P
             .clone()
     };
     loop {
-        match done.recv_timeout(POLL.min(remaining(deadline, Instant::now()))) {
-            Ok(wants_stderr) => {
+        let late = match done.recv_timeout(POLL.min(remaining(deadline, Instant::now()))) {
+            Ok((wants_stderr, finished)) if finished < deadline => {
                 // The worker closed the client, so omp sees stdin EOF and can exit on its own.
                 let mut probe = snapshot();
                 teardown(
@@ -150,22 +150,24 @@ pub fn run(bin: &Path, profile: Option<&str>, cwd: &Path, budget: Duration) -> P
                 );
                 return probe;
             }
+            // A clamped call times out at the deadline, never before it: that is the deadline.
+            Ok(_) => true,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let mut probe = snapshot();
                 probe.note("probe thread ended unexpectedly");
                 teardown(&mut probe, &mut process, Duration::from_millis(100), false);
                 return probe;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) if Instant::now() >= deadline => {
-                // Final at the deadline: what the worker learned so far is the result.
-                let mut probe = snapshot();
-                let learned = std::mem::take(&mut probe.detail);
-                probe.note(&format!("probe exceeded the {budget:?} budget"));
-                probe.note(&learned);
-                teardown(&mut probe, &mut process, Duration::from_millis(100), false);
-                return probe;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => (),
+            Err(mpsc::RecvTimeoutError::Timeout) => Instant::now() >= deadline,
+        };
+        if late {
+            // Final at the deadline: what the worker learned so far is the result.
+            let mut probe = snapshot();
+            let learned = std::mem::take(&mut probe.detail);
+            probe.note(&format!("probe exceeded the {budget:?} budget"));
+            probe.note(&learned);
+            teardown(&mut probe, &mut process, Duration::from_millis(100), false);
+            return probe;
         }
     }
 }
