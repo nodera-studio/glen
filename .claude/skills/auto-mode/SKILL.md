@@ -93,14 +93,19 @@ Per wave, in order — this sequence is the spine of the mode:
    cursor; update the cursor. Idling over ~10 min on background agents, a workflow or CI →
    a `ScheduleWakeup` heartbeat about every 20 min; a background agent that owns a PR's CI
    loop gets a `.claude/auto-mode/ci-owner/pr-<N>.json` marker, and you leave that PR's CI
-   events to it (references → step 6).
+   events to it (references → step 6). On every wake, `bash .claude/scripts/checkpoint-due.sh`
+   first when the goal has checkpoints; overdue → write the checkpoint before anything else
+   (references → Run checkpoints).
 7. **Triage + fix** — start every fix cycle (CI, review or conformance) by merging main
    into the wave checkout: `git -C "$WT" fetch origin && git -C "$WT" merge --no-edit
    origin/main`, never a rebase (a CI-owner agent merges in its own checkout; you merge only
    into a clean `$WT`); a conflict goes to `routing.sh integration`; after a
    non-trivial merge re-run `quality-gate.sh` and `cargo test --locked`, and name the merged
-   SHA in the fix brief (references → step 7). Then CI red or a comment with a real defect →
-   fix, push, poll again; keep tests + docs in sync.
+   SHA in the fix brief (references → step 7). A branch cut from another wave's pre-squash
+   commit uses the squash-merged base recipe (`git replace --graft`, references → step 7);
+   fix-cycle decisions quote their governing AC (`Governing AC: AC-<id> — "<verbatim>"`).
+   Then CI red or a comment with a real defect → fix, push, poll again; keep tests + docs in
+   sync.
 8. **Capture, then merge when the bar is met** — the `ci` checks green on both runners
    (`check (ubuntu-latest)`, `check (macos-latest)`: fmt, clippy `-D warnings`, test),
    no unresolved review comments, the PR mergeable. THEN **store the wave's durable
@@ -119,8 +124,9 @@ Per wave, in order — this sequence is the spine of the mode:
 11. **Release only if the goal asks for one** — when every wave is merged: status
     `landing`, run the `release` skill (version-bump PR → green CI → capture → squash-merge
     → annotated `v0.x.y` tag on that `main` commit), then tag every goal issue
-    `released:v0.x.y` and set status `done`. A goal without a release is `done` once its
-    last wave is merged and tagged `shipped:main`.
+    `released:v0.x.y`. A goal without a release is `done` once its last wave is merged and
+    tagged `shipped:main`. Either way, then "Closing the run" (references), which sets status
+    `done` at its end.
 
 ## Hard rules
 
@@ -148,14 +154,17 @@ Per wave, in order — this sequence is the spine of the mode:
   with `decision` set to its id, and only then SendMessage the running agents, pointing
   them at `bash .claude/scripts/routing.sh` instead of restating the rule. Why: e5464a64
   was broadcast and reversed minutes later, then superseded by 148655d9.
+- **Revise briefs in the file.** A changed or revoked decision goes into the brief or plan
+  file as `REVISED`/`REVOKED` before any message; committers re-read it before committing
+  (references → Harness self-improvement loop).
 - **Commit attribution**: follow the attribution lines the session provides; never invent
   a different trailer.
 
 ## Stop conditions
 
-- Goal without a release: last wave merged + issue `done` with `shipped:main` → status
-  `done`. Release goal: tag pushed + issues tagged `released:v0.x.y` → status `done`.
-  Final summary either way.
+- Goal without a release: last wave merged + issue `done` with `shipped:main`. Release
+  goal: tag pushed + issues tagged `released:v0.x.y`. Either way, then "Closing the run"
+  (references), which sets status `done`; final summary.
 - A wave PR red 3+ cycles with no path forward → stop that wave, flag the user.
 - User says stop/pause or changes the goal → stop, confirm current state.
 
