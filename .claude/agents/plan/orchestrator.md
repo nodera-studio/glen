@@ -319,8 +319,12 @@ degrades to pass-through) and say so.
 that branch on merge state or on another wave ("If W4 is merged…"). Resolve each against the
 actual repo state (`git fetch`, `git log origin/main`, `gh pr view <N> --json state`, `rg`) and
 rewrite it as an unconditional instruction; one that cannot be resolved yet stays, labelled
-`CONDITIONAL — decided by: <the check>`. The planner and the judge do this too
-(`planner.md` → backward check, `judge-selector.md` → plan-step checks); this is the last pass.
+`CONDITIONAL — decided by: <the check>`. In the same pass, give every check or gate that names
+an open branch, PR or worktree its fallback: once that branch is merged (`gh pr view <N> --json
+state` prints `MERGED`), run the check against origin/main instead, since a squash merge leaves
+the branch tip off `main` (batch 10's W9 `merge-tree` gate went stale). The planner and the
+judge do this too (`planner.md` → backward check, `judge-selector.md` → plan-step checks); this
+is the last pass.
 W5's plan kept "If W4 is merged" bullets and its Implementer spent five Codex round trips on them.
 
 **Manual mode (default, hard gate).** Present the plan: total steps, files to create vs. modify,
