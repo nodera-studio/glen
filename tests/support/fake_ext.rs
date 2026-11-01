@@ -17,6 +17,7 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+        mpsc,
     },
     time::Duration,
 };
@@ -76,7 +77,11 @@ impl Peer {
     }
     fn write(&self, s: &mut UnixStream, v: Value) -> io::Result<()> {
         self.log("out", &v);
-        writeln!(s, "{v}")
+        // One write(2) per frame, as the real extension writes each frame once: `writeln!`
+        // emits a syscall per serializer fragment (about 100 for a hello answer).
+        let mut line = v.to_string().into_bytes();
+        line.push(b'\n');
+        s.write_all(&line)
     }
     fn supported(&self) -> &[&str] {
         if self.old_ops {
@@ -386,6 +391,40 @@ impl Peer {
         Ok(data)
     }
 }
+/// Serve each connection on the thread that accepted it, after handing the listener to a fresh
+/// thread. A request then costs this process one wakeup, as with the real extension's event loop:
+/// no poll interval and no thread start sit between glen's request and its answer (F10). The
+/// listener stays blocking, so accepted sockets are blocking too (F1: BSD `accept` would pass on
+/// a listener's O_NONBLOCK).
+#[cfg_attr(test, allow(dead_code))] // The integration tests exercise Peer directly.
+fn accept_next(listener: Arc<UnixListener>, peer: Peer, started: Option<mpsc::Sender<()>>) {
+    std::thread::spawn(move || {
+        if let Some(started) = started {
+            let _ = started.send(());
+        }
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    accept_next(listener, peer.clone(), None);
+                    if let Err(e) = peer.serve(stream) {
+                        eprintln!("fake_ext peer: {e}");
+                    }
+                    return;
+                }
+                // A signal, or a client that gave up before its connection was accepted.
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) => {}
+                Err(e) => {
+                    eprintln!("fake_ext accept: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    });
+}
 fn moved(id: &str) -> String {
     let mut s = id.to_owned();
     if s.len() >= 4 {
@@ -458,29 +497,16 @@ fn main() -> io::Result<()> {
     )?;
     let stop = Arc::new(AtomicBool::new(false));
     signal_hook::flag::register(signal_hook::consts::SIGTERM, stop.clone())?;
-    listener.set_nonblocking(true)?;
+    let (started, accepting) = mpsc::channel();
+    accept_next(Arc::new(listener), peer.clone(), Some(started));
+    accepting
+        .recv()
+        .map_err(|_| io::Error::other("fake_ext accept thread did not start"))?;
     println!("ready");
     io::stdout().flush()?;
+    // Only shutdown polls; requests never wait on this loop.
     while !stop.load(Ordering::Relaxed) {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                // BSD accept inherits O_NONBLOCK from the polling listener.
-                if let Err(e) = stream.set_nonblocking(false) {
-                    eprintln!("fake_ext blocking accepted socket: {e}");
-                    continue;
-                }
-                let peer = peer.clone();
-                std::thread::spawn(move || {
-                    if let Err(e) = peer.serve(stream) {
-                        eprintln!("fake_ext peer: {e}");
-                    }
-                });
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(20))
-            }
-            Err(e) => return Err(e),
-        }
+        std::thread::sleep(Duration::from_millis(20));
     }
     if std::env::var("FAKE_EXT_KEEP_FILES").as_deref() != Ok("1") {
         if let Err(e) = registry::remove_if_unchanged(&peer.home, &reg, false) {

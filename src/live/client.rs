@@ -290,8 +290,66 @@ fn write_request(
     }
     Ok(None)
 }
-fn unary_inner(path: &Path, op: &Op, end: Instant) -> Result<Value, ClientError> {
-    let mut stream = connect(path).map_err(ClientError::Connect)?;
+/// Read the one answer line of a unary request by the absolute `end` (F10). The time left is
+/// recomputed before every read, so a trickling peer cannot stretch the budget. Once `end` has
+/// passed, reads take only bytes already buffered: the verdict is whether the answer had arrived
+/// when glen looked, never whether glen's own thread got scheduled before `end`.
+fn read_reply(mut stream: &UnixStream, end: Instant) -> Result<Vec<u8>, ClientError> {
+    let mut line = Vec::new();
+    let mut chunk = [0u8; DRAIN_CHUNK];
+    let oversized = || ClientError::Protocol("oversized or incomplete frame".into());
+    loop {
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            stream
+                .set_nonblocking(true)
+                .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        } else if let Err(e) = stream.set_read_timeout(Some(left))
+            // macOS rejects a timeout change once the peer has closed; reads on such a socket
+            // return what is buffered, then EOF, without blocking.
+            && e.raw_os_error() != Some(libc::EINVAL)
+        {
+            return Err(ClientError::Protocol(e.to_string()));
+        }
+        let n = match stream.read(&mut chunk) {
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            // A timed-out read loops once more, which then takes only what is buffered.
+            Err(e)
+                if !left.is_zero()
+                    && matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                continue;
+            }
+            Err(e) => return Err(unary_io(e)),
+        };
+        if n == 0 {
+            return Err(if line.is_empty() {
+                ClientError::Protocol("eof".into())
+            } else {
+                oversized()
+            });
+        }
+        let newline = chunk[..n].iter().position(|&b| b == b'\n');
+        line.extend_from_slice(&chunk[..newline.map_or(n, |i| i + 1)]);
+        if line.len() > super::MAX_FRAME {
+            return Err(oversized());
+        }
+        if newline.is_some() {
+            return Ok(line);
+        }
+    }
+}
+/// One request and its answer within `timeout`: connect, write and read share one absolute
+/// deadline. The answer is read on the caller's thread, so an answer that arrived in time is
+/// never lost to a competing timer while a glen I/O thread waited to be scheduled (F10).
+pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientError> {
+    let end = Instant::now() + timeout;
+    // A full unix backlog can block connect(2); `bounded_connect` owns that wait.
+    let mut stream = bounded_connect(path, end, &|| false)?;
     let id = uuid::Uuid::now_v7().to_string();
     stream
         .set_write_timeout(Some(
@@ -313,7 +371,7 @@ fn unary_inner(path: &Path, op: &Op, end: Instant) -> Result<Value, ClientError>
     unary_tests::after_write(path);
     let line = match pre_read {
         Some(line) => line,
-        None => read_line(&mut BufReader::new(stream)).map_err(unary_io)?,
+        None => read_reply(&stream, end)?,
     };
     match parse_frame(&line).map_err(ClientError::Protocol)? {
         Frame::Response {
@@ -334,17 +392,6 @@ fn unary_inner(path: &Path, op: &Op, end: Instant) -> Result<Value, ClientError>
             "unexpected response id or event".into(),
         )),
     }
-}
-pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientError> {
-    // Own the entire connect/write/read budget, including a full unix backlog.
-    let path = path.to_owned();
-    let op = op.clone();
-    let end = Instant::now() + timeout;
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(unary_inner(&path, &op, end));
-    });
-    rx.recv_timeout(timeout).map_err(|_| ClientError::Timeout)?
 }
 /// Control requests carry an expected session id and close their connection on
 /// interruption. The worker checks the deadline again before sending any bytes.
@@ -963,20 +1010,102 @@ mod unary_tests {
         peer.join().unwrap();
     }
 
-    // Match by path so concurrently running client tests never consume this hook.
-    static AFTER_WRITE: Mutex<Option<(PathBuf, Receiver<()>)>> = Mutex::new(None);
+    // Keyed by path, so concurrently running client tests never take each other's hook.
+    static AFTER_WRITE: Mutex<Vec<(PathBuf, Receiver<()>)>> = Mutex::new(Vec::new());
+    /// Hold `unary` for `path` after its request is written, until the returned sender fires.
+    fn hold_after_write(path: &Path) -> mpsc::Sender<()> {
+        let (release, held) = mpsc::channel();
+        AFTER_WRITE.lock().unwrap().push((path.to_owned(), held));
+        release
+    }
+    fn hook_pending(path: &Path) -> bool {
+        AFTER_WRITE.lock().unwrap().iter().any(|(p, _)| p == path)
+    }
     pub(super) fn after_write(path: &Path) {
         let hook = {
-            let mut hook = AFTER_WRITE.lock().unwrap();
-            if hook.as_ref().is_some_and(|(expected, _)| expected == path) {
-                hook.take()
-            } else {
-                None
-            }
+            let mut hooks = AFTER_WRITE.lock().unwrap();
+            hooks
+                .iter()
+                .position(|(expected, _)| expected == path)
+                .map(|i| hooks.swap_remove(i))
         };
-        if let Some((_, closed)) = hook {
-            closed.recv_timeout(Duration::from_secs(10)).unwrap();
+        if let Some((_, release)) = hook {
+            release.recv_timeout(Duration::from_secs(10)).unwrap();
         }
+    }
+
+    /// F10 (W12): the peer's answer is in glen's socket buffer, but the thread that reads it is
+    /// held (as if descheduled) until after the deadline. A competing timer on the caller's
+    /// thread used to report `Timeout` for this answer; the verdict now comes from what the
+    /// kernel had buffered when glen read. The connection stays open, so no EOF path helps.
+    #[test]
+    fn unary_uses_an_answer_that_arrived_while_glen_was_held_past_its_deadline() {
+        let tmp = tempfile::Builder::new()
+            .prefix("gf10-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let release = hold_after_write(&path);
+        let timeout = Duration::from_secs(1);
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let line = read_line(&mut BufReader::new(&stream)).unwrap();
+            // glen set its deadline before it wrote this request.
+            let deadline_passed = Instant::now() + timeout + Duration::from_millis(300);
+            let request: Value = serde_json::from_slice(&line).unwrap();
+            let mut answer =
+                serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"answer":42}})
+                    .to_string()
+                    .into_bytes();
+            answer.push(b'\n');
+            stream.write_all(&answer).unwrap();
+            std::thread::sleep(deadline_passed.saturating_duration_since(Instant::now()));
+            release.send(()).unwrap();
+            stream
+        });
+        let result = unary(&path, &Op::State, timeout);
+        let _open = peer.join().unwrap();
+        assert_eq!(result.unwrap()["answer"], 42);
+        assert!(!hook_pending(&path));
+    }
+
+    /// The answer read has one absolute deadline: a peer that trickles bytes, never a newline,
+    /// for 3 s cannot hold a 300 ms `unary` past it.
+    #[test]
+    fn unary_read_ends_at_its_deadline_against_a_trickling_peer() {
+        let tmp = tempfile::Builder::new()
+            .prefix("gtrk-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("s");
+        let listener = UnixListener::bind(&path).unwrap();
+        let peer = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            read_line(&mut BufReader::new(&stream)).unwrap();
+            for _ in 0..60 {
+                if stream.write_all(b"x").is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        });
+        let start = Instant::now();
+        let result = unary(&path, &Op::State, Duration::from_millis(300));
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "a trickling peer stretched a 300 ms read to {elapsed:?}"
+        );
+        drop(result);
+        peer.join().unwrap();
     }
 
     #[test]
@@ -987,8 +1116,7 @@ mod unary_tests {
             .unwrap();
         let path = tmp.path().join("s");
         let listener = UnixListener::bind(&path).unwrap();
-        let (closed_tx, closed_rx) = mpsc::channel();
-        *AFTER_WRITE.lock().unwrap() = Some((path.clone(), closed_rx));
+        let closed_tx = hold_after_write(&path);
         let peer = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -1011,7 +1139,7 @@ mod unary_tests {
         let answer = unary(&path, &Op::State, Duration::from_secs(10)).unwrap();
         assert_eq!(answer["answer"], 42);
         peer.join().unwrap();
-        assert!(AFTER_WRITE.lock().unwrap().is_none());
+        assert!(!hook_pending(&path));
     }
     #[test]
     fn unary_response_ids_malformed_and_total_timeout() {
