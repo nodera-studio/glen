@@ -3,7 +3,7 @@
 # Bypass with `git commit --no-verify` / `git push --no-verify`, and only with a written reason.
 #
 #   - pre-commit → rustfmt check on staged Rust files + secret scan. Target: < 5 s.
-#   - pre-push   → clippy (warnings are errors) + the full test suite. Target: < 60 s.
+#   - pre-push   → clippy (warnings are errors) + the full test suite under the suite lock. Target: < 60 s.
 #
 # gitleaks is optional (`brew install gitleaks`); the hook degrades to a hint without it.
 
@@ -25,4 +25,9 @@ pre-push:
   commands:
     checks:
       # Sequential: clippy and test share target/, so running them in parallel only contends on the lock.
-      run: cargo clippy --all-targets --locked -- -D warnings && cargo test --locked
+      # The tests run under suite-lock.sh, so they wait for another suite in the same target dir (an
+      # agent's) instead of breaking it. Without one the lock is free and nothing waits; a stale lock
+      # is taken over. The wait is capped at GLEN_SUITE_LOCK_WAIT seconds (600 here), then exit 75.
+      run: |
+        cargo clippy --all-targets --locked -- -D warnings &&
+          GLEN_SUITE_LOCK_WAIT="${GLEN_SUITE_LOCK_WAIT:-600}" bash .claude/scripts/suite-lock.sh cargo test --locked
