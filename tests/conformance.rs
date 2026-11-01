@@ -1,5 +1,6 @@
 //! Conformance suite: behaviour derived from the approved plans and `docs/design.md`, written
 //! without reading the implementation.
+//! v0.1.0 (released as v0.1.0 and v0.1.1):
 //! - W0 (`.claude/plans/v010-wave-0-foundation.md`, AC-001…AC-029): cli_surface, color, doctor,
 //!   fixtures, output_contract, paths, repo_contracts, sanitize, state, width, write_failure.
 //! - W1 (`.claude/plans/v010-wave-1-reader.md`, AC-101…AC-126; §A3, §A8–§A11): ls, show, tail,
@@ -16,6 +17,19 @@
 //!   §A3, §A9–§A11, §A15): watch, on a pseudo-terminal with a VT emulator.
 //! - W10 (`.claude/plans/v010-wave-10-tech-debt.md`, AC-1001…AC-1029, the orchestrator decisions
 //!   and fix cycle 1): w10. The bwrap-only ACs live in `tests/linux_sandbox.rs`.
+//!
+//! v0.2.0 (`.claude/plans/v020.architecture.md`, ADR `0773c35d`): waves run in order, criteria are
+//! `AC-v2-<wave><nn>`, plans are `.claude/plans/v020-wave-<N>-<slug>.md`, and new modules are
+//! `tests/conformance/v2_*.rs`. Each wave replaces "planned" on its own line with its modules.
+//! - v0.2 W0 (`.claude/plans/v020-wave-0-foundation.md`, AC-v2-001…AC-v2-003; §A7, §A16,
+//!   §A18–§A23): repo_contracts.
+//! - v0.2 W1 omp compatibility (AC-v2-101…AC-v2-106; §A10–§A12, §A19): planned.
+//! - v0.2 W2 push (AC-v2-201…AC-v2-206; §A7, §A20): planned.
+//! - v0.2 W3 ACP spike (AC-v2-301…AC-v2-304; §A23): planned.
+//! - v0.2 W4 warm worker (AC-v2-401…AC-v2-407; §A21): planned.
+//! - v0.2 W5 MCP layer (AC-v2-501…AC-v2-506; §A22): planned.
+//! - v0.2 W6 tech debt and audits (AC-v2-601…AC-v2-604): planned.
+//! - v0.2 W7 release v0.2.0 (AC-v2-701…AC-v2-703; §A18): planned.
 //!
 //! Run: `cargo test --locked --test conformance`
 //!

@@ -568,8 +568,7 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 
 - [ ] W3b upgrade checks: re-check all six RPC controls and their wire payloads; Model not found / No API key prefixes; unchanged set_model append, thinking append-on-effective-change, configured thinking and resume defaults; compaction abort/resume and abort keeping queues; TUI setModel/setThinkingLevel/compact/abort wiring; ctx.models.list versus RPC filtering; serial queue including abort. Re-run the Step 12 scratch smoke outside the sandbox, verify persisted model/thinking on resume and unchanged global config, record evidence, and leave/list scratch sessions for the owner.
 
-### §A18 Distribution
-<!-- Level 3 for now: tests/conformance/repo_contracts.rs (AC-024) pins exactly 17 level-2 sections. Promote to ## when that test learns §A18. -->
+## §A18 Distribution
 - **Targets** (W7 plan D1, D2). Four, each built on a native GitHub runner with `cargo build --release --locked`:
 
 | Target | Runner | Smoke test |
@@ -596,3 +595,63 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
   - CI's `site-deploy` job runs `npm ci` (before any step that has the token), then `npx --no wrangler deploy --dry-run` on every PR and push. On a `main` push it also runs the online link check, and deploys the tested `dist/` only when the repo secret `CLOUDFLARE_API_TOKEN` exists; otherwise it prints a notice.
   - The Install section shows no installer URL or `/releases/latest` until `site.releaseAvailable` is true; W8 flips it after v0.1.0 is published, and the link check enforces both states.
 - **Demo golden** (D6). `tests/site_demo.rs` runs the real binary on `tests/fixtures/demo` and compares its ANSI stdout with `site/src/data/demo-capture.json`; `npm --prefix site run demo:refresh` rewrites it. The site decodes the capture at build (`site/src/data/ansi.mjs`), so the demo cannot drift from glen. Only TTY-only stderr (spinner, progress, the `tail -f` diagnostic) is hand-written, and the site's unit tests check those strings against `src/`.
+
+## §A19 omp compatibility
+Stub (v0.2 W0). Owner: **v0.2 W1**, which replaces this body.
+- **Scope.** A supported omp range with capability checks instead of exactly 18.14.0, and a nightly run of the surface contract against the latest omp.
+- **Decided** (ADR `0773c35d`):
+  - `src/omp/compat.json` (`min`, `max_tested`, `tested`) is the single source: Rust, the nightly and the site read it, and `TESTED_OMP_VERSION` derives from it. `omp-rpc` stays pinned to git tag `v18.14.0`, because Cargo cannot take a range of git tags. So the range is a declared, tested policy.
+  - Default (6): at W1, `min` = `max_tested` = 18.14.0. Only W6 raises `max_tested`, and only after the dispatched nightly passes on a newer omp.
+  - Doctor stays passive: `ok` in range, warning `omp_version_untested` above `max_tested`, warning `omp_version_unsupported` below `min`. It never fails on the version alone. `doctor --probe` adds a bounded RPC capability check. Behaviour is gated by negotiated capabilities, not by version strings.
+  - Graft (AC-v2-102): `omp --version` is parsed by glen's own semver code, which W1 moves into `src/version.rs`. It accepts the `omp/` and `v` prefixes, pre-release versions and build metadata. A version that still cannot be parsed is a warning plus "unprobed", not `omp_unavailable`, so W1 amends §A11 and §A12. No `semver` crate.
+  - Default (8): the nightly `omp-latest.yml` is separate from required CI, and the release preflight never reads it. Every omp step runs with `HOME="$(mktemp -d)"` and no credentials or model provider. Its summary names what it does not cover: model turns, and lease and storage behaviour under a real turn.
+
+## §A20 Push to the calling agent
+Stub (v0.2 W0). Owner: **v0.2 W2**, which replaces this body.
+- **Scope.** omp replies reach the calling agent without the agent running a `glen inbox` polling loop.
+- **Decided** (ADR `0773c35d`):
+  - **What push means in v0.2.** No first-party mechanism lets an outside process wake an already-running, idle Claude Code or Codex session (research, 2026-11-01). Claude Code Channels is a research preview and is ignored under `-p` and in subagents. `asyncRewake` is broken headless. Codex hooks are outbound-only, and the visible session's App Server cannot be reached from outside. So push is a finite, one-shot receiver that the caller starts itself: when it exits, the caller wakes. Channels, `asyncRewake` and PTY injection are not foundations. "No polling" means no agent or model loop; glen may still watch its own files on a bounded interval.
+  - **Receivers**, default (7), no new verb: `glen wait <job> --for reply [--after <reply-id>]` exits 10 with `woke:"reply"` when an unseen reply lands, or returns the job's terminal mapping (0/7/11) if the job ends first. `glen inbox --wait [--timeout]` covers replies that arrive after settlement. The job is the subscription: replies already land in `jobs/<id>/replies.ndjson` on both routes, so there is no caller registry.
+  - **Wording**, defaults (4) and (5): release copy says "push" for Claude Code only and "blocking wait" for Codex. Headless and subagent wording follows W2's evidence. For Codex, the v0.2 headline means pending-tool delivery, a blocking wait. W2's CHANGELOG bullet says so, so the goal is not silently redefined. There is no launch-owned caller adapter.
+  - **Channels**, default (1): a hidden `glen mcp --channel` (§A22). It is tested at the protocol level only and stays out of SKILL.md, README and the site.
+- **Per-caller delivery.** W2 keeps this table current:
+
+| Caller | Delivery | Push |
+|---|---|---|
+| Claude Code, interactive | `glen wait <job> --for reply` as a background Bash task; its completion wakes the session | yes |
+| Claude Code, `claude -p` | the same background wait, within the run; W2 records evidence of whether its completion wakes the run, and the skill uses a foreground wait if it does not | evidence in W2 |
+| Claude Code subagent | a foreground wait, or return the job handle to the parent | no |
+| Codex CLI | a blocking wait: `glen wait` through the `exec_command` yield and re-poll, plus `glen inbox --peek` at the start of each turn | Codex: no push |
+| Other MCP clients | tool results from `glen mcp` calls (§A22): pull | no |
+
+## §A21 Warm worker
+Stub (v0.2 W0). Owner: **v0.2 W4**, which replaces this body.
+- **Scope.** An opt-in warm worker that keeps omp alive for a bounded time after a send, so a following send to the same session skips omp's startup.
+- **Decided** (ADR `0773c35d`):
+  - Default (3): off by default (flag absent, or `0`). `send --warm DUR` beats `GLEN_WARM`. The maximum is 10m, and a larger value is a usage error. `@new` sends may stay warm, keyed by the session id recorded at settlement.
+  - Default (2): the warm worker keeps its omp client **and** glen's session lock, marked as lock-holder kind `warm`, and steals queued jobs instead of serving an endpoint. A warm omp child holds omp's owner lease anyway; releasing only glen's lock would leave that lease held and invite misrouting.
+  - It steals the oldest queued RPC job for its session by compare-and-claim, only when the binary, profile, thinking level and environment digest match. Otherwise it cools, and the job runs cold with its own environment.
+  - Graft (AC-v2-402, AC-v2-407): the claimant's pid and start time go into the stolen job's status, and the original observer never marks that job lost while the claimant is alive. Each adopted job gets its own reply sink, and the reply channel is drained at settlement. A `glen_reply` that arrives while the worker is idle is never attributed to the next job. The idle clock starts only after real settlement.
+  - One teardown covers expiry (re-armed after each job), `glen release`, a TUI endpoint for the session appearing, SIGTERM or SIGHUP, and omp exiting. A session control on an idle warm session cools it first, then runs as today; an idle `abort` reports "nothing to abort" and keeps it warm. Failed, aborted and forked outcomes never stay warm, and neither does the live route.
+  - `--warm` and `glen release` stay hidden until the PR that completes W4. W4 documents the lease cost and the residual race in this section.
+
+## §A22 MCP layer
+Stub (v0.2 W0). Owner: **v0.2 W5**, which replaces this body.
+- **Scope.** An MCP server generated from `docs/json.md`, so the CLI and the skill stay primary and there is one contract.
+- **Decided** (ADR `0773c35d`):
+  - `glen mcp` is a synchronous stdio JSON-RPC server with no new crates (no tokio, no rmcp). It handles `initialize` with version negotiation, `tools/list`, `tools/call` and `ping`.
+  - Each tool call runs glen itself (`current_exe`) with argv and `--json`, never through a shell, so every tool result is the CLI's own envelope. `ok:false` maps to `isError:true`, and exits 10, 11 and 130 are ordinary results. Streaming, TTY-only and installer commands are not tools.
+  - The catalog `src/mcp/tools.json` is generated from `<!-- mcp: … -->` annotations in `docs/json.md` plus clap, checked in, and guarded by a drift test. Graft (AC-v2-506): input schemas come only from clap. No type, enum or requiredness is inferred from `docs/json.md` examples. `outputSchema` appears only where an annotation declares it.
+  - Graft (AC-v2-502): cancelling a tool call (`notifications/cancelled`) stops the exec-self child. The job continues, and no abort is sent.
+  - Default (1): a hidden `--channel` flag emits one `notifications/claude/channel` per new reply. It is peek-only and labels the content as omp output (untrusted). It is tested at the protocol level only, stays out of SKILL.md, README and the site, and is not a release blocker. The owner verifies it interactively after v0.2.0.
+  - `mcp` is visible from W5's merge. W5 also updates the §A9 "considered and rejected" MCP bullet when it adds the `glen mcp` row.
+
+## §A23 ACP spike
+Stub (v0.2 W0). Owner: **v0.2 W3**, which replaces this body.
+- **Scope.** A spike of `omp acp` (Agent Client Protocol) as a second transport. It is a spike, not a rewrite: the RPC driver stays. W3 replaces this body with the experiment results and the go/no-go.
+- **Decided** (ADR `0773c35d`):
+  - A hidden `glen __acp` command with a hand-rolled synchronous ACP v1 client. omp 18.14.0 sets `PROTOCOL_VERSION = 1` (`packages/utils/src/acp/protocol.ts:13`). No ACP crate. The command never appears in help, completions, SKILL.md, `docs/json.md` or the MCP catalog.
+  - It takes glen's session lock and runs the endpoint and lease probes, refusing with exit 6 like an RPC resume. It runs omp with `GLEN_MANAGED=1`, writes no `.jsonl`, and creates no durable job.
+  - Experiments: E1, does `session/load` contend for the owner lease? E2, is a minimal permission policy enough to unblock tool calls? E3, can a job result be rebuilt from the `session/update` stream? Real-omp runs use `omp acp --profile glen-harness` in `$TMPDIR` scratch sessions, never the owner's default agent dir.
+  - A negative result completes the spike. There is no `glen_reply` parity claim: W3 records the loss of reply attribution under ACP. The outcome is an ADR with a go/no-go.
+  - `input_required` (§A7) is reserved for an ACP permission request.
