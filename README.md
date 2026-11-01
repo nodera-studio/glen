@@ -22,7 +22,7 @@ The script picks the archive for your platform, verifies its SHA-256 and install
 `~/.local/bin`. It never uses sudo. Pass flags after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- --version 0.1.0 --prefix ~/.local
+curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- --version 0.1.1 --prefix ~/.local
 curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- --dry-run
 ```
 
