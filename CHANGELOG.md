@@ -2,6 +2,12 @@
 
 All notable changes to glen are listed here, newest first.
 
+## Unreleased
+
+### Documentation
+
+- `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). The CLI is unchanged.
+
 ## v0.1.1 — 2026-11-01
 
 ### Fixed
