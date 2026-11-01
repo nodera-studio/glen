@@ -24,15 +24,15 @@ The owner runs `omp --profile glen-harness login cursor`, then
 The live Mnemosyne tool names (`mcp__mnemosyne_memory_*`, including the write tools
 `memory_store`, `memory_update` and `memory_delete` the policy denies) were confirmed in the
 Step 11 acceptance run. Setup picks the first id present in the live Cursor model list from
-an ordered ladder, each entry with its own startup thinking level: `cursor/gemini-4-argon`
-at medium, then `cursor/gemini-3.8-flash` at medium, then `cursor/grok-4.7` at high. It
+an ordered ladder, each entry with its own startup thinking level. The ladder has one entry,
+`cursor/grok-4.7` at high (owner decision 2026-11-01; Cursor dropped Gemini). It
 writes `modelRoles.default` as `<id>:<level>` (omp 18.14.0 honours this suffix itself,
 `config/model-resolver.ts` `splitThinkingSuffix`; host-verified against the session
 transcript's own `thinkingLevel` field, not the model's self-reported, unreliable answer).
 The engine repeats exactly that persisted suffix as a per-dispatch `--thinking <level>` on
 each `glen send`, as belt and braces on top of the persisted default, and passes no
-`--thinking` when the persisted value has no suffix. If none of the three ids is present, omp is unavailable, with a reason
-naming all three. `--model cursor/<id>` selects another model and requires that exact id; it
+`--thinking` when the persisted value has no suffix. If that id is not present, omp is unavailable, with a reason
+naming it. `--model cursor/<id>` selects another model and requires that exact id; it
 does not use the ladder, and setup never appends a thinking-level suffix for it.
 
 ## How to invoke
