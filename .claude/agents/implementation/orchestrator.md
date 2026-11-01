@@ -445,7 +445,7 @@ already-reviewed parallel waves (merging one wave's branch into the other), whic
 agent `routing.sh integration` names (it prints an engine, not an agent type: for `claude`
 dispatch a fresh `subagent_type: "general-purpose"` with `model: "opus"`), recorded as a
 routing deviation and followed by the gate,
-tests and a scoped Claude ‖ Codex review of the resolved files (`loop-procedures.md` → "Shared
+tests and a scoped `/code-review` of the resolved files (`loop-procedures.md` → "Shared
 seams"). The integration agent's brief names the brief or plan file it works from and requires
 the re-hash before the merge commit ("Revising a brief mid-run"): on a changed hash it re-reads
 its section and applies every REVISED or REVOKED line first.
@@ -457,15 +457,17 @@ the remainder (a fresh context is the entire point of splitting). For wave plans
 dispatch one Implementer per wave. Between slices, the handoff is `progress.md` +
 the plan's `<task>` XML — never the previous Implementer's transcript.
 
-### Role 2 — Review (fresh context, engine readiness and risk select the gate)
+### Role 2 — Review (fresh context, risk selects the gate)
 
 A fresh, independent review of the diff + spec — **never** the Implementer's
-transcript. Probe omp before dispatch: when it is ready or the diff is high-risk,
-use the review block described below. Only low-risk diffs with a skipped probe
-run the lean **`/code-review` dual-engine gate** (see
+transcript. A high-risk diff escalates to the triple-engine review block described
+below. Every other diff runs the lean **`/code-review` gate** (see
 `.claude/commands/code-review.md`): the Claude pass (`implementation/code-review.md`)
-‖ a Codex pass (`codex:codex-rescue`) in ONE message, merged by 2-vote consensus into
-one must-fix / recommended / notes report. No lint/type/style re-check — the
+‖ a Codex pass (`codex:codex-rescue`) ‖ the omp engine (`omp-engine.sh review`, when
+`omp-engine.sh probe` is ready; skipped with a one-line note otherwise) in ONE message,
+merged by 2-vote consensus into one must-fix / recommended / notes report. omp-only
+findings are advisory until a verifier confirms them against the code; omp plus one other
+engine is two votes (`code-review.md` step 3). No lint/type/style re-check — the
 deterministic gate already enforced that inside the Implementer; the engines hunt
 real bugs.
 
@@ -486,19 +488,20 @@ message text" and names no output path; you save it (see Review file names) if i
 disk.
 
 **UI diffs are reviewed by running them.** When the diff touches rendered output
-(`site/`, a TUI, terminal rendering), both engines' briefs say: build and run it and look
-at the output (a browser screenshot, or real CLI/TUI output under a pty) before calling
-it correct; a code trace alone is not enough. In W6 both engines traced the terminal
+(`site/`, a TUI, terminal rendering), the Claude and Codex briefs say: build and run it and
+look at the output (a browser screenshot, or real CLI/TUI output under a pty) before calling
+it correct; a code trace alone is not enough (omp traces code only, so its pass never counts
+as a run). In W6 both engines traced the terminal
 demo, approved it, and missed 2 of its 4 scenes never appearing. This is in addition to
 the Visual verification step below, not a substitute for it.
 
 **Codex capacity.** If the Codex pass fails on capacity or rate ("Selected model is at
 capacity", 429, rate limit), retry it once after a short wait (about 60 s). If the retry
-fails too, record Codex as unavailable, proceed with the Claude pass as a single-engine
-verdict, and say so in the Report. Never drop the engine silently.
+fails too, record Codex as unavailable, proceed with the Claude pass (and omp's, when it
+ran) without Codex, and say so in the Report. Never drop the engine silently.
 
-**Review file names.** If you save the passes to disk, name them `claude-review.md` and
-`codex-review.md`, plus `omp-review.txt` for the triple-engine block (plan files
+**Review file names.** If you save the passes to disk, name them `claude-review.md`,
+`codex-review.md` and `omp-review.txt` (plan files
 `<engine>-plan.md`), never `claude.md`: on macOS's
 case-insensitive filesystem Claude Code auto-loads any `claude.md` as a nested
 `CLAUDE.md`, which injects the review as project instructions. This holds for every way
@@ -508,11 +511,11 @@ hook refuses such a name on the Write tool only.
 Escalate to the **triple-engine review block** (see
 `.claude/agents/review-implementation/orchestrator.md`: Claude comprehensive reviewer
 ‖ `codex review` ‖ the omp engine, `.claude/scripts/omp-engine.sh review` → synthesizer) when
-`bash .claude/scripts/omp-engine.sh probe` exits 0 or the diff is high-risk (the risk heuristic
-`.claude/scripts/quick-classify.sh` uses: omp session writes, RPC/bridge, secrets,
-releases, dependency changes). When the probe is skipped, a high-risk diff still runs
-that block with its two available engines and names the probe's reason in the report;
-otherwise (not high-risk, probe skipped) the lean two-engine gate runs.
+the diff is high-risk (the risk heuristic `.claude/scripts/quick-classify.sh` uses: omp
+session writes, RPC/bridge, secrets, releases, dependency changes). When the probe is
+skipped, a high-risk diff still runs that block with its two available engines and names
+the probe's reason in the report. Every other diff runs `/code-review`, which brings omp in
+as its third pass whenever the probe is ready, so omp reviews each wave either way.
 
 Use the default-branch merge-base as `BASE` (no prompt — this is the in-pipeline
 path). If the report has must-fix items, dispatch a **fresh**
@@ -759,7 +762,7 @@ Plans are **kept after implementation** — they accumulate as project history. 
   → re-index. The routed Implementer owns write+wire+harden+test+gate; you write no product
   code (design-heavy UI goes to the agent `routing.sh ui` names, and integrating two
   already-reviewed parallel waves to `routing.sh integration`, a recorded routing deviation
-  followed by gate + tests + a scoped Claude ‖ Codex review) and do not re-introduce separate
+  followed by gate + tests + a scoped `/code-review`) and do not re-introduce separate
   coder/wiring/error-handling/test/verifier dispatches.
 - Before stopping an Implementer, check its worktree, stashes and Codex job, ask it for a
   status and wait one reply cycle (up to 5 min); after stopping, recover its tagged stashes by

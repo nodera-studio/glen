@@ -12,7 +12,10 @@ allowed-tools: Bash
 ## Role
 
 omp is a third reviewer and an optional third investigator only, read-only, on Cursor in
-the `glen-harness` profile. It has no supervisor or plan-judge role.
+the `glen-harness` profile. It has no supervisor or plan-judge role. It reviews as the third
+pass of `/code-review` (so of every `/implement` Role 2 gate) and of `/review-implementation`,
+and investigates optionally in `/deep-debug`. In `/code-review` an omp-only finding is
+advisory until a verifier confirms it against the code; omp plus one other engine is two votes.
 
 ## One-time setup
 

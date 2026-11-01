@@ -61,9 +61,9 @@ Any engine that's unavailable is simply skipped — the synthesizer notes which 
 ran and adjusts confidence (cross-engine agreement needs ≥2 engines). Never silently
 claim three engines ran when one was down.
 
-Inside `/implement`, select this block when omp is ready or the diff is high-risk.
-A low-risk diff with a skipped omp probe uses the lean Claude ‖ Codex `/code-review`
-gate instead. Standalone `/review-implementation` always uses this block, with
+Inside `/implement`, select this block when the diff is high-risk. Every other diff
+uses the lean `/code-review` gate instead (Claude ‖ Codex, with omp as its third pass
+when the probe is ready). Standalone `/review-implementation` always uses this block, with
 unavailable engines and their reasons recorded as above.
 
 ## Step 4 — Run the available engines in parallel
