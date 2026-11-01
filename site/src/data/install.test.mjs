@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { installView } from './install.mjs';
+import { defaultCommand, installView } from './install.mjs';
 import { site } from './site.ts';
 
 const repo = 'https://github.com/nodera-studio/glen';
@@ -25,6 +25,13 @@ test('after the release: the script with copy, the latest release (AC-725)', () 
   cargo,
   binary: { href: `${repo}/releases/latest`, label: 'Download the latest release', note: 'Archives for macOS (arm64, x86_64) and Linux (x86_64, arm64), with SHA-256 checksums.' },
  });
+});
+
+// W12 item 5: the closing CTA band repeats the command Install opens on, so it follows the release flip.
+test('defaultCommand is the default tab\'s command: Cargo before the release, the script after', () => {
+ assert.deepEqual(defaultCommand(installView({ ...site, releaseAvailable: false })), { command: cargo.command, copy: true });
+ assert.deepEqual(defaultCommand(installView({ ...site, releaseAvailable: true })), { command: site.commands.script, copy: true });
+ assert.equal(defaultCommand(installView(site)).command, site.commands.script, 'v0.1.0 is out, so the site shows the script');
 });
 
 test('the script note names only flags install.sh documents', () => {

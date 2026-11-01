@@ -38,7 +38,7 @@ for (const [width, height] of [[360, 800], [390, 844], [1280, 800]]) for (const 
   page.on('pageerror', error => errors.push(error.message));
   await page.goto('/');
   await scrollThrough(page);
-  await expect(page.locator('astro-island:not([ssr])')).toHaveCount(4);
+  await expect(page.locator('astro-island:not([ssr])')).toHaveCount(5);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
   expect(errors).toEqual([]);
   await expect(page.locator('body')).toHaveCSS('background-color', colorScheme === 'light' ? 'rgb(20, 20, 20)' : 'rgb(237, 237, 237)');
@@ -88,6 +88,10 @@ test.describe('without JavaScript', () => {
   await expect(page.locator('.theme-switch')).toBeHidden(); await expect(page.locator('.term-ctl')).toBeHidden();
   await expect(page.locator('#install-panel-cargo button')).toHaveCount(0);
   await expect(page.locator('#install-panel-script button')).toHaveCount(0);
+  // W12 item 5: the closing band repeats the Script command; its Copy needs JS, like Install's, and leaves no empty slot.
+  await expect(page.locator('.cta-command code')).toHaveText(script);
+  await expect(page.locator('.cta-command button')).toHaveCount(0);
+  await expect(page.locator('.cta-command astro-island')).toBeHidden();
   for (const pane of await page.locator('.term-v[data-v=n] .term-vp').all()) expect(await pane.evaluate(e => e.scrollHeight <= e.clientHeight + 1)).toBe(true);
   // How it works shows each finished stage.
   await expect(page.locator('[data-stage=hear] [data-before]')).toBeHidden();
@@ -457,6 +461,32 @@ for (const failure of ['missing', 'rejected']) test(`copy announces ${failure} C
  await expect(page.locator('#install-panel-cargo [role=status]')).toHaveText("Couldn't copy. Select the command and copy it yourself.");
  await expect(page.getByRole('button', { name: 'Copy failed Cargo command', exact: true })).toContainText('Copy failed');
 });
+// W12 item 5: the closing band showed `cargo install` after v0.1.0 shipped, with its own Copy that never reset.
+test('closing band: the command Install opens on, copied and announced by the same button', async ({ page, context }) => {
+ await page.setViewportSize({ width: 1280, height: 800 });
+ await context.grantPermissions(['clipboard-read', 'clipboard-write']); await page.goto('/'); await hydrate(page, '#install');
+ const band = page.locator('.cta-command');
+ await expect(band.locator('code')).toHaveText((await page.locator('#install [role=tabpanel]:not([hidden]) code').textContent())!);
+ await expect(band.locator('code')).toHaveText(script);
+ // The chip outgrows the 720px measure so the whole command, `| sh` included, shows at 1280.
+ expect(await band.locator('code').evaluate(e => e.scrollWidth <= e.clientWidth)).toBe(true);
+ await hydrate(page, '.cta-section');
+ const button = band.getByRole('button', { name: 'Copy install command', exact: true });
+ await expect(button).toHaveCSS('border-top-width', '0px');
+ await expect(button.locator('rect').first()).toHaveAttribute('stroke-dasharray', '16 0');
+ await button.click();
+ expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(script);
+ await expect(band.locator('[role=status]')).toHaveText('Copied');
+ await expect(band.getByRole('button', { name: 'Copied install command', exact: true })).toContainText('Copied');
+ await expect(band.getByRole('button', { name: 'Copy install command', exact: true })).toBeVisible();
+ await expect(band.locator('[role=status]')).toHaveText('');
+});
+for (const failure of ['missing', 'rejected']) test(`closing band copy announces ${failure} Clipboard API failure`, async ({ page }) => {
+ await page.addInitScript(failure => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: failure === 'missing' ? undefined : { writeText: () => Promise.reject(new Error('Clipboard denied')) } }), failure);
+ await page.goto('/'); await hydrate(page, '.cta-section'); await page.getByRole('button', { name: 'Copy install command', exact: true }).click();
+ await expect(page.locator('.cta-command [role=status]')).toHaveText("Couldn't copy. Select the command and copy it yourself.");
+ await expect(page.getByRole('button', { name: 'Copy failed install command', exact: true })).toContainText('Copy failed');
+});
 test('390px: the script and cargo commands stay on one line and fade out', async ({ page }) => {
  await page.setViewportSize({ width: 390, height: 844 }); await page.goto('/'); await hydrate(page, '#install');
  for (const [tab, id] of [['Script', 'script'], ['Cargo', 'cargo']]) {
@@ -553,7 +583,7 @@ test('the page names the installer URL and the latest release, and no pre-releas
  const responses: string[] = [];
  page.on('response', async r => { if (r.url().endsWith('.js')) responses.push(await r.text()); });
  await page.goto('/'); await scrollThrough(page);
- await expect(page.locator('astro-island:not([ssr])')).toHaveCount(4);
+ await expect(page.locator('astro-island:not([ssr])')).toHaveCount(5);
  const html = await page.content();
  expect(html).toContain('https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh');
  expect(html).toContain('https://github.com/nodera-studio/glen/releases/latest');
