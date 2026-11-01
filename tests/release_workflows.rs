@@ -113,6 +113,7 @@ fn release_reuses_main_git_cache_and_manifest_changes_trigger_it() {
 }
 
 const FLAKE: &str = include_str!("../.github/workflows/flake-proof.yml");
+const OMP_LATEST: &str = include_str!("../.github/workflows/omp-latest.yml");
 
 /// `uses:` targets of a workflow, with the trailing `# version` comment.
 fn uses(workflow: &str) -> Vec<&str> {
@@ -180,6 +181,7 @@ fn toolchain_comes_from_rust_toolchain_toml_and_msrv_is_checked() {
         ("ci.yml", CI, 2),
         ("release.yml", RELEASE, 1),
         ("flake-proof.yml", FLAKE, 1),
+        ("omp-latest.yml", OMP_LATEST, 1),
     ] {
         assert!(!workflow.contains("rust-toolchain@stable"), "{name}");
         assert_eq!(workflow.matches(read_pin).count(), jobs, "{name}");
@@ -257,5 +259,162 @@ fn site_deploy_uses_the_locked_wrangler() -> Result {
     let npm_ci = deploy.find("      - run: npm ci\n").expect("npm ci step");
     assert!(npm_ci < deploy.find("--dry-run").expect("dry run"));
     assert!(npm_ci < deploy.find("CLOUDFLARE_API_TOKEN").expect("token"));
+    Ok(())
+}
+
+#[test]
+fn omp_latest_pins_every_action_to_a_commit_sha() {
+    // AC-v2-106: `actions/*` included, unlike the ci.yml rule above.
+    let actions = uses(OMP_LATEST);
+    assert!(actions.len() >= 3, "{actions:?}");
+    for action in actions {
+        assert!(sha_pinned(action), "omp-latest.yml: {action}");
+    }
+}
+
+#[test]
+fn omp_latest_triggers_permissions_and_isolation() {
+    // AC-v2-106: a schedule at an off-the-hour minute, dispatch, and PRs touching only itself.
+    assert!(OMP_LATEST.contains(
+        "\non:\n  schedule:\n    - cron: '41 4 * * *'\n  workflow_dispatch:\n  pull_request:\n    paths: ['.github/workflows/omp-latest.yml']\n\npermissions:\n  contents: read\n"
+    ));
+    let cron = OMP_LATEST
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("- cron: '"))
+        .expect("cron line");
+    assert_ne!(cron.split_whitespace().next(), Some("0"), "{cron}");
+    for trigger in ["push:", "pull_request_target:", "workflow_run:"] {
+        assert!(!OMP_LATEST.contains(trigger), "{trigger}");
+    }
+    assert!(!OMP_LATEST.contains("secrets."));
+    assert!(OMP_LATEST.contains("persist-credentials: false"));
+    assert!(OMP_LATEST.contains("https://omp.sh/install"));
+    assert!(OMP_LATEST.contains("scratch=\"$(mktemp -d)\""));
+    // Every command that runs omp (installer, --version, doctor --probe) clears the
+    // environment and uses the scratch HOME; the surface test sets omp's HOME itself.
+    for needle in ["omp.sh/install", "--version |", "doctor --probe"] {
+        let line = OMP_LATEST
+            .lines()
+            .find(|l| l.contains(needle))
+            .unwrap_or_else(|| panic!("no line runs {needle}"));
+        assert!(
+            line.contains("env -i HOME=\"$scratch\"") || line.contains("env -i HOME=\"$OMP_HOME\""),
+            "{line}"
+        );
+    }
+    for step in ["surface", "facts", "doctor"] {
+        assert!(
+            OMP_LATEST.contains(&format!(
+                "      - id: {step}\n        if: ${{{{ !cancelled() && steps.omp.outcome == 'success' }}}}\n"
+            )),
+            "{step}"
+        );
+    }
+}
+
+#[test]
+fn release_and_ci_never_read_omp_latest() {
+    // AC-v2-106: the nightly never gates a PR check or the release preflight.
+    for (name, workflow) in [("release.yml", RELEASE), ("ci.yml", CI)] {
+        assert!(!workflow.contains("omp-latest"), "{name}");
+    }
+}
+
+#[test]
+fn omp_latest_summary_names_version_outcomes_and_bump_candidate() -> Result {
+    // Execute the real summary block, as GitHub's bash does, from the repo root.
+    let block = OMP_LATEST
+        .split("run: |\n")
+        .find(|block| block.contains("GITHUB_STEP_SUMMARY"))
+        .ok_or_else(|| std::io::Error::other("missing summary block"))?;
+    let script = block
+        .lines()
+        .map_while(|line| line.strip_prefix("          "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(script.contains("Not covered"), "{script}");
+    let untested = r#"{"ok":true,"warnings":[{"code":"omp_version_untested","message":"m"}]}"#;
+    let in_range = r#"{"ok":true}"#;
+    let ok = ["success"; 4];
+    for (version, outcomes, doctor, want, absent) in [
+        (
+            "18.15.0",
+            ok,
+            Some(untested),
+            vec![
+                "omp version: 18.15.0",
+                "bump candidate: omp 18.15.0",
+                "max_tested 18.14.0",
+            ],
+            vec!["FAILED", "no bump needed"],
+        ),
+        (
+            "18.14.0",
+            ok,
+            Some(in_range),
+            vec!["omp version: 18.14.0", "in range, no bump needed"],
+            vec!["FAILED", "bump candidate"],
+        ),
+        (
+            "18.15.0",
+            ["success", "failure", "success", "success"],
+            Some(untested),
+            vec!["- surface: failure", "FAILED: surface (failure)"],
+            vec!["bump candidate", "no bump needed"],
+        ),
+        (
+            "",
+            ["failure", "skipped", "skipped", "skipped"],
+            None,
+            vec![
+                "omp not installed",
+                "FAILED: install (failure) surface (skipped)",
+            ],
+            vec!["bump candidate", "omp version:"],
+        ),
+    ] {
+        let tmp = tempfile::tempdir()?;
+        let summary = tmp.path().join("summary.md");
+        let doctor_json = tmp.path().join("doctor.json");
+        if let Some(text) = doctor {
+            fs::write(&doctor_json, text)?;
+        }
+        let o = Command::new("/bin/bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-e",
+                "-o",
+                "pipefail",
+                "-c",
+                &script,
+            ])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .env("GITHUB_EVENT_NAME", "schedule")
+            .env("GITHUB_STEP_SUMMARY", &summary)
+            .env("DOCTOR_JSON", &doctor_json)
+            .env("OMP_VERSION", version)
+            .env("OUTCOME_OMP", outcomes[0])
+            .env("OUTCOME_SURFACE", outcomes[1])
+            .env("OUTCOME_FACTS", outcomes[2])
+            .env("OUTCOME_DOCTOR", outcomes[3])
+            .output()?;
+        assert!(o.status.success(), "{o:?}");
+        let text = fs::read_to_string(&summary)?;
+        assert!(
+            text.contains(
+                "Not covered: model turns, and lease and storage behaviour under a real turn."
+            ),
+            "{text}"
+        );
+        for line in want {
+            assert!(text.contains(line), "{line:?} missing:\n{text}");
+        }
+        for line in absent {
+            assert!(!text.contains(line), "{line:?} present:\n{text}");
+        }
+    }
     Ok(())
 }
