@@ -79,8 +79,12 @@ Run the suite against the working tree and report the result. Output the exact
 command so it can be re-run after a fix — e.g. (adapt to this project's actual runner):
 
 ```bash
-cargo test --locked --test conformance
+bash .claude/scripts/suite-lock.sh cargo test --locked --test conformance
 ```
+
+`suite-lock.sh` holds a lock on the cargo target dir while the suite runs, so it waits for
+any other suite in that checkout instead of racing it (two suites in one target dir break each
+other: `implementer.md` → Rules).
 
 The suite lives in `tests/conformance.rs` (submodules under `tests/conformance/`) and reads
 omp data only from `tests/fixtures/`.
