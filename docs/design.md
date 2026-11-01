@@ -248,6 +248,7 @@ Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `
 | `lost` | | `failed` |
 | — | reserved for an ACP permission request awaiting an answer (W3, §A23); no job status maps to it | `input_required` |
 
+- `aborted` covers a caller stop (`error.code` `cancelled`), an omp-side abort of the prompt (`aborted`, `src/rpc/worker.rs:1396-1404`, `src/live/drive.rs:147-150`) and a session switch (`session_switched`, `src/live/drive.rs:161-167`); A2A `canceled` does not say who stopped the task, and a caller that needs the cause reads `error.code`.
 - The value is spelled `canceled`, as A2A spells it; the job error code stays `cancelled`. A2A's `auth_required` and `unknown` are not used. W2 adds the field to `docs/json.md` and `tests/json_contract.rs`.
 
 ## §A8 Handles
@@ -541,7 +542,7 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 - **v0.2 W5** MCP layer: `glen mcp`, the generated tool catalog and a hidden `--channel` (§A22).
 - **v0.2 W6** tech debt and audits (decision `fce2ca4d`).
 - **v0.2 W7** release v0.2.0: version bump, site and tag (§A18).
-- Headings and their order are fixed by `tests/conformance/repo_contracts.rs` (v0.2 W0). Each v0.2 wave writes its design in its own section, adds its own rows to §A9, §A15, §A16 and §A17, and amends an earlier section only where its own behaviour changes what that section says (for example W1 in §A10, §A11 and §A12; W4 in §A3 and §A6).
+- Headings and their order are fixed by `tests/conformance/repo_contracts.rs` (v0.2 W0). Each v0.2 wave writes its design in its own section, adds its own rows to §A9, §A15, §A16 and §A17, and amends an earlier section only where its own behaviour changes what that section says (for example W1 in §A10, §A11 and §A12; W2 in §A11; W4 in §A3, §A6 and §A7).
 - Every wave leaves `main` green and usable. Unfinished subcommands stay hidden.
 
 ## §A17 Verify on every omp upgrade (and open items)
@@ -612,6 +613,7 @@ Stub (v0.2 W0). Owner: **v0.2 W2**, which replaces this body.
 - **Decided** (ADR `0773c35d`):
   - **What push means in v0.2.** No first-party mechanism lets an outside process wake an already-running, idle Claude Code or Codex session (research, 2026-11-01). Claude Code Channels is a research preview and is ignored under `-p` and in subagents. `asyncRewake` is broken headless. Codex hooks are outbound-only, and the visible session's App Server cannot be reached from outside. So push is a finite, one-shot receiver that the caller starts itself: when it exits, the caller wakes. Channels, `asyncRewake` and PTY injection are not foundations. "No polling" means no agent or model loop; glen may still watch its own files on a bounded interval.
   - **Receivers**, default (7), no new verb: `glen wait <job> --for reply [--after <reply-id>]` exits 10 with `woke:"reply"` when an unseen reply lands, or returns the job's terminal mapping (0/6/7/11, §A7) if the job ends first. `glen inbox --wait [--timeout]` covers replies that arrive after settlement. The job is the subscription: replies already land in `jobs/<id>/replies.ndjson` on both routes, so there is no caller registry.
+  - **Two exit-10 documents.** Exit 10 already means that the wait bound elapsed while the job is queued or accepted (§A7, §A11, `docs/json.md`, and `skill/glen/SKILL.md` "while exit is 10"). So `wait --for reply` returns two distinct exit-10 documents: a reply wake is `ok:true`, `status:"running"` and `woke:"reply"` plus the replies; bound expiry is the same document without `woke`. The caller passes `--after <last reply id>` on the next call, so a woken reply is not seen twice, and a caller must read `woke` before treating exit 10 as a timeout. W2 amends §A11, the `docs/json.md` exit row and the skill's wait loop to say so.
   - **Wording**, defaults (4) and (5): release copy says "push" for Claude Code only and "blocking wait" for Codex. Headless and subagent wording follows W2's evidence. For Codex, the v0.2 headline means pending-tool delivery, a blocking wait. W2's CHANGELOG bullet says so, so the goal is not silently redefined. There is no launch-owned caller adapter.
   - **Channels**: a hidden `glen mcp --channel`, decided in §A22. It is tested at the protocol level only and stays out of SKILL.md, README and the site.
 - **Per-caller delivery.** W2 keeps this table current:
@@ -632,6 +634,7 @@ Stub (v0.2 W0). Owner: **v0.2 W4**, which replaces this body.
   - Default (2): the warm worker keeps its omp client **and** glen's session lock, marked as lock-holder kind `warm`, and steals queued jobs instead of serving an endpoint. A warm omp child holds omp's owner lease anyway; releasing only glen's lock would leave that lease held and invite misrouting.
   - It steals the oldest queued RPC job for its session by compare-and-claim, only when the binary, profile, thinking level and environment digest match. Otherwise it cools, and the job runs cold with its own environment.
   - Graft (AC-v2-402, AC-v2-407): the claimant's pid and start time go into the stolen job's status, and the original observer never marks that job lost while the claimant is alive. Each adopted job gets its own reply sink, and the reply channel is drained at settlement. A `glen_reply` that arrives while the worker is idle is never attributed to the next job. The idle clock starts only after real settlement.
+  - **Queued-job liveness.** A job queued for a warm worker is non-terminal with a null worker pid until it is claimed, and `is_lost` (`src/jobs/liveness.rs:94-104`) marks that job lost after the 10-second spawn grace (§A7). W4 must do one of three things, and say which in this section: keep the cold `__worker`, which writes its pid before the lock wait, as the queued job's liveness holder; exempt an unclaimed job that a live warm holder can steal; or write the warm worker's pid and start token at enqueue. W4 therefore also amends §A7.
   - One teardown covers expiry (re-armed after each job), `glen release`, a TUI endpoint for the session appearing, SIGTERM or SIGHUP, and omp exiting. A session control on an idle warm session cools it first, then runs as today; an idle `abort` reports "nothing to abort" and keeps it warm. Failed, aborted and forked outcomes never stay warm, and neither does the live route.
   - `--warm` and `glen release` stay hidden until the PR that completes W4. W4 documents the lease cost and the residual race in this section.
 
