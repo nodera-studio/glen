@@ -75,8 +75,8 @@ The full agent index is `.claude/agents/README.md`; commands are listed in
 
 | Command | Use for |
 | --- | --- |
-| `/plan-implementation` → `/implement` (`/implement-quick` for small changes) | Plan, then build with the routed Implementer (`routing.sh implementation`, Claude by default), the Claude ‖ Codex review gate and the conformance tail |
-| `/code-review`, `/respond-to-review` | Review the current diff; answer PR review comments |
+| `/plan-implementation` → `/implement` (`/implement-quick` for small changes) | Plan, then build with the routed Implementer (`routing.sh implementation`, Claude by default), the Claude ‖ Codex ‖ omp review gate and the conformance tail |
+| `/code-review`, `/respond-to-review` | Review the current diff (Claude ‖ Codex, + omp when ready); answer PR review comments |
 | `/review-implementation` | Claude ‖ Codex ‖ omp |
 | `/deep-debug` | Claude ‖ Codex investigator (+ optional omp), then the adversary |
 | `/run-ci` | Run the same checks as `.github/workflows/ci.yml` locally |

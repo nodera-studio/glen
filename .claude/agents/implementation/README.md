@@ -37,12 +37,14 @@ changes — fewer gates, same quality bar — dispatched by `/implement-quick`.
    **UI Implementer** (`coder-ui.md`, agent `impl-coder-ui`, Opus) takes design-heavy web UI
    instead: same fused loop with the site's build/test commands, the frontend-design skill,
    and a required browser check against the named design reference.
-3. **Review (fresh context)** — when omp is ready or the diff is high-risk, run the
-   review block: Claude comprehensive reviewer ‖ `codex review` ‖ omp (via glen), each blind to the others, folded by the
-   Claude **synthesizer** into one dedup'd, provenance-labelled report + ordered fix
-   plan (the `/review-implementation` machinery; never sees the Implementer's transcript).
-   A skipped omp probe is recorded with its reason; low-risk diffs with a skipped
-   probe use the lean Claude ‖ Codex gate instead.
+3. **Review (fresh context)** — every diff that is not high-risk runs the lean
+   `/code-review` gate: Claude ‖ Codex ‖ omp (via glen, when `omp-engine.sh probe` is
+   ready), each blind to the others, merged by 2-vote consensus (omp-only findings are
+   advisory until verified; omp plus one other engine is two votes). A high-risk diff runs
+   the review block instead: Claude comprehensive reviewer ‖ `codex review` ‖ omp, folded by
+   the Claude **synthesizer** into one dedup'd, provenance-labelled report + ordered fix
+   plan (the `/review-implementation` machinery). Neither sees the Implementer's
+   transcript. A skipped omp probe is recorded with its reason.
 4. **parallel tail** — once Review is green: **docs-updater** updates docs from the
    landed code, ‖ **conformance-test-writer** runs the author-blind, plan-derived
    conformance gate (the anti-reward-hacking check).
@@ -56,7 +58,7 @@ session never does. Two cases go elsewhere: design-heavy UI (`site/`, landing pa
 (non-Rust) visual components) goes to the agent `routing.sh ui` names, a Claude Opus
 Implementer (`orchestrator.md` → UI implementation routing; `coder-ui.md`); integrating two
 already-reviewed parallel waves goes to the engine `routing.sh integration` names (Claude),
-followed by the gate, tests and a scoped Claude ‖ Codex review (`orchestrator.md` → Role 1;
+followed by the gate, tests and a scoped `/code-review` (`orchestrator.md` → Role 1;
 `loop-procedures.md` → "Shared seams"). The fused write→wire→harden→test→gate→fix loop runs in **Claude** via `coder-claude.md`
 by default, or in **Codex** via `coder-codex.md` (`codex-companion.mjs task --json --write`)
 when routing says `codex`; both carry the `implementer.md` envelope + the repo-root
