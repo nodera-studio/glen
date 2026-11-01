@@ -78,10 +78,11 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
        "Linux x86_64") t=x86_64-unknown-linux-musl ;;  "Linux aarch64") t=aarch64-unknown-linux-musl ;;
      esac
      D="$(mktemp -d)"
+     # One && chain: a failed download or checksum stops before anything is extracted or run.
      gh release download "v<version>" --repo nodera-studio/glen --dir "$D" \
-       --pattern "glen-$t.tar.gz" --pattern "glen-$t.tar.gz.sha256"
-     (cd "$D" && shasum -a 256 -c "glen-$t.tar.gz.sha256")
-     tar -xzf "$D/glen-$t.tar.gz" -C "$D" && "$D/glen-$t/glen" --version   # prints: glen <version>
+       --pattern "glen-$t.tar.gz" --pattern "glen-$t.tar.gz.sha256" \
+       && (cd "$D" && shasum -a 256 -c "glen-$t.tar.gz.sha256") \
+       && tar -xzf "$D/glen-$t.tar.gz" -C "$D" && "$D/glen-$t/glen" --version   # prints: glen <version>
      ```
 
      `install.sh` itself is covered by the release workflow's `verify-install` job on both OSes
@@ -101,8 +102,11 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
    - Every shipped board issue carries `released:v<version>` (Step 7).
    - Resolve the tech-debt memories whose fixes shipped in this release (`memory_update`, status
      `resolved`, with the fix `path:line`).
-   - Stop any preview server or Codex broker the release work started: remove the release
-     worktree with `bash .claude/scripts/remove-worktree.sh <absolute path>`, then run
+   - Stop any preview server or Codex broker the release work started. Neither script below
+     stops `astro preview`, so first: for each pid of `pgrep -f 'astro preview'`, check its cwd
+     (`lsof -a -d cwd -p <pid> -Fn`) is under the release worktree and `kill <pid>` only then;
+     confirm with `pgrep -f 'astro preview'` again. Then remove the release worktree with
+     `bash .claude/scripts/remove-worktree.sh <absolute path>` and run
      `bash .claude/scripts/sweep-codex-orphans.sh`.
    - Under `/auto-mode`, continue with `.claude/skills/auto-mode/references/loop-procedures.md` →
      "Closing the run" (checkpoints until the run ends, module close, schedule removal).

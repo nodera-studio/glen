@@ -6,7 +6,8 @@
 # Cases: (a) the command's exit status, no lock left; (b) two concurrent runs do not overlap;
 # (c) a stale lock (dead pid, or a live pid with another start time) is taken over with a notice;
 # (d) a live holder plus GLEN_SUITE_LOCK_WAIT=1 exits 75 naming the holder; (e) SIGTERM to a
-# running suite-lock.sh releases the lock. Prints ok/FAIL per case and exits 1 on any FAIL.
+# running suite-lock.sh releases the lock; (f) SIGTERM stops the command's descendants before the
+# lock goes. Prints ok/FAIL per case and exits 1 on any FAIL.
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd -P)"
@@ -95,6 +96,25 @@ HOLDER=""
 if [ "$rc" = 143 ] && [ ! -e "$LOCK" ] && [ ! -e "$LOCK.takeover" ]; then
   ok "(e) SIGTERM released the lock"
 else fail "(e) exit=$rc (want 143), lock left: $(find "$LOCK" "$LOCK.takeover" 2>/dev/null | tr '\n' ' ')"; fi
+
+# (f) SIGTERM with a grandchild running (as cargo runs a test binary): the grandchild is gone
+# once suite-lock.sh exits, and the lock with it.
+# shellcheck disable=SC2016  # expanded by the inner sh, not here
+/bin/bash "$LOCKSH" sh -c 'sleep 30 & echo $! >"$1"; wait' _ "$TMP/f.pid" 2>"$TMP/f.err" &
+HOLDER=$!
+i=0
+while [ ! -s "$TMP/f.pid" ] && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+gc="$(cat "$TMP/f.pid" 2>/dev/null)"
+kill -TERM "$HOLDER" 2>/dev/null
+wait "$HOLDER"
+rc=$?
+HOLDER=""
+if [ -n "$gc" ] && ! kill -0 "$gc" 2>/dev/null && [ "$rc" = 143 ] && [ ! -e "$LOCK" ]; then
+  ok "(f) SIGTERM stopped the grandchild before releasing the lock"
+else
+  fail "(f) exit=$rc grandchild=${gc:-none} $(kill -0 "$gc" 2>/dev/null && echo alive || echo gone), lock left: $([ -e "$LOCK" ] && echo yes || echo no)"
+  [ -n "$gc" ] && kill "$gc" 2>/dev/null
+fi
 
 /bin/bash "$LOCKSH" 2>"$TMP/u.err"
 rc=$?

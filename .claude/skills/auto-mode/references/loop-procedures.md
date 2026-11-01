@@ -296,10 +296,11 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
      A_TIP="$(gh pr view <A> --json headRefOid -q .headRefOid)"
      CUT="$(git -C "$WT" merge-base HEAD "$A_TIP")"
      SQ="$(gh pr view <A> --json mergeCommit -q .mergeCommit.oid)"
-     git -C "$WT" merge-tree --write-tree --name-only HEAD origin/main                   # preview: plain base
-     git -C "$WT" merge-tree --write-tree --name-only --merge-base="$CUT" HEAD origin/main  # preview: cut base
+     # Exit 1 from a preview or the merge means conflicts; `|| …` keeps a `bash -e` shell going.
+     git -C "$WT" merge-tree --write-tree --name-only HEAD origin/main || true                   # preview: plain base
+     git -C "$WT" merge-tree --write-tree --name-only --merge-base="$CUT" HEAD origin/main || true  # preview: cut base
      git -C "$WT" replace --graft "$SQ" "$SQ^" "$CUT"   # temporary: SQ gets CUT as a second parent
-     git -C "$WT" merge --no-edit origin/main; rc=$?
+     rc=0; git -C "$WT" merge --no-edit origin/main || rc=$?
      git -C "$WT" replace -d "$SQ"                       # always, right away, before resolving
      ```
 
@@ -378,8 +379,12 @@ becomes `done` only at its last item.
    after a gitleaks check, or the decision log says why not.
 6. Scratch: `bash .claude/scripts/clean-scratch.sh --dry-run 'glen-*'`, then the real run for the
    entries this run created; list the rest for the owner.
-7. List the merged branches the run pushed (`git branch -r --merged origin/main`) and delete
-   them (`git push origin --delete <branch>`).
+7. Delete the run's merged PR branches. `git branch -r --merged origin/main` cannot find them
+   (a squash merge leaves the branch unmerged) and lists `origin/main` itself, so take them from
+   the run ledger's PR numbers: `gh pr view <N> --repo nodera-studio/glen --json
+   state,headRefName -q 'select(.state == "MERGED") | .headRefName'` for each. Never delete
+   `main` or `HEAD`; for each other name that `git ls-remote --exit-code --heads origin <branch>`
+   still finds, `git push origin --delete <branch>`.
 8. Last, after the closing PR merges: `CronList`, then `CronDelete` the id under
    **Checkpoints** → Schedule (load both with ToolSearch first), set `Cadence: none` and
    `Schedule: none`, set status `done`, and stop scheduling heartbeats.
@@ -405,7 +410,8 @@ the top of the affected section, as `> REVISED <date -u +%Y-%m-%dT%H:%M:%SZ>: <w
 what to do>` or `> REVOKED <ISO>: <decision> — <replacement>`, before any message; every group
 agent and the integrator record `shasum -a 256 <plan file>` when they start and re-hash it
 before each commit and merge, applying every new REVISED or REVOKED line first (and stopping to
-report when one contradicts work already committed). A batch acceptance check that names an
+report when one contradicts work already committed). Group agents never read this file, so each
+group brief carries that instruction itself, or names `coder-claude.md` → Step 3, item 3. A batch acceptance check that names an
 open branch carries "once that branch is merged, run it against `origin/main`" (batch 10's W9
 `merge-tree` gate went stale once W9 squash-merged).
 

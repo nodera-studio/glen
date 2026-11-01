@@ -11,7 +11,9 @@
 # command and the UTC ISO time it took the lock. A second caller waits, printing the holder once a
 # minute, up to GLEN_SUITE_LOCK_WAIT seconds (default 3600), then exits 75. A lock whose pid is
 # gone, or whose pid's start time no longer matches, is stale: it is taken over with a one-line
-# notice. The lock is released on exit, INT or TERM, only by the process that holds it.
+# notice. The lock is released on exit, INT or TERM, only by the process that holds it; on INT or
+# TERM the command's whole process tree (cargo and the test binaries it started) gets TERM first,
+# KILL after 10 s, and the lock goes only once none of it is left.
 #
 # Exit status: the command's; 75 = gave up waiting; 2 = bad input (usage, no target dir).
 set -u
@@ -43,9 +45,37 @@ release() {
   rm -f "$LOCK/owner" && rmdir "$LOCK" 2>/dev/null
   OWNED=0
 }
+# shellcheck disable=SC2329  # used by on_signal
+# tree PID: PID and every descendant of it, parents first.
+tree() {
+  local c
+  echo "$1"
+  for c in $(pgrep -P "$1" 2>/dev/null); do tree "$c"; done
+}
+# shellcheck disable=SC2329  # used by on_signal
+# alive PIDS…: the PIDS still running (a zombie is not running).
+alive() {
+  local p s
+  for p in "$@"; do
+    s="$(ps -o stat= -p "$p" 2>/dev/null)" || continue
+    case "$s" in *Z*) ;; *) echo "$p" ;; esac
+  done
+}
 # shellcheck disable=SC2329  # invoked from the INT/TERM traps
 on_signal() {
-  [ -n "$CHILD" ] && kill -TERM "$CHILD" 2>/dev/null && wait "$CHILD" 2>/dev/null
+  local pids left n=0
+  if [ -n "$CHILD" ]; then
+    # The command runs as a background job, which ignores SIGINT: TERM its whole tree, since cargo
+    # does not pass a signal on to the test binary it started.
+    pids="$(tree "$CHILD")"
+    # shellcheck disable=SC2086  # a list of pids
+    kill -TERM $pids 2>/dev/null
+    # shellcheck disable=SC2086
+    while left="$(alive $pids)" && [ -n "$left" ] && [ "$n" -lt 20 ]; do sleep 0.5; n=$((n + 1)); done
+    # shellcheck disable=SC2086
+    [ -z "$left" ] || kill -KILL $left 2>/dev/null
+    wait "$CHILD" 2>/dev/null
+  fi
   guard_drop
   release
   exit "$1"

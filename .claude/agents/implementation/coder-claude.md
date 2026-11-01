@@ -82,8 +82,11 @@ about 1.5 h). So:
    (`shasum -a 256`). On a changed hash, re-read your section and apply every
    `> REVISED <ISO>: …` or `> REVOKED <ISO>: <decision> — <replacement>` line at its top to the
    work before committing; if a revision contradicts work you already committed, stop and
-   report instead. A revoked decision once reached a commit because the group agent did not
-   re-read its brief (checkpoint 34, commit `26afcdc`).
+   report instead. Plan-state `status=` flips (yours, or the Implementer's) change the hash
+   too: keep a copy of the plan beside the hash (in your scratch dir), and on a changed hash
+   `diff` it first; a diff of only `status=` flips needs no re-read. After either case, refresh
+   the copy and the hash. A revoked decision once reached a commit because the group agent did
+   not re-read its brief (checkpoint 34, commit `26afcdc`).
 4. **Rework** (a review or conformance fix batch from the orchestrator) is one more group: the
    delta only, as a line-range brief where ranges are given, then a commit.
 

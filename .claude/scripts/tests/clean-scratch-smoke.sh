@@ -56,9 +56,11 @@ HOLDERS="$HOLDERS $!"
 ready=0 tries=0
 while [ "$tries" -lt 40 ]; do
   tries=$((tries + 1))
+  # Snapshots plus here-strings: `big | grep -q` under pipefail fails once ps outgrows a pipe.
   cmds="$(ps -axww -o command=)"
-  if printf '%s\n' "$cmds" | grep -qF "$T/glen-cmd" && printf '%s\n' "$cmds" | grep -qF "$WORK/omp-engine.sh" \
-    && lsof -a -d cwd -Fn 2>/dev/null | grep -qxF "n$T/glen-busy"; then ready=1; break; fi
+  cw="$(lsof -a -d cwd -Fn 2>/dev/null || true)"
+  if grep -qF "$T/glen-cmd" <<<"$cmds" && grep -qF "$WORK/omp-engine.sh" <<<"$cmds" \
+    && grep -qxF "n$T/glen-busy" <<<"$cw"; then ready=1; break; fi
   sleep 0.5
 done
 [ "$ready" = 1 ] || { echo "FAIL setup: holder processes did not start" >&2; exit 1; }
@@ -103,11 +105,38 @@ else fail "(c) other-dir or $OUTSIDE/keep is gone"; fi
 for p in $HOLDERS; do kill "$p" 2>/dev/null || true; done
 for p in $HOLDERS; do wait "$p" 2>/dev/null || true; done
 HOLDERS=""
-run --min-age 0 glen-busy glen-cmd glen-omp-engine glen-fresh
+# A real omp-engine.sh run elsewhere on the machine keeps glen-omp-engine refused: leave it out then.
+rest="glen-busy glen-cmd glen-omp-engine glen-fresh"
+if grep -qF omp-engine.sh <<<"$(ps -axww -o command=)"; then
+  rest="glen-busy glen-cmd glen-fresh"
+  echo "note (d) an omp-engine.sh run is active on this machine; glen-omp-engine left out"
+fi
+# shellcheck disable=SC2086 # rest is a list of fixed names
+run --min-age 0 $rest
 gone=1
-for d in glen-busy glen-cmd glen-omp-engine glen-fresh; do [ ! -e "$T/$d" ] || gone=0; done
-if [ "$RC" = 0 ] && [ "$gone" = 1 ]; then ok "(d) holders stopped: all four removed, exit 0"
+for d in $rest; do [ ! -e "$T/$d" ] || gone=0; done
+if [ "$RC" = 0 ] && [ "$gone" = 1 ]; then ok "(d) holders stopped: $rest removed, exit 0"
 else fail "(d) rc $RC: $OUT"; fi
+
+# (f) no usable cwd snapshot (lsof fails, or lists nothing): every entry is refused and kept.
+mkdir -p "$T/glen-nolsof/sub" "$WORK/lsof-fail" "$WORK/lsof-empty"
+find "$T/glen-nolsof" -exec touch -t 202610300000 {} +
+printf '#!/bin/sh\nexit 1\n' >"$WORK/lsof-fail/lsof"
+printf '#!/bin/sh\nexit 0\n' >"$WORK/lsof-empty/lsof"
+chmod +x "$WORK/lsof-fail/lsof" "$WORK/lsof-empty/lsof"
+for f in fail empty; do
+  RC=0
+  OUT="$(env PATH="$WORK/lsof-$f:$PATH" TMPDIR="$T" GLEN_CLEAN_REPO="$REPO" /bin/bash "$SCRIPT" --min-age 0 glen-nolsof 2>&1)" || RC=$?
+  if [ "$RC" = 1 ] && [ -d "$T/glen-nolsof" ] && has "refuse: $T/glen-nolsof: cannot check process cwds"; then
+    ok "(f) lsof $f: glen-nolsof refused and kept"
+  else fail "(f) lsof $f: rc $RC: $OUT"; fi
+done
+
+# (g) a TMPDIR outside the system temp roots exits 2 before anything is touched.
+RC=0
+OUT="$(env TMPDIR=/usr/bin GLEN_CLEAN_REPO="$REPO" /bin/bash "$SCRIPT" --dry-run 'glen-*' 2>&1)" || RC=$?
+if [ "$RC" = 2 ] && has "not under a system temp root"; then ok "(g) TMPDIR=/usr/bin exits 2"
+else fail "(g) TMPDIR=/usr/bin: rc $RC: $OUT"; fi
 
 # (e) the hook points rm -rf of glen scratch at the helper and leaves other rm alone.
 hook() { jq -n --arg c "$1" '{tool_name:"Bash",tool_input:{command:$c}}' | /bin/bash "$HOOK"; }

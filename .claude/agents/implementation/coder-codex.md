@@ -305,8 +305,9 @@ outside the sandbox:
    groups"), and for the last group the message your brief gives (else
    `<wave label>: <slice summary>`), each with the project's trailer. A file in
    `git status` that Codex did not report is not staged; list it as a deviation. Right before
-   each commit, re-hash the plan and brief files (`shasum -a 256`). On a change, re-read your
-   section for `> REVISED <ISO>: …` and `> REVOKED <ISO>: <decision> — <replacement>` lines:
+   each commit, re-hash the plan and brief files (`shasum -a 256`); a change that is only
+   Codex's `status=` flips needs no re-read (`coder-claude.md` → Step 3, item 3, keep a copy
+   and `diff`). On any other change, re-read your section for `> REVISED <ISO>: …` and `> REVOKED <ISO>: <decision> — <replacement>` lines:
    one that changes the code goes back to Codex as a `--resume-last` delta prompt before you
    commit (you never write the code); one that contradicts work already committed means stop
    and report.

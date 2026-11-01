@@ -60,7 +60,7 @@ recipe() {
   local wt="$1" cut
   cut="$(git -C "$wt" merge-base HEAD waveA)"   # waveA's last tip stands in for headRefOid
   git -C "$wt" replace --graft "$SQ" "$SQ^" "$cut"
-  if git -C "$wt" merge -q --no-edit main >/dev/null 2>&1; then RC=0; else RC=$?; fi
+  RC=0; git -C "$wt" merge -q --no-edit main >/dev/null 2>&1 || RC=$?   # the documented form, under set -e
   git -C "$wt" replace -d "$SQ" >/dev/null
 }
 

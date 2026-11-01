@@ -11,8 +11,9 @@
 # canonical ${TMPDIR:-/tmp} (T below). In this order:
 #   1. Check the arguments: a pattern outside ^glen-[A-Za-z0-9._*?-]*$, or containing .., exits 2
 #      before anything is touched.
-#   2. Refuse to run (exit 2) when T is /, the canonical $HOME or an ancestor of it, or inside the
-#      main checkout.
+#   2. Refuse to run (exit 2) when T is not under a system temp root (/tmp, /var/tmp or
+#      /var/folders, with or without /private), is the canonical $HOME or an ancestor of it, or is
+#      inside the main checkout.
 #   3. Take one snapshot: the main checkout's registered worktrees (`git worktree list
 #      --porcelain`; GLEN_CLEAN_REPO, read only, replaces the main checkout for the smoke test),
 #      every process cwd (`lsof -a -d cwd -Fn`) and every process command line (`ps -axww`).
@@ -20,8 +21,9 @@
 #      symlink; not directly under T after canon; a registered worktree, or holds one; a process
 #      cwd, or holds one; named in a process command line (as a whole path, in T's canonical
 #      spelling, without /private, or in $TMPDIR's own); glen-omp-engine or
-#      glen-omp-engine-launcher while any process command line contains omp-engine.sh. Without
-#      lsof every entry is refused ("cannot check process cwds").
+#      glen-omp-engine-launcher while any process command line contains omp-engine.sh. Without a
+#      usable cwd snapshot (lsof missing, or its output lacks this script's own cwd) every entry is
+#      refused ("cannot check process cwds").
 #   5. Skip (`skip: <path>: ...`) an entry holding a file changed within --min-age minutes
 #      (default 30; --min-age 0 turns the check off). A skip is not a refusal.
 #   6. Otherwise remove it (`rm -rf`) and print `removed <path> (<size>)`, or `would remove ...`
@@ -65,6 +67,10 @@ RAW="${TMPDIR:-/tmp}"
 T="$(cd "$RAW" && pwd -P)" || die "refuse: cannot resolve TMPDIR $RAW"
 H="$(cd "$HOME" && pwd -P)" || die "refuse: cannot resolve HOME $HOME"
 [ "$T" != / ] || die "refuse: TMPDIR resolves to /"
+case "$T/" in
+  /tmp/* | /private/tmp/* | /var/tmp/* | /private/var/tmp/* | /var/folders/* | /private/var/folders/*) ;;
+  *) die "refuse: TMPDIR $T is not under a system temp root (/tmp, /var/tmp, /var/folders)" ;;
+esac
 if under "$H" "$T"; then die "refuse: TMPDIR $T is \$HOME or an ancestor of it"; fi
 if under "$T" "$MAIN"; then die "refuse: TMPDIR $T is inside the main checkout $MAIN"; fi
 
@@ -76,8 +82,11 @@ done < <(git -C "$REPO" worktree list --porcelain | sed -n 's/^worktree //p')
 [ -n "$WTS" ] || die "refuse: cannot list the worktrees of $REPO"
 HAVE_LSOF=0 CWDS=""
 if command -v lsof >/dev/null 2>&1; then
-  HAVE_LSOF=1
-  CWDS="$(lsof -a -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' || true)"
+  # lsof may exit 1 over a process it cannot read and still list the rest, so its status is not
+  # the test: the snapshot is usable only when it lists this script's own cwd.
+  CWDS="$(lsof -a -d cwd -Fn 2>/dev/null || true)"
+  CWDS="$(sed -n 's/^n//p' <<<"$CWDS")"
+  if grep -qxF "$(pwd -P)" <<<"$CWDS"; then HAVE_LSOF=1; fi
 fi
 CMDS="$(ps -axww -o command=)" || die "refuse: cannot list processes"
 
@@ -112,7 +121,7 @@ reason() {
   c="$(canon "$1" || true)"
   if [ -z "$c" ] || [ "${c%/*}" != "$T" ]; then echo "not directly under $T"; return; fi
   if at_or_under "$WTS" "$2"; then echo "a git worktree of $REPO is at or under it"; return; fi
-  if [ "$HAVE_LSOF" = 0 ]; then echo "cannot check process cwds (lsof is missing)"; return; fi
+  if [ "$HAVE_LSOF" = 0 ]; then echo "cannot check process cwds (lsof is missing or failed)"; return; fi
   if at_or_under "$CWDS" "$2"; then echo "a process cwd is at or under it"; return; fi
   if named "$2"; then echo "a process command line names it"; return; fi
   case "$2" in

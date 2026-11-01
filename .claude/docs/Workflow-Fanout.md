@@ -47,7 +47,8 @@ cap.
   `> REVOKED <ISO>: <decision> — <replacement>` line at the top of the affected section. Every
   agent that commits or merges records `shasum -a 256 <brief file>` when it starts, re-hashes
   right before it commits or merges, and on a change applies those lines first (or stops and
-  reports when one contradicts committed work).
+  reports when one contradicts committed work). Group agents do not read this file: the brief
+  itself carries that instruction, or names `coder-claude.md` → Step 3, item 3.
 - **Codex roles.** A Codex arm takes only a role that `routing.json` gives Codex (for example
   `routing.sh review` lists `codex`). Implementation goes to the engine `routing.sh implementation`
   names.
