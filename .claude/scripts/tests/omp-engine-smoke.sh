@@ -633,14 +633,14 @@ PY
   mkdir -p "$real_sandbox_base/home/.omp/profiles/glen-harness/agent" "$real_sandbox_base/run"
   cat > "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml" <<'EOF'
 modelRoles:
-  default: cursor/gemini-4-argon
+  default: cursor/grok-4.7
 tools:
   approvalMode: always-ask
 mcp:
   enableProjectConfig: false
 EOF
   printf '%s\n' '{"mcpServers":{}}' > "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/mcp.json"
-  assert_contains 'real omp fixture seeds model configuration before sandbox startup' 'default: cursor/gemini-4-argon' "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml"
+  assert_contains 'real omp fixture seeds model configuration before sandbox startup' 'default: cursor/grok-4.7' "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml"
   assert 'real omp fixture seeds MCP without external services' jq -e '.mcpServers == {}' "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/mcp.json"
   cp "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/config.yml" "$real_sandbox_base/config-before"
   cp "$real_sandbox_base/home/.omp/profiles/glen-harness/agent/mcp.json" "$real_sandbox_base/mcp-before"
@@ -1588,11 +1588,10 @@ done
 # suffix, including the grok rung's "high" and a suffix that differs from
 # the ladder, and is omitted for a bare id even when that id is on the ladder
 # (setup --model cursor/grok-4.7 persists no suffix).
-for ladder_case in argon grok override bare; do
+for ladder_case in grok override bare; do
   case "$ladder_case" in
-    argon) ladder_model=cursor/gemini-4-argon:medium expected_level=medium ;;
     grok) ladder_model=cursor/grok-4.7:high expected_level=high ;;
-    override) ladder_model=cursor/gemini-4-argon:low expected_level=low ;;
+    override) ladder_model=cursor/grok-4.7:low expected_level=low ;;
     bare) ladder_model=cursor/grok-4.7 expected_level='' ;;
   esac
   dispatch_fixture "ladder-$ladder_case"

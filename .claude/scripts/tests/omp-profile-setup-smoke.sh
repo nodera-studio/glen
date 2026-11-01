@@ -149,10 +149,10 @@ new_fixture() {
   : > "$FAKE_TOOL_CALLS"
   # Canned config responses keyed by the exact registered setting ID.
   cat > "$FAKE_OMP_STATE/overlay.json" <<'EOF'
-{"modelRoles":{"default":"cursor/gemini-4-argon:medium","task":"cursor/task-model","custom":"cursor/custom-model"},"tools.approvalMode":"always-ask","tools.approval":{"write":"deny","glen_reply":"allow"},"tools.xdev":false,"tools.restrictedFolders":["~"],"fetch.enabled":false,"web_search.enabled":false,"bash.enabled":false,"eval.py":false,"eval.js":false,"browser.enabled":false,"lsp.enabled":false,"mcp.enableProjectConfig":false,"mcp.startupTimeoutMs":15000}
+{"modelRoles":{"default":"cursor/grok-4.7:high","task":"cursor/task-model","custom":"cursor/custom-model"},"tools.approvalMode":"always-ask","tools.approval":{"write":"deny","glen_reply":"allow"},"tools.xdev":false,"tools.restrictedFolders":["~"],"fetch.enabled":false,"web_search.enabled":false,"bash.enabled":false,"eval.py":false,"eval.js":false,"browser.enabled":false,"lsp.enabled":false,"mcp.enableProjectConfig":false,"mcp.startupTimeoutMs":15000}
 EOF
   cp "$FAKE_OMP_STATE/overlay.json" "$FAKE_OMP_STATE/settings.json"
-  printf '%s\n' '{"models":[{"selector":"cursor/gemini-4-argon"}]}' > "$FAKE_OMP_STATE/models.json"
+  printf '%s\n' '{"models":[{"selector":"cursor/grok-4.7"}]}' > "$FAKE_OMP_STATE/models.json"
 }
 ready_assets() {
   mkdir -p "$TEST_AGENT/skills/mnemosyne-glen"
@@ -173,13 +173,13 @@ assert 'version control leaves native cache cold' test ! -e "$TEST_HOME/.omp/nat
 
 new_fixture
 # Reverse the live list's order and exercise both selector and provider/id forms:
-# preference order, rather than API order, must choose Argon when both exist.
-printf '%s\n' '{"models":[{"selector":"cursor/gemini-3.8-flash"},{"selector":"cursor/other"},{"provider":"cursor","id":"gemini-4-argon"}]}' > "$FAKE_OMP_STATE/models.json"
+# the single preferred model is found among others in provider/id form.
+printf '%s\n' '{"models":[{"selector":"cursor/other"},{"provider":"cursor","id":"grok-4.7"}]}' > "$FAKE_OMP_STATE/models.json"
 jq '.modelRoles.default = "cursor/old" | .["tools.xdev"] = true' "$FAKE_OMP_STATE/settings.json" > "$CASE_DIR/drift.json"
 cp "$CASE_DIR/drift.json" "$FAKE_OMP_STATE/settings.json"
 setup_run "$SETUP"
 assert_exit 'full setup succeeds with record-only modelRoles CLI' 0
-assert 'full setup preserves other model roles' jq -e '.modelRoles == {default:"cursor/gemini-4-argon:medium",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
+assert 'full setup preserves other model roles' jq -e '.modelRoles == {default:"cursor/grok-4.7:high",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
 assert 'full setup applies other overlay settings' jq -e '.["tools.xdev"] == false' "$FAKE_OMP_STATE/settings.json"
 assert 'full setup queries bare modelRoles key' jq -es 'any(.[]; .argv == ["--profile","glen-harness","config","get","modelRoles","--json"])' "$FAKE_OMP_LOG"
 assert 'full setup sets bare modelRoles key with whole record' jq -es 'any(.[]; .argv[2:5] == ["config","set","modelRoles"] and (.argv[5] | fromjson | .task == "cursor/task-model"))' "$FAKE_OMP_LOG"
@@ -187,8 +187,8 @@ assert 'full setup makes only harness-scoped omp calls' all_scoped
 assert 'full setup installs MCP asset' cmp -s "$REPO_ROOT/.claude/omp/mcp.json" "$TEST_AGENT/mcp.json"
 assert 'full setup installs skill asset' cmp -s "$REPO_ROOT/.claude/omp/skills/mnemosyne-glen/SKILL.md" "$TEST_AGENT/skills/mnemosyne-glen/SKILL.md"
 assert_contains 'full setup reaches build stub' 'cargo build --release --locked' "$FAKE_TOOL_CALLS"
-assert_contains 'both preferred models present chooses Argon visibly' 'chose cursor/gemini-4-argon from preference list' "$STDOUT"
-assert_contains 'Argon selection reports its medium thinking level' 'chose cursor/gemini-4-argon from preference list, thinking medium' "$STDOUT"
+assert_contains 'preferred model present is chosen visibly' 'chose cursor/grok-4.7 from preference list' "$STDOUT"
+assert_contains 'selection reports its high thinking level' 'chose cursor/grok-4.7 from preference list, thinking high' "$STDOUT"
 # shellcheck disable=SC2016 # jq binds its own $calls variable.
 assert 'full setup fetches models before setting config' jq -es '
   map(.argv[2:4] | join(" ")) as $calls |
@@ -217,40 +217,28 @@ assert 'failed prewarm never queries models or sets config' jq -es \
 assert 'failed prewarm never invokes sandboxed payload' test ! -s "$FAKE_OMP_LAUNCH_LOG"
 
 new_fixture
-printf '%s\n' '{"models":[{"provider":"cursor","id":"gemini-3.8-flash"},{"selector":"cursor/other"}]}' > "$FAKE_OMP_STATE/models.json"
-setup_run "$SETUP"
-assert_exit 'missing Argon falls back to Flash' 0
-assert 'fallback sets Flash and preserves other model roles' jq -e \
-  '.modelRoles == {default:"cursor/gemini-3.8-flash:medium",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
-assert_contains 'fallback model decision is visible' 'chose cursor/gemini-3.8-flash from preference list' "$STDOUT"
-assert_contains 'Flash fallback also reports medium thinking' 'chose cursor/gemini-3.8-flash from preference list, thinking medium' "$STDOUT"
-assert 'fallback really writes chosen model' jq -es 'any(.[];
-  .argv[2:5] == ["config","set","modelRoles"] and
-  (.argv[5] | fromjson | .default == "cursor/gemini-3.8-flash:medium"))' "$FAKE_OMP_LOG"
-# The subsequent check must display the same resolved model without any drift.
-setup_run "$SETUP" --check
-assert_exit 'fallback model check succeeds' 0
-assert 'fallback check report shows resolved model' grep -Eq '^model[[:space:]]+cursor/gemini-3.8-flash$' "$STDOUT"
-
-new_fixture
 printf '%s\n' '{"models":[{"selector":"cursor/grok-4.7"},{"selector":"cursor/other"}]}' > "$FAKE_OMP_STATE/models.json"
+jq '.modelRoles.default = "cursor/old"' "$FAKE_OMP_STATE/settings.json" > "$CASE_DIR/drift.json"
+cp "$CASE_DIR/drift.json" "$FAKE_OMP_STATE/settings.json"
 setup_run "$SETUP"
-assert_exit 'Argon and Flash both missing falls back to Grok at high' 0
-assert 'Grok fallback sets Grok and preserves other model roles' jq -e \
+assert_exit 'grok-4.7 alone is configured at high' 0
+assert 'setup sets grok at high and preserves other model roles' jq -e \
   '.modelRoles == {default:"cursor/grok-4.7:high",task:"cursor/task-model",custom:"cursor/custom-model"}' "$FAKE_OMP_STATE/settings.json"
-assert_contains 'Grok fallback decision is visible' 'chose cursor/grok-4.7 from preference list, thinking high' "$STDOUT"
-assert 'Grok fallback really writes chosen model' jq -es 'any(.[];
+assert_contains 'model decision is visible' 'chose cursor/grok-4.7 from preference list, thinking high' "$STDOUT"
+assert 'setup really writes chosen model' jq -es 'any(.[];
   .argv[2:5] == ["config","set","modelRoles"] and
   (.argv[5] | fromjson | .default == "cursor/grok-4.7:high"))' "$FAKE_OMP_LOG"
+# The subsequent check must display the same resolved model without any drift.
+setup_run "$SETUP" --check
+assert_exit 'model check succeeds' 0
+assert 'check report shows resolved model' grep -Eq '^model[[:space:]]+cursor/grok-4.7$' "$STDOUT"
 
 new_fixture
 printf '%s\n' '{"models":[{"selector":"cursor/other"}]}' > "$FAKE_OMP_STATE/models.json"
 setup_run "$SETUP"
 assert_exit 'none of the preferred models available fails' 1
 assert_contains 'missing preferences reason explains none found' 'none of the preferred models' "$STDERR"
-assert_contains 'missing preferences reason names Argon' 'cursor/gemini-4-argon' "$STDERR"
-assert_contains 'missing preferences reason names Flash' 'cursor/gemini-3.8-flash' "$STDERR"
-assert_contains 'missing preferences reason names Grok' 'cursor/grok-4.7' "$STDERR"
+assert_contains 'missing preferences reason names cursor/grok-4.7' 'cursor/grok-4.7' "$STDERR"
 assert 'missing preferences never set config' jq -es \
   'all(.[]; .argv[2:4] != ["config","set"])' "$FAKE_OMP_LOG"
 assert 'missing preferences never install MCP' test ! -e "$TEST_AGENT/mcp.json"
@@ -259,14 +247,14 @@ assert 'missing preferences never build or install extension' test ! -s "$FAKE_T
 assert 'missing preferences still use only harness-scoped calls' all_scoped
 
 new_fixture
-printf '%s\n' '{"models":[{"selector":"cursor/gemini-4-argon"},{"selector":"cursor/gemini-3.8-flash"},{"selector":"cursor/explicit"}]}' > "$FAKE_OMP_STATE/models.json"
+printf '%s\n' '{"models":[{"selector":"cursor/grok-4.7"},{"selector":"cursor/explicit"}]}' > "$FAKE_OMP_STATE/models.json"
 setup_run "$SETUP" --model cursor/explicit
 assert_exit 'explicit model bypasses preference order' 0
 assert 'explicit model is the configured default' jq -e '.modelRoles.default == "cursor/explicit"' "$FAKE_OMP_STATE/settings.json"
 assert_contains 'explicit model decision is visible' 'model: cursor/explicit (explicit --model)' "$STDOUT"
 
 new_fixture
-printf '%s\n' '{"models":[{"selector":"cursor/gemini-4-argon"},{"selector":"cursor/gemini-3.8-flash"}]}' > "$FAKE_OMP_STATE/models.json"
+printf '%s\n' '{"models":[{"selector":"cursor/grok-4.7"}]}' > "$FAKE_OMP_STATE/models.json"
 setup_run "$SETUP" --model cursor/missing
 assert_exit 'missing explicit model does not fall back' 1
 assert_contains 'missing explicit model keeps exact-id diagnostic' 'model cursor/missing is not listed' "$STDERR"
