@@ -20,15 +20,24 @@
 #      or cwd at or below the worktree, wait 15 s once, take a new snapshot, re-read both stores
 #      and refuse only if it is still live, listing each job's status, pid, the pid's snapshot
 #      command and its cancel command; refuse if a task, task-worker or review process
-#      (fixed-argv --cwd, or process cwd) is at or below it.
+#      (fixed-argv --cwd, or process cwd) is at or below it. Then list the working material to
+#      preserve: every untracked or ignored file under the worktree's
+#      .claude/{evidence,plans,research,handoffs,tech-debt,testing,reviews}/.
 #   5. SIGTERM every broker of the snapshot whose fixed-position --cwd is at or below the
 #      worktree, wait up to 10 s for all, SIGKILL the survivors. A pid whose pid, start time or
 #      command differs from the snapshot is skipped.
 #   6. Take a new snapshot and confirm no broker, task or live job is left; otherwise exit 1 and
 #      remove nothing.
-#   7. git worktree remove --force (discards uncommitted changes; no repo-wide prune).
-#   8. With <branch>, git branch -D.
-# --dry-run prints what would be stopped and removed, and changes nothing.
+#   7. Preserve the working material in the main checkout: a file absent there is copied to the
+#      same path; an identical one is skipped; a different existing file is never overwritten, the
+#      worktree's copy goes to .claude/evidence/from-worktrees/<worktree name>-<UTC stamp>/<path>.
+#      Each copy prints `preserved <path> -> <dest>`. A failed copy exits 1 and removes nothing.
+#   8. git worktree remove --force. It still discards tracked changes and every untracked or
+#      ignored file outside those directories (target/, scratch), listing up to 20 of the
+#      discarded paths first. No repo-wide prune.
+#   9. With <branch>, git branch -D.
+# --dry-run prints what would be stopped, preserved (`would preserve <path> -> <dest>`) and
+# removed, and changes nothing.
 set -euo pipefail
 
 die() { echo "remove-worktree: $*" >&2; exit 1; }
@@ -157,6 +166,29 @@ if [ -n "$TASKS" ]; then
   exit 1
 fi
 
+# Working material to preserve (step 7): untracked or ignored files (`--others` without
+# --exclude-standard lists both) under the worktree's working directories.
+KEEP=(.claude/evidence .claude/plans .claude/research .claude/handoffs .claude/tech-debt .claude/testing .claude/reviews)
+FALLBACK=".claude/evidence/from-worktrees/${W##*/}-$(date -u +%Y%m%dT%H%M%SZ)"
+git -C "$W" ls-files -z --others -- "${KEEP[@]}" >"$TMP/keep" \
+  || die "refuse: cannot list the untracked files of $W; nothing removed"
+PRES=() NPRES=0
+while IFS= read -r -d '' f; do
+  case "$f" in */) continue ;; esac   # a nested repository, not a file
+  PRES+=("$f")
+  NPRES=$((NPRES + 1))
+done <"$TMP/keep"
+# pres_dest PATH: where the worktree's PATH goes in the main checkout; empty when the main
+# checkout already has an identical file. An existing different file is never the destination.
+pres_dest() {
+  if [ -e "$MAIN/$1" ] || [ -L "$MAIN/$1" ]; then
+    if cmp -s "$W/$1" "$MAIN/$1"; then return 0; fi
+    printf '%s\n' "$MAIN/$FALLBACK/$1"
+  else
+    printf '%s\n' "$MAIN/$1"
+  fi
+}
+
 BROKERS=""
 while IFS="$SEP" read -r kind pid cwd _; do
   [ "$kind" = broker ] || continue
@@ -169,6 +201,12 @@ done <"$PROCS"
 [ -n "$BROKERS" ] || echo "no Codex broker for $W"
 
 if [ "$DRY" = 1 ]; then
+  i=0
+  while [ "$i" -lt "$NPRES" ]; do
+    d="$(pres_dest "${PRES[$i]}")"
+    if [ -n "$d" ]; then echo "would preserve ${PRES[$i]} -> $d"; fi
+    i=$((i + 1))
+  done
   echo "dry run: would stop:${BROKERS:- nothing}; remove worktree $REG${BRANCH:+; delete branch $BRANCH ($WHY)}"
   exit 0
 fi
@@ -196,13 +234,37 @@ if [ -n "$LEFT" ] || [ -n "$LEFT_TASKS" ] || [ -n "$LEFT_JOBS" ]; then
   die "still running for $W (brokers:${LEFT:- none}; tasks: ${LEFT_TASKS:-none}; jobs: ${LEFT_JOBS:-none}); nothing removed"
 fi
 
-# 7. Remove the worktree.
-DIRTY="$(git -C "$W" status --short 2>/dev/null | wc -l | tr -d ' ')"
-[ "$DIRTY" = 0 ] || echo "warning: discarding $DIRTY uncommitted path(s) in $W"
+# 7. Preserve the working material, deciding each destination again now.
+i=0
+while [ "$i" -lt "$NPRES" ]; do
+  f="${PRES[$i]}"
+  i=$((i + 1))
+  d="$(pres_dest "$f")"
+  [ -n "$d" ] || continue
+  if ! { mkdir -p "${d%/*}" && cp -pP "$W/$f" "$d"; }; then die "could not preserve $f; nothing removed"; fi
+  echo "preserved $f -> $d"
+done
+
+# 8. Remove the worktree; list what is discarded (up to 20 paths), skipping the preserved files.
+N=0 SHOWN=""
+while IFS= read -r -d '' e; do
+  st="${e:0:2}" path="${e:3}"
+  case "$st" in R* | C*) IFS= read -r -d '' _ || true ;; esac   # the rename's source path
+  if [ "$st" = '??' ]; then
+    for k in "${KEEP[@]}"; do if under "$path" "$k"; then continue 2; fi; done
+  fi
+  N=$((N + 1))
+  if [ "$N" -le 20 ]; then SHOWN="$SHOWN  $st $path"$'\n'; fi
+done < <(git -C "$W" status --porcelain -z --untracked-files=all 2>/dev/null)
+if [ "$N" -gt 0 ]; then
+  echo "warning: discarding $N uncommitted path(s) in $W:"
+  printf '%s' "$SHOWN"
+  if [ "$N" -gt 20 ]; then echo "  ... and $((N - 20)) more"; fi
+fi
 git -C "$MAIN" worktree remove --force "$REG"
 echo "removed worktree $REG"
 
-# 8. Delete the branch.
+# 9. Delete the branch.
 if [ -n "$BRANCH" ]; then
   git -C "$MAIN" branch -D "$BRANCH"
   echo "  ($BRANCH: $WHY)"
