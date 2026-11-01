@@ -46,6 +46,7 @@ None.
 - The owner noticed that batches 1–12 changed only glen's installed `.claude/`, never the agent-os repo. A separate session is now porting the generic changes to agent-os.
 - `docs-updater.md:32` allows CHANGELOG edits only in release PRs, which conflicts with per-wave `## Unreleased` bullets. Open, for batch 13.
 - The harness docs still say to run harness batches and fix groups "as a workflow". Open, for batch 13.
+- **Session restart, about 18:57Z.** It stopped every session-local process: the W0 Implementer (mid-wave, after steps 1–4), the PR #33 CI watcher, and the hourly cron. The project agent types did not reload either. Recovery: the Implementer was resumed from its transcript at step 5, and the cron was re-created as `54412a65`. Session-only crons and background agents can't outlive a restart, so after any restart the run must recheck them.
 
 ## Blockers
 
