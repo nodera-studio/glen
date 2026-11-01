@@ -12,6 +12,7 @@
       "Bash(cargo test:*)",
       "Bash(cargo clippy:*)",
       "Bash(cargo fmt:*)",
+      "Bash(bash .claude/scripts/clean-scratch.sh:*)",
       "mcp__plugin_mnemosyne_memory__memory_search",
       "mcp__plugin_mnemosyne_memory__memory_get",
       "mcp__plugin_mnemosyne_memory__memory_get_recent",

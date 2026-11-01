@@ -11,6 +11,7 @@
 #     Loopback stays allowed (local API, MCP servers, health checks).
 #   - `omp` with a profile other than glen-harness (`--profile`, OMP_PROFILE, PI_PROFILE), and
 #     `mkdir`/`cp`/`mv`/`rsync`/`ln` into another ~/.omp/profiles/<name> -> HOME="$(mktemp -d)"
+#   - recursive `rm` of glen- scratch under $TMPDIR, /tmp or /var/folders -> scripts/clean-scratch.sh
 # Does NOT touch grep/rg (agentic search is good in-loop — routed via CLAUDE.md)
 # or codex (block-old-codex.sh). Fails open on any error. Project-specific
 # steering (e.g. a dev-tool wrapper hook) can be layered in separately — see
@@ -143,6 +144,15 @@ while IFS= read -r seg || [ -n "$seg" ]; do
           deny "$OMP_PROFILE_REASON"
         fi
       done <<< "$names"
+      ;;
+    rm)
+      # recursive deletes of glen scratch in the temp dirs -> the helper, which refuses anything
+      # a worktree, process or omp engine run still uses
+      # shellcheck disable=SC2016 # $TMPDIR / ${TMPDIR} are matched literally in the command text
+      if printf '%s' "$seg" | grep -qE '(^|[[:space:]])(-[A-Za-z]*[rR][A-Za-z]*|--recursive)([[:space:]]|$)' \
+         && printf '%s' "$seg" | grep -qE '(\$TMPDIR|\$\{TMPDIR[^}]*\}|/tmp/|/private/tmp/|/var/folders/|/private/var/folders/)[^[:space:]]*glen-'; then
+        deny "Delete glen scratch with the helper: bash .claude/scripts/clean-scratch.sh [--dry-run] '<glen-name or glob>' (it refuses anything a worktree, process or omp engine run still uses). rm -rf stays denied."
+      fi
       ;;
   esac
 done < <(printf '%s\n' "$CMD" | tr '|;&' '\n')
