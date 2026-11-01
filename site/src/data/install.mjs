@@ -31,3 +31,13 @@ export function installView(site) {
   binary: { href: site.latestReleaseUrl, label: 'Download the latest release', note: 'Archives for macOS (arm64, x86_64) and Linux (x86_64, arm64), with SHA-256 checksums.' },
  };
 }
+
+/**
+ * The command of the tab the Install section opens on; the closing CTA band repeats it.
+ * @param {InstallView} view
+ * @returns {{command: string, copy: boolean}}
+ */
+export function defaultCommand(view) {
+ if (view.defaultTab === 'cargo' || view.script.command === null) return { command: view.cargo.command, copy: true };
+ return { command: view.script.command, copy: view.script.copy };
+}

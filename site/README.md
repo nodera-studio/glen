@@ -7,7 +7,7 @@ npm ci
 npm run dev
 npm run verify       # check, static build, unit tests, budgets, offline link check
 npx playwright install chromium  # once
-npm run test:e2e     # Chromium smoke; preview starts automatically
+npm run test:e2e     # Chromium smoke; preview starts automatically on 4321 (GLEN_E2E_PORT=<port> for another)
 npm run lhci         # mobile, 3 runs per light/dark URL: performance >= 0.90, accessibility >= 0.95
 ```
 
@@ -64,6 +64,8 @@ tab says the script ships with v0.1.0, the Binary tab links to the Releases page
 the page names the installer URL or `/releases/latest`. It is true since v0.1.0 was published:
 the page opens on the Script tab with a copyable `curl … | sh`, and Binary links to the latest
 release.
+The closing CTA band repeats the command of the tab Install opens on (`defaultCommand()`), with
+the same Copy button.
 Islands take what they show as props, never by importing `site.ts`, so the installer URL stays
 out of their bundles too.
 
