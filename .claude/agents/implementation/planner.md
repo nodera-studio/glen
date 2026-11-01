@@ -185,6 +185,10 @@ controller → service → schema. Then confirm the glue is planned:
 - Every tool, crate or package the plan names resolves in the real tree (`cargo tree -i`,
   `npm ls` in `site/`, `--version`), with the resolved version in the step; every new
   dependency is listed with its exact command in a **Network pre-flight** block.
+- Every check or gate that names an open branch, PR or worktree carries a fallback: once that
+  branch is merged (`gh pr view <N> --json state` prints `MERGED`), run the check against
+  origin/main instead. A squash merge leaves the branch tip off `main`, so the original check
+  goes stale.
 
 Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user can see what was caught.
 

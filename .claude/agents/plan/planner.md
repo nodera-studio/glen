@@ -226,6 +226,12 @@ forward planning misses — especially wiring, error handling, and integration.
    decides it: `CONDITIONAL — decided by: <command or fact>`, with both branches spelled out.
    W5's plan kept "If W4 is merged" bullets, and the Implementer spent five Codex round trips
    confirming plain readings.
+   A verification step, acceptance check or gate that names an open branch, PR or worktree
+   (`git merge-tree --write-tree feat/x HEAD` exits 0, "no conflict with the W9 tip") gets a
+   fallback in the same step: "Once <branch> is merged (`gh pr view <N> --json state` prints
+   `MERGED`), run this check against origin/main instead." A squash merge leaves the branch
+   tip off `main`, so the original check goes stale once the branch is merged: batch 10's W9
+   `merge-tree` gate did (checkpoint 39).
 8. Add any missing steps, marked `[ADDED BY BACKWARD CHECK]` so the user sees what was
    caught.
 </backward_check>
