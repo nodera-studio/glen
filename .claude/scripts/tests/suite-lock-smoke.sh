@@ -121,6 +121,16 @@ rc=$?
 if [ "$rc" = 2 ] && grep -q usage "$TMP/u.err"; then ok "no command: usage, exit 2"
 else fail "no command: exit=$rc stderr=[$(cat "$TMP/u.err")]"; fi
 
+/bin/bash "$LOCKSH" -- sh -c 'echo ran "$1"' _ dashdash >"$TMP/d.out" 2>"$TMP/d.err"
+rc=$?
+if [ "$rc" = 0 ] && grep -qx "ran dashdash" "$TMP/d.out" && [ ! -e "$LOCK" ]; then ok "leading -- is dropped"
+else fail "leading --: exit=$rc out=[$(cat "$TMP/d.out")] stderr=[$(cat "$TMP/d.err")]"; fi
+
+/bin/bash "$LOCKSH" -- 2>"$TMP/u2.err"
+rc=$?
+if [ "$rc" = 2 ] && grep -q usage "$TMP/u2.err"; then ok "only --: usage, exit 2"
+else fail "only --: exit=$rc stderr=[$(cat "$TMP/u2.err")]"; fi
+
 if [ "$FAILS" -gt 0 ]; then
   echo "suite-lock-smoke: $FAILS FAIL"
   exit 1

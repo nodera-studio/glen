@@ -793,26 +793,33 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
     assert_eq!(child.wait().unwrap().code(), Some(130));
 }
 
+/// A path for `FAKE_OMP_PROMPT_SUBMIT_GATE`, in the box's own temp dir.
+fn submit_gate(b: &LiveBox) -> std::path::PathBuf {
+    b.log.with_file_name("submit.gate")
+}
+
+/// Waits until the debug worker's submission thread has reached the gate.
+fn wait_submit_gate(gate: &std::path::Path) {
+    let ready = std::path::PathBuf::from(format!("{}.ready", gate.display()));
+    poll(Duration::from_secs(10), || ready.exists().then_some(()));
+}
+
 #[test]
 fn ac315_worker_rechecks_endpoint_at_prompt_submission() {
     let mut b = LiveBox::new();
+    let gate = submit_gate(&b);
     let o = b
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS", "1200")
+        .env("FAKE_OMP_PROMPT_SUBMIT_GATE", &gate)
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(10));
     let value = json(&o);
     let id = job_id(&value["data"]);
-    poll(Duration::from_secs(5), || {
-        b.rpc
-            .fake_log()
-            .iter()
-            .any(|e| e["event"] == "start")
-            .then_some(())
-    });
+    wait_submit_gate(&gate);
     b.start_ext(A_ID, "ok", &[]);
+    fs::write(&gate, b"").unwrap();
     let out = b
         .rpc
         .glen(&["wait", id, "--timeout", "10s", "--json"])
@@ -827,24 +834,20 @@ fn ac315_worker_rechecks_endpoint_at_prompt_submission() {
 #[test]
 fn ac315_worker_refuses_an_unhealthy_endpoint_at_submission() {
     let b = LiveBox::new();
+    let gate = submit_gate(&b);
     let o = b
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS", "1200")
+        .env("FAKE_OMP_PROMPT_SUBMIT_GATE", &gate)
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(10));
     let value = json(&o);
     let id = job_id(&value["data"]);
-    poll(Duration::from_secs(5), || {
-        b.rpc
-            .fake_log()
-            .iter()
-            .any(|e| e["event"] == "start")
-            .then_some(())
-    });
+    wait_submit_gate(&gate);
     fs::create_dir_all(b.registry(A_ID).parent().unwrap()).unwrap();
     fs::write(b.registry(A_ID), "malformed registry").unwrap();
+    fs::write(&gate, b"").unwrap();
     let out = b
         .rpc
         .glen(&["wait", id, "--timeout", "10s", "--json"])

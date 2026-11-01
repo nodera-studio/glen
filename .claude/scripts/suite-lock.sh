@@ -3,8 +3,9 @@
 # never run at once in one target dir (a concurrent `cargo build --example` re-links example
 # binaries a running suite uses).
 #
-# Usage: bash .claude/scripts/suite-lock.sh <command> [args…]
+# Usage: bash .claude/scripts/suite-lock.sh [--] <command> [args…]
 #   e.g. bash .claude/scripts/suite-lock.sh cargo test --locked
+#   A leading `--` is dropped, so `suite-lock.sh -- cargo test` runs `cargo test`.
 #
 # The lock is the directory <target>/.glen-suite.lock/, <target> = $CARGO_TARGET_DIR if set, else
 # <git toplevel of the cwd>/target. Its `owner` file holds the holder's pid, `ps -o lstart=`, the
@@ -20,7 +21,8 @@ set -u
 
 die() { echo "suite-lock: $*" >&2; exit 2; }
 
-[ $# -ge 1 ] || die "usage: suite-lock.sh <command> [args…]"
+[ "${1:-}" = "--" ] && shift
+[ $# -ge 1 ] || die "usage: suite-lock.sh [--] <command> [args…]"
 WAIT="${GLEN_SUITE_LOCK_WAIT:-3600}"
 case "$WAIT" in '' | *[!0-9]*) die "GLEN_SUITE_LOCK_WAIT must be whole seconds: $WAIT" ;; esac
 
