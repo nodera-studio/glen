@@ -1,5 +1,6 @@
 import { test, expect, type Page } from '@playwright/test';
 const cargo = 'cargo install --git https://github.com/nodera-studio/glen --locked';
+const script = 'curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh';
 
 // Rows a reader can see in the variant that is showing, pane by pane: rendered rows that sit inside
 // the pane's viewport once the scroll transition settles, so a wrong scroll offset changes the text.
@@ -79,13 +80,14 @@ test.describe('without JavaScript', () => {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
   await expect(page.locator('#install-panel-cargo code')).toHaveText(cargo);
   await expect(page.locator('#install-panel-cargo code')).toBeVisible();
-  // Until the first release the Script panel is a note: no installer command to copy (W7 D9).
-  await expect(page.locator('#install-panel-script')).toContainText('The install script ships with the first release (v0.1.0). Use Cargo until then.');
-  await expect(page.locator('#install-panel-script code')).toHaveCount(0);
-  await expect(page.getByRole('link', { name: 'GitHub Releases', exact: true })).toBeVisible();
-  await expect(page.getByRole('link', { name: 'GitHub Releases', exact: true })).toHaveAttribute('href', 'https://github.com/nodera-studio/glen/releases');
+  // G7 (v0.1.0 is out): the Script panel carries the installer command, Binary the latest release.
+  await expect(page.locator('#install-panel-script code')).toHaveText(script);
+  await expect(page.locator('#install-panel-script code')).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Download the latest release', exact: true })).toBeVisible();
+  await expect(page.getByRole('link', { name: 'Download the latest release', exact: true })).toHaveAttribute('href', 'https://github.com/nodera-studio/glen/releases/latest');
   await expect(page.locator('.theme-switch')).toBeHidden(); await expect(page.locator('.term-ctl')).toBeHidden();
   await expect(page.locator('#install-panel-cargo button')).toHaveCount(0);
+  await expect(page.locator('#install-panel-script button')).toHaveCount(0);
   for (const pane of await page.locator('.term-v[data-v=n] .term-vp').all()) expect(await pane.evaluate(e => e.scrollHeight <= e.clientHeight + 1)).toBe(true);
   // How it works shows each finished stage.
   await expect(page.locator('[data-stage=hear] [data-before]')).toBeHidden();
@@ -429,8 +431,10 @@ test('tabs are labelled, with the ink pill on the selected one', async ({ page }
  await expect(pill).toHaveCSS('background-color', 'rgb(41, 41, 41)');
  await expect(page.locator('#install [role=tab][aria-selected=true]')).toHaveCSS('color', 'rgb(255, 255, 255)');
 });
+// Since v0.1.0 the Script tab opens first (G7), so these copy tests select Cargo themselves.
+const selectCargo = (page: Page) => page.getByRole('tab', { name: 'Cargo', exact: true }).click();
 test('copy writes the exact command and announces success', async ({ page, context }) => {
- await context.grantPermissions(['clipboard-read', 'clipboard-write']); await page.goto('/'); await hydrate(page, '#install');
+ await context.grantPermissions(['clipboard-read', 'clipboard-write']); await page.goto('/'); await hydrate(page, '#install'); await selectCargo(page);
  const button = page.getByRole('button', { name: 'Copy Cargo command', exact: true });
  await expect(button).toHaveCSS('border-top-width', '0px');
  await expect(button.locator('rect').first()).toHaveAttribute('stroke-dasharray', '16 0');
@@ -449,15 +453,31 @@ test('copy writes the exact command and announces success', async ({ page, conte
 });
 for (const failure of ['missing', 'rejected']) test(`copy announces ${failure} Clipboard API failure`, async ({ page }) => {
  await page.addInitScript(failure => Object.defineProperty(navigator, 'clipboard', { configurable: true, value: failure === 'missing' ? undefined : { writeText: () => Promise.reject(new Error('Clipboard denied')) } }), failure);
- await page.goto('/'); await hydrate(page, '#install'); await page.getByRole('button', { name: 'Copy Cargo command', exact: true }).click();
+ await page.goto('/'); await hydrate(page, '#install'); await selectCargo(page); await page.getByRole('button', { name: 'Copy Cargo command', exact: true }).click();
  await expect(page.locator('#install-panel-cargo [role=status]')).toHaveText("Couldn't copy. Select the command and copy it yourself.");
  await expect(page.getByRole('button', { name: 'Copy failed Cargo command', exact: true })).toContainText('Copy failed');
 });
-test('390px: the cargo command stays on one line and fades out', async ({ page }) => {
+test('390px: the script and cargo commands stay on one line and fade out', async ({ page }) => {
  await page.setViewportSize({ width: 390, height: 844 }); await page.goto('/'); await hydrate(page, '#install');
- const pre = page.locator('#install-panel-cargo pre');
- expect(await pre.evaluate(e => e.getBoundingClientRect().height)).toBeLessThan(30);
- await expect(pre).toHaveCSS('mask-image', /linear-gradient/);
+ for (const [tab, id] of [['Script', 'script'], ['Cargo', 'cargo']]) {
+  await page.getByRole('tab', { name: tab, exact: true }).click();
+  const pre = page.locator(`#install-panel-${id} pre`);
+  await expect(pre).toBeVisible();
+  expect(await pre.evaluate(e => e.getBoundingClientRect().height)).toBeLessThan(30);
+  await expect(pre).toHaveCSS('mask-image', /linear-gradient/);
+ }
+ // The script note wraps, but never inside a flag ("--" at a line end, "version" on the next).
+ await page.getByRole('tab', { name: 'Script', exact: true }).click();
+ const split = await page.locator('#install-panel-script .panel-note').evaluate(note => ['--version', '--prefix'].filter(flag => {
+  const walker = document.createTreeWalker(note, NodeFilter.SHOW_TEXT);
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+   const at = node.textContent!.indexOf(flag); if (at < 0) continue;
+   const range = document.createRange(); range.setStart(node, at); range.setEnd(node, at + flag.length);
+   return new Set([...range.getClientRects()].map(r => Math.round(r.top))).size !== 1;
+  }
+  return true;
+ }));
+ expect(split).toEqual([]);
 });
 test('agents: five exit codes with glowing status badges', async ({ page }) => {
  await page.goto('/');
@@ -476,13 +496,16 @@ test('FAQ: five rows; Enter opens one and the others close', async ({ page }) =>
  await expect(rows.nth(3)).toHaveAttribute('open', ''); await expect(rows.nth(1)).not.toHaveAttribute('open', '');
  await expect(rows.nth(3).locator('.faq-body')).toContainText('glen wait');
 });
-// W8-DOC-15: no chip may read as released before the first release; the hero dot stops pulsing.
-test('before the first release the header, hero and footer chips say coming soon, and the hero dot is still', async ({ page }) => {
+// W8-DOC-15, after the flip (G7): v0.1.0 is out, so every chip reads as released and the hero dot pulses.
+test('the header, hero and footer chips read v0.1.0, and the hero dot pulses', async ({ page }) => {
  await page.goto('/');
- for (const chip of [page.locator('.header-bar .version-chip'), page.locator('.hero .release-chip'), page.locator('.footer-bottom span').last()]) await expect(chip).toContainText('v0.1.0 · coming soon');
+ await expect(page.locator('.header-bar .version-chip')).toHaveText('v0.1.0');
+ await expect(page.locator('.hero .release-chip')).toHaveText('v0.1.0 · works with omp 18.14.0');
+ await expect(page.locator('.footer-bottom span').last()).toHaveText('v0.1.0');
  const dot = page.locator('.release-chip > span');
- await expect(dot).toHaveCSS('animation-name', 'none');
- await expect(dot).toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
+ await expect(page.locator('.hero .release-chip')).toHaveAttribute('data-release', 'out');
+ await expect(dot).toHaveCSS('animation-name', 'chip-pulse');
+ await expect(dot).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
 });
 // W8-DOC-16, DOC-18, DOC-17 and DOC-6: the copy says what glen does.
 test('copy: exit 6 is a refusal, --project uses the current directory, the Linux limit is conditional, omp is tested not required', async ({ page }) => {
@@ -510,24 +533,29 @@ test('412px first viewport requests no JavaScript file', async ({ page }) => {
  await page.goto('/'); await page.waitForTimeout(2000); expect(scripts).toEqual([]);
  await expect(page.getByRole('heading', { level: 1 })).toBeVisible(); await expect(page.locator('.term-v[data-v=n] .tl.on').first()).toBeVisible();
 });
-test('Cargo defaults; unreleased downloads carry release labels', async ({ page }) => {
- await page.goto('/'); await hydrate(page, '#install');
- await expect(page.getByRole('tab', { name: 'Cargo', exact: true })).toHaveAttribute('aria-selected', 'true');
- for (const [name, note] of [['Script', 'The install script ships with the first release (v0.1.0). Use Cargo until then.'], ['Binary', 'Binaries arrive with the v0.1.0 release.']]) {
-  await page.getByRole('tab', { name, exact: true }).click();
-  await expect(page.locator('#install [role=tabpanel]:not([hidden])')).toContainText(note!);
- }
- await page.getByRole('tab', { name: 'Script', exact: true }).click();
- await expect(page.locator('#install-panel-script button')).toHaveCount(0);
- await expect(page.locator('#install-panel-script code')).toHaveCount(0);
+// G7: v0.1.0 is out, so these two replace the pre-release checks (Cargo first, release notes in
+// place of the installer, no installer URL or /releases/latest on the page) with the released state.
+test('Script defaults and copies the installer; Binary links to the latest release', async ({ page, context }) => {
+ await context.grantPermissions(['clipboard-read', 'clipboard-write']); await page.goto('/'); await hydrate(page, '#install');
+ await expect(page.getByRole('tab', { name: 'Script', exact: true })).toHaveAttribute('aria-selected', 'true');
+ const panel = page.locator('#install-panel-script');
+ await expect(panel.locator('code')).toHaveText(script);
+ await expect(panel).toContainText('Installs the latest release to ~/.local/bin. Add --version X.Y.Z or --prefix DIR after sh -s --.');
+ await page.getByRole('button', { name: 'Copy Script command', exact: true }).click();
+ expect(await page.evaluate(() => navigator.clipboard.readText())).toBe(script);
+ await page.getByRole('tab', { name: 'Binary', exact: true }).click();
+ const latest = page.getByRole('link', { name: 'Download the latest release', exact: true });
+ await expect(latest).toBeVisible();
+ await expect(latest).toHaveAttribute('href', 'https://github.com/nodera-studio/glen/releases/latest');
+ await expect(page.locator('#install-panel-binary')).toContainText('Archives for macOS (arm64, x86_64) and Linux (x86_64, arm64), with SHA-256 checksums.');
 });
-test('before the first release the page names no installer URL and no latest release', async ({ page }) => {
+test('the page names the installer URL and the latest release, and no pre-release copy remains', async ({ page }) => {
  const responses: string[] = [];
  page.on('response', async r => { if (r.url().endsWith('.js')) responses.push(await r.text()); });
  await page.goto('/'); await scrollThrough(page);
  await expect(page.locator('astro-island:not([ssr])')).toHaveCount(4);
- for (const text of [await page.content(), ...responses]) {
-  expect(text).not.toContain('raw.githubusercontent.com');
-  expect(text).not.toContain('/releases/latest');
- }
+ const html = await page.content();
+ expect(html).toContain('https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh');
+ expect(html).toContain('https://github.com/nodera-studio/glen/releases/latest');
+ for (const text of [html, ...responses]) for (const pending of ['coming soon', 'ships with the first release', 'Binaries arrive with']) expect(text).not.toContain(pending);
 });
