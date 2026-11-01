@@ -61,7 +61,9 @@ terminal's stderr, which a capture cannot see (the send spinner, its progress me
 `installView()` in `src/data/install.mjs` decides what the Install tabs show, from
 `releaseAvailable` in `src/data/site.ts`. While it is false the page opens on Cargo, the Script
 tab says the script ships with v0.1.0, the Binary tab links to the Releases page, and nothing on
-the page names the installer URL or `/releases/latest`. W8 flips it after v0.1.0 is published.
+the page names the installer URL or `/releases/latest`. It is true since v0.1.0 was published:
+the page opens on the Script tab with a copyable `curl … | sh`, and Binary links to the latest
+release.
 Islands take what they show as props, never by importing `site.ts`, so the installer URL stays
 out of their bundles too.
 

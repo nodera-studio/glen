@@ -11,6 +11,8 @@ const tabs = [
 ];
 type View = ReturnType<typeof installView>;
 const command = (text: string, label: string, copy: boolean) => <div className="command-row"><pre className="command"><code className="bare">{text}</code></pre>{copy && <CopyButton text={text} label={label} />}</div>;
+// Keeps each --flag whole: at phone widths the note otherwise breaks "--version" after its dashes.
+const unbrokenFlags = (text: string) => text.split(/(--[a-z][a-z-]*)/).map((part, i) => i % 2 ? <span key={i} className="whitespace-nowrap">{part}</span> : part);
 // The page carries only what installView() exposes: until the first release, no installer URL.
 export default function InstallTabs({view}:{view:View}) {
  const [selected,setSelected] = useState<string>(view.defaultTab);
@@ -18,7 +20,7 @@ export default function InstallTabs({view}:{view:View}) {
   if (id==='binary') return <><a className="focus-ring quiet-link" href={view.binary.href}>{view.binary.label}</a><p className="panel-note">{view.binary.note}</p></>;
   if (id==='cargo') return <>{command(view.cargo.command, `${title} command`, true)}<p className="panel-note">{view.cargo.note}</p></>;
   if (view.script.command===null) return <p className="panel-note pending-note">{view.script.note}</p>;
-  return <>{command(view.script.command, `${title} command`, view.script.copy)}<p className="panel-note">{view.script.note}</p></>;
+  return <>{command(view.script.command, `${title} command`, view.script.copy)}<p className="panel-note">{unbrokenFlags(view.script.note)}</p></>;
  };
  return <IslandRoot><div data-tabs>
   <ExpandableTabs labels="always" tabs={tabs} selectedId={selected} onSelect={setSelected} label="Install method" idPrefix="install" />
