@@ -2,6 +2,18 @@
 
 All notable changes to glen are listed here, newest first.
 
+## v0.1.1 — 2026-11-01
+
+### Fixed
+
+- `glen tail -f` no longer prints the whole transcript again when omp 18.14.0 migrates a v1 session file to the current format. omp gives every entry a new id when it migrates, so glen now matches the entries it already printed by position, kind, timestamp, role and content.
+- On a slow or loaded machine, an answer from the omp extension that arrived in time could still count as a timeout. `show`, `tail` and `ls` then reported a live session's state from disk, and `send` refused the live endpoint. Connecting to the endpoint and reading its answer now run on glen's own thread with one deadline, and session-control requests stop cleanly when cancelled.
+
+### Site
+
+- The site shows the released state: the install script first, the latest release under Binary, and a bare version in the header, hero and footer.
+- The closing call-to-action offers the install script, the same command the Install section opens on.
+
 ## v0.1.0 — 2026-10-31
 
 First release. glen is a Rust CLI that lets Claude Code and Codex discover, read, send to and receive replies from [omp](https://github.com/can1357/oh-my-pi) (oh-my-pi) sessions.

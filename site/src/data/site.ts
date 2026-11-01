@@ -2,8 +2,8 @@ const repoUrl = 'https://github.com/nodera-studio/glen';
 const installScriptUrl = 'https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh';
 export const site = {
  repoUrl, releasesUrl: repoUrl + '/releases', latestReleaseUrl: repoUrl + '/releases/latest', installScriptUrl, testedOmp: '18.14.0',
- // v0.1.0 and its 9 assets are published, so the page shows the install script and the latest release; check-links.mjs --online verifies both before any deploy.
- version: '0.1.0', releaseAvailable: true,
+ // v0.1.1 is the current release; every release since v0.1.0 publishes 9 assets, so the page shows the install script and the latest release; check-links.mjs --online verifies both before any deploy.
+ version: '0.1.1', releaseAvailable: true,
  commands: {
   script: `curl -fsSL ${installScriptUrl} | sh`,
   cargo: `cargo install --git ${repoUrl} --locked`, doctor: 'glen doctor',

@@ -293,7 +293,10 @@ fn completions() {
 fn version() {
     let o = glen(&["--version"], &[]);
     assert!(o.status.success());
-    assert_eq!(o.stdout, b"glen 0.1.0\n");
+    assert_eq!(
+        o.stdout,
+        format!("glen {}\n", env!("CARGO_PKG_VERSION")).into_bytes()
+    );
 }
 #[test]
 fn lazy_state() {

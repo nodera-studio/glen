@@ -1,4 +1,5 @@
 import { test, expect, type Page } from '@playwright/test';
+import { site } from '../src/data/site';
 const cargo = 'cargo install --git https://github.com/nodera-studio/glen --locked';
 const script = 'curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh';
 
@@ -526,12 +527,13 @@ test('FAQ: five rows; Enter opens one and the others close', async ({ page }) =>
  await expect(rows.nth(3)).toHaveAttribute('open', ''); await expect(rows.nth(1)).not.toHaveAttribute('open', '');
  await expect(rows.nth(3).locator('.faq-body')).toContainText('glen wait');
 });
-// W8-DOC-15, after the flip (G7): v0.1.0 is out, so every chip reads as released and the hero dot pulses.
-test('the header, hero and footer chips read v0.1.0, and the hero dot pulses', async ({ page }) => {
+// W8-DOC-15, after the flip (G7): the release is out, so every chip reads as released and the hero dot pulses.
+test('the header, hero and footer chips read the released version, and the hero dot pulses', async ({ page }) => {
+ const v = `v${site.version}`;
  await page.goto('/');
- await expect(page.locator('.header-bar .version-chip')).toHaveText('v0.1.0');
- await expect(page.locator('.hero .release-chip')).toHaveText('v0.1.0 · works with omp 18.14.0');
- await expect(page.locator('.footer-bottom span').last()).toHaveText('v0.1.0');
+ await expect(page.locator('.header-bar .version-chip')).toHaveText(v);
+ await expect(page.locator('.hero .release-chip')).toHaveText(`${v} · works with omp ${site.testedOmp}`);
+ await expect(page.locator('.footer-bottom span').last()).toHaveText(v);
  const dot = page.locator('.release-chip > span');
  await expect(page.locator('.hero .release-chip')).toHaveAttribute('data-release', 'out');
  await expect(dot).toHaveCSS('animation-name', 'chip-pulse');
