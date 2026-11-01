@@ -22,7 +22,7 @@
 //! `AC-v2-<wave><nn>`, plans are `.claude/plans/v020-wave-<N>-<slug>.md`, and new modules are
 //! `tests/conformance/v2_*.rs`. Each wave replaces "planned" on its own line with its modules.
 //! - v0.2 W0 (`.claude/plans/v020-wave-0-foundation.md`, AC-v2-001…AC-v2-003; §A7, §A16,
-//!   §A18–§A23): repo_contracts.
+//!   §A18–§A23): repo_contracts, v2_w0.
 //! - v0.2 W1 omp compatibility (AC-v2-101…AC-v2-106; §A10–§A12, §A19): planned.
 //! - v0.2 W2 push (AC-v2-201…AC-v2-206; §A7, §A20): planned.
 //! - v0.2 W3 ACP spike (AC-v2-301…AC-v2-304; §A23): planned.
@@ -89,6 +89,8 @@ mod show;
 mod state;
 #[path = "conformance/tail.rs"]
 mod tail;
+#[path = "conformance/v2_w0.rs"]
+mod v2_w0;
 #[path = "conformance/w10.rs"]
 mod w10;
 #[path = "conformance/w3_surface.rs"]
