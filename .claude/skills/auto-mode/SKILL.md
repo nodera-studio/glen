@@ -4,7 +4,7 @@ description: >
   glen's autonomous wave-by-wave implementation loop. Drives a declared goal (a Glen
   board issue or module on the Mnemosyne workspace, a plan doc, or a freeform objective)
   end to end WITHOUT a user gate between waves: derive waves → /plan-implementation →
-  create and flip board issues → /implement (with its Claude ‖ Codex review gate) →
+  create and flip board issues → /implement (with its Claude ‖ Codex ‖ omp review gate) →
   open a PR into `main` → poll CI → fix every finding → store a Mnemosyne memory →
   squash-merge → next wave; cut a `v0.x.y` release tag only when the goal asks for one.
 
@@ -81,7 +81,7 @@ Per wave, in order — this sequence is the spine of the mode:
 2. **Plan if needed** — `/plan-implementation` scoped to the wave (skip if a plan
    already exists).
 3. **Implement** — invoke `/implement`; let it own its internal gates, including the
-   local `/code-review` gate (Claude ‖ Codex). That gate is the review: the GitHub repo
+   local `/code-review` gate (Claude ‖ Codex, + omp when its probe is ready). That gate is the review: the GitHub repo
    has no review bots and no branch protection.
 4. **Pre-push check** — `cargo fmt --all -- --check && cargo clippy --all-targets
    --locked -- -D warnings && cargo test --locked` (or `/run-ci`); fix red before

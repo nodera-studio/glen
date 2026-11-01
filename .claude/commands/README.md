@@ -9,10 +9,10 @@ drives.
 | Command | Dispatches | What it does |
 | --- | --- | --- |
 | `/plan-implementation` | `agents/plan/orchestrator.md` | Explore, research, dual-engine architect + judge, dual-engine plan + judge — see `agents/plan/README.md` |
-| `/implement` | `agents/implementation/orchestrator.md` | Plan → routed Implementer (`routing.sh implementation`, Claude by default) → triple-engine review → docs + conformance tail → re-index — see `agents/implementation/README.md` |
+| `/implement` | `agents/implementation/orchestrator.md` | Plan → routed Implementer (`routing.sh implementation`, Claude by default) → `/code-review` gate (Claude ‖ Codex ‖ omp; triple-engine + synthesizer when high-risk) → docs + conformance tail → re-index — see `agents/implementation/README.md` |
 | `/implement-quick` | `agents/implementation/orchestrator-quick.md` | Same shape, fewer gates, for small/low-risk changes |
 | `/review-implementation` | `agents/review-implementation/orchestrator.md` | Standalone Claude ‖ Codex ‖ omp review + synthesizer on the current branch |
-| `/code-review` | `agents/implementation/code-review.md` | Lean 2-engine version of the review gate, runnable standalone |
+| `/code-review` | `agents/implementation/code-review.md` | Lean review gate, Claude ‖ Codex ‖ omp (omp when its probe is ready), runnable standalone |
 | `/respond-to-review` | `agents/respond-to-review.md` | Classify PR review comments, verify claims, draft responses, apply fixes |
 | `/run-ci` | `agents/local-ci.md` | Local CI with cargo, mirroring `ci.yml` (fmt check, clippy `-D warnings`, check, build, test) |
 
@@ -91,7 +91,7 @@ flowchart TD
         direction TB
         W1["Bootstrap: branch off main,<br/>board issue → in_progress"]
         W2["/plan-implementation (skip if a plan exists)"]
-        W3["/implement (includes the Claude ‖ Codex /code-review gate)"]
+        W3["/implement (includes the Claude ‖ Codex ‖ omp /code-review gate)"]
         W4["Pre-push cargo checks → open PR into main,<br/>board issue → in_review"]
         W5["Poll CI (fmt, clippy, test on Linux + macOS)<br/>+ PR comments; triage + fix every finding"]
         W6["CI green + no unresolved comments →<br/>memory_store referencing the PR → squash-merge"]

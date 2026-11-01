@@ -199,14 +199,15 @@ Per wave, in order. The OUTER loop runs with no user gate between waves.
 3. **Implement.** Invoke `/implement` for the wave. It owns its gates: the cargo loop of
    the Implementer `bash .claude/scripts/routing.sh implementation` names
    (`impl-coder-claude` or `impl-coder-codex`) and `.claude/scripts/quality-gate.sh`, the local
-   `/code-review` gate (1 Claude ‖ 1 Codex pass, 2-vote), the conformance tail
+   `/code-review` gate (1 Claude ‖ 1 Codex ‖ 1 omp pass when `omp-engine.sh probe` is ready, 2-vote), the conformance tail
    (`cargo test --test conformance`) and the docs updater. This local gate is the code
    review; nothing on GitHub reviews the PR. Saved review or plan files per engine are
    named `<engine>-review.md` / `<engine>-plan.md` (e.g.
    `.claude/plans/reviews/<wave>/claude-review.md`), never `claude.md`: Claude Code loads
    any `claude.md` as a nested `CLAUDE.md` on macOS's case-insensitive filesystem. If the
    Codex review pass hits a capacity or rate error, the gate retries once and then runs
-   single-engine (see `.claude/commands/code-review.md`); record that in the wave-end note.
+   without Codex (see `.claude/commands/code-review.md`); record that, and a skipped or failed
+   omp pass with its reason, in the wave-end note.
    **UI routing:** design-heavy UI (`site/`, landing pages, web (non-Rust) visual
    components) is built by the agent `bash .claude/scripts/routing.sh ui` names
    (`impl-coder-ui`, `implementation/coder-ui.md`: Opus, `frontend-design:frontend-design`
@@ -470,7 +471,7 @@ semantic merge at PR time. So, when planning waves to run in parallel:
    it prints `claude`), not necessarily the Implementer `routing.sh implementation` names,
    since it is merge resolution, not new product code (`implementation/orchestrator.md` →
    Role 1). When the two differ, record it as a routing deviation in the decision log and the
-   PR body. Then re-run the gate and tests and a scoped Claude ‖ Codex `/code-review` of the
+   PR body. Then re-run the gate and tests and a scoped `/code-review` of the
    resolved files.
 
 `.claude/plans/` is git-ignored, so the new worktree does not contain the wave's plan. Every
