@@ -1,14 +1,16 @@
-# glen v0.1.0 design
+# glen v0.2.0 design
 
-Status: v0.1.0 design, written in W0. Target omp version: **18.14.0**.
+Status: v0.2.0 design, written in v0.2 W0 on top of the v0.1.0 design (released as v0.1.0 and v0.1.1). Target omp version: **18.14.0**.
 
 glen uses three channels: a read-only disk reader discovers sessions and reads transcripts; an RPC driver runs omp in a detached worker for each job; a bundled omp extension routes requests into live sessions and carries replies back. The channels share a single CLI and versioned output contract.
 
 ## §A1 Scope and non-goals
-- v0.1.0 supports **macOS and Linux**. Windows is out of scope: the lease probes and unix sockets are Unix-only, and that code is `#[cfg(unix)]`.
+- v0.1.0 and v0.2.0 support **macOS and Linux**. Windows is out of scope: the lease probes and unix sockets are Unix-only, and that code is `#[cfg(unix)]`.
 - glen never writes, renames or deletes omp session files. It never takes omp's `.<file>.jsonl.lock.os` append gate, and it never creates files inside omp's directories. The exception is `install-extension`, which writes `<agent_dir>/extensions/glen/` on explicit request.
-- No MCP server in v0.1.0 (an optional extra later). No network access.
-- Not listed in v0.1.0: archived sessions (`archive/sessions/*.jsonl.gz`), subagent transcripts (nested `<stem>/*.jsonl`) and collab replicas.
+- No MCP server in v0.1.0; v0.2 W5 adds `glen mcp`, a local stdio server over the CLI (§A22). No network access.
+- Not listed in v0.1.0 or v0.2.0: archived sessions (`archive/sessions/*.jsonl.gz`), subagent transcripts (nested `<stem>/*.jsonl`) and collab replicas.
+- v0.2.0 adds a supported omp range with capability checks and a nightly run against the latest omp (§A19), replies that reach the calling agent without a polling loop (§A20), an opt-in warm worker (§A21), an MCP layer generated from `docs/json.md` (§A22), and a spike of `omp acp` (§A23).
+- Out of scope for v0.2.0 (owner): worktree or parallel-agent orchestration, a cross-harness mailbox, remote or phone access, and A2A over HTTP. glen borrows only A2A's task-state names (§A7).
 
 ## §A2 omp surfaces (v18.14.0)
 CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
@@ -233,6 +235,20 @@ Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `
 - **Exit mapping:** completed → 0 (11 when forked); failed `no_route` → 6; other failed/aborted/lost → 7 `job_failed` with `{status,job,error,forked}` details. A bound expiring while queued/accepted → 10 with `ok:true` and a running document. Foreground SIGINT prints that document with `interrupted:true` and exits 130; worker/omp continue. Worker SIGTERM/SIGINT/SIGHUP abort with `cancelled`.
 - **Control seam (W3b):** atomically drop `jobs/<id>/control/<name>.json` = `{v:1,op,args,deadline_ms}` (Unix ms). Replies are `{v:1,ok:true,data?}` or `{v:1,ok:false,error:{code,message,details?}}` at `<name>.done.json`, then remove the request. Dotfiles/results are ignored. The polling loop is 50ms during a run; startup/lock wait defers non-abort ops until a client exists. The worker runs list_models, set_model, and set_thinking_level one at a time off that loop on its held client, with 30s list/model and 10s other budgets bounded by the job deadline. Expired requests answer timeout unrun. Compact answers busy. Pending ops at job end answer job_ended; an in-flight request is skipped until its actual result arrives after scope join, preventing duplicate application. Abort acknowledgement carries data.job_status and session_id/queued. Startup cancellation publishes terminal status/ack before joining the bounded startup thread.
 - **Live job semantics:** no glen session lock and no omp child. The existing detached worker and wait/jobs lifecycle apply. Ack publishes accepted and delivered_as; reply events append jobs/replies and result in order. Every failure after send writes result before status. Settled completed/aborted/error maps completed/aborted/failed omp_error; shutdown or EOF fails omp_exited; ack mismatch fails session_moved with from/to details. Unknown events are ignored. Ack has a 10s bound (protocol/delivery_unknown), and the earlier absolute deadline is timeout. A post-ack deadline does not interrupt omp; the hint distinguishes consumed from still queued. Worker signals abort observation with cancelled and live_turn_continues. Live control abort returns unsupported_op with “stop the run with `glen abort <session>`”; other control files explain the socket route, and the job continues. Send-frame writes have ≤200ms cancellation checks and a 2s total budget; after a broken pipe, reading the peer's last line is bounded by min(1s, that budget) and the same cancellation.
+- **A2A task state (introduced in v0.2 W2).** Job views gain an append-only `task_state` field that names the job's state in A2A's task-state vocabulary. glen borrows the names only: it speaks no A2A protocol, and A2A over HTTP is out of scope (§A1). `status` stays authoritative and keeps its exit mapping; `task_state` follows from `status` and `error.code`:
+
+| glen `status` | Condition | `task_state` |
+|---|---|---|
+| `queued` | | `submitted` |
+| `accepted` | | `working` |
+| `completed` | forked too (exit 11) | `completed` |
+| `aborted` | includes the worker-signal `cancelled` code | `canceled` |
+| `failed` | `error.code` is `no_route` (exit 6) | `rejected` |
+| `failed` | any other `error.code` | `failed` |
+| `lost` | | `failed` |
+| — | reserved for an ACP permission request awaiting an answer (W3, §A23); no job status maps to it | `input_required` |
+
+- The value is spelled `canceled`, as A2A spells it; the job error code stays `cancelled`. A2A's `auth_required` and `unknown` are not used. W2 adds the field to `docs/json.md` and `tests/json_contract.rs`.
 
 ## §A8 Handles
 - **Session handle** = the **last 7 hex digits** of the dash-free session id.
@@ -252,7 +268,9 @@ Lock holder records (W3b) are written on the held inode with ftruncate/pwrite: `
   4. Then follow continuations.
 - `@new` is valid only for `glen send`.
 
-## §A9 Commands (v0.1.0)
+## §A9 Commands
+The Wave column names v0.1 waves `W<n>` and v0.2 waves `v0.2 W<n>`; each v0.2 wave adds its own rows.
+
 | Command | Purpose | Wave | Visible |
 |---|---|---|---|
 | `glen ls [--all] [--cwd DIR] [-n N] [--live] [--since DUR]` | List sessions for the cwd bucket (`--all`: every bucket); `--all` conflicts with `--cwd`; `-n 0` lists all. Columns: handle, state, title, last turn, updated ("3m ago"), model; plus project with `--all` | W1 | W1 |
@@ -479,7 +497,7 @@ Controls in the agent loop: `glen models <h>` → `glen model <h> <provider/id>`
 - W3 Step 14: **run on the host — see evidence** `.claude/evidence/v010-wave-3-live/README.md`. Steps other than busy attribution passed; Step 5 failed and motivated the O6 message-boundary amendment. `extension/glen/test/settlement.test.ts` replays all 42 trace events in order, supplementing the body-free trace with transcript bodies. The post-fix live Step 5 rerun remains a host gate; never call fake-host replay real-omp acceptance.
 - An `Env` snapshot means code and tests never mutate the process environment.
 - Integration tests use `CARGO_BIN_EXE_glen` with `env_clear()`.
-- Conformance tests live in `tests/conformance.rs` (the `/implement` tail).
+- Conformance tests live in `tests/conformance.rs` (the `/implement` tail); v0.2 waves add theirs as `tests/conformance/v2_*.rs`.
 - **Flake ledger.** Each flake is fixed at its root cause, with a deterministic regression test, never by widening a timeout. The label-triggered `flake-proof` workflow reruns the suite 20 times per OS under CPU load.
   - F1: `fake_ext`'s accepted socket inherited O_NONBLOCK on macOS (BSD `accept`), so `serve` dropped a request that had not arrived yet and the client saw EPIPE; it now serves in blocking mode (W10, 53fed35).
   - F2: the live client never read after a write error, losing an answer the endpoint sent before closing; it drains one frame under an absolute deadline (W10, 53fed35; cycle 3 keeps one read after that deadline).
@@ -502,7 +520,8 @@ W3b fakes share `tests/support/fake_models.json` (six complete SDK ModelInfo rec
 fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical set. FAKE_EXT_NO_AUTH, FAKE_EXT_COMPACT_DELAY_MS, FAKE_EXT_ABORT_STUCK and FAKE_EXT_POST_ID cover auth, cancellation, settle bounds and post-op forks. The TS host covers every op's happy/error path, expected identity, subagents, UI notifications, concurrent compaction and abort. tests/controls.rs covers RPC/live/job routing and output. Real-omp Step 12 remains an orchestrator-only smoke, explicitly skipped here; no runtime acceptance is inferred from fake-based results.
 
 ## §A16 Wave map
-- **W0** foundation: this plan.
+**v0.1.0** (released as v0.1.0 and v0.1.1):
+- **W0** foundation: the original design, §A1–§A17.
 - **W1** disk reader: ls, show, tail and `-f`, handles, continuations, leaf rule, read-only lease probe.
 - **W2** RPC driver: send/wait/jobs for sessions with no live owner, `@new`, the per-job worker, the per-session lock, the `glen_reply` host tool, fork detection, the fake RPC peer, the `omp-rpc` git dependency.
 - **W3** live route: the bundled extension, install-extension, endpoint-first routing, inbox, talk-back from the TUI.
@@ -512,6 +531,17 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 - **W6** site: `site/`, static Astro in the Nodex-redesign look; a CSS-compiled terminal demo; morphin islands; palette from `src/render/palette.json`; CI job `site`.
 - **W7** deploy + release workflow: §A18.
 - **W8** audits + release v0.1.0.
+
+**v0.2.0** (planned 2026-11-01, ADR `0773c35d`). Waves run strictly in order, each is its own PR into `main`, and acceptance criteria are `AC-v2-<wave><nn>`:
+- **v0.2 W0** foundation, docs and tests only: §A18 promoted to a section, the §A19–§A23 stubs, the §A7 `task_state` table, this map and CHANGELOG `## Unreleased`. `glen --help` is unchanged.
+- **v0.2 W1** omp compatibility: the supported range in `src/omp/compat.json`, version normalization, `doctor --probe` capabilities, the omp surface contract tests and the nightly `omp-latest` workflow (§A19).
+- **v0.2 W2** push, tier 1: `glen wait --for reply`, `glen inbox --wait`, the `task_state` field and the SKILL.md section "Replies without polling" (§A20).
+- **v0.2 W3** ACP spike: hidden `glen __acp`, experiments E1–E3 and a go/no-go (§A23).
+- **v0.2 W4** opt-in warm worker: `send --warm` and `glen release` (§A21).
+- **v0.2 W5** MCP layer: `glen mcp`, the generated tool catalog and a hidden `--channel` (§A22).
+- **v0.2 W6** tech debt and audits (decision `fce2ca4d`).
+- **v0.2 W7** release v0.2.0: version bump, site and tag (§A18).
+- Headings and their order are fixed by `tests/conformance/repo_contracts.rs` (v0.2 W0). Each v0.2 wave writes its design in its own section, adds its own rows to §A9, §A15, §A16 and §A17, and amends an earlier section only where its own behaviour changes what that section says (for example W1 in §A10, §A11 and §A12; W4 in §A3 and §A6).
 - Every wave leaves `main` green and usable. Unfinished subcommands stay hidden.
 
 ## §A17 Verify on every omp upgrade (and open items)
