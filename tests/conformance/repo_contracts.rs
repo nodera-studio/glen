@@ -80,13 +80,12 @@ fn design_section(doc: &str, n: u32) -> String {
         .join("\n")
 }
 
-#[test]
-fn acv2_002_design_doc_has_the_v02_wave_map_and_task_state_table() {
-    let doc = read("docs/design.md");
-
-    let a7 = design_section(&doc, 7);
+/// Checks §A7's `task_state` table. Returns the first violation.
+fn check_task_state_table(a7: &str) -> Result<(), String> {
     for needle in ["`task_state`", "introduced in v0.2 W2"] {
-        assert!(a7.contains(needle), "§A7 names {needle}:\n{a7}");
+        if !a7.contains(needle) {
+            return Err(format!("§A7 does not name {needle}"));
+        }
     }
     let rows: Vec<Vec<&str>> = a7
         .lines()
@@ -101,43 +100,173 @@ fn acv2_002_design_doc_has_the_v02_wave_map_and_task_state_table() {
                 .collect::<Vec<_>>()
         })
         .collect();
-    for row in &rows {
-        assert_eq!(row.len(), 3, "§A7 task_state row has 3 cells: {row:?}");
+    if let Some(row) = rows.iter().find(|r| r.len() != 3) {
+        return Err(format!("§A7 task_state row without 3 cells: {row:?}"));
     }
     let pairs: Vec<(&str, &str)> = rows.iter().map(|r| (r[0], r[2])).collect();
-    assert_eq!(
-        pairs,
-        [
-            ("`queued`", "`submitted`"),
-            ("`accepted`", "`working`"),
-            ("`completed`", "`completed`"),
-            ("`aborted`", "`canceled`"),
-            ("`failed`", "`rejected`"),
-            ("`failed`", "`failed`"),
-            ("`lost`", "`failed`"),
-            ("—", "`input_required`"),
-        ],
-        "§A7 task_state table rows: {rows:#?}"
-    );
-    assert!(rows[4][1].contains("`no_route`"), "row 5: {:?}", rows[4]);
-    assert!(rows[7][1].contains("ACP"), "row 8: {:?}", rows[7]);
+    let expected = [
+        ("`queued`", "`submitted`"),
+        ("`accepted`", "`working`"),
+        ("`completed`", "`completed`"),
+        ("`aborted`", "`canceled`"),
+        ("`failed`", "`rejected`"),
+        ("`failed`", "`failed`"),
+        ("`lost`", "`failed`"),
+        ("—", "`input_required`"),
+    ];
+    if pairs != expected {
+        return Err(format!("§A7 task_state table rows: {rows:#?}"));
+    }
+    // (row, needles its Condition cell must hold, lowercase needles it must not hold); no
+    // needles means an empty cell. The two `failed` rows are complementary: `rejected` matches
+    // `no_route` and only it, and `failed` is the fallback for every other code and never
+    // names `no_route`.
+    let conditions: [(usize, &[&str], &[&str]); 8] = [
+        (0, &[], &[]),
+        (1, &[], &[]),
+        (2, &["forked", "(exit 11)"], &[]),
+        (3, &["`cancelled`"], &[]),
+        (
+            4,
+            &["`error.code` is `no_route`", "(exit 6)"],
+            &[" not ", "other"],
+        ),
+        (5, &["any other `error.code`"], &["`no_route`"]),
+        (6, &[], &[]),
+        (7, &["ACP", "§A23"], &[]),
+    ];
+    for (i, must, must_not) in conditions {
+        let cell = rows[i][1];
+        let lower = cell.to_lowercase();
+        let ok = if must.is_empty() {
+            cell.is_empty()
+        } else {
+            must.iter().all(|n| cell.contains(n)) && !must_not.iter().any(|n| lower.contains(n))
+        };
+        if !ok {
+            return Err(format!(
+                "§A7 task_state row {} condition {cell:?}: wants {must:?}, not {must_not:?}",
+                i + 1
+            ));
+        }
+    }
+    Ok(())
+}
 
-    let a16 = design_section(&doc, 16);
-    assert!(
-        a16.contains("**v0.2.0**"),
-        "§A16 has the v0.2.0 map:\n{a16}"
-    );
-    let waves: Vec<u32> = a16
-        .lines()
-        .filter_map(|l| l.strip_prefix("- **v0.2 W"))
+/// The `(id, description)` of each `- **v0.2 <id>** <description>` bullet in §A16.
+fn wave_bullets(a16: &str) -> Result<Vec<(&str, &str)>, String> {
+    a16.lines()
+        .filter_map(|l| l.strip_prefix("- **v0.2 "))
         .map(|rest| {
-            rest.chars()
-                .next()
-                .and_then(|c| c.to_digit(10))
-                .unwrap_or_else(|| panic!("§A16 wave bullet without a digit: {rest}"))
+            rest.split_once("**")
+                .map(|(id, desc)| (id, desc.trim()))
+                .ok_or_else(|| format!("§A16 wave bullet without a closing `**`: {rest}"))
         })
+        .collect()
+}
+
+/// Checks §A16's v0.2.0 wave map. Returns the first violation.
+fn check_wave_map(a16: &str) -> Result<(), String> {
+    if !a16.contains("**v0.2.0**") {
+        return Err("§A16 has no v0.2.0 map".to_owned());
+    }
+    let bullets = wave_bullets(a16)?;
+    // Each wave's essential assignment as keywords, not its full prose.
+    let expected: [(&str, &[&str]); 8] = [
+        ("W0", &["foundation"]),
+        ("W1", &["omp compatibility", "nightly"]),
+        ("W2", &["push", "reply"]),
+        ("W3", &["ACP"]),
+        ("W4", &["warm"]),
+        ("W5", &["MCP"]),
+        ("W6", &["tech debt", "audits"]),
+        ("W7", &["release v0.2.0"]),
+    ];
+    let ids: Vec<&str> = bullets.iter().map(|(id, _)| *id).collect();
+    if ids != expected.map(|(id, _)| id) {
+        return Err(format!("§A16 v0.2 waves: {ids:?}"));
+    }
+    for ((id, desc), (_, keywords)) in bullets.iter().zip(expected) {
+        if let Some(k) = keywords.iter().find(|k| !desc.contains(*k)) {
+            return Err(format!("§A16 v0.2 {id} does not name {k:?}: {desc}"));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn acv2_002_design_doc_has_the_v02_wave_map_and_task_state_table() {
+    let doc = read("docs/design.md");
+    let a7 = design_section(&doc, 7);
+    check_task_state_table(&a7).unwrap_or_else(|e| panic!("{e}\n{a7}"));
+    let a16 = design_section(&doc, 16);
+    check_wave_map(&a16).unwrap_or_else(|e| panic!("{e}\n{a16}"));
+}
+
+/// `section` with the first `from` replaced by `to`; panics when `from` is absent, so a
+/// negative check never runs against an unchanged section.
+fn mutate(section: &str, from: &str, to: &str) -> String {
+    assert!(section.contains(from), "mutation source {from:?} not found");
+    section.replacen(from, to, 1)
+}
+
+#[test]
+fn acv2_002_task_state_check_rejects_an_inverted_or_overlapping_failed_row() {
+    let a7 = design_section(&read("docs/design.md"), 7);
+    let mutations = [
+        // Inverted: the `rejected` row no longer matches `no_route`.
+        (
+            "`error.code` is `no_route` (exit 6)",
+            "`error.code` is NOT `no_route` (exit 6)",
+        ),
+        // Overlapping: the fallback row also matches `no_route`.
+        (
+            "any other `error.code`",
+            "any `error.code`, including `no_route`",
+        ),
+        ("any other `error.code`", "any `error.code`"),
+        // Overlapping: the `rejected` row also matches other codes.
+        (
+            "`error.code` is `no_route` (exit 6)",
+            "`error.code` is `no_route` or any other code (exit 6)",
+        ),
+        // The note cells: forked completion and the worker-signal code.
+        ("forked too (exit 11)", ""),
+        ("includes the worker-signal `cancelled` code", ""),
+    ];
+    let accepted: Vec<_> = mutations
+        .into_iter()
+        .filter(|(from, to)| check_task_state_table(&mutate(&a7, from, to)).is_ok())
         .collect();
-    assert_eq!(waves, [0, 1, 2, 3, 4, 5, 6, 7], "§A16 v0.2 waves:\n{a16}");
+    assert!(accepted.is_empty(), "§A7 check accepts: {accepted:#?}");
+}
+
+#[test]
+fn acv2_002_wave_map_check_rejects_a_renamed_or_swapped_wave() {
+    let a16 = design_section(&read("docs/design.md"), 16);
+    let bullets = wave_bullets(&a16).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!((bullets[3].0, bullets[4].0), ("W3", "W4"));
+    let (d3, d4) = (bullets[3].1, bullets[4].1);
+    let mutations = [
+        (
+            "W3 renamed W30",
+            mutate(&a16, "- **v0.2 W3**", "- **v0.2 W30**"),
+        ),
+        (
+            "W3/W4 descriptions swapped",
+            mutate(
+                &mutate(&a16, &format!("W3** {d3}"), &format!("W3** {d4}")),
+                &format!("W4** {d4}"),
+                &format!("W4** {d3}"),
+            ),
+        ),
+    ];
+    let accepted: Vec<_> = mutations
+        .iter()
+        .filter(|(_, mutated)| check_wave_map(mutated).is_ok())
+        .map(|(name, _)| name)
+        .collect();
+    assert!(accepted.is_empty(), "§A16 check accepts: {accepted:?}");
 }
 
 #[test]
