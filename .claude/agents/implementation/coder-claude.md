@@ -46,6 +46,8 @@ still applies.
 
 - Read the plan from the **absolute main-checkout path** in your brief. `.claude/plans/` is
   git-ignored, so a wave worktree never contains it: that is expected, never "missing".
+- Record `shasum -a 256 <file>` of the plan and of every brief file you were given, before you
+  write anything (Step 3 re-checks them before every commit).
 - Read `progress.md` and the files the plan names. If the plan contradicts itself or names
   files that do not exist, STOP and report before writing anything.
 - **Line-range briefs** (a small or targeted fix with `path:start-end` ranges): read ONLY those
@@ -76,7 +78,12 @@ about 1.5 h). So:
    (never `git add -A` or `git add .`), and commit `wip: <wave> steps N–M` with the project's
    trailer. The last group uses the commit message your brief gives (else
    `<wave label>: <slice summary>`). A file in `git status` you did not touch is not staged;
-   list it as a deviation.
+   list it as a deviation. Right before every commit, re-hash the plan and brief files
+   (`shasum -a 256`). On a changed hash, re-read your section and apply every
+   `> REVISED <ISO>: …` or `> REVOKED <ISO>: <decision> — <replacement>` line at its top to the
+   work before committing; if a revision contradicts work you already committed, stop and
+   report instead. A revoked decision once reached a commit because the group agent did not
+   re-read its brief (checkpoint 34, commit `26afcdc`).
 4. **Rework** (a review or conformance fix batch from the orchestrator) is one more group: the
    delta only, as a line-range brief where ranges are given, then a commit.
 
@@ -95,6 +102,9 @@ Return these fields, one line per item:
 - **Deviations**: anything you did that the plan did not say, and files you noticed but left
   untouched.
 - **Blockers**: anything that stopped you; a non-empty list or a failing gate is NOT green.
+- **Not done**: every plan step, AC or brief item not fully done, with its id and one line
+  why; `none` when all are done. Never fold a not-done item into Deviations, Blockers or Key
+  decisions.
 - **Key decisions and deferred risks** a reviewer must know.
 
 ## Rules
@@ -102,6 +112,9 @@ Return these fields, one line per item:
 - Step 0 first: you run only when `routing.sh implementation` prints `claude`.
 - Plans are read from the absolute main-checkout path; line-range briefs read only the given
   ranges.
+- Hash the plan and brief files when you start and re-hash them right before every commit; on
+  a change, apply every REVISED or REVOKED line first, or stop and report if it contradicts
+  committed work (Step 3, item 3).
 - Never delete, move, rename or revert a file you did not create in this task, tracked or
   untracked, even if it looks unrelated (an untracked `.claude/launch.json` was once deleted as
   "unrelated"). Leave it and list it under deviations.

@@ -50,7 +50,8 @@ rather than dispatching a doomed Codex run.
 The plan file itself is not one of those files. `.claude/plans/` is git-ignored, so a wave
 worktree never contains it: read the plan from the absolute main-checkout path in your brief,
 and do not report it "missing" from the worktree. Inline the plan text into the Codex prompt
-(Step 3) rather than pointing Codex at a path.
+(Step 3) rather than pointing Codex at a path. Record `shasum -a 256` of the plan and of every
+brief file you were given now; Step 6 item 4 re-checks them before each commit.
 
 If the brief gives line ranges (a small or targeted fix), read only those ranges yourself
 (Read with `offset`/`limit`) and carry them into the Codex prompt as in Step 3 → "Line-range
@@ -119,7 +120,7 @@ it in your final message instead of guessing.
 <structured_output_contract>
 End your final message with a fenced block and NOTHING after it:
 ```json COMPLETION
-{"created":[],"modified":[],"tests":[],"deviations":[],"blockers":[],"gate":"clean|warn|fail"}
+{"created":[],"modified":[],"tests":[],"deviations":[],"blockers":[],"not_done":[],"gate":"clean|warn|fail"}
 ```
 </structured_output_contract>
 ```
@@ -268,6 +269,9 @@ The `--json` payload is `{status, threadId, rawOutput, touchedFiles, reasoningSu
   - **Tests added** + **gate state** + **deviations** + **blockers** from the
     `COMPLETION` block.
   - **Key decisions / deferred risks** from `reasoningSummary` + `rawOutput`.
+  - **Not done** from the `COMPLETION` block's `not_done` plus every plan `<task>` still
+    `status="pending"` for the steps this run owned, each with its id and one line why; `none`
+    when all are done. Never fold a not-done item into deviations, blockers or key decisions.
 - If `blockers` is non-empty or `gate` is `fail`, report it as NOT green — do not
   paper over it — unless Step 6 classifies it as a sandbox artifact (host re-run green).
 
@@ -300,7 +304,12 @@ outside the sandbox:
    `git add -A`/`.`, and commit on its behalf: a WIP commit per step group (Step 4 → "Step
    groups"), and for the last group the message your brief gives (else
    `<wave label>: <slice summary>`), each with the project's trailer. A file in
-   `git status` that Codex did not report is not staged; list it as a deviation.
+   `git status` that Codex did not report is not staged; list it as a deviation. Right before
+   each commit, re-hash the plan and brief files (`shasum -a 256`). On a change, re-read your
+   section for `> REVISED <ISO>: …` and `> REVOKED <ISO>: <decision> — <replacement>` lines:
+   one that changes the code goes back to Codex as a `--resume-last` delta prompt before you
+   commit (you never write the code); one that contradicts work already committed means stop
+   and report.
 5. Report every discrepancy explicitly, one line each: what Codex reported (red/green, the
    error), what the host re-run showed, and the verdict (sandbox artifact | real failure |
    Codex green but host red).
@@ -339,6 +348,8 @@ too, say so instead of guessing.
   network-only manifest changes (`cargo add`).
 - One Codex turn per step group of at most about 4 plan steps; a WIP commit
   (`wip: <wave> steps N–M`, with the trailer) after each group passes host verification.
+- Re-hash the plan and brief files before each commit; a REVISED or REVOKED line that changes
+  the code goes to Codex as a delta prompt first (Step 6, item 4).
 - Foreground dispatch only; pin `--effort high`; pin `--model` via `CODEX_MODEL`
   when determinism matters.
 - Stopping this agent never stops Codex: cancel the job and the worktree's broker as in

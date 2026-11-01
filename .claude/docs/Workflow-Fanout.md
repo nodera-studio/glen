@@ -37,6 +37,17 @@ cap.
   Two agents that need the same file belong in one agent, or in sequence.
 - **Heavy concurrency.** Agents that run cargo and agents that call Codex both count against
   `heavy_concurrency`. Read-only Claude agents count only against `workflow_max_agents`.
+- **One test suite per target dir.** Each cargo agent works in its own worktree (own `target/`)
+  or sets its own `CARGO_TARGET_DIR`; agents sharing a checkout run suites through
+  `bash .claude/scripts/suite-lock.sh cargo test --locked`. Two suites in one target dir break
+  each other (a concurrent `cargo build --example` re-links the binaries the other is running).
+- **Briefs are files; committers re-read them.** A workflow agent's brief is a file path plus a
+  section id, never only inline text: running workflow agents cannot receive SendMessage, so a
+  revision reaches them only through the file, as a `> REVISED <ISO>: …` or
+  `> REVOKED <ISO>: <decision> — <replacement>` line at the top of the affected section. Every
+  agent that commits or merges records `shasum -a 256 <brief file>` when it starts, re-hashes
+  right before it commits or merges, and on a change applies those lines first (or stops and
+  reports when one contradicts committed work).
 - **Codex roles.** A Codex arm takes only a role that `routing.json` gives Codex (for example
   `routing.sh review` lists `codex`). Implementation goes to the engine `routing.sh implementation`
   names.
