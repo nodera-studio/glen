@@ -338,6 +338,37 @@ fn v1_rewrite_with_shifted_ordinals_emits_only_new_content() {
     assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
     sb.clean();
 }
+// W12 item 3: omp's v1 → v3 migration rewrites every entry with a fresh random id, so the
+// stream must match the streamed v1 entries to the migrated ones, not re-emit the transcript.
+#[test]
+fn v1_migration_rewrite_emits_rewritten_then_only_the_new_turn() {
+    let sb = OmpBox::new();
+    let path = sb.alpha().join("legacy.jsonl");
+    fs::write(&path, include_str!("fixtures/v1-migration-before.jsonl")).unwrap();
+    let f = Following::start(&sb, &["tail", path.to_str().unwrap(), "-f", "--json"]);
+    assert_eq!(f.event()["event"], "session");
+    for _ in 0..7 {
+        assert_eq!(f.event()["event"], "item");
+    }
+    let stage = path.with_extension("staged");
+    fs::write(&stage, include_str!("fixtures/v1-migration-after.jsonl")).unwrap();
+    fs::rename(stage, &path).unwrap();
+    assert_eq!(f.event()["event"], "rewritten");
+    for (id, text) in [
+        ("d8a61f3c", "first prompt after migration"),
+        ("1b7e4c29", "first answer after migration"),
+    ] {
+        let item = f.event();
+        assert_eq!(item["item"]["id"], id);
+        assert_eq!(item["item"]["text"], text);
+    }
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    append(&path, &message("after-migration", "1b7e4c29", "migrate me"));
+    assert_eq!(f.event()["item"]["id"], "after-migration");
+    assert!(f.lines.recv_timeout(Duration::from_millis(600)).is_err());
+    drop(f);
+    sb.clean();
+}
 #[cfg(unix)]
 #[test]
 fn ac124_sigint_trailer() {
