@@ -196,11 +196,13 @@ asked.
 
 ## Review use (review-implementation)
 
-The triple-engine review (`/review-implementation`, or `/implement` Role 2 when omp
-is ready or risk is high) uses ONE Codex
+The triple-engine review (`/review-implementation`, or `/implement` Role 2 when the diff
+is high-risk) uses ONE Codex
 engine — the native `codex review --base <BASE>` (or `--uncommitted`) reviewer — run by
 the review orchestrator alongside the Claude comprehensive reviewer and omp (via glen), then
-folded by the synthesizer. No N-pass voting, no shuffled diffs.
+folded by the synthesizer. No N-pass voting, no shuffled diffs. Every other Role 2 diff runs
+the lean `/code-review` gate, where Codex is the `codex:codex-rescue` pass beside Claude and
+the optional omp pass (when `omp-engine.sh probe` is ready).
 
 ## Fallback (only if `codex:codex-rescue` is unavailable)
 

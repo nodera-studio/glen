@@ -28,10 +28,17 @@ Optional scope hint: $ARGUMENTS
 
 Steps:
 
-1. Establish the diff to review:
-   - Default: uncommitted changes — `git diff --stat HEAD` then `git diff HEAD`.
-   - If `$ARGUMENTS` names a base (e.g. "vs main") or a path, scope to that
-     (`git diff <base>...HEAD` or limit to the path).
+1. Establish the diff to review. Every engine reviews the same working-tree scope,
+   untracked files included, because that is what `omp-engine.sh review` captures:
+   - Default: uncommitted changes — `git diff --stat HEAD`, `git diff HEAD`, and
+     `git ls-files --others --exclude-standard` (omp: `--uncommitted`).
+   - If `$ARGUMENTS` names a base (e.g. "vs main"): the merge-base to the working tree —
+     `MERGE_BASE=$(git merge-base HEAD <base>)`, `git diff "$MERGE_BASE"` plus the
+     untracked files above (omp: `--base <base>`). This covers committed, uncommitted and
+     untracked changes; never review `git diff <base>...HEAD` alone, which omits the
+     working tree omp sees.
+   - A path limits the report, not the capture: give the path to every pass, and drop
+     findings outside it.
    - If there are no changes, say so and stop.
    - Probe omp: `bash .claude/scripts/omp-engine.sh probe` (exit 0 = ready; exit 3 =
      skipped, including `GLEN_OMP_ENGINE=off`). On a skip, keep its JSON `.reason` for the
@@ -41,11 +48,13 @@ Steps:
    when the probe is ready, in one tool-use block, so they run concurrently):
    - **Claude pass** — `subagent_type` default, prompt: "Read
      `.claude/agents/implementation/code-review.md` and follow its
-     instructions. Review these changes: {diff scope + changed file list}."
+     instructions. Review these changes: {diff scope + changed file list, untracked
+     files included}."
    - **Codex pass** — `subagent_type: "codex:codex-rescue"`, prompt:
      "Independent full-category code review (security, architecture, data flow,
      performance, accessibility, error handling, test coverage) of these
-     changes: {diff scope + changed file list}. Conventions are in CLAUDE.md and
+     changes: {diff scope + changed file list, untracked files included; review the
+     working tree, not only commits}. Conventions are in CLAUDE.md and
      `.claude/rules/*`. If the diff touches rendered output (`site/`, a TUI,
      terminal rendering), build and run it and look at the output before calling
      it correct: screenshot the built page (`npx playwright screenshot` against
@@ -75,15 +84,22 @@ Steps:
      `mkdir -p target/reports && bash .claude/scripts/omp-engine.sh review --repo "$PWD"
      --uncommitted --out target/reports/omp-review.txt --scope "<scope hint>" >
      target/reports/omp-engine.log 2>&1`. For a named base use `--base <base>` in place of
-     `--uncommitted`; a path scope goes in `--scope` as text (omp still receives the whole
-     diff, so drop its findings outside the path). Read the review in
+     `--uncommitted` (step 1's merge-base scope); a path scope goes in `--scope` as text (omp
+     still receives the whole diff, so drop its findings outside the path). Read the review in
      `target/reports/omp-review.txt` and the result in `target/reports/omp-review.txt.json`.
      omp traces code only: it cannot run UI or tests, so it never counts as having run them.
      Do not re-run it by hand (the engine retries capacity once itself). A non-zero exit,
      or `"status"` other than `ok` (including `"failed"` with `"reason":"malformed
      output"`), means omp did not run: name its `.reason` in the report and continue with
-     Claude ‖ Codex. omp never blocks the gate: its default deadline is 15 minutes (exit 5
-     on timeout), after which you merge without it. Recovering a killed run is in
+     Claude ‖ Codex. omp never blocks the gate, and its own 15-minute `--deadline` does not
+     bound the whole pass (the snapshot capture runs before that timer starts, the wait
+     allows 75 s more, and a capacity retry adds a minute). So note the launch time
+     (`date +%s`) and set an absolute gate deadline of launch + 20 minutes. Poll the
+     background task (its completion notification, or `target/reports/omp-review.txt.json`
+     reaching a terminal `.status`) against that deadline. When it expires with omp still
+     running, merge without omp and report "omp: no result by the gate deadline". Leave the
+     run alone: read its result later for the record, outside the gate, and never let a late
+     result change a verdict already given. Recovering a killed run is in
      `.claude/skills/omp/SKILL.md`.
    - Never name an output path in the Codex brief: its sandbox is workspace-write,
      does not escalate, and writes only inside its own cwd (your shell's directory
