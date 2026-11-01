@@ -138,14 +138,22 @@ try_lock() {
 
 START="$(date +%s)"
 LAST_NOTE=""
+RETRIED=0
 while :; do
+  r=1
   if guard_take; then
     try_lock "$@"
     r=$?
     guard_drop
     [ "$r" = 0 ] && break
-    [ "$r" = 2 ] && continue
   fi
+  # A removed stale lock is retried at once, but only once in a row: a stale lock that cannot be
+  # removed waits like a live one, so the deadline below always bounds the loop.
+  if [ "$r" = 2 ] && [ "$RETRIED" = 0 ]; then
+    RETRIED=1
+    continue
+  fi
+  RETRIED=0
   now="$(date +%s)"
   if [ $((now - START)) -ge "$WAIT" ]; then
     echo "suite-lock: gave up after ${WAIT}s; lock $LOCK held by $(holder)" >&2

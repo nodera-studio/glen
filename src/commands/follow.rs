@@ -83,12 +83,20 @@ fn entry_key(entry: &Entry, legacy: bool, occurrences: &mut HashMap<String, usiz
 fn is_legacy(session: &Session) -> bool {
     session.header.raw["version"].as_u64().unwrap_or(1) < 2
 }
-/// What omp's v1 migration keeps of an entry: its kind and message role, with the v2 → v3
-/// `hookMessage` → `custom` rename applied.
-fn shape(entry: &Entry) -> (&str, Option<&str>) {
-    let role = entry.raw["message"]["role"].as_str();
+/// What omp's v1 migration keeps of an entry: its kind, entry timestamp, message role and
+/// message content, with the v2 → v3 `hookMessage` → `custom` rename applied. Only the ids, the
+/// compaction's kept-entry pointer and assistant usage totals change (omp 18.14.0
+/// `session-migrations.ts`, `normalizeLoadedUsage`).
+fn shape(entry: &Entry) -> (&str, &serde_json::Value, Option<&str>, &serde_json::Value) {
+    let message = &entry.raw["message"];
+    let role = message["role"].as_str();
     let role = role.map(|r| if r == "hookMessage" { "custom" } else { r });
-    (entry.kind.as_str(), role)
+    (
+        entry.kind.as_str(),
+        &entry.raw["timestamp"],
+        role,
+        &message["content"],
+    )
 }
 fn branch_keys<'a>(
     session: &'a Session,
@@ -239,9 +247,9 @@ impl Follower {
     /// before, and loading may change its content (usage totals, the `hookMessage` role, the
     /// compaction's kept-entry index). Neither glen's synthesized v1 ids nor its content keys
     /// survive that, so the v1 entries already emitted are matched to the migrated ones by
-    /// position and keyed by their new ids. The match stops at the first entry whose kind or
-    /// role differs: everything after it counts as unseen, so a misaligned file repeats entries
-    /// rather than hiding new ones.
+    /// position and keyed by their new ids. The match stops at the first entry whose kind,
+    /// timestamp, role or content differs: everything after it counts as unseen, so a misaligned
+    /// or edited file repeats entries rather than hiding new ones.
     fn migrated(&self, next: &Session) -> Option<HashSet<Emitted>> {
         if !is_legacy(&self.session) || is_legacy(next) {
             return None;
@@ -1044,6 +1052,30 @@ mod poll_tests {
         assert!(matches!(items.first(), Some(Item::ModelChange { id, .. }) if id == "c71f03bd"));
         assert_eq!(items.len(), 6, "{items:?}");
         assert!(new_turn(&items[4..]), "{items:?}");
+    }
+    /// W12 review: a rewrite that keeps an entry's kind and role but changes its text is not
+    /// omp's migration of that entry, so the edited entry is emitted, not hidden as seen.
+    #[test]
+    fn a_v1_migration_with_an_edited_message_emits_the_edited_entry() {
+        let tree = fixtures::tree();
+        let (path, mut f) = v1_follower(&tree);
+        let edited = V1_AFTER.replacen(
+            "\"text\":\"migrate me\"}],\"timestamp\":1765241616000",
+            "\"text\":\"edited prompt\"}],\"timestamp\":1765241616000",
+            1,
+        );
+        assert_ne!(edited, V1_AFTER);
+        replace(&path, &edited);
+        let events = f.poll().unwrap();
+        let [FollowEvent::Rewritten { .. }, FollowEvent::Items(items)] = events.as_slice() else {
+            panic!("expected a rewrite and items: {events:?}");
+        };
+        assert!(
+            matches!(items.as_slice(), [Item::User { id, text, .. }, ..] if id == "e0c3915a" && text == "edited prompt"),
+            "{items:?}"
+        );
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(new_turn(&items[1..]), "{items:?}");
     }
     #[test]
     fn returning_to_an_emitted_leaf_keeps_the_empty_items_event() {

@@ -5,7 +5,7 @@
 # A temp target dir through CARGO_TARGET_DIR; the locked commands are `sh -c` sleeps, never cargo.
 # Cases: (a) the command's exit status, no lock left; (b) two concurrent runs do not overlap;
 # (c) a stale lock (dead pid, or a live pid with another start time) is taken over with a notice;
-# (d) a live holder plus GLEN_SUITE_LOCK_WAIT=1 exits 75 naming the holder; (e) SIGTERM to a
+# (c3) a stale lock that cannot be removed still ends at the wait cap with 75; (d) a live holder plus GLEN_SUITE_LOCK_WAIT=1 exits 75 naming the holder; (e) SIGTERM to a
 # running suite-lock.sh releases the lock; (f) SIGTERM stops the command's descendants before the
 # lock goes. Prints ok/FAIL per case and exits 1 on any FAIL.
 set -u
@@ -74,6 +74,29 @@ rc=$?
 if [ "$rc" = 0 ] && grep -q "taking over stale lock (pid $$" "$TMP/c2.err" && [ ! -e "$LOCK" ]; then
   ok "(c2) reused-pid lock taken over with the notice"
 else fail "(c2) exit=$rc stderr=[$(cat "$TMP/c2.err")]"; fi
+
+# (c3) a stale lock that cannot be removed (an extra file keeps rmdir from removing it) is
+# bounded by GLEN_SUITE_LOCK_WAIT like a live one: exit 75, not an endless takeover loop.
+mkdir -p "$LOCK"
+printf 'pid=%s\nlstart=Thu Jan  1 00:00:00 1970\ncmd=cargo test\nsince=2026-11-01T08:00:00Z\n' "$dead" >"$LOCK/owner"
+: >"$LOCK/stuck"
+GLEN_SUITE_LOCK_WAIT=1 /bin/bash "$LOCKSH" sh -c 'exit 0' 2>"$TMP/c3.err" &
+c3=$!
+i=0
+while kill -0 "$c3" 2>/dev/null && [ "$i" -lt 100 ]; do sleep 0.1; i=$((i + 1)); done
+if kill -0 "$c3" 2>/dev/null; then
+  kill -TERM "$c3" 2>/dev/null
+  wait "$c3" 2>/dev/null
+  fail "(c3) still running after 10 s with an unremovable stale lock"
+else
+  wait "$c3"
+  rc=$?
+  if [ "$rc" = 75 ] && grep -q "gave up after 1s" "$TMP/c3.err"; then
+    ok "(c3) unremovable stale lock bounded by the wait cap"
+  else fail "(c3) exit=$rc stderr=[$(head -c 2000 "$TMP/c3.err")]"; fi
+fi
+rm -f "$LOCK/stuck" "$LOCK/owner"
+rmdir "$LOCK" 2>/dev/null
 
 # (d) a live holder plus GLEN_SUITE_LOCK_WAIT=1: exit 75 naming the holder.
 /bin/bash "$LOCKSH" sh -c 'sleep 30' 2>"$TMP/holder.err" &

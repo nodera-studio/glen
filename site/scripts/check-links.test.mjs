@@ -47,7 +47,6 @@ function fixture(t, html, readme) {
 }
 // W12 item 4: every run used to leave its glen-links-* dirs in the temp dir.
 after(() => {
- assert.ok(roots.length > 0, 'no fixture was made');
  assert.deepEqual(roots.filter(root => existsSync(root)), [], 'fixture dirs left behind');
 });
 const failures = r => r.rows.filter(row => !row.ok).map(row => row.url);

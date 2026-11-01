@@ -944,52 +944,82 @@ fn show_and_tail_use_extension_state_for_persisted_sessions() {
 /// probe. The test is the endpoint: it stops glen once the request arrives, answers, lets the
 /// probe deadline pass, then resumes glen. Before the fix, glen's competing timer usually won and
 /// show/tail fell back to the disk state.
+///
+/// glen sets its probe deadline after it was spawned, so a stop that lands within `STATE_LS` of
+/// the spawn is certainly before that deadline. A run whose stop lands later (the test itself
+/// was descheduled) proves nothing: its `"disk"` is retried, never counted as a pass or a fail.
 #[test]
 fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
     use rustix::process::{Pid, Signal, kill_process};
     use std::io::{BufRead, BufReader, Write};
-    use std::os::unix::net::UnixListener;
+    use std::os::unix::net::{UnixListener, UnixStream};
     use std::process::Stdio;
     let b = LiveBox::new();
     fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
     let socket = live::run_dir(&home(&b)).join("stall.sock");
     let listener = UnixListener::bind(&socket).unwrap();
-    listener.set_nonblocking(true).unwrap();
     b.write_registry(A_ID, std::process::id(), &socket);
+    // A blocking accept on its own thread hands each connection over as soon as glen connects.
+    let (accepted, connections) = std::sync::mpsc::channel();
+    let acceptor = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if accepted.send(stream.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
     for command in ["show", "tail"] {
-        let child = b
-            .rpc
-            .glen(&[command, A_ID, "--json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let pid = Pid::from_raw(child.id() as i32).unwrap();
-        let (mut stream, _) = poll(Duration::from_secs(10), || listener.accept().ok());
-        // BSD accept passes on the listener's O_NONBLOCK.
-        stream.set_nonblocking(false).unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(&stream).read_line(&mut line).unwrap();
-        // glen set its probe deadline before it wrote this request.
-        let past_deadline = Instant::now() + live::STATE_LS + Duration::from_millis(200);
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["op"], "state", "{command}: {request}");
-        let answer = serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":A_ID,"busy":false,"state":"idle","mode":"tui","pid":std::process::id()}});
-        kill_process(pid, Signal::STOP).unwrap();
-        let wrote = stream.write_all(format!("{answer}\n").as_bytes());
-        std::thread::sleep(past_deadline.saturating_duration_since(Instant::now()));
-        kill_process(pid, Signal::CONT).unwrap();
-        wrote.unwrap();
-        let o = child.wait_with_output().unwrap();
-        let row = &data(&o)["session"];
-        assert_eq!(row["state_source"], "extension", "{command}: {o:?}");
-        assert_eq!(row["state_detail"], "tui");
-        assert_eq!(row["state"], "live");
-        assert!(!row["path"].is_null());
+        let mut conclusive = false;
+        for attempt in 1..=10 {
+            let spawned = Instant::now();
+            let child = b
+                .rpc
+                .glen(&[command, A_ID, "--json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = Pid::from_raw(child.id() as i32).unwrap();
+            let stream = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            // glen set its probe deadline before it wrote this request.
+            let past_deadline = Instant::now() + live::STATE_LS + Duration::from_millis(200);
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["op"], "state", "{command}: {request}");
+            let answer = serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":A_ID,"busy":false,"state":"idle","mode":"tui","pid":std::process::id()}});
+            kill_process(pid, Signal::STOP).unwrap();
+            let stopped_in_time = spawned.elapsed() < live::STATE_LS;
+            let wrote = (&stream).write_all(format!("{answer}\n").as_bytes());
+            std::thread::sleep(past_deadline.saturating_duration_since(Instant::now()));
+            kill_process(pid, Signal::CONT).unwrap();
+            wrote.unwrap();
+            let o = child.wait_with_output().unwrap();
+            let row = &data(&o)["session"];
+            if row["state_source"] == "disk" && !stopped_in_time {
+                eprintln!("{command} attempt {attempt}: stopped glen too late to prove anything");
+                continue;
+            }
+            assert_eq!(row["state_source"], "extension", "{command}: {o:?}");
+            assert_eq!(row["state_detail"], "tui");
+            assert_eq!(row["state"], "live");
+            assert!(!row["path"].is_null());
+            conclusive = true;
+            break;
+        }
+        assert!(
+            conclusive,
+            "{command}: no attempt stopped glen within {:?} of its spawn",
+            live::STATE_LS
+        );
     }
+    drop(connections);
+    // Wake the acceptor so it sees the closed channel and ends.
+    drop(UnixStream::connect(&socket));
+    acceptor.join().unwrap();
 }
 
 #[test]

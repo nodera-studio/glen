@@ -96,44 +96,69 @@ impl std::fmt::Display for ClientError {
     }
 }
 impl std::error::Error for ClientError {}
-pub fn connect(path: &Path) -> Result<UnixStream, ConnectError> {
-    if !super::socket_path_ok(path) {
-        return Err(ConnectError::PathTooLong);
-    }
-    let stream = UnixStream::connect(path).map_err(|e| match e.raw_os_error() {
-        Some(libc::ENOENT) => ConnectError::Missing,
-        Some(libc::ECONNREFUSED) => ConnectError::Refused,
-        _ => ConnectError::Io(e),
-    })?;
-    stream
-        .set_write_timeout(Some(super::WRITE))
-        .map_err(ConnectError::Io)?;
-    Ok(stream)
+/// How long one blocking step of a client wait may last before `cancelled` is checked again.
+const POLL_STEP: Duration = Duration::from_millis(100);
+fn unix_socket() -> io::Result<std::os::fd::OwnedFd> {
+    use rustix::net::{AddressFamily, SocketType};
+    #[cfg(not(target_vendor = "apple"))]
+    let fd = rustix::net::socket_with(
+        AddressFamily::UNIX,
+        SocketType::STREAM,
+        rustix::net::SocketFlags::CLOEXEC,
+        None,
+    )?;
+    #[cfg(target_vendor = "apple")]
+    let fd = {
+        let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None)?;
+        rustix::io::fcntl_setfd(&fd, rustix::io::FdFlags::CLOEXEC)?;
+        // As std does for its sockets: a write to a closed peer fails with EPIPE, no SIGPIPE.
+        rustix::net::sockopt::set_socket_nosigpipe(&fd, true)?;
+        fd
+    };
+    Ok(fd)
 }
+/// Connect by the absolute `end`, on the caller's thread (F10). A full unix backlog makes
+/// connect(2) wait on Linux (macOS refuses at once); SO_SNDTIMEO bounds that wait in the kernel,
+/// in steps of at most `POLL_STEP` so `cancelled` is checked between them. The first attempt is
+/// made even when `end` has already passed, so an endpoint that can take the connection is never
+/// reported as timed out because glen itself ran late.
 fn bounded_connect(
     path: &Path,
     end: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<UnixStream, ClientError> {
-    let (tx, rx) = mpsc::channel();
-    let path = path.to_owned();
-    std::thread::spawn(move || {
-        let _ = tx.send(connect(&path));
-    });
+    use rustix::{io::Errno, net::sockopt};
+    let connect_error = |e: io::Error| ClientError::Connect(ConnectError::Io(e));
+    if !super::socket_path_ok(path) {
+        return Err(ClientError::Connect(ConnectError::PathTooLong));
+    }
+    let addr = rustix::net::SocketAddrUnix::new(path)
+        .map_err(|_| ClientError::Connect(ConnectError::PathTooLong))?;
+    let fd = unix_socket().map_err(connect_error)?;
     loop {
         if cancelled() {
             return Err(ClientError::Cancelled);
         }
-        let left = end.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(ClientError::Timeout);
-        }
-        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
-            Ok(r) => return r.map_err(ClientError::Connect),
-            Err(mpsc::RecvTimeoutError::Timeout) => (),
-            Err(_) => return Err(ClientError::Protocol("connect thread ended".into())),
+        let step = end
+            .saturating_duration_since(Instant::now())
+            .clamp(Duration::from_millis(1), POLL_STEP);
+        sockopt::set_socket_timeout(&fd, sockopt::Timeout::Send, Some(step))
+            .map_err(|e| connect_error(e.into()))?;
+        match rustix::net::connect(&fd, &addr) {
+            Ok(()) => break,
+            Err(Errno::INTR) => (),
+            Err(Errno::AGAIN) if Instant::now() < end => (),
+            Err(Errno::AGAIN) => return Err(ClientError::Timeout),
+            Err(Errno::NOENT) => return Err(ClientError::Connect(ConnectError::Missing)),
+            Err(Errno::CONNREFUSED) => return Err(ClientError::Connect(ConnectError::Refused)),
+            Err(e) => return Err(connect_error(e.into())),
         }
     }
+    let stream = UnixStream::from(fd);
+    stream
+        .set_write_timeout(Some(super::WRITE))
+        .map_err(connect_error)?;
+    Ok(stream)
 }
 fn read_line(reader: &mut impl BufRead) -> io::Result<Vec<u8>> {
     let mut line = Vec::new();
@@ -293,18 +318,26 @@ fn write_request(
 /// Read the one answer line of a unary request by the absolute `end` (F10). The time left is
 /// recomputed before every read, so a trickling peer cannot stretch the budget. Once `end` has
 /// passed, reads take only bytes already buffered: the verdict is whether the answer had arrived
-/// when glen looked, never whether glen's own thread got scheduled before `end`.
-fn read_reply(mut stream: &UnixStream, end: Instant) -> Result<Vec<u8>, ClientError> {
+/// when glen looked, never whether glen's own thread got scheduled before `end`. Each blocking
+/// read lasts at most `POLL_STEP`, and `cancelled` is checked before every read.
+fn read_reply(
+    mut stream: &UnixStream,
+    end: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Vec<u8>, ClientError> {
     let mut line = Vec::new();
     let mut chunk = [0u8; DRAIN_CHUNK];
     let oversized = || ClientError::Protocol("oversized or incomplete frame".into());
     loop {
+        if cancelled() {
+            return Err(ClientError::Cancelled);
+        }
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
             stream
                 .set_nonblocking(true)
                 .map_err(|e| ClientError::Protocol(e.to_string()))?;
-        } else if let Err(e) = stream.set_read_timeout(Some(left))
+        } else if let Err(e) = stream.set_read_timeout(Some(left.min(POLL_STEP)))
             // macOS rejects a timeout change once the peer has closed; reads on such a socket
             // return what is buffered, then EOF, without blocking.
             && e.raw_os_error() != Some(libc::EINVAL)
@@ -344,12 +377,35 @@ fn read_reply(mut stream: &UnixStream, end: Instant) -> Result<Vec<u8>, ClientEr
     }
 }
 /// One request and its answer within `timeout`: connect, write and read share one absolute
-/// deadline. The answer is read on the caller's thread, so an answer that arrived in time is
-/// never lost to a competing timer while a glen I/O thread waited to be scheduled (F10).
+/// deadline. Everything runs on the caller's thread, so an answer that arrived in time is never
+/// lost to a competing timer while a glen I/O thread waited to be scheduled (F10).
 pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientError> {
+    exchange(path, op, None, timeout, &|| false)
+}
+/// Control requests carry an expected session id and close their connection on interruption:
+/// `stop` is checked between steps of at most `POLL_STEP`, and the connection is dropped with
+/// the error. No bytes are sent once the deadline has passed.
+pub fn unary_for(
+    path: &Path,
+    op: &Op,
+    expect: &str,
+    timeout: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<Value, ClientError> {
+    use std::sync::atomic::Ordering;
+    exchange(path, op, Some(expect), timeout, &|| {
+        stop.load(Ordering::SeqCst)
+    })
+}
+fn exchange(
+    path: &Path,
+    op: &Op,
+    expect: Option<&str>,
+    timeout: Duration,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Value, ClientError> {
     let end = Instant::now() + timeout;
-    // A full unix backlog can block connect(2); `bounded_connect` owns that wait.
-    let mut stream = bounded_connect(path, end, &|| false)?;
+    let mut stream = bounded_connect(path, end, cancelled)?;
     let id = uuid::Uuid::now_v7().to_string();
     stream
         .set_write_timeout(Some(
@@ -357,7 +413,7 @@ pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientErr
                 .max(Duration::from_millis(1)),
         ))
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
-    let mut bytes = crate::ops::request_bytes(&op.request(&id))
+    let mut bytes = crate::ops::request_bytes(&op.request_for(&id, expect))
         .map_err(|e| ClientError::Protocol(format!("cannot serialize endpoint request: {e}")))?;
     bytes.push(b'\n');
     stream
@@ -366,12 +422,12 @@ pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientErr
                 .max(Duration::from_millis(1)),
         ))
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
-    let pre_read = write_request(&mut stream, &bytes, end, &|| false)?;
+    let pre_read = write_request(&mut stream, &bytes, end, cancelled)?;
     #[cfg(test)]
     unary_tests::after_write(path);
     let line = match pre_read {
         Some(line) => line,
-        None => read_reply(&stream, end)?,
+        None => read_reply(&stream, end, cancelled)?,
     };
     match parse_frame(&line).map_err(ClientError::Protocol)? {
         Frame::Response {
@@ -391,103 +447,6 @@ pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientErr
         _ => Err(ClientError::Protocol(
             "unexpected response id or event".into(),
         )),
-    }
-}
-/// Control requests carry an expected session id and close their connection on
-/// interruption. The worker checks the deadline again before sending any bytes.
-pub fn unary_for(
-    path: &Path,
-    op: &Op,
-    expect: &str,
-    timeout: Duration,
-    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> Result<Value, ClientError> {
-    use std::sync::{Arc, Mutex, atomic::Ordering};
-    let end = Instant::now() + timeout;
-    let active = Arc::new(Mutex::new(None::<UnixStream>));
-    let thread_active = active.clone();
-    let thread_stop = stop.clone();
-    let path = path.to_owned();
-    let id = uuid::Uuid::now_v7().to_string();
-    let request = op.request_for(&id, Some(expect));
-    let (tx, rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let result = (|| {
-            let mut stream = bounded_connect(&path, end, &|| thread_stop.load(Ordering::SeqCst))?;
-            *thread_active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                Some(stream.try_clone().map_err(unary_io)?);
-            if thread_stop.load(Ordering::SeqCst) {
-                return Err(ClientError::Cancelled);
-            }
-            let left = end.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return Err(ClientError::Timeout);
-            }
-            stream.set_write_timeout(Some(left)).map_err(unary_io)?;
-            stream.set_read_timeout(Some(left)).map_err(unary_io)?;
-            let mut bytes = crate::ops::request_bytes(&request).map_err(|e| {
-                ClientError::Protocol(format!("cannot serialize endpoint request: {e}"))
-            })?;
-            bytes.push(b'\n');
-            let pre_read = write_request(&mut stream, &bytes, end, &|| {
-                thread_stop.load(Ordering::SeqCst)
-            })?;
-            let line = match pre_read {
-                Some(line) => line,
-                None => read_line(&mut BufReader::new(stream)).map_err(unary_io)?,
-            };
-            match parse_frame(&line).map_err(ClientError::Protocol)? {
-                Frame::Response {
-                    id: Some(got),
-                    ok,
-                    data,
-                    error,
-                } if got == id => {
-                    if ok {
-                        Ok(data)
-                    } else {
-                        Err(ClientError::Refused(error.ok_or_else(|| {
-                            ClientError::Protocol("missing response error".into())
-                        })?))
-                    }
-                }
-                _ => Err(ClientError::Protocol(
-                    "unexpected response id or event".into(),
-                )),
-            }
-        })();
-        if tx.send(result).is_err() {
-            drop(thread_active);
-        }
-    });
-    loop {
-        let stopped = stop.load(Ordering::SeqCst);
-        let left = end.saturating_duration_since(Instant::now());
-        if stopped || left.is_zero() {
-            if let Some(stream) = active
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .take()
-                && let Err(error) = stream.shutdown(Shutdown::Both)
-                && error.kind() != io::ErrorKind::NotConnected
-            {
-                return Err(ClientError::Protocol(format!(
-                    "cannot close control socket: {error}"
-                )));
-            }
-            return Err(if stopped {
-                ClientError::Cancelled
-            } else {
-                ClientError::Timeout
-            });
-        }
-        match rx.recv_timeout(left.min(Duration::from_millis(50))) {
-            Ok(result) => return result,
-            Err(mpsc::RecvTimeoutError::Timeout) => (),
-            Err(_) => return Err(ClientError::Protocol("control socket thread ended".into())),
-        }
     }
 }
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -1038,39 +997,155 @@ mod unary_tests {
     /// held (as if descheduled) until after the deadline. A competing timer on the caller's
     /// thread used to report `Timeout` for this answer; the verdict now comes from what the
     /// kernel had buffered when glen read. The connection stays open, so no EOF path helps.
+    /// Control requests (`unary_for`) used the same competing timer.
     #[test]
     fn unary_uses_an_answer_that_arrived_while_glen_was_held_past_its_deadline() {
+        use std::sync::{Arc, atomic::AtomicBool};
+        for control in [false, true] {
+            let tmp = tempfile::Builder::new()
+                .prefix("gf10-")
+                .tempdir_in("/tmp")
+                .unwrap();
+            let path = tmp.path().join("s");
+            let listener = UnixListener::bind(&path).unwrap();
+            let release = hold_after_write(&path);
+            let timeout = Duration::from_secs(1);
+            let peer = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .unwrap();
+                let line = read_line(&mut BufReader::new(&stream)).unwrap();
+                // glen set its deadline before it wrote this request.
+                let deadline_passed = Instant::now() + timeout + Duration::from_millis(300);
+                let request: Value = serde_json::from_slice(&line).unwrap();
+                let mut answer =
+                    serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"answer":42}})
+                        .to_string()
+                        .into_bytes();
+                answer.push(b'\n');
+                stream.write_all(&answer).unwrap();
+                std::thread::sleep(deadline_passed.saturating_duration_since(Instant::now()));
+                release.send(()).unwrap();
+                (stream, request)
+            });
+            let result = if control {
+                unary_for(
+                    &path,
+                    &Op::Abort,
+                    "expected-session",
+                    timeout,
+                    Arc::new(AtomicBool::new(false)),
+                )
+            } else {
+                unary(&path, &Op::State, timeout)
+            };
+            let (_open, request) = peer.join().unwrap();
+            assert_eq!(result.unwrap()["answer"], 42, "control={control}");
+            assert!(!hook_pending(&path));
+            if control {
+                assert_eq!(request["args"]["expect_session_id"], "expected-session");
+            }
+        }
+    }
+
+    /// F10 (W12 review): connect used to run on a spawned thread against a competing timer, so
+    /// a glen that ran late reported `Timeout` for an endpoint that could take the connection.
+    /// Looking only after the deadline has passed is the extreme case of running late.
+    #[test]
+    fn connect_after_the_deadline_still_reaches_an_available_endpoint() {
         let tmp = tempfile::Builder::new()
-            .prefix("gf10-")
+            .prefix("gconn-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("s");
+        let _listener = UnixListener::bind(&path).unwrap();
+        let end = Instant::now();
+        std::thread::sleep(Duration::from_millis(5));
+        let stream = bounded_connect(&path, end, &|| false).unwrap();
+        assert!(stream.peer_addr().is_ok());
+        assert!(matches!(
+            bounded_connect(&tmp.path().join("missing"), end, &|| false),
+            Err(ClientError::Connect(ConnectError::Missing))
+        ));
+        drop(_listener);
+        assert!(matches!(
+            bounded_connect(&path, end, &|| false),
+            Err(ClientError::Connect(ConnectError::Refused))
+        ));
+    }
+
+    /// A full backlog makes Linux connect(2) wait: the wait is bounded by the deadline and ends
+    /// in a connection once the endpoint accepts. macOS refuses a full backlog at once.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn connect_to_a_full_backlog_waits_until_accepted_or_the_deadline() {
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketType};
+        let tmp = tempfile::Builder::new()
+            .prefix("gback-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = tmp.path().join("s");
+        let fd = rustix::net::socket(AddressFamily::UNIX, SocketType::STREAM, None).unwrap();
+        rustix::net::bind(&fd, &SocketAddrUnix::new(&path).unwrap()).unwrap();
+        rustix::net::listen(&fd, 0).unwrap();
+        let listener = UnixListener::from(fd);
+        // Backlog 0 holds one pending connection; the next connect waits.
+        let _pending = UnixStream::connect(&path).unwrap();
+        let start = Instant::now();
+        let result = bounded_connect(&path, start + Duration::from_millis(300), &|| false);
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
+        assert!(
+            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3),
+            "full-backlog connect took {elapsed:?}"
+        );
+        let accepter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            let first = listener.accept().unwrap();
+            let second = listener.accept().unwrap();
+            (first, second)
+        });
+        let stream = bounded_connect(&path, Instant::now() + Duration::from_secs(10), &|| false);
+        assert!(stream.is_ok(), "{:?}", stream.err());
+        let _accepted = accepter.join().unwrap();
+    }
+
+    /// `unary_for` ends on `stop` while it waits for the answer, and drops the connection, so
+    /// the endpoint sees the control abandoned.
+    #[test]
+    fn a_stopped_control_request_is_cancelled_and_closes_its_connection() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let tmp = tempfile::Builder::new()
+            .prefix("gstop-")
             .tempdir_in("/tmp")
             .unwrap();
         let path = tmp.path().join("s");
         let listener = UnixListener::bind(&path).unwrap();
-        let release = hold_after_write(&path);
-        let timeout = Duration::from_secs(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let peer_stop = stop.clone();
         let peer = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let (stream, _) = listener.accept().unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .unwrap();
-            let line = read_line(&mut BufReader::new(&stream)).unwrap();
-            // glen set its deadline before it wrote this request.
-            let deadline_passed = Instant::now() + timeout + Duration::from_millis(300);
-            let request: Value = serde_json::from_slice(&line).unwrap();
-            let mut answer =
-                serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"answer":42}})
-                    .to_string()
-                    .into_bytes();
-            answer.push(b'\n');
-            stream.write_all(&answer).unwrap();
-            std::thread::sleep(deadline_passed.saturating_duration_since(Instant::now()));
-            release.send(()).unwrap();
-            stream
+            let mut reader = BufReader::new(&stream);
+            read_line(&mut reader).unwrap();
+            peer_stop.store(true, Ordering::SeqCst);
+            // Never answers; the next read sees glen close the connection.
+            let mut rest = Vec::new();
+            reader.read_to_end(&mut rest).unwrap();
+            rest
         });
-        let result = unary(&path, &Op::State, timeout);
-        let _open = peer.join().unwrap();
-        assert_eq!(result.unwrap()["answer"], 42);
-        assert!(!hook_pending(&path));
+        let start = Instant::now();
+        let result = unary_for(&path, &Op::Abort, "s", Duration::from_secs(10), stop);
+        let elapsed = start.elapsed();
+        assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
+        assert!(elapsed < Duration::from_secs(3), "stop took {elapsed:?}");
+        assert!(peer.join().unwrap().is_empty());
     }
 
     /// The answer read has one absolute deadline: a peer that trickles bytes, never a newline,
