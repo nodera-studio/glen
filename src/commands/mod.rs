@@ -39,7 +39,7 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
         Command::Show(a) => show::run(cli, a, env, ctx),
         Command::Ls(a) => ls::run(cli, a, env, ctx),
         Command::InstallSkill(a) => install_skill::run(a, env, ctx),
-        Command::Doctor(_) => doctor::run(cli, env, ctx),
+        Command::Doctor(a) => doctor::run(cli, a, env, ctx),
         Command::Completions(args) => {
             let mut outcome = completions::run(args)?;
             outcome.human = crate::cli::complete_controls(args.shell, outcome.human);

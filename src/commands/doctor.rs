@@ -1,11 +1,17 @@
 use crate::{
-    cli::Cli,
+    cli::{Cli, DoctorArgs},
+    ctl::probe,
     env::Env,
     error::{ErrorCode, GlenError, Warning},
     glen_home,
-    omp::{self, bin, paths},
+    omp::{
+        self, bin,
+        compat::{self, Support},
+        paths,
+    },
     output::{Mode, Outcome, OutputCtx},
     render::{self, palette::Token, spinner::Spinner},
+    version,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -17,7 +23,7 @@ struct Check {
     value: serde_json::Value,
     detail: String,
 }
-pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
+pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     let glen_home = glen_home::resolve(env)?;
     let mut checks = Vec::new();
@@ -60,37 +66,17 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             .unwrap_or_else(|| "not found".into()),
         binary_error.unwrap_or_default(),
     );
-    let version = if let Some(bin) = &binary {
+    // `version` is the normalized text (`None` when unparseable or when omp cannot run);
+    // `runs` is whether `omp --version` ran at all, which gates the probe.
+    let (version, runs) = if let Some(bin) = &binary {
         let spinner = Spinner::start(ctx.mode == Mode::Human && ctx.stderr_tty, "checking omp");
         let result = bin::omp_version(bin, Duration::from_secs(10), cli.global.profile.as_deref());
         spinner.finish();
         match result {
-            Ok(version) => {
-                let tested = version == omp::TESTED_OMP_VERSION;
-                add(
-                    "omp_version",
-                    if tested { "ok" } else { "warn" },
-                    version.clone(),
-                    if tested {
-                        String::new()
-                    } else {
-                        "untested".into()
-                    },
-                );
-                if !tested {
-                    warnings.push(Warning {
-                        code: "omp_version_untested".into(),
-                        message: format!(
-                            "omp {version} is untested; tested against {}",
-                            omp::TESTED_OMP_VERSION
-                        ),
-                    });
-                }
-                Some(version)
-            }
+            Ok(line) => (omp_version_row(&line, &mut add, &mut warnings), true),
             Err(e) => {
                 add("omp_version", "fail", "unavailable".into(), e);
-                None
+                (None, false)
             }
         }
     } else {
@@ -100,8 +86,47 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             "skipped".into(),
             "omp binary is missing".into(),
         );
-        None
+        (None, false)
     };
+    let mut capabilities = serde_json::Value::Null;
+    match &binary {
+        _ if !args.probe => add(
+            "omp_capabilities",
+            "info",
+            "not probed".into(),
+            "run glen doctor --probe to check omp's RPC capabilities".into(),
+        ),
+        None => add(
+            "omp_capabilities",
+            "info",
+            "skipped".into(),
+            "omp binary is missing".into(),
+        ),
+        Some(_) if !runs => add(
+            "omp_capabilities",
+            "info",
+            "skipped".into(),
+            "omp --version failed".into(),
+        ),
+        Some(bin) => {
+            let spinner = Spinner::start(ctx.mode == Mode::Human && ctx.stderr_tty, "probing omp");
+            let result = probe::run(
+                bin,
+                cli.global.profile.as_deref(),
+                env.cwd(),
+                probe_budget(env),
+            );
+            spinner.finish();
+            let caps = &result.capabilities;
+            add(
+                "omp_capabilities",
+                caps.status(),
+                caps.value(),
+                result.detail.clone(),
+            );
+            capabilities = json!(caps);
+        }
+    }
     let profile = paths.profile.as_deref().unwrap_or("default");
     add("profile", "info", profile.into(), String::new());
     add(
@@ -356,7 +381,7 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
     if let Some(check) = checks.iter_mut().find(|c| c.name == "omp_env_files") {
         check.value = json!(env_files);
     }
-    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":omp::TESTED_OMP_VERSION},"paths":json_paths,"extension":{"path":path_value(&extension_path),"state":extension_state_name,"version":extension_version,"current":current},"checks":checks,"skills":skills});
+    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":*omp::TESTED_OMP_VERSION,"supported":compat::get().supported(),"capabilities":capabilities},"paths":json_paths,"extension":{"path":path_value(&extension_path),"state":extension_state_name,"version":extension_version,"current":current},"checks":checks,"skills":skills});
     let p = &ctx.painter;
     let mut table = render::Table::new(p, ctx.width);
     for (name, status, value, detail) in rows {
@@ -377,9 +402,12 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
             },
         ]);
     }
+    let range = compat::get();
     let footer = format!(
-        "tested against omp {} · profile {}",
-        omp::TESTED_OMP_VERSION,
+        "tested against omp {} · supported {} to {} · profile {}",
+        *omp::TESTED_OMP_VERSION,
+        range.min_text,
+        range.max_tested_text,
         render::sanitize(profile)
     );
     let footer = wrap(&footer, ctx.width);
@@ -389,10 +417,14 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
         table.render(),
         p.paint(Token::Muted, &footer)
     );
-    if checks.iter().any(|c| c.status == "fail") {
+    if let Some(failed) = checks.iter().find(|c| c.status == "fail") {
         return Err(
             GlenError::new(ErrorCode::OmpUnavailable, "omp is not available")
-                .with_hint("install omp or set GLEN_OMP_BIN")
+                .with_hint(if failed.name == "omp_capabilities" {
+                    "omp lacks a capability glen needs: see the omp_capabilities row"
+                } else {
+                    "install omp or set GLEN_OMP_BIN"
+                })
                 .with_details(json!({"report":data}))
                 .with_report(human),
         );
@@ -400,6 +432,82 @@ pub fn run(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> 
     let mut outcome = Outcome::new(data, human);
     outcome.warnings = warnings;
     Ok(outcome)
+}
+/// Adds the `omp_version` row for one `omp --version` line and returns the normalized text.
+fn omp_version_row(
+    line: &str,
+    add: &mut impl FnMut(&'static str, &'static str, String, String),
+    warnings: &mut Vec<Warning>,
+) -> Option<String> {
+    let Some(parsed) = version::parse_omp_line(line) else {
+        add(
+            "omp_version",
+            "warn",
+            "unprobed".into(),
+            "cannot parse omp --version output".into(),
+        );
+        let mut quoted: String = line.chars().take(64).collect();
+        if line.chars().nth(64).is_some() {
+            quoted.push('…');
+        }
+        warnings.push(Warning {
+            code: "omp_version_untested".into(),
+            message: format!(
+                "cannot parse omp --version output \"{}\"; treating this omp as untested",
+                render::sanitize(&quoted)
+            ),
+        });
+        return None;
+    };
+    let range = compat::get();
+    let text = parsed.text;
+    let (status, detail, warning) = match compat::classify(&parsed.version) {
+        Support::Supported => ("ok", "", None),
+        Support::Untested => (
+            "warn",
+            "untested",
+            Some((
+                "omp_version_untested",
+                format!(
+                    "omp {text} is untested; the newest tested version is {}",
+                    range.max_tested_text
+                ),
+            )),
+        ),
+        Support::Unsupported => (
+            "warn",
+            "unsupported",
+            Some((
+                "omp_version_unsupported",
+                format!(
+                    "omp {text} is older than the supported minimum {}",
+                    range.min_text
+                ),
+            )),
+        ),
+    };
+    add("omp_version", status, text.clone(), detail.into());
+    if let Some((code, message)) = warning {
+        warnings.push(Warning {
+            code: code.into(),
+            message,
+        });
+    }
+    Some(text)
+}
+/// `probe::BUDGET`; debug builds let `GLEN_PROBE_BUDGET_MS` (100 to 30000) shorten it for tests.
+fn probe_budget(env: &Env) -> Duration {
+    #[cfg(debug_assertions)]
+    if let Some(ms) = env
+        .get("GLEN_PROBE_BUDGET_MS")
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|ms| (100..=30_000).contains(ms))
+    {
+        return Duration::from_millis(ms);
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = env;
+    probe::BUDGET
 }
 fn wrap(text: &str, width: Option<u16>) -> String {
     let Some(width) = width else {

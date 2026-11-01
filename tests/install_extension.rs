@@ -184,10 +184,10 @@ fn ac304_doctor_checks_and_ac321_warning() {
     assert!(!b.glen_home.exists());
     install(&b, &[]);
     let d = doctor();
-    assert_eq!(d["checks"].as_array().unwrap().len(), 12);
+    assert_eq!(d["checks"].as_array().unwrap().len(), 13);
     assert_eq!(d["extension"]["current"], true);
     fs::write(target(&b), glen::extension::render("0.0.1", &b.glen_home)).unwrap();
-    assert_eq!(doctor()["checks"][6]["status"], "warn");
+    assert_eq!(doctor()["checks"][7]["status"], "warn");
     let home = b.tmp.path().join("x".repeat(110));
     let o = b
         .command(&["install-extension", "--json"], &b.alpha())
@@ -337,7 +337,7 @@ fn doctor_only_suggests_install_when_needed_and_reports_inspection_errors() {
         )
     };
     assert!(
-        doctor()["checks"][6]["detail"]
+        doctor()["checks"][7]["detail"]
             .as_str()
             .unwrap()
             .contains("install-extension")
@@ -346,7 +346,7 @@ fn doctor_only_suggests_install_when_needed_and_reports_inspection_errors() {
     let d = doctor();
     assert_eq!(d["extension"]["current"], true);
     assert!(
-        !d["checks"][6]["detail"]
+        !d["checks"][7]["detail"]
             .as_str()
             .unwrap()
             .contains("install-extension")
@@ -355,9 +355,9 @@ fn doctor_only_suggests_install_when_needed_and_reports_inspection_errors() {
     fs::create_dir(target(&b)).unwrap();
     let d = doctor();
     assert_eq!(d["extension"]["state"], "unreadable");
-    assert_eq!(d["checks"][6]["status"], "warn");
+    assert_eq!(d["checks"][7]["status"], "warn");
     assert!(
-        d["checks"][6]["detail"]
+        d["checks"][7]["detail"]
             .as_str()
             .unwrap()
             .contains("cannot inspect extension")
