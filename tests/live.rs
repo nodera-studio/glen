@@ -657,7 +657,7 @@ fn ac323_version_mismatch_warns() {
     let mut b = LiveBox::new();
     b.start_ext(A_ID, "ok", &[("FAKE_EXT_VERSION", "0.0.1")]);
     let o = send(&b, &[]);
-    assert!(o.status.success());
+    assert!(o.status.success(), "{o:?}");
     let v = json(&o);
     assert_eq!(v["warnings"][0]["code"], "extension_version_mismatch");
     b.rpc.wait_worker_gone(job_id(&v["data"]));
@@ -703,7 +703,7 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
         .unwrap()
         .iter()
         .find(|s| s["id"] == id)
-        .unwrap();
+        .unwrap_or_else(|| panic!("no endpoint-only row: {d}; extension log {:?}", b.ext_log()));
     assert_eq!(row["state_source"], "extension");
     assert_eq!(row["state"], "live");
     assert!(row["path"].is_null());
@@ -922,7 +922,10 @@ fn show_and_tail_use_extension_state_for_persisted_sessions() {
         for command in ["show", "tail"] {
             let o = b.rpc.glen(&[command, A_ID, "--json"]).output().unwrap();
             let row = &data(&o)["session"];
-            assert_eq!(row["state_source"], "extension");
+            assert_eq!(
+                row["state_source"], "extension",
+                "{scenario} {command}: {o:?}"
+            );
             assert_eq!(row["state_detail"], "tui");
             assert_eq!(
                 row["state"],
@@ -930,6 +933,59 @@ fn show_and_tail_use_extension_state_for_persisted_sessions() {
             );
             assert!(!row["path"].is_null());
         }
+    }
+}
+
+/// W12 flake 1 (macOS CI run 41256925367 saw `"disk"` above): an endpoint answer that is in
+/// glen's socket buffer counts, even when glen itself was descheduled past the 300 ms state
+/// probe. The test is the endpoint: it stops glen once the request arrives, answers, lets the
+/// probe deadline pass, then resumes glen. Before the fix, glen's competing timer usually won and
+/// show/tail fell back to the disk state.
+#[test]
+fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::UnixListener;
+    use std::process::Stdio;
+    let b = LiveBox::new();
+    fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
+    let socket = live::run_dir(&home(&b)).join("stall.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    b.write_registry(A_ID, std::process::id(), &socket);
+    for command in ["show", "tail"] {
+        let child = b
+            .rpc
+            .glen(&[command, A_ID, "--json"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = Pid::from_raw(child.id() as i32).unwrap();
+        let (mut stream, _) = poll(Duration::from_secs(10), || listener.accept().ok());
+        // BSD accept passes on the listener's O_NONBLOCK.
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut line = String::new();
+        BufReader::new(&stream).read_line(&mut line).unwrap();
+        // glen set its probe deadline before it wrote this request.
+        let past_deadline = Instant::now() + live::STATE_LS + Duration::from_millis(200);
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["op"], "state", "{command}: {request}");
+        let answer = serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":A_ID,"busy":false,"state":"idle","mode":"tui","pid":std::process::id()}});
+        kill_process(pid, Signal::STOP).unwrap();
+        let wrote = stream.write_all(format!("{answer}\n").as_bytes());
+        std::thread::sleep(past_deadline.saturating_duration_since(Instant::now()));
+        kill_process(pid, Signal::CONT).unwrap();
+        wrote.unwrap();
+        let o = child.wait_with_output().unwrap();
+        let row = &data(&o)["session"];
+        assert_eq!(row["state_source"], "extension", "{command}: {o:?}");
+        assert_eq!(row["state_detail"], "tui");
+        assert_eq!(row["state"], "live");
+        assert!(!row["path"].is_null());
     }
 }
 
