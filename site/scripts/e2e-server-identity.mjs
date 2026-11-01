@@ -14,6 +14,9 @@ export async function checkServedBuild(baseURL, distDir) {
  if (!body.equals(readFileSync(index)))
   throw new Error(`e2e: the server at ${url} is not serving this checkout's build (${index} differs). Stop it (lsof -nP -iTCP:${new URL(url).port || 80} -sTCP:LISTEN) or rebuild; GLEN_E2E_REUSE=1 reuses a server only when it serves this build.`);
 }
-export default async function globalSetup() {
- await checkServedBuild('http://127.0.0.1:4321', fileURLToPath(new URL('../dist', import.meta.url)));
+/** @param {import('@playwright/test').FullConfig} config */
+export default async function globalSetup(config) {
+ const baseURL = config.projects[0]?.use.baseURL;
+ if (!baseURL) throw new Error('e2e: playwright.config.ts sets no baseURL');
+ await checkServedBuild(baseURL, fileURLToPath(new URL('../dist', import.meta.url)));
 }

@@ -663,6 +663,14 @@ impl Worker {
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
+                if !submit_gate(|| {
+                    *phase
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        == Submission::Cancelled
+                }) {
+                    return;
+                }
                 // Startup may claim our RPC child's own lease. Check only the endpoint,
                 // on this thread so a slow hello cannot block cancellation on the worker.
                 let endpoint =
@@ -1162,6 +1170,29 @@ fn test_delay(key: &str) -> Duration {
         let _ = key;
         Duration::ZERO
     }
+}
+// Debug workers only: with FAKE_OMP_PROMPT_SUBMIT_GATE=<path>, the submission thread writes
+// `<path>.ready` and waits (20 s bound) until a test creates <path>, so a test can change the
+// endpoint before the submission-time check without racing a wall-clock delay. Returns false when
+// `cancelled` reports a cancellation during the wait.
+fn submit_gate(cancelled: impl Fn() -> bool) -> bool {
+    #[cfg(debug_assertions)]
+    if let Some(path) = Env::from_process().get("FAKE_OMP_PROMPT_SUBMIT_GATE") {
+        let gate = std::path::Path::new(&path);
+        if let Err(e) = std::fs::write(format!("{path}.ready"), b"submitting") {
+            eprintln!("cannot write submit gate {path}.ready: {e}");
+        }
+        let end = Instant::now() + Duration::from_secs(20);
+        while !gate.exists() && Instant::now() < end {
+            if cancelled() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = &cancelled;
+    true
 }
 use super::polling_command;
 polling_command!(SubmitPrompt, PromptCommand, 100);

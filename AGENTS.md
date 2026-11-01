@@ -72,6 +72,7 @@ clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and
 ## Conventions
 
 - Rust stable, edition 2024. Errors: `GlenError` (`thiserror`) throughout, binary and library; no `anyhow`.
+- The MSRV (`rust-version` in `Cargo.toml`) is verified only by CI's `msrv` job: `cargo +1.89` cannot link on macOS 27 (`ld` rejects the SDK's `libSystem.B.tbd` architecture `arm64e.x1-macos`).
 - Parse omp's formats leniently: unknown entry types and fields must be skipped, not fatal.
   omp adds entry types between releases.
 - Tests that need omp data use fixtures under `tests/fixtures/`, never a live `~/.omp`.

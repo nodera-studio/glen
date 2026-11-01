@@ -657,7 +657,7 @@ fn ac323_version_mismatch_warns() {
     let mut b = LiveBox::new();
     b.start_ext(A_ID, "ok", &[("FAKE_EXT_VERSION", "0.0.1")]);
     let o = send(&b, &[]);
-    assert!(o.status.success());
+    assert!(o.status.success(), "{o:?}");
     let v = json(&o);
     assert_eq!(v["warnings"][0]["code"], "extension_version_mismatch");
     b.rpc.wait_worker_gone(job_id(&v["data"]));
@@ -703,7 +703,7 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
         .unwrap()
         .iter()
         .find(|s| s["id"] == id)
-        .unwrap();
+        .unwrap_or_else(|| panic!("no endpoint-only row: {d}; extension log {:?}", b.ext_log()));
     assert_eq!(row["state_source"], "extension");
     assert_eq!(row["state"], "live");
     assert!(row["path"].is_null());
@@ -793,26 +793,33 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
     assert_eq!(child.wait().unwrap().code(), Some(130));
 }
 
+/// A path for `FAKE_OMP_PROMPT_SUBMIT_GATE`, in the box's own temp dir.
+fn submit_gate(b: &LiveBox) -> std::path::PathBuf {
+    b.log.with_file_name("submit.gate")
+}
+
+/// Waits until the debug worker's submission thread has reached the gate.
+fn wait_submit_gate(gate: &std::path::Path) {
+    let ready = std::path::PathBuf::from(format!("{}.ready", gate.display()));
+    poll(Duration::from_secs(10), || ready.exists().then_some(()));
+}
+
 #[test]
 fn ac315_worker_rechecks_endpoint_at_prompt_submission() {
     let mut b = LiveBox::new();
+    let gate = submit_gate(&b);
     let o = b
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS", "1200")
+        .env("FAKE_OMP_PROMPT_SUBMIT_GATE", &gate)
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(10));
     let value = json(&o);
     let id = job_id(&value["data"]);
-    poll(Duration::from_secs(5), || {
-        b.rpc
-            .fake_log()
-            .iter()
-            .any(|e| e["event"] == "start")
-            .then_some(())
-    });
+    wait_submit_gate(&gate);
     b.start_ext(A_ID, "ok", &[]);
+    fs::write(&gate, b"").unwrap();
     let out = b
         .rpc
         .glen(&["wait", id, "--timeout", "10s", "--json"])
@@ -827,24 +834,20 @@ fn ac315_worker_rechecks_endpoint_at_prompt_submission() {
 #[test]
 fn ac315_worker_refuses_an_unhealthy_endpoint_at_submission() {
     let b = LiveBox::new();
+    let gate = submit_gate(&b);
     let o = b
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS", "1200")
+        .env("FAKE_OMP_PROMPT_SUBMIT_GATE", &gate)
         .output()
         .unwrap();
     assert_eq!(o.status.code(), Some(10));
     let value = json(&o);
     let id = job_id(&value["data"]);
-    poll(Duration::from_secs(5), || {
-        b.rpc
-            .fake_log()
-            .iter()
-            .any(|e| e["event"] == "start")
-            .then_some(())
-    });
+    wait_submit_gate(&gate);
     fs::create_dir_all(b.registry(A_ID).parent().unwrap()).unwrap();
     fs::write(b.registry(A_ID), "malformed registry").unwrap();
+    fs::write(&gate, b"").unwrap();
     let out = b
         .rpc
         .glen(&["wait", id, "--timeout", "10s", "--json"])
@@ -922,7 +925,10 @@ fn show_and_tail_use_extension_state_for_persisted_sessions() {
         for command in ["show", "tail"] {
             let o = b.rpc.glen(&[command, A_ID, "--json"]).output().unwrap();
             let row = &data(&o)["session"];
-            assert_eq!(row["state_source"], "extension");
+            assert_eq!(
+                row["state_source"], "extension",
+                "{scenario} {command}: {o:?}"
+            );
             assert_eq!(row["state_detail"], "tui");
             assert_eq!(
                 row["state"],
@@ -931,6 +937,89 @@ fn show_and_tail_use_extension_state_for_persisted_sessions() {
             assert!(!row["path"].is_null());
         }
     }
+}
+
+/// W12 flake 1 (macOS CI run 41256925367 saw `"disk"` above): an endpoint answer that is in
+/// glen's socket buffer counts, even when glen itself was descheduled past the 300 ms state
+/// probe. The test is the endpoint: it stops glen once the request arrives, answers, lets the
+/// probe deadline pass, then resumes glen. Before the fix, glen's competing timer usually won and
+/// show/tail fell back to the disk state.
+///
+/// glen sets its probe deadline after it was spawned, so a stop that lands within `STATE_LS` of
+/// the spawn is certainly before that deadline. A run whose stop lands later (the test itself
+/// was descheduled) proves nothing: its `"disk"` is retried, never counted as a pass or a fail.
+#[test]
+fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
+    use rustix::process::{Pid, Signal, kill_process};
+    use std::io::{BufRead, BufReader, Write};
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::Stdio;
+    let b = LiveBox::new();
+    fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
+    let socket = live::run_dir(&home(&b)).join("stall.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    b.write_registry(A_ID, std::process::id(), &socket);
+    // A blocking accept on its own thread hands each connection over as soon as glen connects.
+    let (accepted, connections) = std::sync::mpsc::channel();
+    let acceptor = std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            if accepted.send(stream.unwrap()).is_err() {
+                break;
+            }
+        }
+    });
+    for command in ["show", "tail"] {
+        let mut conclusive = false;
+        for attempt in 1..=10 {
+            let spawned = Instant::now();
+            let child = b
+                .rpc
+                .glen(&[command, A_ID, "--json"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap();
+            let pid = Pid::from_raw(child.id() as i32).unwrap();
+            let stream = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut line = String::new();
+            BufReader::new(&stream).read_line(&mut line).unwrap();
+            // glen set its probe deadline before it wrote this request.
+            let past_deadline = Instant::now() + live::STATE_LS + Duration::from_millis(200);
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["op"], "state", "{command}: {request}");
+            let answer = serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":A_ID,"busy":false,"state":"idle","mode":"tui","pid":std::process::id()}});
+            kill_process(pid, Signal::STOP).unwrap();
+            let stopped_in_time = spawned.elapsed() < live::STATE_LS;
+            let wrote = (&stream).write_all(format!("{answer}\n").as_bytes());
+            std::thread::sleep(past_deadline.saturating_duration_since(Instant::now()));
+            kill_process(pid, Signal::CONT).unwrap();
+            wrote.unwrap();
+            let o = child.wait_with_output().unwrap();
+            let row = &data(&o)["session"];
+            if row["state_source"] == "disk" && !stopped_in_time {
+                eprintln!("{command} attempt {attempt}: stopped glen too late to prove anything");
+                continue;
+            }
+            assert_eq!(row["state_source"], "extension", "{command}: {o:?}");
+            assert_eq!(row["state_detail"], "tui");
+            assert_eq!(row["state"], "live");
+            assert!(!row["path"].is_null());
+            conclusive = true;
+            break;
+        }
+        assert!(
+            conclusive,
+            "{command}: no attempt stopped glen within {:?} of its spawn",
+            live::STATE_LS
+        );
+    }
+    drop(connections);
+    // Wake the acceptor so it sees the closed channel and ends.
+    drop(UnixStream::connect(&socket));
+    acceptor.join().unwrap();
 }
 
 #[test]

@@ -80,13 +80,31 @@ fn entry_key(entry: &Entry, legacy: bool, occurrences: &mut HashMap<String, usiz
         occurrence: *occurrence,
     }
 }
+fn is_legacy(session: &Session) -> bool {
+    session.header.raw["version"].as_u64().unwrap_or(1) < 2
+}
+/// What omp's v1 migration keeps of an entry: its kind, entry timestamp, message role and
+/// message content, with the v2 → v3 `hookMessage` → `custom` rename applied. Only the ids, the
+/// compaction's kept-entry pointer and assistant usage totals change (omp 18.14.0
+/// `session-migrations.ts`, `normalizeLoadedUsage`).
+fn shape(entry: &Entry) -> (&str, &serde_json::Value, Option<&str>, &serde_json::Value) {
+    let message = &entry.raw["message"];
+    let role = message["role"].as_str();
+    let role = role.map(|r| if r == "hookMessage" { "custom" } else { r });
+    (
+        entry.kind.as_str(),
+        &entry.raw["timestamp"],
+        role,
+        &message["content"],
+    )
+}
 fn branch_keys<'a>(
     session: &'a Session,
     occurrences: &mut HashMap<String, usize>,
 ) -> Vec<(&'a Entry, Emitted)> {
     #[cfg(test)]
     FULL_RECONCILIATIONS.with(|count| count.set(count.get() + 1));
-    let legacy = session.header.raw["version"].as_u64().unwrap_or(1) < 2;
+    let legacy = is_legacy(session);
     occurrences.clear();
     session
         .active_branch()
@@ -222,6 +240,32 @@ impl Follower {
         self.last_on_branch = self.session.leaf_id().map(str::to_owned);
         items
     }
+    /// The emitted set for `next` when it is omp's migration of the followed v1 file, else None.
+    /// omp 18.14.0 migrates a v1 file when it resumes it (`migrateToCurrentVersion` in
+    /// `session-migrations.ts`) and writes it back as version 3, in place or as a continuation:
+    /// each entry keeps its place in file order but gets a fresh random id chained to the one
+    /// before, and loading may change its content (usage totals, the `hookMessage` role, the
+    /// compaction's kept-entry index). Neither glen's synthesized v1 ids nor its content keys
+    /// survive that, so the v1 entries already emitted are matched to the migrated ones by
+    /// position and keyed by their new ids. The match stops at the first entry whose kind,
+    /// timestamp, role or content differs: everything after it counts as unseen, so a misaligned
+    /// or edited file repeats entries rather than hiding new ones.
+    fn migrated(&self, next: &Session) -> Option<HashSet<Emitted>> {
+        if !is_legacy(&self.session) || is_legacy(next) {
+            return None;
+        }
+        let mut occurrences = HashMap::new();
+        let before = branch_keys(&self.session, &mut occurrences);
+        Some(
+            before
+                .into_iter()
+                .zip(&next.entries)
+                .take_while(|((old, _), new)| shape(old) == shape(new))
+                .filter(|((_, key), _)| self.emitted.contains(key))
+                .map(|(_, new)| Emitted::Id(new.id.clone()))
+                .collect(),
+        )
+    }
     fn continued(&mut self, events: &mut Vec<FollowEvent>) -> Result<bool, GlenError> {
         let c =
             continuation::follow_known(&self.session.path, Some(&self.summary), &mut self.entries)?;
@@ -245,6 +289,9 @@ impl Follower {
             path: c.path,
             handle,
         });
+        if let Some(emitted) = self.migrated(&session) {
+            self.emitted = emitted;
+        }
         self.identity = identity(&metadata);
         self.observed = metadata.modified().ok().map(|time| (metadata.len(), time));
         self.known_ids = session
@@ -334,6 +381,9 @@ impl Follower {
                 }
                 Err(e) => return Err(open::load_error(&self.session.path, e)),
             };
+            if let Some(emitted) = self.migrated(&session) {
+                self.emitted = emitted;
+            }
             self.known_ids = session
                 .entries
                 .iter()
@@ -373,7 +423,7 @@ impl Follower {
                 }
                 let mut switched = false;
                 let unseen = if linear {
-                    let legacy = self.session.header.raw["version"].as_u64().unwrap_or(1) < 2;
+                    let legacy = is_legacy(&self.session);
                     let new = self.session.entries[added]
                         .iter()
                         .filter(|entry| {
@@ -889,6 +939,143 @@ mod poll_tests {
         let err = f.poll_at(start + Duration::from_secs(5)).unwrap_err();
         assert_eq!(err.code, ErrorCode::NotFound);
         assert!(err.message.contains(path.to_str().unwrap()));
+    }
+    const V1_BEFORE: &str = include_str!("../../tests/fixtures/v1-migration-before.jsonl");
+    const V1_AFTER: &str = include_str!("../../tests/fixtures/v1-migration-after.jsonl");
+    /// The migrated file without the turn omp wrote in the same rewrite: the title slot, the
+    /// header and the seven migrated entries.
+    fn migrated_only() -> String {
+        V1_AFTER.lines().take(9).map(|l| format!("{l}\n")).collect()
+    }
+    fn replace(path: &Path, text: &str) {
+        let staged = path.with_extension("staged");
+        fs::write(&staged, text).unwrap();
+        fs::rename(staged, path).unwrap();
+    }
+    fn v1_follower(tree: &tempfile::TempDir) -> (PathBuf, Follower) {
+        let path = tree.path().join("legacy.jsonl");
+        fs::write(&path, V1_BEFORE).unwrap();
+        let f = follower(tree, &path);
+        assert_eq!(f.backlog(usize::MAX).len(), 7);
+        (path, f)
+    }
+    fn new_turn(items: &[Item]) -> bool {
+        matches!(items, [
+            Item::User { id: q, text: prompt, .. },
+            Item::Assistant { id: a, text: answer, .. },
+        ] if q == "d8a61f3c" && prompt == "first prompt after migration"
+            && a == "1b7e4c29" && answer == "first answer after migration")
+    }
+    // W12 item 3: omp's v1 → v3 migration gives every entry a fresh random id and normalises
+    // content (usage, the hookMessage role), so neither glen's synthesized v1 ids nor its
+    // content keys survive. Only the turn omp wrote with the rewrite is new.
+    #[test]
+    fn v1_migration_rewrite_emits_only_the_turn_written_with_it() {
+        let tree = fixtures::tree();
+        let (path, mut f) = v1_follower(&tree);
+        replace(&path, V1_AFTER);
+        let events = f.poll().unwrap();
+        let [
+            FollowEvent::Rewritten { path: actual },
+            FollowEvent::Items(items),
+        ] = events.as_slice()
+        else {
+            panic!("expected a rewrite and the new turn: {events:?}");
+        };
+        assert_eq!(actual, &path);
+        assert!(new_turn(items), "{items:?}");
+        assert!(f.poll().unwrap().is_empty());
+        append(&path, &message("after-migration", "1b7e4c29"));
+        one(&f.poll().unwrap(), "after-migration");
+    }
+    #[test]
+    fn a_pure_v1_migration_emits_nothing_and_keys_later_entries_by_omp_id() {
+        let tree = fixtures::tree();
+        let (path, mut f) = v1_follower(&tree);
+        replace(&path, &migrated_only());
+        let events = f.poll().unwrap();
+        assert!(
+            matches!(events.as_slice(), [FollowEvent::Rewritten { .. }, FollowEvent::Items(items)] if items.is_empty()),
+            "{events:?}"
+        );
+        assert!(f.emitted.iter().all(|key| matches!(key, Emitted::Id(_))));
+        // Repeating an old prompt after the migration is a new entry, not a seen one.
+        let repeat = json!({"type":"message", "id":"repeat", "parentId":"e0c3915a",
+            "message":{"role":"user", "content":[{"type":"text", "text":"migrate me"}]}});
+        append(&path, &format!("{repeat}\n"));
+        let events = f.poll().unwrap();
+        assert!(matches!(events.as_slice(), [FollowEvent::Items(items)]
+            if matches!(items.as_slice(), [Item::User { id, text, .. }] if id == "repeat" && text == "migrate me")));
+    }
+    #[test]
+    fn a_v1_parent_continued_in_a_migrated_child_emits_only_the_new_turn() {
+        let tree = fixtures::tree();
+        let (path, mut f) = v1_follower(&tree);
+        let to = "01a20000-0000-7000-8000-00000000c1d0";
+        let child = tree
+            .path()
+            .join(format!("2026-10-30T12-00-00-000Z_{to}.jsonl"));
+        let header = "\"id\":\"legacy-v1-migration\"";
+        let carried = format!(
+            "\"id\":\"{to}\",\"parentSession\":\"legacy-v1-migration\",\"continuationOf\":\"legacy-v1-migration\""
+        );
+        fs::write(&child, V1_AFTER.replacen(header, &carried, 1)).unwrap();
+        fs::remove_file(&path).unwrap();
+        let events = f.poll().unwrap();
+        let [
+            FollowEvent::Continued { to: actual, .. },
+            FollowEvent::Items(items),
+        ] = events.as_slice()
+        else {
+            panic!("expected a continuation and the new turn: {events:?}");
+        };
+        assert_eq!(actual, to);
+        assert!(new_turn(items), "{items:?}");
+        assert!(f.poll().unwrap().is_empty());
+    }
+    #[test]
+    fn a_misaligned_v1_migration_repeats_entries_rather_than_hiding_new_ones() {
+        let tree = fixtures::tree();
+        let (path, mut f) = v1_follower(&tree);
+        // The third migrated entry no longer matches the third v1 entry's kind, so nothing
+        // from there on counts as already emitted.
+        let shifted = V1_AFTER.replacen(
+            "\"type\":\"thinking_level_change\"",
+            "\"type\":\"future_kind\"",
+            1,
+        );
+        replace(&path, &shifted);
+        let events = f.poll().unwrap();
+        let [FollowEvent::Rewritten { .. }, FollowEvent::Items(items)] = events.as_slice() else {
+            panic!("expected a rewrite and items: {events:?}");
+        };
+        assert!(matches!(items.first(), Some(Item::ModelChange { id, .. }) if id == "c71f03bd"));
+        assert_eq!(items.len(), 6, "{items:?}");
+        assert!(new_turn(&items[4..]), "{items:?}");
+    }
+    /// W12 review: a rewrite that keeps an entry's kind and role but changes its text is not
+    /// omp's migration of that entry, so the edited entry is emitted, not hidden as seen.
+    #[test]
+    fn a_v1_migration_with_an_edited_message_emits_the_edited_entry() {
+        let tree = fixtures::tree();
+        let (path, mut f) = v1_follower(&tree);
+        let edited = V1_AFTER.replacen(
+            "\"text\":\"migrate me\"}],\"timestamp\":1765241616000",
+            "\"text\":\"edited prompt\"}],\"timestamp\":1765241616000",
+            1,
+        );
+        assert_ne!(edited, V1_AFTER);
+        replace(&path, &edited);
+        let events = f.poll().unwrap();
+        let [FollowEvent::Rewritten { .. }, FollowEvent::Items(items)] = events.as_slice() else {
+            panic!("expected a rewrite and items: {events:?}");
+        };
+        assert!(
+            matches!(items.as_slice(), [Item::User { id, text, .. }, ..] if id == "e0c3915a" && text == "edited prompt"),
+            "{items:?}"
+        );
+        assert_eq!(items.len(), 3, "{items:?}");
+        assert!(new_turn(&items[1..]), "{items:?}");
     }
     #[test]
     fn returning_to_an_emitted_leaf_keeps_the_empty_items_event() {

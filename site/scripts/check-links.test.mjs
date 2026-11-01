@@ -1,6 +1,6 @@
-import { test } from 'node:test';
+import { after, test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { collectUrls, classify, markdownUrls, markdownPaths, offline, status, versionChips } from './check-links.mjs';
@@ -32,9 +32,12 @@ test('Markdown: link targets, bare URLs in code, and relative paths', () => {
  assert.deepEqual(markdownPaths(md), ['docs/demo.png', 'docs/design.md']);
 });
 
-/** A checkout with dist/ and README.md in a temp dir. */
-function fixture(html, readme) {
+/** A checkout with dist/ and README.md in a temp dir, removed after the test. */
+const roots = [];
+function fixture(t, html, readme) {
  const root = mkdtempSync(join(tmpdir(), 'glen-links-'));
+ roots.push(root);
+ t.after(() => rmSync(root, { recursive: true, force: true }));
  mkdirSync(join(root, 'site/dist/_astro'), { recursive: true });
  writeFileSync(join(root, 'site/dist/index.html'), html);
  writeFileSync(join(root, 'site/dist/404.html'), '<p>404</p>');
@@ -42,17 +45,21 @@ function fixture(html, readme) {
  if (readme !== undefined) writeFileSync(join(root, 'README.md'), readme);
  return { root, dist: join(root, 'site/dist'), readme: join(root, 'README.md') };
 }
+// W12 item 4: every run used to leave its glen-links-* dirs in the temp dir.
+after(() => {
+ assert.deepEqual(roots.filter(root => existsSync(root)), [], 'fixture dirs left behind');
+});
 const failures = r => r.rows.filter(row => !row.ok).map(row => row.url);
 
-test('offline: passes a clean dist and leaves remote URLs for --online', () => {
- const f = fixture('<a href="https://github.com/nodera-studio/glen/releases">r</a><code>curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh</code>', '[d](install.sh)');
+test('offline: passes a clean dist and leaves remote URLs for --online', t => {
+ const f = fixture(t, '<a href="https://github.com/nodera-studio/glen/releases">r</a><code>curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh</code>', '[d](install.sh)');
  const released = offline({ ...f, releaseAvailable: true });
  assert.deepEqual(failures(released), []);
  assert.deepEqual(released.remote, ['https://github.com/nodera-studio/glen/releases']);
 });
 
-test('offline: before the first release, an installer URL or /releases/latest anywhere in dist fails', () => {
- const f = fixture('<a href="https://github.com/nodera-studio/glen/releases/latest">r</a>');
+test('offline: before the first release, an installer URL or /releases/latest anywhere in dist fails', t => {
+ const f = fixture(t, '<a href="https://github.com/nodera-studio/glen/releases/latest">r</a>');
  writeFileSync(join(f.dist, '_astro/Island.js'), 'const u="https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh"');
  const r = offline({ ...f, releaseAvailable: false });
  assert.equal(failures(r).length, 2, failures(r).join('\n'));
@@ -68,27 +75,27 @@ test('versionChips: text nodes that open with a version tag, entity-decoded, out
 });
 
 // W8-DOC-15: the header, hero and footer chips said v0.1.0 before any release existed.
-test('offline: before the first release, a version chip that reads as released fails', () => {
+test('offline: before the first release, a version chip that reads as released fails', t => {
  const released = versionLabel({ ...site, releaseAvailable: true }), unreleased = versionLabel({ ...site, releaseAvailable: false });
  assert.equal(released, `v${site.version}`);
  assert.equal(unreleased, `v${site.version} · coming soon`);
  const chips = label => `<span class="version-chip">${label}</span><p class="release-chip"><span aria-hidden="true"></span>${label} · works with omp 18.14.0</p>`;
- const early = fixture(chips(released));
+ const early = fixture(t, chips(released));
  writeFileSync(join(early.dist, '404.html'), `<footer><span>Tested with omp 18.14.0</span><span>${released}</span></footer>`);
  assert.deepEqual(failures(offline({ ...early, releaseAvailable: false })), [
   `404.html: version chip "${released}"`, `index.html: version chip "${released}"`, `index.html: version chip "${released} · works with omp 18.14.0"`,
  ]);
  assert.deepEqual(failures(offline({ ...early, releaseAvailable: true })), []);
- assert.deepEqual(failures(offline({ ...fixture(chips(unreleased)), releaseAvailable: false })), []);
+ assert.deepEqual(failures(offline({ ...fixture(t, chips(unreleased)), releaseAvailable: false })), []);
 });
 
-test('offline: repo-main URLs and README paths must exist in the checkout; dist pages must exist', () => {
- const f = fixture('<a href="https://github.com/nodera-studio/glen/blob/main/LICENSE">l</a>', '![x](docs/demo.png)\n`https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh`');
+test('offline: repo-main URLs and README paths must exist in the checkout; dist pages must exist', t => {
+ const f = fixture(t, '<a href="https://github.com/nodera-studio/glen/blob/main/LICENSE">l</a>', '![x](docs/demo.png)\n`https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh`');
  assert.deepEqual(failures(offline({ ...f, releaseAvailable: true })), ['README.md -> docs/demo.png', 'https://github.com/nodera-studio/glen/blob/main/LICENSE']);
  writeFileSync(join(f.root, 'LICENSE'), 'MIT');
  mkdirSync(join(f.root, 'docs')); writeFileSync(join(f.root, 'docs/demo.png'), '');
  assert.deepEqual(failures(offline({ ...f, releaseAvailable: true })), []);
- const empty = fixture('');
+ const empty = fixture(t, '');
  const r = offline({ dist: join(empty.root, 'nope'), root: empty.root, releaseAvailable: false });
  assert.deepEqual(failures(r), ['dist/index.html', 'dist/404.html']);
 });

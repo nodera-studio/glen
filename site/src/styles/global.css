@@ -267,7 +267,7 @@ section[id] { scroll-margin-top: 88px }
 .tabs-list button:not([aria-selected=true]):hover { color: var(--ink) }
 .tabs-list button > span:not(.tab-pill) { position: relative; z-index: 1 }
 .tab-pill { position: absolute; inset: 0; border-radius: 999px; background: var(--ink); box-shadow: var(--shadow-1) }
-.tabs-list button:active, .inline-copy:active, .tabs-card [role=tabpanel] button:active { transform: scale(.985) }
+.tabs-list button:active, .tabs-card [role=tabpanel] button:active, .cta-command button:active { transform: scale(.985) }
 .command-row { display: flex; align-items: center; gap: 12px }
 .command { flex: 1; min-width: 0; padding-right: 24px; overflow-x: auto; font: 13px/1.7 var(--font-mono); white-space: pre; user-select: all; scrollbar-width: none; mask-image: linear-gradient(90deg, black 85%, transparent) }
 .command::-webkit-scrollbar { display: none }
@@ -318,17 +318,15 @@ section[id] { scroll-margin-top: 88px }
 }
 
 /* ---------- Closing CTA (MK .cta-section on the morphin grid ground) ---------- */
-.cta-section { position: relative; isolation: isolate; overflow: hidden; padding: var(--section-pt) var(--gutter) var(--section-pb); text-align: center }
-.cta-inner { max-width: 720px; margin: auto }
+.cta-section { position: relative; isolation: isolate; overflow: hidden; padding: var(--section-pt) var(--gutter) var(--section-pb); text-align: center; container-type: inline-size }
+.cta-inner { display: flex; flex-direction: column; align-items: center; max-width: 720px; margin: auto }
 .cta-inner h2 { font-size: clamp(2rem, 1.2rem + 3.4vw, 3.25rem); font-weight: 510; line-height: 1.04; letter-spacing: -.021em; color: var(--ink-heading); text-wrap: balance }
 .cta-inner > p { margin-top: 16px; font-size: clamp(1rem, .95rem + .4vw, 1.1875rem); line-height: 1.6; color: var(--ink-subdued) }
 .cta-inner .actions { justify-content: center; margin-top: 28px }
-.cta-command { display: flex; align-items: center; gap: 4px; max-width: 560px; margin: 28px auto 0; padding: 4px 4px 4px 14px; border: 1px solid var(--line-strong); border-radius: 12px; background: color-mix(in oklch, var(--content) 85%, transparent); text-align: left; box-shadow: var(--shadow-1); backdrop-filter: blur(6px) }
-.cta-command code.bare { flex: 1; min-width: 0; overflow: auto hidden; font: 13px/32px var(--font-mono); white-space: pre; scrollbar-width: none; color: var(--ink); mask-image: linear-gradient(90deg, black 85%, transparent) }
+/* The command chip may outgrow the 720px measure, up to the band's width, so the whole install command shows on desktop. */
+.cta-command { display: flex; align-items: center; gap: 4px; width: max-content; max-width: 100cqi; margin-top: 28px; padding: 4px 4px 4px 14px; border: 1px solid var(--line-strong); border-radius: 12px; background: color-mix(in oklch, var(--content) 85%, transparent); text-align: left; box-shadow: var(--shadow-1); backdrop-filter: blur(6px) }
+.cta-command code.bare { flex: 1; min-width: 0; overflow: auto hidden; font: 13px/32px var(--font-mono); white-space: pre; scrollbar-width: none; color: var(--ink); padding-right: 24px; mask-image: linear-gradient(90deg, black calc(100% - 24px), transparent) }
 .cta-command code.bare::before { content: '$ '; color: var(--ink-subdued) }
-.inline-copy { flex-shrink: 0; height: 32px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 8px; background: var(--layer-1); font-size: 13px; font-weight: 510; color: var(--ink); transition: transform 120ms var(--ease-out-quart), background-color 160ms var(--ease-out-quart), color 160ms var(--ease-out-quart), border-color 160ms var(--ease-out-quart) }
-.inline-copy:hover { background: var(--layer-2) }
-.inline-copy[data-state=copied] { color: var(--success); border-color: color-mix(in oklch, var(--success) 45%, transparent) }
 .cta-ground { position: absolute; z-index: -1; inset: 0; pointer-events: none; mask-image: radial-gradient(ellipse 70% 80% at center, black 25%, transparent 75%) }
 .cta-ground > div { position: absolute; inset: -40px; opacity: .55; background: linear-gradient(var(--line-strong) 1px, transparent 1px), linear-gradient(90deg, var(--line-strong) 1px, transparent 1px); background-size: 40px 40px }
 .cta-ground .grid-spotlight { opacity: 0; background-image: linear-gradient(color-mix(in oklch, var(--brand) 55%, transparent) 1px, transparent 1px), linear-gradient(90deg, color-mix(in oklch, var(--brand) 55%, transparent) 1px, transparent 1px); mask-image: radial-gradient(260px circle at var(--mx, 50%) var(--my, 50%), black, transparent); transition: opacity 300ms var(--ease-out-quart) }
