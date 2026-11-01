@@ -36,13 +36,17 @@ The local pipeline runs the same three, plus a typecheck and a build, in this or
 | 2. Lint      | `cargo clippy --all-targets --locked -- -D warnings` | clippy; any warning fails, as in CI          |
 | 3. Typecheck | `cargo check --all-targets --locked`                 | type errors in the crate, tests and examples |
 | 4. Build     | `cargo build --locked`                               | the debug binary links                       |
-| 5. Tests     | `cargo test --locked`                                | unit tests, `tests/` integration tests, doc tests |
+| 5. Tests     | `bash .claude/scripts/suite-lock.sh cargo test --locked` | unit tests, `tests/` integration tests, doc tests |
 
 Notes:
 
 - `--locked` makes cargo fail instead of rewriting `Cargo.lock`. A lockfile error means
   `Cargo.toml` changed without `cargo update`/`cargo build` being run and the new
   `Cargo.lock` committed.
+- Step 5 runs under `suite-lock.sh`, which holds `<target>/.glen-suite.lock/` and waits
+  while another suite holds it (exit 75 after `GLEN_SUITE_LOCK_WAIT` seconds, default 3600).
+  Never run two test suites at once in one target dir: a concurrent `cargo build --example`
+  re-links example binaries a running suite uses.
 - Clippy already typechecks, so step 3 rarely fails when step 2 passed; keep it for
   the "static checks only" mode and for a clear error when clippy itself is missing.
 - Rust tests read omp data only from `tests/fixtures/`, never a live
@@ -80,7 +84,7 @@ cargo fmt --all -- --check 2>&1
 cargo clippy --all-targets --locked -- -D warnings 2>&1
 cargo check --all-targets --locked 2>&1
 cargo build --locked 2>&1
-cargo test --locked 2>&1
+bash .claude/scripts/suite-lock.sh cargo test --locked 2>&1
 ```
 
 ## Site stage
