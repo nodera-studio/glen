@@ -33,6 +33,17 @@ Fixture mtimes are checkout times, not conversation timestamps. Tests that depen
 copy fixtures with `tests/common::OmpBox` and set deterministic mtimes; never rewrite the checked-in fixtures.
 Fixture A has nine raw entries after its title slot and session header.
 
+## v1 migration pair
+
+`v1-migration-before.jsonl` is a v1 session (no title slot, no `version`, id-less entries).
+`v1-migration-after.jsonl` is the file omp 18.14.0 writes when it resumes it
+(`migrateToCurrentVersion` in `session-migrations.ts`, then the loader's usage repair, then the
+atomic rewrite): a 256-byte title slot, the header with `"version":3` appended, the seven
+entries in the same order with fresh random 8-hex `id`s and a linear `parentId` chain added at
+the end of each object, `firstKeptEntryIndex` replaced by `firstKeptEntryId`, `hookMessage`
+renamed to `custom`, and the assistant's partial usage completed. Its last two entries are the
+resumed turn omp wrote with the rewrite. Tests take the first nine lines for a pure migration.
+
 ## Fake RPC peer (`fake_omp` example)
 
 `tests/support/fake_omp.rs` is an independent JSON-lines peer built by `cargo build --example fake_omp`.

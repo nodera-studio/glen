@@ -972,6 +972,46 @@ fn v1_rewrite_does_not_duplicate_messages_when_ordinals_shift() {
     b.clean();
 }
 
+// W12 item 3: watch shares tail -f's follower, so omp's v1 → v3 migration must not repeat the
+// transcript there either.
+#[test]
+fn v1_migration_rewrite_shows_only_the_new_turn_in_watch() {
+    let b = OmpBox::new();
+    let path = b.session('A');
+    let fixture = |text: &str| text.replace("legacy-v1-migration", A_ID);
+    fs::write(
+        &path,
+        fixture(include_str!("fixtures/v1-migration-before.jsonl")),
+    )
+    .unwrap();
+    let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 80);
+    pty.wait_for("pre-migration hook note", START);
+    pty.assert_raw_while_running();
+    poll(START, || {
+        (pty.text_from(0).matches("migrate me").count() == 2).then_some(())
+    });
+    let staged = path.with_extension("staged");
+    fs::write(
+        &staged,
+        fixture(include_str!("fixtures/v1-migration-after.jsonl")),
+    )
+    .unwrap();
+    fs::rename(staged, &path).unwrap();
+    pty.wait_for("── session file rewritten ──", DATA);
+    pty.wait_for("first answer after migration", DATA);
+    let shown = pty.text_from(0);
+    assert_eq!(shown.matches("migrate me").count(), 2, "{shown}");
+    assert_eq!(shown.matches("pre-migration answer").count(), 1, "{shown}");
+    assert_eq!(
+        shown.matches("pre-migration hook note").count(),
+        1,
+        "{shown}"
+    );
+    assert_eq!(shown.matches("first prompt after migration").count(), 1);
+    pty.quit();
+    b.clean();
+}
+
 #[test]
 fn inbox_talk_back_is_visible_without_marking_read() {
     let b = OmpBox::new();

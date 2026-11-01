@@ -1,0 +1,8 @@
+{"type":"session","id":"legacy-v1-migration","title":"Legacy migration","timestamp":"2025-12-09T00:53:29.825Z","cwd":"/home/fixture/work/alpha","provider":"test","modelId":"old","thinkingLevel":"off"}
+{"type":"message","timestamp":"2025-12-09T00:53:30.000Z","message":{"role":"user","content":[{"type":"text","text":"migrate me"}],"timestamp":1765241610000}}
+{"type":"message","timestamp":"2025-12-09T00:53:31.000Z","message":{"role":"assistant","content":[{"type":"text","text":"pre-migration answer"}],"api":"test","provider":"test","model":"old","usage":{"input":10,"output":5},"stopReason":"stop","timestamp":1765241611000}}
+{"type":"thinking_level_change","timestamp":"2025-12-09T00:53:32.000Z","thinkingLevel":"low"}
+{"type":"model_change","timestamp":"2025-12-09T00:53:33.000Z","provider":"test","modelId":"newer"}
+{"type":"compaction","timestamp":"2025-12-09T00:53:34.000Z","summary":"pre-migration checkpoint","firstKeptEntryIndex":3,"tokensBefore":15}
+{"type":"message","timestamp":"2025-12-09T00:53:35.000Z","message":{"role":"hookMessage","customType":"fixture-hook","content":"pre-migration hook note","display":true,"timestamp":1765241615000}}
+{"type":"message","timestamp":"2025-12-09T00:53:36.000Z","message":{"role":"user","content":[{"type":"text","text":"migrate me"}],"timestamp":1765241616000}}
