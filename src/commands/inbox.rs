@@ -295,10 +295,13 @@ fn wait_for_unread(
         let interrupted = stop.load(std::sync::atomic::Ordering::SeqCst);
         if interrupted || std::time::Instant::now() >= deadline {
             let next = wait_again(a);
+            // Quoting keeps the filters' controls; only the terminal line escapes them.
             let mut outcome = Outcome::new(
                 json!({"total":0,"marked_read":false,"skipped_lines":read.skipped,"messages":[],"next":next,"interrupted":interrupted}),
-                ctx.painter
-                    .paint(Token::Muted, &format!("no messages yet · {next}")),
+                ctx.painter.paint(
+                    Token::Muted,
+                    &render::sanitize(&format!("no messages yet · {next}")),
+                ),
             );
             outcome.exit = if interrupted {
                 OkExit::Interrupted
@@ -564,6 +567,75 @@ mod tests {
         ] {
             assert_eq!(shell_word(raw), want);
         }
+    }
+    /// W2 review 1 (Codex P2): shell quoting keeps escape sequences, so the no-message line
+    /// escapes the caller's filters before painting; `data.next` stays byte-exact.
+    #[test]
+    fn wait_expiry_line_escapes_controls_from_the_callers_filters() {
+        use crate::{
+            output::{Mode, Terminal},
+            render::{
+                palette::{ColorDepth, Theme},
+                style::Painter,
+            },
+        };
+        let tree = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: tree.path().join("glen"),
+        };
+        let env = Env::for_test(None, tree.path(), &[]);
+        let term = Terminal {
+            stdout_tty: true,
+            stderr_tty: false,
+            stdout_cols: None,
+        };
+        let mut ctx = OutputCtx::fallback(Mode::Human, &env, &term);
+        ctx.painter = Painter::new(ColorDepth::Ansi16, Theme::Dark);
+        let session = "\u{1b}]8;;https://x.test\u{7}c0de\r\u{202e}gpj";
+        let a = args(&[
+            "glen",
+            "inbox",
+            "--wait",
+            "--timeout",
+            "0ms",
+            "--session",
+            session,
+            "--cwd",
+            "/w/\u{1b}[2J\u{2066}",
+        ]);
+        let Err(o) = wait_for_unread(&home, &a, &env, &ctx, None).unwrap() else {
+            panic!("an empty inbox has no message")
+        };
+        assert_eq!(o.exit.exit_code(), 10);
+        let next = o.data["next"].as_str().unwrap();
+        assert_eq!(next, wait_again(&a));
+        assert!(next.contains(session) && next.contains("/w/\u{1b}[2J\u{2066}"));
+        assert!(
+            o.human.contains("\u{1b}["),
+            "painted in colour: {:?}",
+            o.human
+        );
+        for raw in [
+            "\u{1b}]",
+            "\u{7}",
+            "\r",
+            "\u{202e}",
+            "\u{1b}[2J",
+            "\u{2066}",
+        ] {
+            assert!(
+                !o.human.contains(raw),
+                "{raw:?} reached the terminal: {:?}",
+                o.human
+            );
+        }
+        assert!(
+            o.human.contains(
+                r"'\x1b]8;;https://x.test\x07c0de\r\u{202e}gpj' --cwd '/w/\x1b[2J\u{2066}'"
+            ),
+            "{:?}",
+            o.human
+        );
     }
     #[test]
     fn out_of_order_dates_never_mark_an_unprinted_line_read() {
