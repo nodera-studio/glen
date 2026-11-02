@@ -410,6 +410,29 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     all.insert("wait".into(), vec![json(&out)]);
     r.wait_worker_gone(v["data"]["job"]["id"].as_str().unwrap());
     all.insert("send.running".into(), vec![v]);
+    // v0.2 W4: `glen release` of an idle warm worker, then `--all` with none left.
+    let r = RpcBox::new();
+    let out = r
+        .glen(&["send", "e27c0de", "hi", "--warm", "30s"])
+        .env("FAKE_OMP_MULTI", "1")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let job = json(&out)["data"]["job"]["id"].as_str().unwrap().to_owned();
+    let home = glen::glen_home::GlenHome {
+        root: r.omp.glen_home.clone(),
+    };
+    poll(std::time::Duration::from_secs(10), || {
+        glen::rpc::warm::read(&home, A_ID).map(drop)
+    });
+    let out = r.glen(&["release", "e27c0de"]).output().unwrap();
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    all.insert("release".into(), vec![json(&out)]);
+    r.wait_worker_gone(&job);
+    let r = RpcBox::new();
+    let out = r.glen(&["release", "--all"]).output().unwrap();
+    assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+    all.insert("release.all.empty".into(), vec![json(&out)]);
     for (id, args, scenario, exit) in [
         ("models", vec!["models", "--json"], "ok", 0),
         (

@@ -35,7 +35,7 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 | 4 | false | `ambiguous` | use a candidate handle |
 | 5 | false | `omp_unavailable` | omp missing, broken or timed out, or `doctor --probe` proved a required capability missing |
 | 6 | false | `no_route` | refusal: live owner, unknown lease, or sandbox |
-| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation |
+| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation (including `release_timeout`) |
 | 8 | false | `not_implemented` | hidden unfinished command |
 | 10 | true | running | job continues; use wait. With --for reply, data.woke = "reply" marks new replies, and its absence a bound expiry |
 | 11 | true | forked | use forked.to_handle |
@@ -440,6 +440,15 @@ a `<model-id>:<level>` suffix on `modelRoles.default` (honoured by omp itself); 
 `omp-profile-setup.sh` writes that suffix for its model ladder, and `omp-engine.sh` repeats
 exactly that suffix as `--thinking` on every dispatch, as belt and braces on top of it, and
 passes no `--thinking` when the persisted value has none.
+`--warm <DUR>` (v0.2, design §A21; at most 10m, `0` is off) keeps the worker's omp alive for DUR after a
+completed, settled, unforked job, so the next send to the same session runs on it without omp's startup.
+`GLEN_WARM` sets the same duration when the flag is absent; the flag wins, even `--warm 0`. A bad `--warm` exits 2
+`usage` and a bad `GLEN_WARM` exits 2 `invalid_env`, both before a job exists. `job.json` records `warm_ms` when
+warm is on and `env_digest` (16 hex digits of the send's environment, never its values) on every RPC and `@new`
+job. A queued job whose binary, profile, thinking level, cwd or `env_digest` differs makes the warm worker cool
+and runs cold. A job that ran on the warm omp has `omp_reused:true` in its job view. On the live route an explicit
+`--warm` is ignored with an `ignored_flag` warning. While warm, the worker holds the session (and omp's lease), so
+the omp TUI cannot open it until the window ends or `glen release <handle>` ends it.
 
 | Field | Meaning |
 |---|---|
@@ -900,6 +909,59 @@ omp TUI with no job. With `--cwd`, a reply from a session glen has not yet place
 {"event":"end","ok":true,"v":1}
 ```
 
+## `glen release`
+
+Ends warm workers (`glen send --warm`, design §A21). Give exactly one of a target (a session id, a hex tail of 4
+or more, or a job handle, matched against warm workers only) and `--all`. An idle worker is asked to cool and
+waited for until its session lock is free and its registry gone (`released`); a busy one is asked and cools after
+its job (`cooling`, returned at once); a dead or identity-changed registry is removed (`cleaned`). With `--force`,
+a worker whose heartbeat is stale, or that did not release within `--timeout` (default 10s, at most 24h), is killed
+with its omp process group after a pid and start-time check (`forced`); a process glen cannot prove unchanged is
+never signalled. A target that matches no warm worker exits 3 `not_found` with
+`details:{reason:"not_warm",target}`. A worker that did not release in time without `--force` exits 7
+`control_failed` with `details:{reason:"release_timeout",workers}` and a hint naming `--force`. `--all` with no
+warm worker is exit 0 with `total:0`. It creates no glen home.
+
+| Field | Meaning |
+|---|---|
+| `total` | warm workers processed |
+| `workers` | `{session:{id,handle},job,pid,state,outcome}`: `state` idle, busy, stale or dead as found; `outcome` released, cooling, forced or cleaned |
+
+<!-- contract: release -->
+```json
+{
+  "data": {
+    "total": 1,
+    "workers": [
+      {
+        "job": "j6977273",
+        "outcome": "released",
+        "pid": 4242,
+        "session": {
+          "handle": "e27c0de",
+          "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de"
+        },
+        "state": "idle"
+      }
+    ]
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: release.all.empty -->
+```json
+{
+  "data": {
+    "total": 0,
+    "workers": []
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
 ## `glen doctor`
 
 Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
@@ -1008,7 +1070,7 @@ no usable model, is `warn`).
 `extension.state` is
 current/not_installed/outdated/newer/different_home/modified/foreign; `live_endpoints` reports live and stale counts.
 `warm_workers` (v0.2) reports `<w> warm, <s> stale, <d> dead` warm-worker registries: `info`, or `warn`
-naming the session and the fix when a heartbeat is stale or a registry unreadable.
+naming the session and `glen release <handle> --force` when a heartbeat is stale or a registry unreadable.
 The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
 
 ## `glen completions`
@@ -1116,7 +1178,8 @@ Help and version are text in every output mode, with no JSON envelope.
 Usage errors may include clap diagnostics in details; for a missing required argument the message names it
 after the colon (`… were not provided: <MESSAGE>`). Usage `details.reason` values are `missing_cwd` (send,
 with `cwd`), `invalid_level` (thinking) and `unknown_reply` (`wait --after` names no reply of the job, with `job`
-and `after`). Not-found errors supply a hint: `glen ls --all` for sessions,
+and `after`). Not-found `details.reason` `not_warm` (release, with `target`) means no warm worker matched.
+Not-found errors supply a hint: `glen ls --all` for sessions,
 `glen jobs` for jobs, `glen models <session>` for models. When a session lookup misses while some session file
 or project directory could not be read, the error is `io` (exit 1) naming that path, with `details.unreadable`
 listing every unreadable path. Ambiguous errors include `details.candidates`: session objects for sessions,
@@ -1799,7 +1862,7 @@ On Linux, command-line instructions are limited by the OS to 128 KiB (`MAX_ARG_S
 
 All controls use one 90s default command deadline, accept a positive `--timeout DUR`, and route live → owning job → unowned RPC. JSON emits one envelope and empty stderr. Mutations never persist global settings. A changed post-op session id exits 11 with `forked:{from,to,to_handle}`; otherwise forked is null. Model/thinking changes on endpoint-only sessions warn `not_yet_persisted` until omp's first answer writes the file.
 
-`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol|outcome_unknown. Missing credentials include an omp-login hint. `outcome_unknown` means omp went away after glen submitted the change: the change may have been applied, so check `glen models <session>` before retrying. RPC deadlines and SIGINT, SIGTERM or SIGHUP stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT, SIGTERM and SIGHUP exit 130 with `{status:"interrupted",session,route,interrupted:true,hint}`; a second signal exits at once (130, 143 or 129). A model, thinking or compact change that succeeds after the deadline keeps its result and adds the top-level warning `deadline_passed_after_apply`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
+`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol|outcome_unknown, and `glen release` adds release_timeout (with `workers`). Missing credentials include an omp-login hint. `outcome_unknown` means omp went away after glen submitted the change: the change may have been applied, so check `glen models <session>` before retrying. RPC deadlines and SIGINT, SIGTERM or SIGHUP stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT, SIGTERM and SIGHUP exit 130 with `{status:"interrupted",session,route,interrupted:true,hint}`; a second signal exits at once (130, 143 or 129). A model, thinking or compact change that succeeds after the deadline keeps its result and adds the top-level warning `deadline_passed_after_apply`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
 
 <!-- contract: error.control_failed -->
 ```json

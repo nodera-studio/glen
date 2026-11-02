@@ -65,6 +65,8 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 - Send quoted text: `glen send <handle> -- "-v is broken"`; `--` lets a message start with `-`.
 - Never send the same message twice. After exit 10, exit 130 or a call your shell cut off, it is still queued or
   running: `glen jobs --active`, then `glen wait <job>`.
+- Another send coming soon: `glen send <handle> "…" --warm 5m` keeps omp alive up to 5m so it skips startup. <!-- glen:if release -->
+  Warm holds the session (the omp TUI cannot open it) until it ends or `glen release <handle>` (`glen release --all` for all). <!-- glen:if release -->
 
 ## Replies without polling
 Never poll the inbox in a loop or re-run `glen wait` on a timer: start one receiver that returns when something arrives.

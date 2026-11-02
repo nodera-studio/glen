@@ -288,7 +288,11 @@ fn ac_v2_301_acp_is_hidden_and_help_lists_exactly_the_visible_commands() {
         HIDDEN.contains(&"__acp"),
         "the conformance HIDDEN list names __acp"
     );
-    assert_eq!(VISIBLE.len(), 18, "VISIBLE still lists 18 commands");
+    assert_eq!(
+        VISIBLE.len(),
+        19,
+        "VISIBLE lists 19 commands (v0.2 W4 adds release)"
+    );
     assert!(!VISIBLE.contains(&"__acp"));
     let sb = Sandbox::new();
     let mut want: Vec<String> = VISIBLE.iter().map(|s| (*s).to_owned()).collect();

@@ -729,3 +729,44 @@ fn w2_headless_bullet_matches_the_a20_row() {
         .is_some()
     );
 }
+#[test]
+fn w4_warm_bullet_is_guarded_and_valid() {
+    use clap::Parser;
+    let warm: Vec<_> = skill::parse_template(skill::TEMPLATE)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.text.contains("--warm") || s.text.contains("glen release"))
+        .collect();
+    assert_eq!(warm.len(), 2, "{warm:?}");
+    for segment in &warm {
+        assert_eq!(segment.guards, ["release"], "{segment:?}");
+    }
+    for agent in Agent::ALL {
+        let text = skill::render_current(agent).unwrap();
+        let sending = text
+            .split("\n## Sending well\n")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .unwrap();
+        for term in [
+            "`glen send <handle> \"…\" --warm 5m`",
+            "`glen release <handle>`",
+            "`glen release --all`",
+            "the omp TUI cannot open it",
+            "coming soon",
+        ] {
+            assert!(sending.contains(term), "{agent:?}: {term}\n{sending}");
+        }
+    }
+    // Every span parses through the real clap.
+    let cli = cli::Cli::try_parse_from(["glen", "send", "e27c0de", "…", "--warm", "5m"]).unwrap();
+    match cli.command {
+        cli::Command::Send(a) => {
+            assert_eq!(a.warm, Some(std::time::Duration::from_secs(300)))
+        }
+        other => panic!("{other:?}"),
+    }
+    for args in [["glen", "release", "e27c0de"], ["glen", "release", "--all"]] {
+        assert!(cli::Cli::try_parse_from(args).is_ok(), "{args:?}");
+    }
+}

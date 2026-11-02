@@ -62,7 +62,7 @@ pub enum Command {
     Tail(TailArgs),
     #[command(
         about = "Send a message to an omp session and wait for the reply (default 90s)",
-        after_help = "Examples:\n  glen send e27c0de \"run the tests\"\n  glen send @new hi --cwd ~/work/app\n  echo hi | glen send @latest - --no-wait"
+        after_help = "Examples:\n  glen send e27c0de \"run the tests\"\n  glen send @new hi --cwd ~/work/app\n  echo hi | glen send @latest - --no-wait\n  glen send e27c0de \"run the tests\" --warm 5m"
     )]
     Send(SendArgs),
     #[command(
@@ -111,7 +111,6 @@ pub enum Command {
     )]
     Inbox(InboxArgs),
     #[command(
-        hide = true,
         about = "End warm workers (glen send --warm)",
         after_help = "Examples:\n  glen release e27c0de\n  glen release --all\n  glen release e27c0de --force"
     )]
@@ -259,7 +258,6 @@ pub struct SendArgs {
         long,
         value_name = "DUR",
         value_parser = crate::rpc::warm::parse_warm,
-        hide = true,
         help = "keep omp alive for DUR after this job so the next send to the session skips startup (at most 10m; 0 = off)"
     )]
     pub warm: Option<Duration>,
@@ -898,29 +896,22 @@ mod warm_tests {
         );
     }
     #[test]
-    fn warm_surface_is_hidden_until_the_flip() {
+    fn warm_surface_is_public() {
         let public = public_command();
-        assert!(public.get_subcommands().all(|c| c.get_name() != "release"));
+        let release = public.find_subcommand("release").unwrap();
+        assert!(!release.is_hide_set());
         let send = public.find_subcommand("send").unwrap();
-        assert!(send.get_arguments().all(|a| a.get_id() != "warm"));
-        assert_eq!(
-            send.get_after_help().map(|h| h.to_string()),
-            Cli::command()
-                .find_subcommand("send")
-                .and_then(|s| s.get_after_help())
-                .map(|h| h.to_string())
-        );
-        let full = Cli::command();
         assert!(
-            full.find_subcommand("release")
-                .is_some_and(|c| c.is_hide_set())
+            send.get_arguments()
+                .any(|a| a.get_id() == "warm" && !a.is_hide_set())
         );
         assert!(
-            full.find_subcommand("send")
-                .unwrap()
-                .get_arguments()
-                .any(|a| a.get_id() == "warm" && a.is_hide_set())
+            send.get_after_help()
+                .is_some_and(|h| h.to_string().contains("--warm 5m"))
         );
+        let names: Vec<_> = public.get_subcommands().map(|c| c.get_name()).collect();
+        let at = names.iter().position(|n| *n == "release").unwrap();
+        assert_eq!(names[at - 1], "inbox");
         for shell in [
             clap_complete::Shell::Bash,
             clap_complete::Shell::Zsh,
@@ -929,8 +920,8 @@ mod warm_tests {
             let mut buf = Vec::new();
             clap_complete::generate(shell, &mut public_command(), "glen", &mut buf);
             let script = String::from_utf8(buf).unwrap();
-            assert!(!script.contains("warm"), "{shell}");
-            assert!(!script.contains("release"), "{shell}");
+            assert!(script.contains("warm"), "{shell}");
+            assert!(script.contains("release"), "{shell}");
         }
     }
 }

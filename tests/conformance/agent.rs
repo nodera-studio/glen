@@ -3223,8 +3223,10 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // AC-412 — docs/json.md against the real binary.
 // ---------------------------------------------------------------------------------------------
 
-/// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 36] = [
+/// Every contract example ID in docs/json.md that this suite runs. `release` and
+/// `release.all.empty` (v0.2 W4) get their conformance runners in Step 13's `v2_warm` module;
+/// `tests/json_contract.rs` runs both today.
+const CONTRACT_IDS: [&str; 38] = [
     "ls",
     "show",
     "show.raw",
@@ -3243,6 +3245,8 @@ const CONTRACT_IDS: [&str; 36] = [
     "inbox",
     "inbox.wait",
     "inbox.follow",
+    "release",
+    "release.all.empty",
     "install-extension",
     "models",
     "models.session",

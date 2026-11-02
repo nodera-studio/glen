@@ -42,6 +42,7 @@ fn public_help() {
             "thinking",
             "compact",
             "inbox",
+            "release",
             "watch",
             "install-extension",
             "install-skill",
@@ -265,9 +266,11 @@ fn completions() {
             "thinking",
             "compact",
             "inbox",
+            "release",
             "watch",
             "install-extension",
             "install-skill",
+            "--warm",
         ] {
             assert!(s.contains(visible));
         }
