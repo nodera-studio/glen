@@ -293,6 +293,15 @@ fn remove_file(path: &Path) -> io::Result<()> {
 pub fn remove(home: &GlenHome, session_id: &str) -> io::Result<()> {
     remove_file(&path(home, session_id))
 }
+/// Removes the registry only while it still names the worker `ident` (see [`ident`]); true when
+/// it did. Only the session lock's holder publishes a registry, so a caller that holds the lock
+/// can never remove a successor's (`glen release`).
+pub fn remove_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
+    if read(home, session_id).is_none_or(|i| i.entry.ident() != ident) {
+        return Ok(false);
+    }
+    remove(home, session_id).map(|()| true)
+}
 fn read_regular(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
     let meta = fs::symlink_metadata(path).ok()?;
     if !meta.is_file() {
@@ -344,27 +353,37 @@ pub fn release_requested(home: &GlenHome, session_id: &str, me: &str) -> bool {
 pub fn clear_release(home: &GlenHome, session_id: &str) -> io::Result<()> {
     remove_file(&release_path(home, session_id))
 }
+/// Removes the release request only while it is addressed to `ident`; true when it did.
+pub fn clear_release_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
+    if !release_requested(home, session_id, ident) {
+        return Ok(false);
+    }
+    clear_release(home, session_id).map(|()| true)
+}
 /// What `glen release --force` may signal: only a process whose pid and start token are proven
 /// unchanged (`Alive`). `Unknown` never signals.
 #[derive(Debug, PartialEq, Eq)]
 pub struct KillIdentity {
     pub worker: Liveness,
-    /// `None` when the entry records no omp, or no omp start token to prove it by.
+    /// `None` when the entry records no omp. A recorded omp without a start token is `Unknown`
+    /// unless its pid is gone.
     pub omp: Option<Liveness>,
 }
 pub fn kill_identity(entry: &Entry) -> KillIdentity {
     KillIdentity {
-        worker: match &entry.start {
-            Some(start) => liveness::check(entry.pid, start),
-            None if matches!(liveness::start_token(entry.pid), liveness::Probe::Gone) => {
-                Liveness::Dead
-            }
-            None => Liveness::Unknown,
-        },
+        worker: proven(entry.pid, entry.start.as_deref()),
         omp: entry
             .omp_pid
-            .zip(entry.omp_start.as_deref())
-            .map(|(pid, start)| liveness::check(pid, start)),
+            .map(|pid| proven(pid, entry.omp_start.as_deref())),
+    }
+}
+/// A pid's liveness against its recorded start token; without one only a gone pid is proven
+/// (`Dead`), anything else is `Unknown`.
+fn proven(pid: u32, start: Option<&str>) -> Liveness {
+    match start {
+        Some(start) => liveness::check(pid, start),
+        None if matches!(liveness::start_token(pid), liveness::Probe::Gone) => Liveness::Dead,
+        None => Liveness::Unknown,
     }
 }
 
@@ -1314,6 +1333,24 @@ mod registry_tests {
         assert_eq!(ident(12, Some("t")), "12:t");
     }
     #[test]
+    fn conditional_removal_spares_another_workers_files() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        assert!(!remove_if(&h, ID, "1:old").unwrap(), "nothing to remove");
+        assert!(!clear_release_if(&h, ID, "1:old").unwrap());
+        let successor = me(EntryState::Idle);
+        publish(&h, &successor).unwrap();
+        request_release(&h, ID, &successor.ident()).unwrap();
+        // A snapshot of an earlier worker of the session removes nothing of its successor's.
+        assert!(!remove_if(&h, ID, "1:old").unwrap());
+        assert!(!clear_release_if(&h, ID, "1:old").unwrap());
+        assert_eq!(read(&h, ID).unwrap().entry, successor);
+        assert!(release_requested(&h, ID, &successor.ident()));
+        assert!(remove_if(&h, ID, &successor.ident()).unwrap());
+        assert!(clear_release_if(&h, ID, &successor.ident()).unwrap());
+        assert!(read(&h, ID).is_none() && !release_path(&h, ID).exists());
+    }
+    #[test]
     fn kill_identity_requires_proof() {
         let mut e = me(EntryState::Idle);
         assert_eq!(kill_identity(&e).worker, Liveness::Alive);
@@ -1321,9 +1358,16 @@ mod registry_tests {
         e.omp_pid = Some(std::process::id());
         assert_eq!(
             kill_identity(&e).omp,
-            None,
+            Some(Liveness::Unknown),
             "no omp start token proves nothing"
         );
+        e.omp_pid = Some(crate::jobs::liveness::tests_dead_pid());
+        assert_eq!(
+            kill_identity(&e).omp,
+            Some(Liveness::Dead),
+            "a gone omp pid"
+        );
+        e.omp_pid = Some(std::process::id());
         e.omp_start = Some("reused".into());
         assert_eq!(kill_identity(&e).omp, Some(Liveness::Dead));
         e.omp_start = e.start.clone();

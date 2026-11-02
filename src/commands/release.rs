@@ -72,23 +72,32 @@ pub fn run(
     ))
 }
 
-/// One warm worker by session id, a hex tail of 4 or more, or a job handle (`run/warm` only).
+/// One warm worker by session id, a hex tail of 4 or more, or a job handle (`run/warm` only). A
+/// job handle names its session's worker: the session it targeted, or for `@new` the one omp
+/// created (`actual_session_id`), even after the registry moved on to an adopted job.
 fn select(home: &GlenHome, entries: Vec<Indexed>, target: &str) -> Result<Indexed, GlenError> {
     let mut found: Vec<Indexed> = entries
         .iter()
         .filter(|e| matches_session(Some(&e.entry.session_id), target))
         .cloned()
         .collect();
+    let store = JobStore::new(home.clone());
     if found.is_empty()
         && (target.starts_with(['j', 'J']) || JobId::parse(target).is_some())
-        && let Ok(id) = JobStore::new(home.clone()).resolve(target)
-        && let Ok(job) = JobStore::new(home.clone()).read_job(&id)
+        && let Ok(id) = store.resolve(target)
+        && let Ok(job) = store.read_job(&id)
     {
+        let actual = store
+            .read_status(&id)
+            .ok()
+            .and_then(|s| s.actual_session_id);
         found = entries
             .into_iter()
             .filter(|e| {
+                let session = Some(e.entry.session_id.as_str());
                 e.entry.job_id == id.as_str()
-                    || job.session_id.as_deref() == Some(e.entry.session_id.as_str())
+                    || job.session_id.as_deref() == session
+                    || actual.as_deref() == session
             })
             .collect();
     }
@@ -153,7 +162,7 @@ fn release_one(
     let e = &t.entry;
     let class = e.class(t.mtime, SystemTime::now(), stale);
     if class == Class::Dead {
-        cleanup(home, &e.session_id);
+        cleanup(home, e);
         return Ok(("cleaned", true));
     }
     warm::request_release(home, &e.session_id, &e.ident())
@@ -166,9 +175,7 @@ fn release_one(
     }
     let end = Instant::now() + args.timeout;
     loop {
-        if warm::read(home, &e.session_id).is_none_or(|now| now.entry.pid != e.pid)
-            && !lock::is_held(home, &e.session_id)
-        {
+        if gone(home, e) {
             return Ok(("released", true));
         }
         if Instant::now() >= end {
@@ -182,40 +189,96 @@ fn release_one(
     }
 }
 
-/// SIGKILL the omp group and the worker, but only processes whose pid and start token are proven
-/// unchanged (an `Unknown` identity is never signalled and falls to `release_timeout`).
-fn force(home: &GlenHome, t: &Indexed) -> (&'static str, bool) {
-    let e = &t.entry;
-    let identity = warm::kill_identity(e);
-    match identity.worker {
-        Liveness::Dead => {
-            cleanup(home, &e.session_id);
-            ("cleaned", true)
-        }
-        Liveness::Unknown => ("timeout", false),
-        Liveness::Alive => {
-            if identity.omp == Some(Liveness::Alive)
-                && let Some(omp) = e.omp_pid
-            {
-                let _ = rpc::kill_group(omp, rustix::process::Signal::KILL);
+/// The worker `e` names is gone: the registry is missing or another worker's (pid and start
+/// token), and the session lock is free, recorded as another identity's, or `e`'s process is
+/// proven dead. A successor that took the session meanwhile does not hold the release up.
+fn gone(home: &GlenHome, e: &warm::Entry) -> bool {
+    let me = e.ident();
+    warm::read(home, &e.session_id).is_none_or(|now| now.entry.ident() != me)
+        && (!lock::is_held(home, &e.session_id)
+            || lock::holder(home, &e.session_id)
+                .is_some_and(|h| warm::ident(h.pid, h.start.as_deref()) != me)
+            || warm::kill_identity(e).worker == Liveness::Dead)
+}
+
+/// How long `--force` waits for a killed worker and its omp group to be gone.
+const FORCE_BOUND: Duration = Duration::from_secs(2);
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kill {
+    Group(u32),
+    Process(u32),
+}
+/// SIGKILL; a process or group that is already gone is not an error.
+fn signal(target: Kill) -> std::io::Result<()> {
+    match target {
+        Kill::Group(pid) => rpc::kill_group(pid, rustix::process::Signal::KILL),
+        Kill::Process(pid) => {
+            let p = rustix::process::Pid::from_raw(pid as i32)
+                .ok_or_else(|| std::io::Error::other(format!("invalid worker pid {pid}")))?;
+            match rustix::process::kill_process(p, rustix::process::Signal::KILL) {
+                Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+                Err(e) => Err(e.into()),
             }
-            if let Some(pid) = rustix::process::Pid::from_raw(e.pid as i32) {
-                let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
-            }
-            cleanup(home, &e.session_id);
-            // The kernel frees the flock with the worker; wait a moment for it.
-            let end = Instant::now() + Duration::from_secs(2);
-            while lock::is_held(home, &e.session_id) && Instant::now() < end {
-                std::thread::sleep(POLL);
-            }
-            ("forced", true)
         }
     }
 }
+fn force(home: &GlenHome, t: &Indexed) -> (&'static str, bool) {
+    force_with(home, &t.entry, &signal, FORCE_BOUND)
+}
+/// SIGKILL the omp group and the worker, but only when every recorded process is proven by pid
+/// and start token (binding J11): an `Unknown` worker or omp is never signalled, and a failed
+/// signal or a worker still alive after `bound` falls to `release_timeout` with the registry kept.
+/// `forced` only once the worker is proven dead and omp's group gone.
+fn force_with(
+    home: &GlenHome,
+    e: &warm::Entry,
+    kill: &dyn Fn(Kill) -> std::io::Result<()>,
+    bound: Duration,
+) -> (&'static str, bool) {
+    let identity = warm::kill_identity(e);
+    match identity.worker {
+        Liveness::Dead => {
+            cleanup(home, e);
+            return ("cleaned", true);
+        }
+        Liveness::Unknown => return ("timeout", false),
+        Liveness::Alive => (),
+    }
+    // A dead omp needs no signal (and its pid may be reused); an unproven one blocks the kill.
+    let omp = match (e.omp_pid, identity.omp) {
+        (Some(pid), Some(Liveness::Alive)) => Some(pid),
+        (_, Some(Liveness::Unknown)) => return ("timeout", false),
+        _ => None,
+    };
+    if omp.is_some_and(|pid| kill(Kill::Group(pid)).is_err()) || kill(Kill::Process(e.pid)).is_err()
+    {
+        return ("timeout", false);
+    }
+    let end = Instant::now() + bound;
+    while !(warm::kill_identity(e).worker == Liveness::Dead && omp.is_none_or(group_gone)) {
+        if Instant::now() >= end {
+            return ("timeout", false);
+        }
+        std::thread::sleep(POLL);
+    }
+    cleanup(home, e);
+    ("forced", true)
+}
+fn group_gone(pid: u32) -> bool {
+    rustix::process::Pid::from_raw(pid as i32).is_none_or(|pid| {
+        rustix::process::test_kill_process_group(pid) == Err(rustix::io::Errno::SRCH)
+    })
+}
 
-fn cleanup(home: &GlenHome, session_id: &str) {
-    let _ = warm::remove(home, session_id);
-    let _ = warm::clear_release(home, session_id);
+/// Removes `e`'s registry and release request while they still name `e`, under the session lock:
+/// only the lock's holder publishes a registry, so no successor can write one in between. A
+/// held lock belongs to a live process that owns the session's files; they are left to it.
+fn cleanup(home: &GlenHome, e: &warm::Entry) {
+    let Ok(Some(_lock)) = lock::try_acquire(home, &e.session_id) else {
+        return;
+    };
+    let _ = warm::remove_if(home, &e.session_id, &e.ident());
+    let _ = warm::clear_release_if(home, &e.session_id, &e.ident());
 }
 
 #[cfg(test)]
@@ -319,5 +382,188 @@ mod tests {
             mtime: SystemTime::now() - Duration::from_secs(60),
         };
         assert_eq!(force(&h, &indexed), ("timeout", false));
+    }
+    fn me() -> crate::jobs::liveness::Identity {
+        crate::jobs::liveness::current().unwrap()
+    }
+    /// A live worker `glen release` can prove (pid and start token): a `sleep` child.
+    fn sleeper() -> (std::process::Child, warm::Entry) {
+        let child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let crate::jobs::liveness::Probe::Running(start) =
+            crate::jobs::liveness::start_token(child.id())
+        else {
+            panic!("no start token for the sleeper")
+        };
+        let e = entry(A, child.id(), Some(start));
+        (child, e)
+    }
+    /// This process as the session's next warm worker: it holds the lock, marked `warm`, and has
+    /// published its registry.
+    fn successor(h: &GlenHome) -> (lock::SessionLock, warm::Entry) {
+        let me = me();
+        let held = lock::try_acquire(h, A).unwrap().unwrap();
+        lock::mark(
+            &held,
+            &lock::Holder {
+                v: 1,
+                kind: lock::HolderKind::Warm,
+                job_id: Some(JobId::new().as_str().into()),
+                pid: me.pid,
+                start: Some(me.start.clone()),
+            },
+        )
+        .unwrap();
+        let e = entry(A, me.pid, Some(me.start));
+        warm::publish(h, &e).unwrap();
+        (held, e)
+    }
+    fn args(force: bool, timeout: Duration) -> ReleaseArgs {
+        ReleaseArgs {
+            target: None,
+            all: true,
+            force,
+            timeout,
+        }
+    }
+    #[test]
+    fn release_completes_when_a_successor_retook_the_session() {
+        for force in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let h = home(&t);
+            let env = Env::for_test(None, t.path(), &[]);
+            let (mut old, w1) = sleeper();
+            // The snapshot `glen release` indexed; then that worker cooled and a successor took
+            // the lock and published its own registry.
+            let snapshot = Indexed {
+                entry: w1,
+                mtime: SystemTime::now(),
+            };
+            let (_held, w2) = successor(&h);
+            let got = release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(force, Duration::from_millis(300)),
+                warm::STALE,
+            )
+            .unwrap();
+            assert_eq!(got, ("released", true), "force {force}");
+            assert_eq!(warm::read(&h, A).unwrap().entry, w2, "force {force}");
+            assert!(old.try_wait().unwrap().is_none(), "never signalled");
+            old.kill().unwrap();
+            old.wait().unwrap();
+        }
+    }
+    #[test]
+    fn a_dead_snapshot_never_removes_a_successors_files() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let env = Env::for_test(None, t.path(), &[]);
+        let snapshot = Indexed {
+            entry: entry(A, crate::jobs::liveness::tests_dead_pid(), None),
+            mtime: SystemTime::now(),
+        };
+        let (held, w2) = successor(&h);
+        warm::request_release(&h, A, &w2.ident()).unwrap();
+        let release = || {
+            release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(true, Duration::from_millis(100)),
+                warm::STALE,
+            )
+            .unwrap()
+        };
+        assert_eq!(release(), ("cleaned", true));
+        assert_eq!(warm::read(&h, A).unwrap().entry, w2);
+        assert!(warm::release_requested(&h, A, &w2.ident()));
+        // With the lock free too: a file is removed only while it names the dead worker.
+        drop(held);
+        assert_eq!(release(), ("cleaned", true));
+        assert_eq!(warm::read(&h, A).unwrap().entry, w2);
+        assert!(warm::release_requested(&h, A, &w2.ident()));
+    }
+    #[test]
+    fn force_never_signals_an_unproven_omp_and_keeps_the_registry() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let me = me();
+        // A proven worker whose omp pid is recorded without a start token (`Unknown`).
+        let mut e = entry(A, me.pid, Some(me.start));
+        e.omp_pid = Some(me.pid);
+        warm::publish(&h, &e).unwrap();
+        let never = |k: Kill| -> std::io::Result<()> { panic!("signalled {k:?}") };
+        assert_eq!(
+            force_with(&h, &e, &never, Duration::ZERO),
+            ("timeout", false)
+        );
+        assert_eq!(warm::read(&h, A).unwrap().entry, e, "the registry is kept");
+    }
+    #[test]
+    fn a_failed_signal_or_a_surviving_worker_is_never_forced() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let me = me();
+        let e = entry(A, me.pid, Some(me.start));
+        warm::publish(&h, &e).unwrap();
+        let refused =
+            |_: Kill| -> std::io::Result<()> { Err(std::io::ErrorKind::PermissionDenied.into()) };
+        assert_eq!(
+            force_with(&h, &e, &refused, Duration::ZERO),
+            ("timeout", false)
+        );
+        assert_eq!(warm::read(&h, A).unwrap().entry, e);
+        // A signal that reported success but left the worker (this process) running.
+        let sent = std::cell::Cell::new(vec![]);
+        let ignored = |k: Kill| -> std::io::Result<()> {
+            let mut all = sent.take();
+            all.push(k);
+            sent.set(all);
+            Ok(())
+        };
+        assert_eq!(
+            force_with(&h, &e, &ignored, Duration::from_millis(100)),
+            ("timeout", false)
+        );
+        assert_eq!(sent.take(), [Kill::Process(me.pid)]);
+        assert_eq!(warm::read(&h, A).unwrap().entry, e);
+    }
+    #[test]
+    fn force_kills_a_proven_worker_then_removes_its_registry() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (mut child, e) = sleeper();
+        warm::publish(&h, &e).unwrap();
+        assert_eq!(force_with(&h, &e, &signal, FORCE_BOUND), ("forced", true));
+        assert!(warm::read(&h, A).is_none());
+        assert!(!child.wait().unwrap().success(), "killed");
+    }
+    #[test]
+    fn an_at_new_job_handle_finds_its_worker_after_a_follow_up_was_adopted() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let store = JobStore::new(h.clone());
+        let mut first = crate::jobs::tests::job();
+        first.route = crate::jobs::Route::New;
+        first.session_id = None;
+        first.session_file = None;
+        first.session_handle = None;
+        store.create(&first).unwrap();
+        let id = JobId::parse(&first.id).unwrap();
+        let mut s = store.read_status(&id).unwrap();
+        s.status = crate::jobs::State::Completed;
+        s.actual_session_id = Some(A.into());
+        store.write_status(&id, &s).unwrap();
+        // The registry names the adopted follow-up job now, not the `@new` job.
+        let mut e = entry(A, std::process::id(), None);
+        e.job_id = JobId::new().as_str().into();
+        warm::publish(&h, &e).unwrap();
+        warm::publish(&h, &entry(B, std::process::id(), None)).unwrap();
+        let found = select(&h, warm::index(&h).0, &id.handle()).unwrap();
+        assert_eq!(found.entry.session_id, A);
     }
 }
