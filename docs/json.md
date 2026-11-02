@@ -603,10 +603,10 @@ so replies already present return at once. An `--after` id that is not one of th
 with `details:{reason:"unknown_reply",job,after}`. `--after` requires `--for`.
 
 - **Reply wake**, exit 10 (`wait.reply`): the running document plus `woke:"reply"` and `replies` (the unseen
-  replies, in order, at least one). `next` is `glen wait <job> --for reply --after <last reply id>`: run it to wait
-  for the next one. `job.status` is `queued` or `accepted`.
+  replies, in order, at least one). `next` is `glen wait <job> --for reply --after <last reply id>`, plus the
+  caller's `--timeout` when it is not 90s: run it to wait for the next one. `job.status` is `queued` or `accepted`.
 - **Bound expiry**, exit 10 (`wait.reply.expired`): the same document without `woke` and with `replies:[]`;
-  `next` repeats the caller's `--after`. Read `woke` before treating exit 10 as a timeout.
+  `next` repeats the caller's `--after` and `--timeout`. Read `woke` before treating exit 10 as a timeout.
 - **SIGINT**, exit 130: the bound-expiry document with `interrupted:true`.
 - **The job ended first**: the plain terminal outcome (exit 0, 6, 7 or 11). A completed document's `data.replies`
   and a failed, aborted or lost job's `error.details.replies` (always an array) hold only the unseen replies.
@@ -744,7 +744,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "task_state": "working",
       "updated_at": "2026-11-02T05:55:20.688672Z"
     },
-    "next": "glen wait jc6ccc17 --for reply --after 01a19ad3-989d-7070-9273-90556dd5f602",
+    "next": "glen wait jc6ccc17 --for reply --after 01a19ad3-989d-7070-9273-90556dd5f602 --timeout 300ms",
     "replies": [],
     "session": {
       "handle": "e27c0de",

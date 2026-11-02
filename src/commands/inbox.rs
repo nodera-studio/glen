@@ -233,7 +233,8 @@ fn collect(
     Ok(read)
 }
 /// A value as one shell word: unchanged when it holds only safe characters, else single-quoted.
-fn shell_word(s: &str) -> String {
+/// Shared with `wait --for reply`'s `next`.
+pub(super) fn shell_word(s: &str) -> String {
     if !s.is_empty()
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b))
@@ -244,7 +245,7 @@ fn shell_word(s: &str) -> String {
     }
 }
 /// A duration in the largest unit that states it exactly, as `--timeout` parses it.
-fn duration_flag(d: Duration) -> String {
+pub(super) fn duration_flag(d: Duration) -> String {
     let ms = d.as_millis();
     [("h", 3_600_000), ("m", 60_000), ("s", 1000)]
         .into_iter()

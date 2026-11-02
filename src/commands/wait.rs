@@ -1,3 +1,4 @@
+use super::inbox::{duration_flag, shell_word};
 use crate::{
     cli::{Cli, WaitArgs, WaitFor},
     env::Env,
@@ -12,7 +13,10 @@ use crate::{
     rpc::session_handle,
 };
 use serde_json::{Value, json};
-use std::{collections::HashSet, time::Instant};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 pub(crate) fn progress(s: &Status) -> &'static str {
     match s.status {
         State::Queued if s.waiting_for_lock => "queued behind another glen job",
@@ -133,10 +137,14 @@ pub(crate) fn completed_summary(job: &Job, s: &Status, now: jiff::Timestamp) -> 
     let elapsed = duration(job_view(job, s, now)["elapsed_ms"].as_i64().unwrap_or(0));
     format!("✓ completed · {} · {label} · {elapsed}", job.handle)
 }
-/// What a `wait --for reply` caller has seen already: the ids up to its `--after`.
+/// `wait --timeout`'s default (`cli::WaitArgs`); a reply `next` states any other bound.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+/// What a `wait --for reply` caller has seen already: the ids up to its `--after`, and its
+/// `--timeout`, which `next` repeats.
 pub(crate) struct ReplyView {
     pub(crate) seen: HashSet<String>,
     pub(crate) after: Option<String>,
+    pub(crate) timeout: Duration,
 }
 impl ReplyView {
     fn unseen(&self, replies: Vec<Reply>) -> Vec<Reply> {
@@ -265,11 +273,14 @@ pub(crate) fn outcome_with(
         let next = match reply {
             None => format!("glen wait {}", job.handle),
             Some(reply) => {
-                let after = woken.last().map(|r| &r.id).or(reply.after.as_ref());
-                match after {
-                    Some(after) => format!("glen wait {} --for reply --after {after}", job.handle),
-                    None => format!("glen wait {} --for reply", job.handle),
+                let mut next = format!("glen wait {} --for reply", job.handle);
+                if let Some(after) = woken.last().map(|r| &r.id).or(reply.after.as_ref()) {
+                    next.push_str(&format!(" --after {}", shell_word(after)));
                 }
+                if reply.timeout != DEFAULT_TIMEOUT {
+                    next.push_str(&format!(" --timeout {}", duration_flag(reply.timeout)));
+                }
+                next
             }
         };
         human.extend(reply_lines(ctx, &woken));
@@ -327,6 +338,7 @@ pub fn run(_cli: &Cli, args: &WaitArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
     let reply = watch.as_ref().map(|w| ReplyView {
         seen: w.seen().clone(),
         after: args.after.clone(),
+        timeout: args.timeout,
     });
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
@@ -587,10 +599,12 @@ mod tests {
         let fresh = ReplyView {
             seen: HashSet::new(),
             after: None,
+            timeout: Duration::from_secs(90),
         };
         let after_r1 = ReplyView {
             seen: HashSet::from(["r1".to_owned()]),
             after: Some("r1".into()),
+            timeout: Duration::from_secs(90),
         };
         // A reply wake: exit 10, woke, the woken replies and a next that continues after them.
         let o = outcome_with(
@@ -725,6 +739,7 @@ mod tests {
         let view = ReplyView {
             seen: HashSet::new(),
             after: None,
+            timeout: Duration::from_secs(90),
         };
         let o = outcome_with(
             &store,
@@ -749,6 +764,57 @@ mod tests {
                 format!("glen wait {} --for reply --after r2", j.handle),
             ]
         );
+    }
+    /// W2 review 1 (LOW-001, LOW-004): a reply `next` repeats a non-default `--timeout`, as
+    /// inbox's does, and passes the reply id as one shell word.
+    #[test]
+    fn reply_next_repeats_the_callers_timeout_and_quotes_the_reply_id() {
+        let t = tempfile::tempdir().unwrap();
+        let store = fixtures::store(t.path());
+        let j = fixtures::job();
+        store.create(&j).unwrap();
+        let s = Status {
+            status: State::Accepted,
+            ..Status::default()
+        };
+        let ctx = ctx(t.path(), false);
+        let view = |after: Option<&str>, timeout: Duration| ReplyView {
+            seen: HashSet::new(),
+            after: after.map(Into::into),
+            timeout,
+        };
+        let uuid = "01a19ad3-989d-7070-9273-90556dd5f602";
+        let h = &j.handle;
+        for (waited, v, want) in [
+            (
+                Waited::Running(s.clone()),
+                view(None, Duration::from_secs(90)),
+                format!("glen wait {h} --for reply"),
+            ),
+            (
+                Waited::Running(s.clone()),
+                view(None, Duration::from_secs(120)),
+                format!("glen wait {h} --for reply --timeout 2m"),
+            ),
+            (
+                Waited::Interrupted(s.clone()),
+                view(Some("r1"), Duration::from_millis(300)),
+                format!("glen wait {h} --for reply --after r1 --timeout 300ms"),
+            ),
+            (
+                Waited::Replied(s.clone(), vec![reply(&j, uuid, "one", false)]),
+                view(None, Duration::from_secs(90)),
+                format!("glen wait {h} --for reply --after {uuid}"),
+            ),
+            (
+                Waited::Replied(s.clone(), vec![reply(&j, "r 2;$x", "two", false)]),
+                view(None, Duration::from_secs(3600)),
+                format!("glen wait {h} --for reply --after 'r 2;$x' --timeout 1h"),
+            ),
+        ] {
+            let o = outcome_with(&store, &j, waited, &ctx, Some(&v)).unwrap();
+            assert_eq!(o.data["next"], want);
+        }
     }
     #[test]
     fn unknown_reply_is_a_usage_error_with_its_reason() {

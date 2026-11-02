@@ -143,7 +143,7 @@ fn rpc_reply_wakes_wait_for_reply_within_a_second() {
     let last = ids(&d["replies"]).last().unwrap().to_string();
     assert_eq!(
         d["next"],
-        format!("glen wait {handle} --for reply --after {last}")
+        format!("glen wait {handle} --for reply --after {last} --timeout 20s")
     );
     fs::write(&result, "").unwrap();
     b.wait_worker_gone(&id);
@@ -170,7 +170,7 @@ fn after_skips_seen_replies_and_the_end_carries_every_unseen_one() {
     let d = &wait(&["--for", "reply", "--after", &one], 10)["data"];
     assert_eq!(d["woke"], "reply");
     assert_eq!(ids(&d["replies"]), [two.as_str()]);
-    // --after the last: the bound, no woke, no replies, next repeats --after.
+    // --after the last: the bound, no woke, no replies, next repeats --after and --timeout.
     let d = &wait(
         &["--for", "reply", "--after", &two, "--timeout", "300ms"],
         10,
@@ -179,7 +179,7 @@ fn after_skips_seen_replies_and_the_end_carries_every_unseen_one() {
     assert_eq!(d["replies"], json!([]));
     assert_eq!(
         d["next"],
-        format!("glen wait {h} --for reply --after {two}")
+        format!("glen wait {h} --for reply --after {two} --timeout 300ms")
     );
     // An unknown --after is a usage error, never "everything is unseen".
     let e = &wait(&["--for", "reply", "--after", "not-a-reply"], 2)["error"];
