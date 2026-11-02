@@ -12,6 +12,7 @@ All notable changes to glen are listed here, newest first.
 - `glen inbox --wait [--timeout DUR]` waits (90 s by default, at most 24 h) for one unread message: exit 0 with the messages, or exit 10 with none and a `next` command. It honours `--session`, `--cwd` and `--peek`, and marks messages read only after printing them.
 - Job views in `send`, `wait`, `jobs` and job error details carry `task_state`, the job's state in A2A's vocabulary (`submitted`, `working`, `completed`, `canceled`, `rejected`, `failed`). `status` is unchanged and still decides the exit code.
 - The agent skill has a "Replies without polling" section: Claude Code starts `glen wait <job> --for reply` as a background command and is woken when it finishes; a subagent waits in the foreground or hands the job to its parent; Codex runs a blocking wait and peeks the inbox at the start of each turn. Codex: blocking wait, not push.
+- A hidden, unsupported `glen __acp <session|@new> <message>` talks to `omp acp` (ACP v1) for the v0.2 spike. It is not in `--help`, completions, the skill or `docs/json.md`, creates no job and writes no session file; `docs/design.md` §A23 records the experiment results and the verdict.
 
 ### Changed
 

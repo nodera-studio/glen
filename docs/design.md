@@ -39,6 +39,7 @@ CA = `packages/coding-agent/src`; references are pinned to v18.14.0.
 | Extension tools and host | `types.ts:971-1020`, `docs/extensions.md:62,379,437-458` | essential/read; factories rebind per subagent; ctx.agent gates main; managed timers isolate errors |
 | Explicit extension | `CA/cli/args.ts:382` | `--no-extensions -e FILE` still loads the explicit file |
 | Directories | `packages/utils/src/dirs.ts` | §A12 |
+| ACP server (spike) | `CA/modes/acp/acp-mode.ts:74-97`, `CA/modes/acp/acp-agent.ts:812-863,889-899,1007,1324`, `packages/utils/src/acp/protocol.ts:13`, `packages/utils/src/acp/stream.ts:10-82`, `CA/session/acp-permission-gate.ts:7-23` | `omp acp`: NDJSON JSON-RPC 2.0 over stdio, `PROTOCOL_VERSION = 1`, `initialize` ignores the client's version, `session/load` replays history before answering, permission is a request with four fixed options; the spike client is §A23 |
 
 **Session controls (W3b).** `rpc-mode.ts` implements `abort`, `get_available_models`, `set_model {provider,modelId}`, `get_available_thinking_levels`, `set_thinking_level {level}`, and `compact {customInstructions?}`. Ordinary commands are serialized: abort does not overtake a registry refresh or compaction. Only prompt/steer/follow_up and a few side channels bypass that queue.
 
@@ -297,7 +298,7 @@ The Wave column names v0.1 waves `W<n>` and v0.2 waves `v0.2 W<n>`; each v0.2 wa
 - **Global flags:** `--json`, `--human` (mutually exclusive), `--color auto|always|never`, `--profile NAME`, `-h`, `-V`.
 - **Defaults and aliases:** `--color` defaults to `auto`; `--profile` overrides `OMP_PROFILE` and `PI_PROFILE`. `ls` and `jobs` use `-n/--limit` (default 20); `tail` uses `-n/--lines` (default 10). `tail` and `inbox` accept `-f/--follow`. `show --tools` defaults to `collapsed`; `send --as` defaults to `auto`; `send --wait`, `wait --timeout` and `inbox --timeout` (with `--wait`) default to `90s`. `wait --for` takes `reply`, its only value; `wait --after <reply-id>` requires `--for`. `-h/--help` and `-V/--version` are available on every command. Unfinished commands remain hidden and return `not_implemented` (exit 8).
 - **Durations:** `<n>ms|s|m|h` or bare seconds, at most 24h. `--wait 0` equals `--no-wait`. `ls --since` accepts `<n>s|m|h|d|w` or bare seconds, at most 3650 days.
-- **Internal:** `glen __worker <job-id>` (W2), always hidden.
+- **Internal:** `glen __worker <job-id>` (W2), always hidden. `glen __acp <session|@new> <message> [--permission allow|deny]` (v0.2 W3), a hidden spike, not a public contract (§A23).
 - **Considered and rejected:**
   - a `glen reply` CLI: the reply path is the `glen_reply` tool, and an omp Bash call has no job context;
   - a separate `glen steer` verb: folded into `send --as`;
@@ -493,6 +494,23 @@ Controls in the agent loop: `glen models <h>` → `glen model <h> <provider/id>`
 - `FAKE_OMP_SCENARIO`: ok, local, progress, bad_reply, unsettled, never_settles, error, aborted, crash, hang, wedge, fork, fork_silent, moved, reject_tools, reject_filter, no_ready, delayed_state, fork_reply, local_result_unsettled, unsettled_exit, local_exit, stale_state. Timing/shape knobs: `FAKE_OMP_DELAY_MS`, `FAKE_OMP_READY_DELAY_MS`, `FAKE_OMP_SETTLE_DELAY_MS`, `FAKE_OMP_REPLY_BYTES`, `FAKE_OMP_OWNERS_DIR`, `FAKE_OMP_V2=1|partial`. `FAKE_OMP_LOG` records start, inbound/outbound frames and exits as NDJSON. `FAKE_OMP_STARTUP_RECOVERY=1` makes the fake claim its lease and append a recovery record to the copied fixture before ready. `FAKE_OMP_STATE_DELAY_MS` delays running state replies without blocking abort. `FAKE_OMP_RUN_RELEASE` holds prompt work until a test-owned file exists. `FAKE_OMP_READY_RELEASE` holds ready until a test-owned file exists (20 s bound). `FAKE_OMP_PROMPT_SUBMIT_DELAY_MS` delays the debug worker’s submission thread to exercise the cancellation gate; `FAKE_OMP_ACK_FORWARD_DELAY_MS` delays acknowledgement forwarding. `FAKE_OMP_PROMPT_SUBMIT_GATE` holds the debug worker’s submission thread before its endpoint check until a test-owned file exists (20 s bound, `<path>.ready` signals entry; cancellation still ends the wait). Release workers ignore all three. `FAKE_OMP_LEASE_PROBE_GATE` gates the debug send after the glen-lock check until a test-owned file exists (5 s bound, `<path>.ready` signals entry). `FAKE_OMP_NEVER_SETTLE=1` keeps fork scenarios unsettled; `FAKE_OMP_RESULT_RELEASE` holds the fake before its result. `FAKE_OMP_OLD_STATE_DELAY_MS` controls the stale_state scenario’s old identity response.
 - **v0.2 W1 (omp compatibility).** `fake_omp` answers `--version` with `omp/<FAKE_OMP_VERSION>` (default 18.14.0) and `--help` with a short help listing the flags glen passes; `FAKE_OMP_STALL=<frame type>` leaves that command unanswered. Debug builds read `GLEN_PROBE_BUDGET_MS` (100 to 30000) to shorten the `doctor --probe` budget; release builds ignore it. `tests/omp_compat.rs` covers the version matrix, the probe cases and timing, and `rpc_protocol`. `tests/omp_surface.rs` is the omp surface contract: it runs against `fake_omp` in CI and against a real omp when `GLEN_OMP_SURFACE_BIN` holds its absolute path, always with its own `tempfile` HOME holding only the loopback stub provider from `tests/fixtures/omp-surface/models.yml`. `tests/omp_source_facts.rs` checks `tests/fixtures/omp-surface/facts.json` against `GLEN_OMP_SOURCE` or the sibling reference clone; CI's `ci.yml` has no omp source tree, so there it checks only the manifest and the matcher, and the facts themselves run in CI only in the nightly `omp-latest` workflow, against the latest tag (§A19).
 - **v0.2 W2 (push).** `fake_ext` gains `FAKE_EXT_RUN_RELEASE` (holds the request before its first reply) and `FAKE_EXT_RESULT_RELEASE` (holds after the replies, before `settled`), so a live job stays running after a reply; the RPC route reuses `fake_omp`'s `FAKE_OMP_RUN_RELEASE` and `FAKE_OMP_RESULT_RELEASE`. `tests/push.rs` covers both routes' reply wake within 1 s, `--after`, the terminal mapping, `task_state` and `inbox --wait`. Acceptance mode `p` (`tests/acceptance`) runs `claude -p` against `fake_omp` and records the wake class; the real-omp legs run under profile `glen-harness`, and the scratch `install-extension` call stays profile-less.
+- **v0.2 W3 (ACP spike).** `fake_omp acp [--profile NAME]` is an ACP v1 agent shaped like omp 18.14.0; any other argument exits 64. It writes no session file, ever. `FAKE_OMP_LOG` records `start` (argv, cwd, pid, pgid, env `GLEN_MANAGED`, `OMP_PROFILE`, `PI_PROFILE`), every inbound frame as `{event:"in",frame}`, every outbound frame as `{event:"out",frame}`, and the `permission` scenario's answer as `{event:"permission",response}`. `FAKE_OMP_VERSION` sets `agentInfo.version`; `FAKE_OMP_STARTUP_STDERR` writes to stderr at start. Knobs: `FAKE_OMP_ACP=<scenario>` (default `ok`), `FAKE_OMP_ACP_SESSION=<id>` (default `01a1ffff-0000-7000-8000-<pid as 12 hex>`), `FAKE_OMP_ACP_REPLAY=<n>` (default 2 history pairs on `session/load`), `FAKE_OMP_ACP_OPTIONS=all|reject_only|allow_only` (default `all`, the four real options), `FAKE_OMP_ACP_STOP=<stopReason>` (scenario `stop`, default `refusal`). Debug builds of glen read `GLEN_ACP_SETUP_MS` (100 to 60000; the `initialize`, `session/new` and `session/load` bound) and `GLEN_ACP_CANCEL_GRACE_MS` (100 to 10000); release builds and out-of-range values ignore them. `tests/acp.rs` is the Implementer's suite and `tests/conformance/v2_acp.rs` the blind conformance module. The E1 to E3 evidence lives under `.claude/evidence/v020-wave-3-acp-spike/<UTC>/`; real omp runs only under profile `glen-harness`, in `$TMPDIR` scratch sessions.
+
+| Scenario | Behaviour |
+|---|---|
+| `ok` | `initialize` answers a real-shaped result (`protocolVersion:1`, `agentInfo`, `authMethods:[{id:"agent",…}]`, `agentCapabilities:{loadSession:true, promptCapabilities, sessionCapabilities:{list:{},fork:{},resume:{},close:{}}}`, `_meta.steering`). `session/new` answers `{sessionId, modes, configOptions}` (cwd must be absolute, else -32603 with `data.details`). `session/load` emits `FAKE_OMP_ACP_REPLAY` pairs (`user_message_chunk` "REPLAYED QUESTION", `agent_message_chunk` "REPLAYED ANSWER", `messageId` `replay-<n>`) **before** its answer, and 100 ms **after** it a thread emits `available_commands_update` and `session_info_update` (non-text kinds only). `session/prompt` (blocks must be `[{type:"text",text}]`) streams `agent_thought_chunk` (m1), `agent_message_chunk` "Hel", "lo " (m1), a `tool_call` t1 and its `tool_call_update` completed, then `agent_message_chunk` "reply: " and `<prompt text>` (m2), and answers `{stopReason:"end_turn", usage:{totalTokens:3,inputTokens:1,outputTokens:2}}`. `session/close` answers `{}`. Unknown requests answer -32601; `session/cancel` while idle is ignored; stdin EOF exits 0. |
+| `proto2`, `proto_missing`, `init_error` | `initialize` answers `protocolVersion:2`, no `protocolVersion`, or a -32603 error. |
+| `no_load` | like `ok` with `loadSession:false` and no `sessionCapabilities`. |
+| `init_hang`, `startup_exit` | `initialize` is never answered; the process exits 1 before reading (with `FAKE_OMP_STARTUP_STDERR`). |
+| `noise` | writes a non-JSON line right after `initialize`'s answer. |
+| `rpc_error_load`, `rpc_error_prompt` | `session/load` or `session/prompt` answers -32603 `{message:"Internal error", data:{details:"ACP session not found: <id>"}}`. |
+| `permission` | during `session/prompt`, after the first chunk, emits a pending `tool_call` t1 and sends `session/request_permission` (id 100; `toolCall:{toolCallId:"t1",title,kind:"execute",status:"pending",rawInput}`, options per `FAKE_OMP_ACP_OPTIONS`), waits for the response, logs it, emits `tool_call_update` `completed` for `allow_once`/`allow_always` and `failed` otherwise, then a final chunk `permission:<optionId or cancelled>` (m2) and `end_turn`. |
+| `agent_request` | during the prompt sends `fs/read_text_file` (id 101), expects error -32601, then ends with a chunk `agent-request:<code>` (m2) and `end_turn`. |
+| `cancel` | streams a first chunk, then waits for `session/cancel` and answers `{stopReason:"cancelled"}`. |
+| `cancel_ignored`, `hang` | after the first chunk never answers the prompt (and ignores `session/cancel`); exits on stdin EOF or SIGTERM. |
+| `crash` | exits 1 after the first prompt chunk. |
+| `stop` | answers the prompt with `stopReason` = `FAKE_OMP_ACP_STOP` after the chunks "Hel", "lo " (m1) and a final chunk `stopped: <stopReason>` (m2), no cancel needed. |
+
 - Process tests wait for terminal status, worker exit and the omp group to disappear before dropping scratch directories. The startup-abort regression delays ready by 5 s and checks terminal status/ack within 1.5 s with no prompt.
 - W2 Step 15 smoke is separate orchestrator evidence: use fresh scratch PI_CODING_AGENT_DIR and cwd, never resume a user session. It remains unverified in the sandbox.
 - W3 `fake_ext` (`tests/support/fake_ext.rs`) serves real private Unix sockets/registries from a separate process: ok, busy, progress, slow, never_settles, aborted, error, moved, switched, shutdown, crash, mismatch, rekey, hang, no_send, v2, malformed, no_ack, queued. FAKE_EXT_LOG records inbound/outbound frames; FAKE_EXT_DELAY_MS, FAKE_EXT_VERSION and FAKE_EXT_KEEP_FILES tune scenarios; FAKE_EXT_CWD supplies catalog scope. It owns live inbox writes; worker tests check no duplicates.
@@ -539,12 +557,12 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 - **v0.2 W0** foundation, docs and tests only: §A18 promoted to a section, the §A19–§A23 stubs, the §A7 `task_state` table, this map and CHANGELOG `## Unreleased`. `glen --help` is unchanged.
 - **v0.2 W1** omp compatibility: the supported range in `src/omp/compat.json`, version normalization, `doctor --probe` capabilities, the omp surface contract tests and the nightly `omp-latest` workflow (§A19).
 - **v0.2 W2** push, tier 1: `glen wait --for reply`, `glen inbox --wait`, the `task_state` field and the SKILL.md section "Replies without polling" (§A20).
-- **v0.2 W3** ACP spike: hidden `glen __acp`, experiments E1–E3 and a go/no-go (§A23).
+- **v0.2 W3** ACP spike: hidden `glen __acp`, experiments E1–E3 and a go/no-go (§A23). Verdict: PENDING-STEP-7 (written after the live runs).
 - **v0.2 W4** opt-in warm worker: `send --warm` and `glen release` (§A21).
 - **v0.2 W5** MCP layer: `glen mcp`, the generated tool catalog and a hidden `--channel` (§A22).
 - **v0.2 W6** tech debt and audits (decision `fce2ca4d`).
 - **v0.2 W7** release v0.2.0: version bump, site and tag (§A18).
-- Headings and their order are fixed by `tests/conformance/repo_contracts.rs` (v0.2 W0). Each v0.2 wave writes its design in its own section, adds its own rows to §A9, §A15, §A16 and §A17, and amends an earlier section only where its own behaviour changes what that section says (for example W1 in §A10, §A11 and §A12; W2 in §A11; W4 in §A3, §A6 and §A7).
+- Headings and their order are fixed by `tests/conformance/repo_contracts.rs` (v0.2 W0). Each v0.2 wave writes its design in its own section, adds its own rows to §A9, §A15, §A16 and §A17, and amends an earlier section only where its own behaviour changes what that section says (for example W1 in §A10, §A11 and §A12; W2 in §A11; W3 in §A2; W4 in §A3, §A6 and §A7).
 - Every wave leaves `main` green and usable. Unfinished subcommands stay hidden.
 
 ## §A17 Verify on every omp upgrade (and open items)
@@ -558,6 +576,7 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
 - [ ] Re-check whether `RpcHostToolDefinition` gained an `approval` field, and whether `fetch.enabled` / `tools.restrictedFolders` still gate the read tools; re-run the glen-harness enforcement probe.
 - [ ] Re-check the extension API: `sendUserMessage` deliverAs, `registerTool` and session events.
 - [ ] Re-check extension agent_end original flags versus tail re-tag, prompt bracket unwinding, before_agent_start prompt joining, hasPendingMessages, loadMode/approval, factory rebinding and ctx.agent, managed timers, and -e/--no-extensions; re-run the Step 14 live smoke.
+- [ ] Re-run the E1 to E3 ACP smoke (§A23) under profile `glen-harness`: `initialize` still reports protocol 1, the permission option ids are unchanged, the `session/update` kinds are unchanged, and the `session/load` replay still precedes its answer.
 - [ ] Bump `src/omp/compat.json` (`tested`, and `max_tested` only after a passing nightly) only after all of these checks. `tests/omp_source_facts.rs` automates the RPC command, CLI flag, lease-name, session-entry, session-version and title-slot facts, and the nightly `omp-latest` workflow runs them against the latest tag (§A19).
 - **Open, owned by later waves:**
   - [x] W1: confirmed Linux abstract datagram bind semantics against `crates/pi-natives/src/file_lock/linux.rs:14-22` and the `.lock` suffix against `utils/src/file-lock.ts:31-33`. Tests cover both golden names and `<id>.lock` path suffixes.
@@ -568,6 +587,7 @@ fake_ext defaults to all eight ops; FAKE_EXT_OPS=w3 advertises the historical se
   - [x] v0.2 W1: the supported range is data (`src/omp/compat.json`), `doctor --probe` checks the RPC capabilities, and the surface contract and source facts run nightly against the latest omp (§A19).
   - [ ] Re-verify Claude Code skill frontmatter/allowed-tools and Codex skill paths, limits, shell timeout and sandbox variables on each Claude Code or Codex upgrade.
   - [ ] v0.2 W2: on each Claude Code or Codex upgrade, re-verify that a background `glen wait --for reply` wakes a `claude -p` run (acceptance mode `p`) and that Codex's `exec_command` still yields and keeps the process running (§A13, §A20).
+  - [ ] v0.2 W3: the ACP spike's verdict is PENDING-STEP-7 (§A23). W6 candidate: add ACP source facts to `facts.json` so the nightly sees `PROTOCOL_VERSION` move.
 
 - [ ] W4 tech debt: verify Linux network-on CODEX_SANDBOX live delivery and EROFS behaviour under bubblewrap.
 
@@ -665,11 +685,103 @@ Stub (v0.2 W0). Owner: **v0.2 W5**, which replaces this body.
   - `mcp` is visible from W5's merge. W5 also updates the §A9 "considered and rejected" MCP bullet when it adds the `glen mcp` row.
 
 ## §A23 ACP spike
-Stub (v0.2 W0). Owner: **v0.2 W3**, which replaces this body.
-- **Scope.** A spike of `omp acp` (Agent Client Protocol) as a second transport. It is a spike, not a rewrite: the RPC driver stays. W3 replaces this body with the experiment results and the go/no-go.
-- **Decided** (ADR `0773c35d`):
-  - A hidden `glen __acp` command with a hand-rolled synchronous ACP v1 client. omp 18.14.0 sets `PROTOCOL_VERSION = 1` (`packages/utils/src/acp/protocol.ts:13`). No ACP crate. The command never appears in help, completions, SKILL.md, `docs/json.md` or the MCP catalog.
-  - It takes glen's session lock and runs the endpoint and lease probes, refusing with exit 6 like an RPC resume. It runs omp with `GLEN_MANAGED=1`, writes no `.jsonl`, and creates no durable job.
-  - Experiments: E1, does `session/load` contend for the owner lease? E2, is a minimal permission policy enough to unblock tool calls? E3, can a job result be rebuilt from the `session/update` stream? Real-omp runs use `omp acp --profile glen-harness` in `$TMPDIR` scratch sessions, never the owner's default agent dir.
-  - A negative result completes the spike. There is no `glen_reply` parity claim: W3 records the loss of reply attribution under ACP. The outcome is an ADR with a go/no-go.
-  - `input_required` (§A7) is reserved for an ACP permission request.
+Owner: **v0.2 W3** (ADR `0773c35d`, plan `.claude/plans/v020-wave-3-acp-spike.md`). A spike of `omp acp` (Agent Client Protocol v1) as an optional second transport. It is a spike, not a rewrite: the RPC driver stays, and ACP stays out of production routing.
+
+**Result:** PENDING-STEP-7. After the live runs the orchestrator writes `GO`, `NO-GO` or `inconclusive` here, with the date and the evidence directory name (`.claude/evidence/v020-wave-3-acp-spike/<UTC>/`).
+
+**What ships.** A hidden `glen __acp <session|@new> <message> [--permission allow|deny]` (`src/commands/acp.rs`) on a hand-rolled, synchronous ACP v1 client (`src/acp/`): a reader thread and a writer thread over the child's stdio, no tokio, no ACP crate, no new crate. It is not a contract: it is absent from `--help`, completions, SKILL.md, `docs/json.md` and any MCP catalog, its document is described only here, and it may change or go away without notice.
+
+**Decided** (ADR `0773c35d`):
+- `__acp` never appears in help, completions, SKILL.md, `docs/json.md` or the MCP catalog. It is in the conformance `HIDDEN` set and has a help page (`glen __acp --help`, `glen help __acp`).
+- It takes glen's session lock and runs the endpoint and lease probes, refusing with exit 6 like an RPC resume. It runs omp with `GLEN_MANAGED=1`, writes no `.jsonl`, and creates no durable job: `GLEN_HOME` gains only `run/locks/<key>.lock`, never `jobs/` or `inbox/`.
+- A negative result completes the spike. There is no `glen_reply` parity claim: the losses below record the loss of reply attribution under ACP. The outcome is an ADR with a go/no-go.
+- `input_required` (§A7) appears only in `__acp` events, one per permission request omp sends.
+
+**Protocol facts** (omp 18.14.0, read in `../metis/references/oh-my-pi`; CA = `packages/coding-agent/src`):
+
+| Fact | Source |
+|---|---|
+| `PROTOCOL_VERSION = 1`; NDJSON, one JSON object per line, `"jsonrpc":"2.0"` required | `packages/utils/src/acp/protocol.ts:13`, `packages/utils/src/acp/stream.ts:10-82` |
+| Codes -32601 method not found, -32603 internal, -32800 cancelled, -32003 session busy; a missing result is sent as `{}` | `packages/utils/src/acp/transport.ts:31-97, 325` |
+| `omp acp` re-parses its argv with the root parser (`--profile NAME` works) and forces ACP mode; stdout is the transport and everything else goes to stderr; stdin EOF closes the connection and quits 0 | `CA/commands/acp.ts:14-35`, `CA/modes/acp/acp-mode.ts:43-61, 74-97` |
+| `initialize` ignores the client's version and answers its own `PROTOCOL_VERSION`, `loadSession:true` and `sessionCapabilities:{list,fork,resume,close}`; no `authenticate` is required | `CA/modes/acp/acp-agent.ts:812-863` |
+| `session/load` replays the whole history as `session/update` before it answers; bootstrap updates follow on a timer | `acp-agent.ts:889-899, 2470-2516, 2686-2701` |
+| `session/prompt`; `session/cancel` answers the prompt with `stopReason:"cancelled"` at once and cleans up asynchronously; `agent_end` flushes the final text before the response, but an update can overtake the response in principle | `acp-agent.ts:1007-1121, 1226-1231, 1324-1399, 1801-1862` |
+| Stop reasons: `aborted` becomes `cancelled`, `length` becomes `max_tokens`, and an assistant `error` becomes `end_turn` unless it matches content-filter or refusal | `acp-agent.ts:2025-2051` |
+| Permission: gated tools `bash`, `edit` (delete or move intent), `delete`, `move`; four fixed options `allow_once`, `allow_always`, `reject_once`, `reject_always`, ids equal to kinds; the outcome is `selected` with an `optionId`, or `cancelled`; `bash` resolves its own approval first | `CA/session/acp-permission-gate.ts:7-23`, `CA/session/session-tools.ts:1029-1262`, `CA/modes/acp/acp-client-bridge.ts:116-208` |
+| `session/fork` is advertised and unused by the spike (the research note's "no fork" is too broad) | `packages/utils/src/acp/connection.ts:237-239`, `acp-agent.ts:929` |
+| A stored session is found by id, with a global fallback; nothing in the ACP path takes the owner lease at `session/load` (E1 measures it) | `acp-agent.ts:2651-2673`, `CA/session/session-storage.ts:618-640, 1300-1326` |
+
+A `cancelled` prompt response confirms acceptance, not finished cleanup, so `cancel.confirmed` means accepted. `stopReason` is a field of the correlated `session/prompt` response (`protocol.ts:360-363`), never of a `session/update`: glen rebuilds the text from the updates and takes `stop_reason` from the response. No completion notification is invented.
+
+**How `__acp` works.**
+1. Validate the message (empty or over 512 KiB is `usage`, before anything else). Refuse in a sandbox (`refuse_unreachable`, then `refuse_rpc`: ACP never takes the live route). Resolve the session (handle, id or `@latest`) unless it is `@new`; omp runs in the header's cwd when it is a directory, else in glen's cwd. Resolve `GLEN_HOME`. The deadline is `GLEN_JOB_TIMEOUT` (default 60m; its `invalid_env` warning is kept).
+2. An existing session gets the guard of `Ephemeral::open_session`, in its order: `lock::try_acquire` (held: exit 6 `rpc_job_running`, with a hint to wait for `glen jobs --active --session <handle>`); mark the holder `control`; follow continuations and re-read (a changed id is `control_failed` `session_moved`); `live::route::find` with the 1 s hello probe (a live endpoint is exit 6 `live_owner` with the hint `use glen send <handle> (the live route); __acp never joins a live session`, an unhealthy one is `unhealthy_endpoint`, and a not-yet-persisted session with no endpoint is `endpoint_gone`); then `refuse_hidden_lease`, the lease probe and `map_probe_failure`, and `live_owner` or `unknown_lease` unless the lease is free. Every refusal comes before omp starts.
+3. Find omp (`GLEN_OMP_BIN`; missing is exit 5 `acp_spawn`), install the SIGINT, SIGTERM and SIGHUP flag, and spawn `omp acp [--profile NAME]` in the cwd, in its own process group, with `GLEN_MANAGED=1` (an explicit profile drops `OMP_PROFILE` and `PI_PROFILE`). omp's stderr is drained (16 lines of 1024 bytes) and reported as `details.stderr` on failures only.
+4. `initialize` with `protocolVersion:1`, `clientCapabilities:{fs:{readTextFile:false,writeTextFile:false},terminal:false}` and `clientInfo:{name:"glen",title:"glen",version}`. The result's `protocolVersion` must be the integer 1; an existing session also needs `agentCapabilities.loadSession:true`. `agentInfo.{name,version}` becomes `data.agent`.
+5. `@new`: `session/new {cwd, mcpServers:[]}`. Its non-empty `sessionId` is locked right after the answer, as the RPC worker locks an id omp reveals (§A3); a lock already held there is an `io` error. An existing session: `session/load {sessionId, cwd, mcpServers:[]}` with an absolute cwd.
+6. `session/prompt {sessionId, prompt:[{type:"text",text}]}`. Agent requests are answered inline: `session/request_permission` by the policy, every other request (`fs/*`, `terminal/*`, `elicitation/create`) with -32601. Unknown notifications, `$/cancel_request` included, are ignored.
+7. After a turn omp answered without a glen cancel, `session/close` (2 s, best effort, warning `acp_close_failed`) when omp advertises it; then stdin EOF and the bounded teardown. The session lock is released only after the process group is gone.
+
+Frames: requests carry integer ids from 1. A frame with `method` is a request (with `id`) or a notification (without); one with `result` or `error` and no `method` is a response, matched by exact id type and value, so an agent request that reuses an id never completes a call. A frame over 16 MiB, invalid UTF-8, invalid JSON, a non-object, a wrong `jsonrpc` or a frame that is none of the three is malformed; blank lines are skipped, as omp skips them.
+
+**Text rebuild.** Only `session/update` notifications for the session that are processed after the prompt frame is queued count. Chunks are `agent_message_chunk` with text content, grouped by `messageId`; a chunk without one joins the current anonymous group, and a `tool_call` or `user_message_chunk` closes it. `assistant_text` is the last non-empty group (the RPC route's "last assistant text"), `null` when none, capped at 4 MiB (`text_truncated:true`). Updates processed before the turn (history replay, bootstrap) are counted as `updates.replayed`. After the prompt response glen keeps processing frames for one more 100 ms tick, so an update that overtook the response is not lost.
+
+**Permission.** `allow` answers the offered `allow_once` and `deny` (the default) the offered `reject_once`, never an `*_always` option (omp caches those per session). When the wanted kind is not offered the answer is `{"outcome":{"outcome":"cancelled"}}`. Once glen has written `session/cancel` (signal or deadline), every permission request is answered `cancelled`, whatever `--permission` says. Each request adds `{event:"task_state", task_state:"input_required", tool_call_id, title, kind, policy:"allow"|"deny", answer:"allow_once"|"reject_once"|"cancelled", option_id}` to `data.events` (at most 100; `events_dropped` counts the rest).
+
+**The document** (hidden; not in `docs/json.md`): `data:{transport:"acp", protocol_version:1, agent:{name,version}|null, permission, session:{id,handle,path|null,created}, task_state, stop_reason, assistant_text, text_truncated, events, events_dropped, updates:{replayed, during_turn, messages, kinds}, usage, cancel}`. `messages` counts the non-empty assistant groups of the turn, and `kinds` counts the turn's updates by `sessionUpdate`. `end_turn` is `completed` and exit 0; `cancelled` is `canceled`; `refusal` is `rejected`; `max_tokens`, `max_turn_requests` and any other value are `failed`, with the raw value kept in `stop_reason`.
+
+**Signals.** SIGINT, SIGTERM or SIGHUP during the turn writes one `session/cancel` within 250 ms and waits up to 5 s for the prompt response. The result is an `ok:true` document with `task_state:"canceled"`, `cancel:{sent:true, confirmed, reason:"interrupt"}` and exit 130; `stop_reason` is omp's answer (`cancelled` when it confirmed) and `null` when none came. Before the prompt there is nothing to cancel: `cancel` is `{sent:false,confirmed:false,reason:"interrupt"}` and the group is stopped with a 100 ms grace. A second signal exits at once and leaves omp's group to its own stdin EOF handling, as the session controls do (§A4; the W8-ERR-3 residual).
+
+**Failures.** Every error repeats `session`, `events`, `assistant_text`, `stop_reason`, `task_state`, `cancel` and `stderr` in `details` when they exist.
+
+| When | Exit / code | `details.reason` |
+|---|---|---|
+| omp missing or cannot be spawned | 5 `omp_unavailable` | `acp_spawn` |
+| EOF or exit before the `initialize` result | 5 | `acp_exited` (+ `stderr`) |
+| `initialize` not answered in time | 5 | `acp_timeout` |
+| `initialize` error response, `protocolVersion` missing, not an integer or not 1 | 5 | `acp_protocol` (+ `requested:1`, `got`) |
+| bad frame before the `initialize` result | 5 | `acp_malformed` |
+| `session/load` wanted and `loadSession` is not `true` | 5 | `acp_capability` (+ `capability:"loadSession"`) |
+| JSON-RPC error on `session/new`, `session/load` or `session/prompt` | 7 `job_failed` | `acp_rpc_error` (+ `method`, `code`, `message`; omp's `data.details` wins for `message`) |
+| EOF or exit after the `initialize` result | 7 | `acp_exited` |
+| bad frame after the `initialize` result | 7 | `acp_malformed` |
+| `session/new` or `session/load` not answered in time | 7 | `acp_timeout` |
+| the deadline passes during the turn (glen sends `session/cancel` first) | 7 | `acp_timeout` (+ `cancel.reason:"deadline"`) |
+| `stop_reason` other than `end_turn` and no glen cancel | 7 | `acp_stop_reason` (+ `stop_reason`, `task_state`) |
+| a guard refusal | 6 `no_route` | the existing `NoRouteReason` values |
+
+**Timing bounds.**
+
+| Wait | Bound |
+|---|---|
+| main loop tick | 100 ms; the stop flag and the deadlines are checked every tick |
+| `initialize`, `session/new`, `session/load` | each `min(60 s, time left)`; debug builds read `GLEN_ACP_SETUP_MS` (100 to 60000) |
+| `session/prompt` | the job deadline |
+| cancel grace | 5 s, ended early by the response; debug builds read `GLEN_ACP_CANCEL_GRACE_MS` (100 to 10000) |
+| trailing drain after the prompt response | one 100 ms tick |
+| `session/close` | 2 s, skipped once a stop is pending |
+| teardown | stdin EOF, then a 2 s exit grace after a success or a confirmed cancel and 100 ms on every other path (unconfirmed cancel, deadline, failure, an interrupt before the prompt), then SIGTERM 1 s, SIGKILL 1 s and the stderr join 1 s |
+| a signal during the turn | `session/cancel` within 250 ms; exit within 11 s (100 ms tick + 5 s cancel grace + teardown of at most 5 s: 2 s exit grace + 1 s TERM + 1 s KILL + 1 s stderr join; worst case 10.1 s); an unconfirmed cancel exits within 8.3 s |
+| a signal before the prompt | no `session/cancel`; exit within 3.5 s |
+| stdin writes | on a writer thread, so a blocked pipe never delays the tick or the cancel |
+
+**Experiments** (Step 7: real `omp acp --profile glen-harness` in `$TMPDIR` scratch sessions, never the owner's default agent dir; two real turns in total, no reruns):
+- **E3** (turn 1, creates the scratch session S): `__acp @new "Reply with exactly: acp-e3-ok"`, compared with S's transcript read after `__acp` exited. Result: PENDING-STEP-7.
+- **E1** (no model call): does `omp acp` hold S's owner lease between `session/load` and the first write; what does `session/load` do while another process holds the lease; and does `__acp` refuse with exit 6 `live_owner` before any spawn (E1(c) points glen at `fake_omp`, so a broken guard reaches only the fake). Result: PENDING-STEP-7.
+- **E2** (turn 2, loads S): one delete-tool call under `--permission allow`. Branch R (at least one `input_required` event) or Branch Z (none: the profile's approval policy, which denies `bash`, `edit` and `delete`, pre-empts the ACP gate). Result: PENDING-STEP-7.
+
+**The rule, fixed before the runs.** GO (ACP is a viable optional second transport) only if all hold: (G1) E3 matches on every point (the last assistant text equals `assistant_text`, `stop_reason` is `end_turn`, `updates.kinds` has an `agent_message_chunk`, and the transcript's assistant `stop_reason` is not `error`, `aborted` or `length`); (G2) E2's turn ended `end_turn`, a request (if any) shows the answered `allow_once` and no error caused by a missing answer, and the transcript's last assistant `stop_reason` in `e2-show.json` is not `error`, `aborted` or `length`, because omp reports an assistant `error` as `end_turn`; (G3) the E1 observations are recorded and E1(c)'s refusal held. E1 never fails GO by itself: it sets the scope line. NO-GO if G1 or G2 fails. A turn that could not run (a provider refusal, no login, a provider error in the transcript) makes the verdict "inconclusive, no GO claimed" and AC-v2-304 blocked. Applied: PENDING-STEP-7.
+
+**Losses under ACP v1.** Regardless of the verdict they bound any GO to "sends that need no `glen_reply`", never "replacement of the RPC route" or "the push headline":
+- No `glen_reply` attribution. `GLEN_MANAGED=1` registers no tool, and ACP v1 has no host-tool registration. With `GLEN_MANAGED` unset the extension's tool would write `inbox/<session>.ndjson` with a null job id and nothing in `jobs/<id>/replies.ndjson`, so `wait --for reply` could never see it. The only conceivable path is a client-supplied MCP server in `session/new.mcpServers`, unproven.
+- No fork detection, so no exit 11: ACP has no `get_state`, and the `session/load` answer carries no id.
+- No `session_settled`, no `agentInvoked` and no `command_output`.
+- Controls are only `session/cancel` and `session/set_config_option`; there is no steer or follow-up delivery beyond omp's non-standard `_session/steering`.
+- ACP `end_turn` cannot distinguish a failed model turn: omp maps an assistant `error` to `end_turn` unless it matches content-filter or refusal, so only a transcript comparison can.
+
+**Limits.** A post-load `agent_message_chunk` notice is indistinguishable from turn text. A message that starts with `/` reaches omp's ACP slash-command layer; the spike does not escape it. `session/resume` would avoid the history replay (and the 60 s setup bound on a huge transcript) and is the first refinement if GO. The guard mirrors `Ephemeral::open_session` instead of sharing it, and the spawn recipe has a third copy (`Process::spawn_piped`); W6 tech debt: one shared guard and one spawn helper. `live::route::unhealthy_refusal` words its message for controls.
+
+**W5 carry-over.** The MCP catalog (`src/mcp/tools.json`) does not exist yet. It is generated from `public_command()` and `docs/json.md`, neither of which names `__acp`; W5's generator must skip hidden commands, and `tests/mcp_contract.rs` should assert that `__acp` is absent.
+
+**What a NO-GO means.** The hidden command stays as a probe tool; removing it is the owner's call.
