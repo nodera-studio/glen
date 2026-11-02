@@ -7,12 +7,12 @@ checks as real omp, Claude Code or Codex acceptance.
 
 Prerequisites: Rust toolchain, omp/18.14.0 with the `glen-harness` profile configured
 (`.claude/scripts/omp-profile-setup.sh`, its own model and auth), jq, perl, GNU screen, expect for
-person mode, Claude Code for b/b2/b3/p, Codex plus the `codex:codex-rescue` companion for c1/c2,
+person mode, Claude Code for b/b2/b3/p/m, Codex plus the `codex:codex-rescue` companion for c1/c2,
 shasum, and gitleaks. No download or package upgrade is performed by the harness.
 **Close other omp sessions first**, including other omp runs and `omp-engine.sh` reviews under the same profile:
 they share the profile's session dir, so the session snapshot could not attribute their changes
 to the recorded scratch buckets. Build, version checks and setup progress go to stderr; setup
-prints only its scratch path to stdout. Mode p needs no omp, screen or expect (below).
+prints only its scratch path to stdout. Modes p and m need no omp, screen or expect (below).
 
 Final orchestrator decisions override the draft plan's credential-copy design:
 
@@ -75,9 +75,19 @@ without `--wait`/`--peek`, fails `AC-206-no-inbox-polling`), a woken report with
 run without a `result` event and a second send; and that the wrapper passes only the whitelisted
 manifest `env` names (`LD_PRELOAD` is ignored), accepts P, refuses a foreign handle and a foreign
 profile (exit 99), records `wait <job> --for reply --after <id>` and `inbox --wait --timeout 90s`
-unchanged, and prepends `--profile glen-harness` only when the manifest names it. Its scratch
-directory is owned by that self-test and removed on exit. It never calls setup/person/teardown
-or an actual agent.
+unchanged, and prepends `--profile glen-harness` only when the manifest names it. For mode m it
+generates the recording launcher from a manifest carrying `OMP_PROFILE`, `PI_CONFIG_DIR`,
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `LD_PRELOAD`, runs a scripted session through it against a
+fake server (bounded by a 10-second alarm, so a launcher that outlives the client's stdin fails) and
+checks that the server saw only the allowlisted names, a scratch `GLEN_HOME` and `mcp` as its argv,
+and that the wire log equals the session. It then checks a passing wire log (both protocol
+versions, with and without `ToolSearch`, and without `m.jsonl` as the Codex leg leaves it), a
+`Bash` or other tool in `m.jsonl` (fails `AC-505-no-shell`), a missing `glen_wait`, two `glen_send`,
+an `isError:true` send, a protocol version outside the list, a missing `initialize`, a report
+without the nonce and a missing recording, and that teardown of a passing run exits 0 with the
+wire log in evidence and no owner-session snapshot. Its scratch directory is owned by that
+self-test and removed on exit. It never calls setup, person or an actual agent, and runs teardown
+only on those hand-made mode m recordings (with `HOME` pointed into its scratch directory).
 
 ## Real runs — orchestrator only, after W3 merges
 
@@ -214,6 +224,85 @@ its first `result`, then resumes the run on the notification with a new `init`, 
 as for b/b3. Teardown keeps gitleaks and the owner-skills comparison and skips the owner-session
 snapshot (mode p touches only scratch sessions).
 
+(m) MCP evidence (v0.2 W5, AC-v2-505). No real omp and no profile: `setup m` builds `fake_omp`
+and prepares the scratch project, fixture session P (`e27c0de`) and `HOME=$S/omp-home` as `setup p`
+does, with `FAKE_OMP_DELAY_MS=8000` (the job takes about 8 seconds, so a model that sends without
+waiting must call a wait) and `GLEN_HOME=$S/home`. It writes the recording launcher
+`$S/bin/glen-mcp`: `exec env -i PATH=/usr/bin:/bin <names> "$S/glen-bin/glen" mcp`, its stdin and
+stdout teed into `$S/mcp-in.ndjson` and `$S/mcp-out.ndjson` (the wire log). Only manifest `env`
+names `HOME`, `PI_CODING_AGENT_DIR`, `GLEN_OMP_BIN` and `FAKE_OMP_*` pass and `GLEN_HOME` is fixed
+under scratch, so `OMP_PROFILE`, `PI_PROFILE`, `PI_CONFIG_DIR`, `CLAUDE_*`, `CODEX_*` and API keys
+never reach the server or its children; that closed environment, not the recording wrapper's
+guard, is what makes all 14 tools safe here. Setup also writes `$S/mcp.json` (for Claude Code; its
+`env` repeats the same names), `$S/codex-mcp.toml` (the `[mcp_servers.glen]` table for Codex, same
+`command` and `env`, `tool_timeout_sec = 120`) and the uncoached `prompt-m-claude.md` and
+`prompt-m-codex.md` (`prompts/claude-mcp.md`, `prompts/codex-mcp.md`), which name neither the
+protocol, the tools nor a shell. `calls.ndjson` stays empty (there is no recording wrapper), so the
+`json_contract` evidence step below is vacuous for mode m. Give the `claude -p` call a 300-second
+shell timeout.
+
+```bash
+A=tests/acceptance
+E=.claude/evidence/v020-wave-5-mcp/$(date -u +%Y%m%dT%H%M)
+S=$($A/acc.sh setup m)
+(cd "$S/project" && claude -p "$(cat "$S/prompt-m-claude.md")" --mcp-config "$S/mcp.json" --strict-mcp-config \
+  --allowedTools "mcp__glen__glen_ls,mcp__glen__glen_send,mcp__glen__glen_wait" \
+  --permission-mode dontAsk --max-budget-usd 1.00 --output-format stream-json --verbose) > "$S/m.jsonl"
+jq -r 'select(.type=="result") | .result' "$S/m.jsonl" > "$S/report.md"
+$A/acc.sh check m "$S"
+# The fake job may still run after claude exits: wait up to 60 s for no active job.
+for _ in $(seq 60); do
+  [[ $(env GLEN_HOME="$S/home" "$S/glen-bin/glen" jobs --active --json | jq '.data.jobs | length') == 0 ]] && break
+  sleep 1
+done
+$A/acc.sh teardown "$S" "$E/m-claude-mcp"
+```
+
+`--strict-mcp-config` keeps the owner's MCP servers (Mnemosyne included) out of the run;
+`--permission-mode dontAsk` with only the three `mcp__glen__` tools allowed denies Bash, Skill,
+Edit and Task; the run has no `PATH` shim, and an owner-installed `glen` is unreachable because
+Bash is denied. If the model needs `ToolSearch` to load the MCP tool schemas, add exactly
+`ToolSearch` to `--allowedTools` and record it. After teardown, confirm that no `glen mcp`,
+`glen __worker` or `fake_omp` survives for the scratch home.
+
+Checks (each `tools/call` is matched to its answer by `id` in the wire log): `AC-505-initialize`
+(an `initialize` request was recorded and its `protocolVersion` is `2025-11-25` or `2025-06-18`;
+evidence `client=<name>/<version> protocol=<v> first_method=<m>`), `AC-505-list` (a `tools/list`
+was answered), `AC-505-ls` (a `glen_ls` answered `isError:false`), `AC-505-send` (exactly one
+`glen_send`, its `arguments.session` P's handle or id and `arguments.message` `NONCE_M`, answered
+`isError:false`), `AC-505-wait` (a `glen_wait` of that send's job handle or id answered
+`isError:false`), `AC-505-nonce` (the report quotes `NONCE_M`) and `AC-505-no-shell` (every
+`tool_use` in `m.jsonl` is `mcp__glen__glen_ls`, `mcp__glen__glen_send`, `mcp__glen__glen_wait` or
+`ToolSearch`; without `m.jsonl`, as in the Codex leg, the wire log alone decides). The evidence
+strings of `AC-505-ls`, `-send` and `-wait` carry each call's exact `arguments` object, which shows
+whether the client fills schema defaults. Mode m has no `paired_calls`, `guard_refused` or
+`call_budget`. Teardown keeps gitleaks and the owner-skills comparison, skips the owner-session
+snapshot (mode m touches only scratch fixture copies) and copies `m.jsonl` and the wire log into
+evidence.
+
+Record in `$E/README.md`, reading `AC-505-initialize` first: the client's `initialize`
+`protocolVersion` and `clientInfo` and the first method from `mcp-in.ndjson`; `claude --version`,
+the git SHA and the binary sha256 (`provenance.json`); the `result` event's `num_turns` and
+`total_cost_usd` (expected `num_turns` ≤ 6; a run over 6 turns or $1.00 is reported, not repeated);
+and each tool call's exact `arguments`. Read every tool call of `m.jsonl` as for b and b3. At most
+one rerun for model nondeterminism, recorded, and only if a check failed because the agent misread
+a tool description (then fix that tool's `note` in `docs/json.md`, regenerate the catalog and keep
+both wordings in the evidence). If the client probed `server/discover` and never fell back, or
+refused the server for its protocol, stop: AC-v2-505 fails for that client, and supporting the
+stateless revision is a scope change to report to the owner, not to make here.
+
+The Codex leg is **owner-pending** by default. `setup m` writes `$S/codex-mcp.toml` and
+`prompt-m-codex.md` as material the owner runs by hand, after which `check m "$S"` reads the wire
+log that run left in `$S`. `acc.sh` reads no `ACC_*_CONSENT` for mode m and never touches
+`~/.codex`. The orchestrator records `owner-pending / not run: no route that leaves ~/.codex
+untouched` unless a read-only inspection (`codex --help`, `codex mcp --help`, the
+`codex-companion.mjs task --help` text) finds a documented way to supply `[mcp_servers.glen]` to one
+run without writing `~/.codex/config.toml`, `$CODEX_HOME` or any credential file and without
+copying a credential; then it dispatches `codex:codex-rescue` with `--write --cwd $S/project
+--prompt-file $S/prompt-m-codex.md` and that route, and runs `check m`. Owner: register
+`[mcp_servers.glen]` from `$S/codex-mcp.toml` yourself, run `prompt-m-codex.md` in `$S/project`,
+then `acc.sh check m "$S"` and `acc.sh teardown "$S" "$E/m-codex-mcp"`.
+
 For every agent mode, before teardown, also run:
 
 ```bash
@@ -235,7 +324,9 @@ Logging failures preserve the subprocess exit. Targets are manifest IDs or hex s
 Directory traversal/symlink cwd escapes and user-scope skill installation are refused (exit 99).
 Every glen invocation sets GLEN_HOME under scratch; the `glen-harness` profile's auth stays in
 place, never copied. Mode p's manifest `env` passes only `HOME`, `PI_CODING_AGENT_DIR`,
-`GLEN_OMP_BIN` and `FAKE_OMP_*`; any other name is ignored.
+`GLEN_OMP_BIN` and `FAKE_OMP_*`; any other name is ignored. Mode m has no wrapper: its launcher
+starts `glen mcp` under `env -i` with the same names plus a scratch `GLEN_HOME`, and its wire log
+holds protocol messages only, never environment values.
 
 `check` is read-only with respect to agents/sessions and writes only verdict evidence. Missing
 transcript or missing nonce fails; unpaired start means a killed call. `verdict.json` names

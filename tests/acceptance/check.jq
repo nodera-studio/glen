@@ -64,6 +64,11 @@ def probe_success:
   (try (.content | if type=="string" then fromjson
     elif type=="array" then [.[] | select(.type?=="text") | .text? | strings] | join("\n") | fromjson
     else null end) catch null | if type=="object" then .ok == true else false end);
+# Mode m: the MCP wire log (client requests in, server messages out) of one `glen mcp` run.
+def mcp_answer($out; $id): [$out[] | select(type == "object" and .id == $id and (has("method") | not))] | first;
+def mcp_calls($in; $name): [$in[] | select(.method? == "tools/call" and .params.name? == $name)];
+def mcp_ok($out): if . == null then false else (mcp_answer($out; .id) // {}) | .result.isError? == false end;
+def mcp_doc: (.result.content[0].text? // "") | try fromjson catch null;
 $m[0] as $manifest | $calls as $all |
 [$all[]|select(.t=="end")] as $ends |
 [$all[]|select(.t=="start")] as $starts |
@@ -81,6 +86,30 @@ $m[0] as $manifest | $calls as $all |
    check("AC-416-control-denied"; any($cc[]; .id as $id | any($cr[]; .tool_use_id==$id and denied)); "otherwise inconclusive; never pass")]
  elif $mode == "a" then
   [check("AC-414-person"; $person.pass == true; $person)]
+ elif $mode == "m" then
+  # AC-v2-505 (v0.2 W5): list, send and wait through `glen mcp`, every result isError:false.
+  $manifest.P as $p | $manifest.NONCE_M as $n |
+  ([$mcp_in[] | select(.method? == "initialize")] | first) as $init |
+  (($mcp_in | first) // {} | .method? // null) as $first |
+  mcp_calls($mcp_in; "glen_ls") as $ls | mcp_calls($mcp_in; "glen_send") as $send | mcp_calls($mcp_in; "glen_wait") as $wait |
+  ($send | first) as $s1 |
+  (if $s1 == null then null else mcp_answer($mcp_out; $s1.id) // {} | mcp_doc end) as $sent |
+  [uses($discovered)[] | .name] as $tools |
+  [check("AC-505-initialize"; $init != null and ($init.params.protocolVersion? | IN("2025-11-25", "2025-06-18"));
+     "client=\($init.params.clientInfo.name?)/\($init.params.clientInfo.version?) protocol=\($init.params.protocolVersion?) first_method=\($first)"),
+   check("AC-505-list"; any($mcp_in[] | select(.method? == "tools/list"); (mcp_answer($mcp_out; .id) // {}) | has("result")); "a tools/list was answered"),
+   check("AC-505-ls"; any($ls[]; mcp_ok($mcp_out)); "a glen_ls answered isError:false; arguments=\([$ls[].params.arguments]|tojson)"),
+   check("AC-505-send"; ($send|length) == 1 and ($s1.params.arguments.session? | IN($p.handle, $p.id)) and
+       $s1.params.arguments.message? == $n and ($s1 | mcp_ok($mcp_out));
+     "exactly one glen_send to P with NONCE_M, isError:false; arguments=\([$send[].params.arguments]|tojson)"),
+   check("AC-505-wait"; $sent != null and ($sent.data.job? | type) == "object" and
+       any($wait[]; (.params.arguments.job? | IN($sent.data.job.handle, $sent.data.job.id)) and mcp_ok($mcp_out));
+     "a glen_wait of the sent job, isError:false; arguments=\([$wait[].params.arguments]|tojson)"),
+   check("AC-505-nonce"; $report | has_nonce($n); "report quotes NONCE_M"),
+   # Claude leg only: every tool_use is one of the three glen tools (ToolSearch when the run allowed it).
+   check("AC-505-no-shell";
+     ($discovered|length) == 0 or all($tools[]; IN("mcp__glen__glen_ls", "mcp__glen__glen_send", "mcp__glen__glen_wait", "ToolSearch"));
+     if ($discovered|length) == 0 then "no m.jsonl in scratch (the Codex leg)" else "tools=\($tools|unique|join(","))" end)]
  elif $mode == "p" then
   # AC-v2-206: does a background `glen wait --for reply` wake a `claude -p` run? The class is the
   # evidence: woke, no_wake, foreground_only or no_wait (Step 13 decides the skill wording by it).
