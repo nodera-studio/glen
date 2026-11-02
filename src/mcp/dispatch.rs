@@ -302,6 +302,11 @@ impl Registry {
 pub(crate) enum Watch<'a> {
     /// A `tools/call`: its registry entry decides.
     Call(&'a Registry, &'a str),
+    /// A helper child (the channel's inbox poll): SIGKILLed past `deadline` or once `stop` is set.
+    Bounded {
+        deadline: Instant,
+        stop: &'a AtomicBool,
+    },
 }
 
 #[derive(Default)]
@@ -375,27 +380,34 @@ pub(crate) fn run_child(
     env: &[(&str, &str)],
     watch: Watch,
 ) -> Run {
-    let Watch::Call(registry, key) = watch;
-    if !registry.may_start(key) {
+    if let Watch::Call(registry, key) = watch
+        && !registry.may_start(key)
+    {
         return Run::Cancelled;
     }
     let child = match spawn(launcher, argv, env) {
         Ok(child) => child,
         Err(e) => return Run::NotStarted(e),
     };
-    registry.started(key, child.id());
+    if let Watch::Call(registry, key) = watch {
+        registry.started(key, child.id());
+    }
     supervise(child, watch)
 }
 
 /// Polls a started child every `CALL_TICK` until it exits: cancellation escalates to SIGKILL
-/// after `CANCEL_GRACE`, and a stdout flood past `MAX_OUTPUT` is killed at once.
+/// after `CANCEL_GRACE`, a bounded helper is killed at its bound, and a stdout flood past
+/// `MAX_OUTPUT` is killed at once.
 pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
-    let Watch::Call(registry, key) = watch;
     let out = capture(child.stdout.take(), MAX_OUTPUT, false);
     let err = capture(child.stderr.take(), STDERR_TAIL, true);
-    let mut killed = false;
+    let (mut killed, mut stopped) = (false, false);
     let status = loop {
-        match registry.poll(key, &mut child) {
+        let polled = match watch {
+            Watch::Call(registry, key) => registry.poll(key, &mut child),
+            Watch::Bounded { .. } => child.try_wait(),
+        };
+        match polled {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => {
@@ -410,10 +422,21 @@ pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
             let _ = child.kill();
             killed = true;
         }
+        if let Watch::Bounded { deadline, stop } = watch
+            && !stopped
+            && (Instant::now() >= deadline || stop.load(Ordering::SeqCst))
+        {
+            let _ = child.kill();
+            stopped = true;
+        }
         thread::sleep(CALL_TICK);
     };
     // A cancelled call is not answered, so its pipe readers are not waited for.
-    if registry.cancelled(key) {
+    let cancelled = match watch {
+        Watch::Call(registry, key) => registry.cancelled(key),
+        Watch::Bounded { .. } => stopped,
+    };
+    if cancelled {
         return Run::Cancelled;
     }
     let deadline = Instant::now() + READER_JOIN;

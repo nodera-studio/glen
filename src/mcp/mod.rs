@@ -3,6 +3,7 @@
 //! never a shell), so every tool result is the CLI's own envelope. The tool catalog
 //! (`tools.json`) is generated from the `<!-- mcp: … -->` annotations in `docs/json.md` plus clap.
 pub mod catalog;
+pub(crate) mod channel;
 pub mod dispatch;
 pub mod server;
 

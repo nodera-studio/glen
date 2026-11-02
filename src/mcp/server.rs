@@ -1,8 +1,10 @@
 //! The JSON-RPC loop (design §A22): framing, the handshake, `tools/list`, `ping`, the error
 //! table, and the shutdown on stdin EOF or a signal.
 use super::{
-    CALL_TICK, Line, MAX_IN_FLIGHT, MAX_LINE, SHUTDOWN_JOIN, SUPPORTED_VERSIONS, TICK, Writer,
+    CALL_TICK, CHANNEL_BASELINE, Line, MAX_IN_FLIGHT, MAX_LINE, SHUTDOWN_JOIN, SUPPORTED_VERSIONS,
+    TICK, Writer,
     catalog::{Catalog, Tool},
+    channel::{self, Poller, Seen},
     dispatch::{self, Launcher, Registry, Watch},
     read_line,
 };
@@ -12,7 +14,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, RecvTimeoutError},
     },
     thread,
@@ -53,6 +55,10 @@ struct Server {
     tools: Vec<Value>,
     calls: Vec<thread::JoinHandle<()>>,
     registry: Arc<Registry>,
+    /// The channel baseline, taken while answering `initialize` (only with `--channel`).
+    baseline: Option<Seen>,
+    /// The running channel notifier and its stop flag.
+    notifier: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
 }
 
 /// Serves MCP on `input` and `output` until stdin EOF, a gone client or a signal recorded in
@@ -116,6 +122,8 @@ impl Server {
             tools,
             calls: vec![],
             registry: Arc::default(),
+            baseline: None,
+            notifier: None,
         }
     }
     fn result(&self, id: Value, result: Value) {
@@ -226,11 +234,32 @@ impl Server {
         if self.config.channel {
             result["capabilities"]["experimental"] = json!({"claude/channel":{}});
             result["instructions"] = json!(INSTRUCTIONS);
+            // Replies present before the client can see this result are the silent baseline.
+            self.baseline = Some(self.poller().baseline(CHANNEL_BASELINE));
         }
         self.result(id, result);
         self.initialized = true;
     }
+    fn poller(&self) -> Poller {
+        Poller {
+            launcher: self.config.launcher.clone(),
+            profile: self.config.profile.clone(),
+            cwd: self.config.cwd.clone(),
+        }
+    }
     fn notification(&mut self, method: &str, params: Option<&Value>) {
+        if method == "notifications/initialized"
+            && let Some(seen) = self.baseline.take()
+        {
+            let stop = Arc::new(AtomicBool::new(false));
+            // Without a thread there is no channel; tools keep working.
+            if let Ok(handle) =
+                channel::spawn(self.poller(), seen, self.writer.clone(), stop.clone())
+            {
+                self.notifier = Some((stop, handle));
+            }
+            return;
+        }
         if method == "notifications/cancelled"
             && let Some(key) = params.and_then(|p| p.get("requestId")).and_then(id_key)
         {
@@ -303,8 +332,15 @@ impl Server {
     /// Cancels every call in parallel and waits up to `SHUTDOWN_JOIN` for their threads.
     fn shutdown(&mut self) {
         self.registry.cancel_all();
+        if let Some((stop, _)) = &self.notifier {
+            stop.store(true, Ordering::SeqCst);
+        }
         let deadline = Instant::now() + SHUTDOWN_JOIN;
-        while self.calls.iter().any(|h| !h.is_finished()) && Instant::now() < deadline {
+        let running = |s: &Self| {
+            s.calls.iter().any(|h| !h.is_finished())
+                || s.notifier.as_ref().is_some_and(|(_, h)| !h.is_finished())
+        };
+        while running(self) && Instant::now() < deadline {
             thread::sleep(CALL_TICK);
         }
     }
@@ -800,6 +836,52 @@ esac"#
                 .contains("after")
         );
         assert_eq!(s.answers(&json!(1)), 1);
+        assert_eq!(s.close().0, Exit::Eof);
+    }
+
+    /// An `inbox` child that lists reply `a` on its first run and `a`, `b` afterwards.
+    fn inbox_script(dir: &std::path::Path) -> String {
+        let (pids, n) = (dir.join("pids"), dir.join("n"));
+        let one = r#"{"v":1,"ok":true,"data":{"messages":[{"id":"a","session_handle":"e27c0de","job_handle":null,"text":"x","final":true}]}}"#;
+        let two = one.replace("}]}}", r#"},{"id":"b","session_handle":"e27c0de","job_handle":null,"text":"y","final":true}]}}"#);
+        format!(
+            r#"echo $$ >> '{p}'
+[ "$2 $3" = "inbox --peek" ] || exit 9
+n=$(cat '{n}' 2>/dev/null || echo 0); n=$((n+1)); echo $n > '{n}'
+if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
+            p = pids.display(),
+            n = n.display(),
+        )
+    }
+
+    #[test]
+    fn the_channel_baselines_at_initialize_and_notifies_after_initialized() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Live::start(config(true, &inbox_script(dir.path())));
+        assert_eq!(
+            pids(&dir.path().join("pids")).len(),
+            1,
+            "the baseline ran before the result"
+        );
+        s.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        let n = s.wait(|m| m["method"] == "notifications/claude/channel");
+        assert_eq!(n["params"]["meta"]["reply_id"], "b");
+        wait_pids(&dir.path().join("pids"), 4);
+        let channel = |m: &Value| m["method"] == "notifications/claude/channel";
+        assert_eq!(s.out.lines().iter().filter(|m| channel(m)).count(), 1);
+        let (exit, took) = s.close();
+        assert_eq!(exit, Exit::Eof);
+        assert!(took < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn a_plain_server_never_polls_the_inbox() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Live::start(config(false, &inbox_script(dir.path())));
+        s.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        thread::sleep(std::time::Duration::from_millis(300));
+        assert!(pids(&dir.path().join("pids")).is_empty());
+        assert_eq!(s.out.lines().len(), 1);
         assert_eq!(s.close().0, Exit::Eof);
     }
 }
