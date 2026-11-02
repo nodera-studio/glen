@@ -250,6 +250,34 @@ fn ac_v2_302_303_existing_session_loads_and_excludes_the_replay() {
 }
 
 #[test]
+fn ac_v2_302_a_relative_stored_cwd_reaches_omp_absolute() {
+    let b = RpcBox::new();
+    let sub = b.omp.alpha().join("sub");
+    fs::create_dir(&sub).unwrap();
+    // The header names `sub`, which exists relative to glen's own cwd (alpha).
+    let file = b.omp.session('A');
+    let text = fs::read_to_string(&file).unwrap();
+    fs::write(
+        &file,
+        text.replacen(r#""cwd":"/home/fixture/work/alpha""#, r#""cwd":"sub""#, 1),
+    )
+    .unwrap();
+    let out = run(&b, &["e27c0de", "hi"], &[]);
+    let d = envelope(&out, 0)["data"].clone();
+    assert_eq!(d["assistant_text"], "reply: hi");
+    let load = &frames_in(&b, "session/load")[0]["frame"]["params"];
+    assert_eq!(Path::new(load["cwd"].as_str().unwrap()), sub);
+    // The same absolute path is omp's working directory.
+    let start = b
+        .fake_log()
+        .into_iter()
+        .find(|r| r["event"] == "start")
+        .unwrap();
+    assert_eq!(Path::new(start["cwd"].as_str().unwrap()), sub);
+    assert_groups_gone(&b);
+}
+
+#[test]
 fn ac_v2_302_the_initialize_result_must_be_protocol_1() {
     for (scenario, got) in [
         ("proto2", json!(2)),

@@ -57,7 +57,7 @@ pub fn run(cli: &Cli, args: &AcpArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
     } else {
         None
     };
-    let cwd = send_cwd(opened.as_ref(), None, env)?;
+    let cwd = acp_cwd(env, &send_cwd(opened.as_ref(), None, env)?)?;
     let home = glen_home::resolve_trusted(env, &["run/live"])?;
     let (timeout, warning) = rpc::job_timeout(env);
     let deadline = Instant::now() + timeout;
@@ -70,7 +70,8 @@ pub fn run(cli: &Cli, args: &AcpArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
     let stop = wait::install_interrupt_all()?;
     let (id, label, session, lock) = match target {
         Some(t) => {
-            let session = json!({"id":t.id,"handle":t.handle,"path":t.path,"created":false});
+            let path = t.path.as_deref().map(Path::to_string_lossy);
+            let session = json!({"id":t.id,"handle":t.handle,"path":path,"created":false});
             (Some(t.id), t.handle, session, Some(t.lock))
         }
         None => (None, "@new".to_owned(), Value::Null, None),
@@ -89,7 +90,8 @@ pub fn run(cli: &Cli, args: &AcpArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
         stop: &stop,
     };
     let profile = cli.global.profile.as_deref();
-    let report = talk(&turn, acp::command(&bin, profile, &cwd), lock, session);
+    let command = acp::command(&bin, profile, Path::new(&cwd));
+    let report = talk(&turn, command, lock, session);
     spinner.finish();
     let mut report = report?;
     warnings.append(&mut report.warnings);
@@ -97,6 +99,26 @@ pub fn run(cli: &Cli, args: &AcpArgs, env: &Env, ctx: &OutputCtx) -> Result<Outc
     finish(report, args, ctx)
 }
 
+/// omp's working directory for the turn, both the child's `current_dir` and the wire `cwd`:
+/// absolute (omp rejects a relative `cwd`, and a stored header cwd can be relative) and UTF-8 (it
+/// travels as a JSON string).
+fn acp_cwd(env: &Env, cwd: &Path) -> Result<String, GlenError> {
+    let utf8 = |path: &Path| {
+        path.to_str().map(str::to_owned).ok_or_else(|| {
+            GlenError::new(
+                ErrorCode::Usage,
+                format!(
+                    "omp acp needs a UTF-8 working directory, not {}",
+                    path.display()
+                ),
+            )
+            .with_detail("reason", "non_utf8_cwd")
+            .with_detail("cwd", path.to_string_lossy())
+            .with_hint("run glen __acp from a directory whose path is valid UTF-8")
+        })
+    };
+    utf8(&paths::absolute(env, &utf8(cwd)?))
+}
 fn validate(message: &str) -> Result<(), GlenError> {
     if message.trim().is_empty() {
         return Err(GlenError::new(ErrorCode::Usage, "message is empty"));
@@ -215,7 +237,8 @@ struct Turn<'a> {
     env: &'a Env,
     home: &'a GlenHome,
     args: &'a AcpArgs,
-    cwd: &'a Path,
+    /// Absolute and UTF-8 ([`acp_cwd`]).
+    cwd: &'a str,
     /// The id of an existing session; `None` for `@new`.
     existing: Option<&'a str>,
     deadline: Instant,
@@ -921,7 +944,7 @@ mod tests {
             env: &env,
             home: &home,
             args: &args,
-            cwd: tree.path(),
+            cwd: tree.path().to_str().unwrap(),
             existing,
             deadline: Instant::now() + Duration::from_secs(30),
             stop: &stop,
@@ -962,6 +985,28 @@ mod tests {
         assert!(matches!(ending, Ending::Completed { .. }), "{ending:?}");
         assert_eq!(facts.session, Value::Null);
         assert!(lock.is_none());
+    }
+    #[test]
+    fn the_cwd_is_made_absolute_and_must_be_utf8() {
+        use std::{ffi::OsStr, os::unix::ffi::OsStrExt};
+        let env = Env::for_test(None, Path::new("/w"), &[]);
+        assert_eq!(acp_cwd(&env, Path::new("sub")).unwrap(), "/w/sub");
+        assert_eq!(acp_cwd(&env, Path::new("/a/./b")).unwrap(), "/a/b");
+        // Linux allows such a directory (macOS does not); it must not reach `json!` and panic.
+        let bad = Path::new(OsStr::from_bytes(b"/tmp/\xff"));
+        let relative = Path::new(OsStr::from_bytes(b"\xff"));
+        let under_bad = Env::for_test(None, bad, &[]);
+        for (env, cwd) in [(&env, bad), (&under_bad, Path::new("sub"))] {
+            let e = acp_cwd(env, cwd).unwrap_err();
+            assert_eq!(e.code, ErrorCode::Usage);
+            assert_eq!(reason(&e), "non_utf8_cwd");
+            let shown = e.details.unwrap()["cwd"].as_str().unwrap().to_owned();
+            assert!(shown.contains('\u{fffd}'), "{shown}");
+        }
+        assert_eq!(
+            reason(&acp_cwd(&env, relative).unwrap_err()),
+            "non_utf8_cwd"
+        );
     }
     #[test]
     fn the_failure_table_through_a_scripted_client() {
