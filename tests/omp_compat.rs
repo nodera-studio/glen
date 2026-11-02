@@ -525,6 +525,54 @@ fn a_late_ready_returns_within_the_budget_and_tears_omp_down() {
     // ProbeBox::probe already waited for the fake's process group to disappear.
     assert_eq!(b.log().iter().filter(|e| e["event"] == "start").count(), 1);
 }
+/// omp runs in its own process group, so a terminal Ctrl-C reaches only glen: glen tears the
+/// group down, then SIGINT's default disposition ends it (doctor has no interrupted document).
+#[cfg(debug_assertions)]
+#[test]
+fn sigint_during_the_probe_tears_omp_down_before_glen_exits() {
+    use std::os::unix::process::{CommandExt, ExitStatusExt};
+    let b = ProbeBox::new();
+    let fake = fake_omp_bin();
+    let mut command = b.command(
+        &["doctor", "--probe", "--json"],
+        &[
+            ("GLEN_OMP_BIN", fake.to_str().unwrap()),
+            // Stalled at startup: the fake neither sends ready nor reads stdin EOF.
+            ("FAKE_OMP_READY_DELAY_MS", "20000"),
+        ],
+    );
+    // A terminal's Ctrl-C meets SIGINT's default disposition, but a suite run in the background
+    // (suite-lock.sh) would hand glen an ignored SIGINT.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::signal(libc::SIGINT, libc::SIG_DFL) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut glen = command
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    poll(Duration::from_secs(10), || {
+        b.log().iter().any(|e| e["event"] == "start").then_some(())
+    });
+    rustix::process::kill_process(
+        rustix::process::Pid::from_raw(glen.id() as i32).unwrap(),
+        rustix::process::Signal::INT,
+    )
+    .unwrap();
+    let start = Instant::now();
+    let status = poll(Duration::from_secs(10), || glen.try_wait().unwrap());
+    let elapsed = start.elapsed();
+    assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
+    // Poll, 100 ms grace, 1 s after SIGTERM and the stderr join: well inside 4 s.
+    assert!(elapsed < Duration::from_millis(4000), "{elapsed:?}");
+    // glen has exited, so the group must already be gone; this waits at most 3 s more.
+    b.assert_fake_gone();
+}
 #[test]
 fn status_records_the_negotiated_protocol() {
     for (v2, protocol) in [(None, 1), (Some("1"), 2)] {

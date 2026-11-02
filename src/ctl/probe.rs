@@ -8,7 +8,11 @@ use serde::Serialize;
 use std::{
     path::Path,
     process::{ChildStdin, ChildStdout, Stdio},
-    sync::{Arc, Mutex, PoisonError, mpsc},
+    sync::{
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     time::{Duration, Instant},
 };
 /// The whole probe: startup and every call share it.
@@ -92,8 +96,16 @@ impl Probe {
     }
 }
 /// Starts `bin --mode rpc --no-ui --no-session` in `cwd` and checks its capabilities. The
-/// result is final at `budget`; teardown after it is bounded by [`Process::finish`].
-pub fn run(bin: &Path, profile: Option<&str>, cwd: &Path, budget: Duration) -> Probe {
+/// result is final at `budget`; teardown after it is bounded by [`Process::finish`]. Once
+/// `stop` is set (the caller's interrupt flag) it tears omp down and returns `interrupted`:
+/// omp runs in its own process group, so a terminal's Ctrl-C reaches only glen.
+pub fn run(
+    bin: &Path,
+    profile: Option<&str>,
+    cwd: &Path,
+    budget: Duration,
+    stop: &AtomicBool,
+) -> Probe {
     let deadline = Instant::now() + budget;
     let mut command = rpc::base_command(bin, profile, cwd);
     command.arg("--no-session");
@@ -155,6 +167,11 @@ pub fn run(bin: &Path, profile: Option<&str>, cwd: &Path, budget: Duration) -> P
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 let mut probe = snapshot();
                 probe.note("probe thread ended unexpectedly");
+                teardown(&mut probe, &mut process, Duration::from_millis(100), false);
+                return probe;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) if stop.load(Ordering::SeqCst) => {
+                let mut probe = Probe::unknown("interrupted".into());
                 teardown(&mut probe, &mut process, Duration::from_millis(100), false);
                 return probe;
             }

@@ -4,6 +4,7 @@ use crate::{
     env::Env,
     error::{ErrorCode, GlenError, Warning},
     glen_home,
+    jobs::wait,
     omp::{
         self, bin,
         compat::{self, Support},
@@ -15,7 +16,7 @@ use crate::{
 };
 use serde::Serialize;
 use serde_json::json;
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::atomic::Ordering, time::Duration};
 #[derive(Serialize)]
 struct Check {
     name: &'static str,
@@ -109,14 +110,20 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
             "omp --version failed".into(),
         ),
         Some(bin) => {
+            // Installed before omp starts: the probe owns omp's process group until it returns.
+            let stop = wait::install_interrupt_all()?;
             let spinner = Spinner::start(ctx.mode == Mode::Human && ctx.stderr_tty, "probing omp");
             let result = probe::run(
                 bin,
                 cli.global.profile.as_deref(),
                 env.cwd(),
                 probe_budget(env),
+                &stop,
             );
             spinner.finish();
+            if stop.load(Ordering::SeqCst) {
+                interrupted();
+            }
             let caps = &result.capabilities;
             add(
                 "omp_capabilities",
@@ -508,6 +515,13 @@ fn probe_budget(env: &Env) -> Duration {
     #[cfg(not(debug_assertions))]
     let _ = env;
     probe::BUDGET
+}
+/// Doctor has no interrupted document (§A11), so once the probe has torn omp down a stop
+/// signal ends glen through SIGINT's default disposition (status 130 in a shell).
+fn interrupted() -> ! {
+    #[cfg(unix)]
+    signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGINT).ok();
+    std::process::exit(130)
 }
 fn wrap(text: &str, width: Option<u16>) -> String {
     let Some(width) = width else {
