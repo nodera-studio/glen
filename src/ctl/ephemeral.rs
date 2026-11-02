@@ -37,6 +37,14 @@ pub(super) struct Process {
 }
 impl Process {
     pub(super) fn stop(&mut self, grace: Duration) -> io::Result<()> {
+        self.stop_with(grace, rustix::process::test_kill_process_group)
+    }
+    /// `stop` with the `kill(-pgid, 0)` group probe injected, so a test can observe it.
+    fn stop_with(
+        &mut self,
+        grace: Duration,
+        mut probe: impl FnMut(rustix::process::Pid) -> rustix::io::Result<()>,
+    ) -> io::Result<()> {
         if self.reaped {
             return Ok(());
         }
@@ -46,7 +54,7 @@ impl Process {
             if self.child.try_wait()?.is_some() {
                 let group = rustix::process::Pid::from_raw(pid as i32)
                     .ok_or_else(|| io::Error::other("invalid omp pid"))?;
-                if group_gone(rustix::process::test_kill_process_group(group))? {
+                if group_gone(probe(group))? {
                     self.reaped = true;
                     return Ok(());
                 }
@@ -67,7 +75,7 @@ impl Process {
                 let exited = self.child.try_wait()?.is_some();
                 let group = rustix::process::Pid::from_raw(pid as i32)
                     .ok_or_else(|| io::Error::other("invalid omp pid"))?;
-                if group_gone(rustix::process::test_kill_process_group(group))? && exited {
+                if group_gone(probe(group))? && exited {
                     self.reaped = true;
                     return Ok(());
                 }
@@ -110,9 +118,10 @@ impl Process {
         warnings
     }
 }
-/// Reads a `kill(-pgid, 0)` probe: ESRCH is gone. macOS answers EPERM while the group's members
-/// have exited but are not yet reaped, so EPERM (like success) means the group is still there.
-fn group_gone(probe: Result<(), rustix::io::Errno>) -> io::Result<bool> {
+/// Reads a `kill(-pgid, sig)` result: ESRCH is gone. macOS answers EPERM while the group's
+/// members have exited but are not yet reaped, so EPERM (like success) means the group is still
+/// there.
+pub(crate) fn group_gone(probe: Result<(), rustix::io::Errno>) -> io::Result<bool> {
     match probe {
         Err(rustix::io::Errno::SRCH) => Ok(true),
         Ok(()) | Err(rustix::io::Errno::PERM) => Ok(false),
@@ -630,6 +639,7 @@ mod tests {
     }
     #[test]
     fn stop_waits_for_a_group_of_exited_unreaped_members() {
+        use rustix::io::Errno;
         use std::os::unix::process::CommandExt;
         // A long grace polls the group; a zero grace also signals it (SIGTERM, then the poll).
         for grace in [Duration::from_secs(2), Duration::ZERO] {
@@ -638,28 +648,49 @@ mod tests {
                 .process_group(0)
                 .spawn()
                 .unwrap();
-            let mut member = std::process::Command::new("true")
+            let member = std::process::Command::new("true")
                 .process_group(leader.id() as i32)
                 .spawn()
                 .unwrap();
             wait_exited(&member);
             leader.kill().unwrap();
             wait_exited(&leader);
-            // Once stop reaps the leader, the group holds only the zombie member: macOS answers
-            // kill(-pgid, _) with EPERM until that member is reaped, Linux with success.
-            let reaper = std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_millis(200));
-                member.wait()
-            });
+            let group = rustix::process::Pid::from_raw(leader.id() as i32).unwrap();
             let mut process = Process {
                 child: leader,
                 stderr: None,
                 reaped: false,
             };
-            let stopped = process.stop(grace);
-            reaper.join().unwrap().unwrap();
+            // Once stop reaps the leader, the group holds only the zombie member: macOS answers
+            // kill(-pgid, _) with EPERM until that member is reaped, Linux with success. The
+            // member is reaped at the second probe that sees it (with a zero grace, after the
+            // SIGTERM), so only the third probe can find the group gone.
+            let mut member = Some(member);
+            let mut probes = vec![];
+            let stopped = process.stop_with(grace, |group| {
+                let probe = rustix::process::test_kill_process_group(group);
+                probes.push(probe);
+                if probes.len() == 2 {
+                    member.take().unwrap().wait().unwrap();
+                }
+                probe
+            });
             assert!(stopped.is_ok(), "grace {grace:?}: {stopped:?}");
             assert!(process.reaped, "grace {grace:?}");
+            assert!(member.is_none(), "grace {grace:?}: {probes:?}");
+            assert_eq!(probes.len(), 3, "grace {grace:?}: {probes:?}");
+            for present in &probes[..2] {
+                assert!(
+                    matches!(present, Ok(()) | Err(Errno::PERM)),
+                    "grace {grace:?}: {probes:?}"
+                );
+            }
+            assert_eq!(probes[2], Err(Errno::SRCH), "grace {grace:?}");
+            assert_eq!(
+                rustix::process::test_kill_process_group(group),
+                Err(Errno::SRCH),
+                "grace {grace:?}"
+            );
         }
     }
     #[test]

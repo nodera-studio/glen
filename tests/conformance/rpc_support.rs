@@ -24,6 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
+use rustix::io::Errno;
 use rustix::process::{Pid, Signal};
 use serde_json::{Map, Value, json};
 
@@ -188,9 +189,14 @@ pub fn pid_alive(raw: i64) -> bool {
     pid_of(raw).is_some_and(|p| rustix::process::test_kill_process(p).is_ok())
 }
 
-/// True while any process of this process group exists.
+/// True while any process of this process group exists (zombies count as existing: macOS answers
+/// EPERM while the group's members have exited but are not yet reaped).
 pub fn group_alive(raw: i64) -> bool {
-    pid_of(raw).is_some_and(|p| rustix::process::test_kill_process_group(p).is_ok())
+    pid_of(raw).is_some_and(|p| match rustix::process::test_kill_process_group(p) {
+        Ok(()) | Err(Errno::PERM) => true,
+        Err(Errno::SRCH) => false,
+        Err(e) => panic!("killpg {raw} 0: {e}"),
+    })
 }
 
 pub fn own_pgid() -> i64 {
@@ -203,10 +209,14 @@ pub fn signal(raw: i64, sig: Signal) {
 }
 
 /// Signal a whole process group, the way a terminal delivers Ctrl-C to its foreground job.
+/// A group that is gone (ESRCH) or holds only unreaped zombies (macOS: EPERM) is already past it.
 pub fn signal_group(raw: i64, sig: Signal) {
     assert_ne!(raw, own_pgid(), "refusing to signal the test's own group");
     let pid = pid_of(raw).unwrap_or_else(|| panic!("bad pgid {raw}"));
-    rustix::process::kill_process_group(pid, sig).unwrap_or_else(|e| panic!("killpg {raw}: {e}"));
+    match rustix::process::kill_process_group(pid, sig) {
+        Ok(()) | Err(Errno::SRCH | Errno::PERM) => (),
+        Err(e) => panic!("killpg {raw}: {e}"),
+    }
 }
 
 /// A pid that existed and is gone (spawned and reaped).

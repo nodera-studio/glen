@@ -1120,9 +1120,11 @@ impl Drop for Workers<'_> {
                         == glen::jobs::liveness::Liveness::Alive
                 {
                     if let Some(omp) = s.omp_pid.and_then(|pid| Pid::from_raw(pid as i32)) {
+                        // EPERM: macOS, a group of unreaped zombies. The poll below decides; a
+                        // surviving group fails the test there, never while unwinding.
                         match rustix::process::kill_process_group(omp, Signal::KILL) {
-                            Ok(()) | Err(rustix::io::Errno::SRCH) => (),
-                            Err(e) => panic!("cannot kill test omp process group: {e}"),
+                            Ok(()) | Err(rustix::io::Errno::SRCH | rustix::io::Errno::PERM) => (),
+                            Err(e) => eprintln!("watch: cannot kill test omp group {omp:?}: {e}"),
                         }
                     }
                     match rustix::process::kill_process(

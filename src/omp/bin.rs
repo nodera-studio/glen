@@ -54,13 +54,12 @@ pub fn find_omp(env: &Env) -> Result<PathBuf, String> {
 fn terminate(child: &mut Child) -> Result<(), String> {
     #[cfg(unix)]
     {
-        if let Err(e) = rustix::process::kill_process_group(
+        // EPERM (macOS: only unreaped zombies left) is not fatal; the reap loop bounds the wait.
+        crate::ctl::ephemeral::group_gone(rustix::process::kill_process_group(
             rustix::process::Pid::from_child(child),
             rustix::process::Signal::KILL,
-        ) && e != rustix::io::Errno::SRCH
-        {
-            return Err(format!("cannot kill omp process group: {e}"));
-        }
+        ))
+        .map_err(|e| format!("cannot kill omp process group: {e}"))?;
     }
     #[cfg(not(unix))]
     child.kill().map_err(|e| e.to_string())?;
@@ -195,6 +194,20 @@ mod tests {
         ] {
             assert!(!retryable_spawn_error(&io::Error::from(kind)), "{kind:?}");
         }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn terminate_reaps_a_group_of_only_unreaped_zombies() {
+        use std::os::unix::process::CommandExt;
+        let mut child = Command::new("true").process_group(0).spawn().unwrap();
+        // Exited but unreaped: macOS answers kill(-pgid, _) with EPERM, Linux with success.
+        rustix::process::waitid(
+            rustix::process::WaitId::Pid(rustix::process::Pid::from_child(&child)),
+            rustix::process::WaitIdOptions::EXITED | rustix::process::WaitIdOptions::NOWAIT,
+        )
+        .unwrap();
+        assert_eq!(terminate(&mut child), Ok(()));
+        assert!(child.try_wait().unwrap().is_some());
     }
     #[cfg(unix)]
     fn script(dir: &Path, name: &str, text: &str) -> PathBuf {
