@@ -110,18 +110,24 @@ pub fn mark_lost(store: &JobStore, id: &JobId, s: Status) -> Status {
 /// lock, a job a warm worker claimed meanwhile (its `worker_pid` names another process) or a
 /// terminal one is returned unchanged; only then is `lost` written.
 pub fn mark_lost_unless_claimed(store: &JobStore, id: &JobId, child_pid: u32, s: Status) -> Status {
-    let result = (|| {
-        let _lock = store.status_lock(id)?;
-        let mut s = store.read_status(id)?;
-        if s.status.is_terminal() || s.worker_pid.is_some_and(|p| p != child_pid) {
-            return Ok(s);
-        }
-        s = lost(s);
-        s.updated_at = jiff::Timestamp::now().to_string();
-        store.write_status_locked(id, &s)?;
-        Ok(s)
-    })();
-    report_lost(id, s, result)
+    report_lost(id, s, try_mark_lost_unless_claimed(store, id, child_pid))
+}
+/// [`mark_lost_unless_claimed`] without the in-memory fallback: `Err` when the status cannot be
+/// read or written, for a caller that reports the failure its own way (`glen watch`).
+pub(crate) fn try_mark_lost_unless_claimed(
+    store: &JobStore,
+    id: &JobId,
+    child_pid: u32,
+) -> Result<Status, crate::error::GlenError> {
+    let _lock = store.status_lock(id)?;
+    let mut s = store.read_status(id)?;
+    if s.status.is_terminal() || s.worker_pid.is_some_and(|p| p != child_pid) {
+        return Ok(s);
+    }
+    s = lost(s);
+    s.updated_at = jiff::Timestamp::now().to_string();
+    store.write_status_locked(id, &s)?;
+    Ok(s)
 }
 /// Re-read and publish under the worker's status lock; never reports to stderr.
 pub(crate) fn try_mark_lost(

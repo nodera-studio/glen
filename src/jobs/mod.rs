@@ -295,15 +295,22 @@ impl JobStore {
         (rows, warnings)
     }
     pub fn create(&self, job: &Job) -> Result<(), GlenError> {
-        self.create_mapped(job, |path, e| {
+        self.create_mapped(job, vec![], |path, e| {
             GlenError::new(
                 ErrorCode::Io,
                 format!("cannot write {}: {e}", path.display()),
             )
         })
     }
-    pub fn create_for_send(&self, job: &Job, env: &crate::env::Env) -> Result<(), GlenError> {
-        self.create_mapped(job, |path, e| {
+    /// `send`'s create: `warnings` go into the first `status.json`, so they are on disk before
+    /// a warm worker can claim the job and the sender never rewrites the status afterwards.
+    pub fn create_for_send(
+        &self,
+        job: &Job,
+        warnings: Vec<Warning>,
+        env: &crate::env::Env,
+    ) -> Result<(), GlenError> {
+        self.create_mapped(job, warnings, |path, e| {
             let mut error = crate::sandbox::map_home_write(env, "send", e);
             error.message = format!("{} (write target {})", error.message, path.display());
             error
@@ -312,6 +319,7 @@ impl JobStore {
     fn create_mapped(
         &self,
         job: &Job,
+        warnings: Vec<Warning>,
         map: impl Fn(&Path, io::Error) -> GlenError,
     ) -> Result<(), GlenError> {
         let id = JobId::parse(&job.id)
@@ -344,6 +352,7 @@ impl JobStore {
                 v: 1,
                 status: State::Queued,
                 updated_at: job.created_at.clone(),
+                warnings,
                 ..Status::default()
             },
             &map,

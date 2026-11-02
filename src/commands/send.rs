@@ -97,7 +97,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
             args.wait
         },
         &flag,
-        Some(&mut child),
+        child.as_mut(),
         |s| spinner.set_message(&super::wait::job_progress(&job, s)),
     );
     spinner.finish();
@@ -108,7 +108,8 @@ pub(crate) struct Submitted {
     pub job: Job,
     pub id: JobId,
     pub store: JobStore,
-    pub child: Child,
+    /// `None` only when the spawn failed after a warm worker had claimed the job.
+    pub child: Option<Child>,
     pub created: Instant,
 }
 /// Validate before reading stdin, preserving send's error precedence.
@@ -217,23 +218,7 @@ pub(crate) fn submit(
         if live.is_none() && !lock::is_held(&home, &o.session.header.id) {
             #[cfg(debug_assertions)]
             if let Some(path) = env.get("FAKE_OMP_LEASE_PROBE_GATE") {
-                let ready = format!("{path}.ready");
-                std::fs::write(&ready, b"probing").map_err(|e| {
-                    GlenError::new(
-                        ErrorCode::Io,
-                        format!("cannot write probe gate {ready}: {e}"),
-                    )
-                })?;
-                let end = Instant::now() + Duration::from_secs(5);
-                while !Path::new(path).exists() {
-                    if Instant::now() >= end {
-                        return Err(GlenError::new(
-                            ErrorCode::Io,
-                            format!("timed out waiting for probe gate {path}"),
-                        ));
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
+                test_gate(path, "probing")?;
             }
             let lease = lease::probe(&paths.session_owners_dir, &o.session.header.id);
             if let Some(error) = crate::sandbox::map_probe_failure(env, "send", &lease) {
@@ -302,9 +287,6 @@ pub(crate) fn submit(
             .map(|w| w.duration.as_millis().min(u128::from(u64::MAX)) as u64),
         env_digest: (route != Route::Live).then(|| rpc::warm::env_digest(env)),
     };
-    let store = JobStore::new(home.clone());
-    store.create_for_send(&job, env)?;
-    store.prune(now);
     if live.is_some()
         && let Some(level) = thinking.map(str::trim).filter(|t| !t.is_empty())
     {
@@ -331,24 +313,18 @@ pub(crate) fn submit(
         });
     }
     route_warnings.extend(warning);
-    if !route_warnings.is_empty() {
-        let mut s = store.read_status(&id)?;
-        s.warnings.extend(route_warnings);
-        store.write_status(&id, &s)?;
+    let store = JobStore::new(home.clone());
+    // From here a warm worker may claim the job: the sender never rewrites its status again,
+    // except for a spawn failure on a job nobody claimed.
+    store.create_for_send(&job, route_warnings, env)?;
+    #[cfg(debug_assertions)]
+    if let Some(path) = env.get("FAKE_SEND_CREATED_GATE") {
+        test_gate(path, id.as_str())?;
     }
+    store.prune(now);
     let child = match rpc::spawn_worker(&home, &id) {
-        Ok(c) => c,
-        Err(e) => {
-            let mut s = store.read_status(&id)?;
-            s.status = State::Failed;
-            s.updated_at = jiff::Timestamp::now().to_string();
-            s.error = Some(JobError {
-                code: "spawn".into(),
-                message: e.to_string(),
-                hint: None,
-                details: None,
-            });
-            store.write_status(&id, &s)?;
+        Ok(c) => Some(c),
+        Err(e) if fail_unclaimed(&store, &id, &e)? => {
             return Err(GlenError::new(
                 ErrorCode::Io,
                 format!(
@@ -358,6 +334,8 @@ pub(crate) fn submit(
                 ),
             ));
         }
+        // A warm worker claimed the job before the spawn failed: it runs there.
+        Err(_) => None,
     };
     Ok(Submitted {
         job,
@@ -366,6 +344,48 @@ pub(crate) fn submit(
         child,
         created,
     })
+}
+/// Records a failed worker spawn as the job's failure, under the status lock and only while no
+/// warm worker has claimed the job (the claim's own compare). False when a claim was found and
+/// kept: the claimant runs the job.
+fn fail_unclaimed(store: &JobStore, id: &JobId, e: &io::Error) -> Result<bool, GlenError> {
+    let (_, wrote) = store.update_status_if(id, |s| {
+        if s.status != State::Queued || s.omp_reused {
+            return false;
+        }
+        s.status = State::Failed;
+        s.updated_at = jiff::Timestamp::now().to_string();
+        s.error = Some(JobError {
+            code: "spawn".into(),
+            message: e.to_string(),
+            hint: None,
+            details: None,
+        });
+        true
+    })?;
+    Ok(wrote)
+}
+/// A debug-build test gate: writes `<path>.ready` with `body`, then waits up to 5 s for `path`.
+#[cfg(debug_assertions)]
+fn test_gate(path: &str, body: &str) -> Result<(), GlenError> {
+    let ready = format!("{path}.ready");
+    std::fs::write(&ready, body.as_bytes()).map_err(|e| {
+        GlenError::new(
+            ErrorCode::Io,
+            format!("cannot write test gate {ready}: {e}"),
+        )
+    })?;
+    let end = Instant::now() + Duration::from_secs(5);
+    while !Path::new(path).exists() {
+        if Instant::now() >= end {
+            return Err(GlenError::new(
+                ErrorCode::Io,
+                format!("timed out waiting for test gate {path}"),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -544,6 +564,133 @@ mod tests {
 mod submit_tests {
     use super::*;
     use clap::Parser;
+    /// The worker child is this unit-test binary, not a live omp process.
+    fn reap(child: &mut Child) {
+        if child.try_wait().unwrap().is_none() {
+            child.kill().unwrap();
+        }
+        child.wait().unwrap();
+    }
+    /// Runs an `@new` submit that stops at `FAKE_SEND_CREATED_GATE`, right after the job became
+    /// claimable, runs `at_gate` on the created job there, then lets the submit finish.
+    fn submit_with_gate(
+        vars: &[(&str, &str)],
+        at_gate: impl FnOnce(&JobStore, &JobId),
+    ) -> (
+        tempfile::TempDir,
+        JobStore,
+        JobId,
+        Result<Submitted, GlenError>,
+    ) {
+        let tree = tempfile::tempdir().unwrap();
+        let home = tree.path().join("glen");
+        let agent = tree.path().join("agent");
+        let gate = tree.path().join("gate");
+        let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/bin/fake-omp");
+        let mut all = vec![
+            ("GLEN_HOME", home.to_str().unwrap()),
+            ("PI_CODING_AGENT_DIR", agent.to_str().unwrap()),
+            ("GLEN_OMP_BIN", bin.to_str().unwrap()),
+            ("FAKE_SEND_CREATED_GATE", gate.to_str().unwrap()),
+        ];
+        all.extend_from_slice(vars);
+        let env = Env::for_test(Some(tree.path()), tree.path(), &all);
+        let cli = Cli::try_parse_from(["glen", "send", "@new", "hi"]).unwrap();
+        let store = JobStore::new(crate::glen_home::GlenHome { root: home.clone() });
+        let ready = tree.path().join("gate.ready");
+        let (id, result) = std::thread::scope(|scope| {
+            let sender = scope.spawn(|| {
+                let cwd = send_cwd(None, None, &env).unwrap();
+                submit(
+                    &cli,
+                    &env,
+                    None,
+                    cwd,
+                    "hi".into(),
+                    DeliverAs::Auto,
+                    None,
+                    None,
+                )
+            });
+            let end = Instant::now() + Duration::from_secs(10);
+            let id = loop {
+                if let Some(id) = std::fs::read_to_string(&ready)
+                    .ok()
+                    .and_then(|s| JobId::parse(&s))
+                {
+                    break id;
+                }
+                assert!(Instant::now() < end, "the submit never reached its gate");
+                std::thread::sleep(Duration::from_millis(5));
+            };
+            at_gate(&store, &id);
+            std::fs::write(&gate, b"go").unwrap();
+            (id, sender.join().unwrap())
+        });
+        (tree, store, id, result)
+    }
+    fn claim_as_me(store: &JobStore, id: &JobId) {
+        let me = crate::jobs::liveness::current().unwrap();
+        rpc::warm::claim(store, id, me.pid, Some(&me.start))
+            .unwrap()
+            .unwrap();
+    }
+    /// A path the worker log cannot be opened at, so `spawn_worker` fails.
+    fn break_spawn(store: &JobStore, id: &JobId) {
+        std::fs::create_dir(store.dir(id).join("worker.log")).unwrap();
+    }
+    #[test]
+    fn route_warnings_are_in_the_first_status_a_claimant_reads_and_a_claim_survives() {
+        let mut claimant = None;
+        let (_tree, _store, _id, result) =
+            submit_with_gate(&[("GLEN_JOB_TIMEOUT", "soon")], |store, id| {
+                // The job is claimable from here: its warnings are already on disk.
+                let first = store.read_status(id).unwrap();
+                assert_eq!(first.warnings.len(), 1, "{:?}", first.warnings);
+                assert_eq!(first.warnings[0].code, "invalid_env");
+                claim_as_me(store, id);
+                claimant = Some(store.read_status(id).unwrap());
+            });
+        let mut submitted = result.unwrap();
+        let disk = submitted.store.read_status(&submitted.id).unwrap();
+        let claimed = claimant.unwrap();
+        assert_eq!(
+            (
+                disk.worker_pid,
+                disk.worker_start.as_deref(),
+                disk.omp_reused
+            ),
+            (claimed.worker_pid, claimed.worker_start.as_deref(), true),
+            "the sender never rewrote the claimed status"
+        );
+        assert_eq!(disk.warnings.len(), 1);
+        reap(submitted.child.as_mut().unwrap());
+    }
+    #[test]
+    fn a_spawn_failure_never_fails_a_job_a_warm_worker_claimed() {
+        let (_tree, store, id, result) = submit_with_gate(&[], |store, id| {
+            claim_as_me(store, id);
+            break_spawn(store, id);
+        });
+        let submitted = result.unwrap();
+        assert!(submitted.child.is_none(), "the claimant runs the job");
+        let disk = store.read_status(&id).unwrap();
+        assert_eq!(disk.status, State::Queued);
+        assert!(disk.omp_reused && disk.error.is_none(), "{disk:?}");
+        assert_eq!(disk.worker_pid, Some(std::process::id()));
+    }
+    #[test]
+    fn a_spawn_failure_on_an_unclaimed_job_fails_it() {
+        let (_tree, store, id, result) = submit_with_gate(&[], break_spawn);
+        let Err(e) = result else {
+            panic!("the spawn failure must fail the send")
+        };
+        assert_eq!(e.code, ErrorCode::Io);
+        assert!(e.message.contains("cannot spawn worker"), "{}", e.message);
+        let disk = store.read_status(&id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(disk.error.unwrap().code, "spawn");
+    }
     #[test]
     fn literal_hyphen_is_submitted_without_reading_stdin() {
         let tree = tempfile::tempdir().unwrap();
@@ -572,11 +719,7 @@ mod submit_tests {
             None,
         )
         .unwrap();
-        // The worker child is this unit-test binary, not a live omp process.
-        if submitted.child.try_wait().unwrap().is_none() {
-            submitted.child.kill().unwrap();
-        }
-        submitted.child.wait().unwrap();
+        reap(submitted.child.as_mut().unwrap());
         let stored = submitted.store.read_job(&submitted.id).unwrap();
         assert_eq!(stored.text, "-");
         assert_eq!(stored.deliver_as, crate::jobs::Deliver::FollowUp);
