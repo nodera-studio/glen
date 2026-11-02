@@ -596,3 +596,27 @@ fn status_records_the_negotiated_protocol() {
         assert_eq!(status["rpc_protocol"], protocol, "{status}");
     }
 }
+#[test]
+fn status_records_the_protocol_when_host_tools_are_rejected() {
+    for (v2, protocol) in [(None, 1), (Some("1"), 2)] {
+        let b = RpcBox::new();
+        let mut c = b.glen(&["send", "e27c0de", "hi", "--json"]);
+        c.env("FAKE_OMP_SCENARIO", "reject_tools");
+        if let Some(v2) = v2 {
+            c.env("FAKE_OMP_V2", v2);
+        }
+        let o: Output = c.output().unwrap();
+        let v = json(&o);
+        assert_eq!(v["error"]["code"], "job_failed", "{o:?}");
+        let id = v["error"]["details"]["job"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        b.wait_worker_gone(&id);
+        let status = b.job(&id).1;
+        assert_eq!(status["status"], "failed", "{status}");
+        assert_eq!(status["error"]["code"], "reply_tool_rejected", "{status}");
+        assert_eq!(status["rpc_protocol"], protocol, "{status}");
+        assert!(status["omp_pid"].as_u64().is_some(), "{status}");
+    }
+}
