@@ -50,6 +50,7 @@ struct Server {
     writer: Writer,
     initialized: bool,
     tools: Vec<Value>,
+    calls: Vec<thread::JoinHandle<()>>,
 }
 
 /// Serves MCP on `input` and `output` until stdin EOF, a gone client or a signal recorded in
@@ -110,6 +111,7 @@ impl Server {
             writer,
             initialized: false,
             tools,
+            calls: vec![],
         }
     }
     fn result(&self, id: Value, result: Value) {
@@ -239,11 +241,33 @@ impl Server {
     }
     fn call(&mut self, id: Value, params: &Map<String, Value>) {
         let tool = match self.tool(params) {
-            Ok(t) => t,
+            Ok(t) => t.clone(),
             Err(e) => return self.error(id, INVALID_PARAMS, e),
         };
-        let result = dispatch::exec_failure(&tool.name, "tools/call is not in this build yet", b"");
-        self.result(id, result);
+        // An argument error is a tool error (MCP 2025-11-25), answered at once without a child.
+        let argv = match dispatch::validate(&tool, params.get("arguments")) {
+            Ok(supplied) => dispatch::argv(&tool, &supplied, self.config.profile.as_deref()),
+            Err(e) => return self.result(id, dispatch::argument_failure(&tool.name, &e)),
+        };
+        let (config, writer, answer) = (self.config.clone(), self.writer.clone(), id.clone());
+        let spawned = thread::Builder::new()
+            .name("glen-mcp-call".into())
+            .spawn(move || {
+                let run = dispatch::run_child(&config.launcher, &argv, &[]);
+                let result = dispatch::result(&tool, run);
+                writer.send(&json!({"jsonrpc":"2.0","id":answer,"result":result}));
+            });
+        match spawned {
+            Ok(handle) => self.calls.push(handle),
+            Err(e) => self.result(
+                id,
+                dispatch::exec_failure(
+                    params["name"].as_str().unwrap_or_default(),
+                    &format!("cannot start a call thread: {e}"),
+                    b"",
+                ),
+            ),
+        }
     }
     fn shutdown(&mut self) {}
 }
