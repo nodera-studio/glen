@@ -67,7 +67,7 @@ pub enum Command {
     Send(SendArgs),
     #[command(
         about = "Wait for a glen job (default 90s)",
-        after_help = "Examples:\n  glen wait j1a2b3c4\n  glen wait j1a2b3c4 --timeout 2m"
+        after_help = "Examples:\n  glen wait j1a2b3c4\n  glen wait j1a2b3c4 --timeout 2m\n  glen wait j1a2b3c4 --for reply"
     )]
     Wait(WaitArgs),
     #[command(
@@ -106,7 +106,8 @@ pub enum Command {
         after_help = "Examples:
   glen inbox
   glen inbox --peek --session e27c0de
-  glen inbox -f"
+  glen inbox -f
+  glen inbox --wait --timeout 2m"
     )]
     Inbox(InboxArgs),
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
@@ -273,12 +274,31 @@ impl SendArgs {
 pub struct WorkerArgs {
     pub job: String,
 }
+/// What `glen wait --for` returns on besides the end of the job (v0.2 W2, design §A20).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum WaitFor {
+    Reply,
+}
 #[derive(Debug, Args)]
 pub struct WaitArgs {
     #[arg(help = "job handle or full job UUID")]
     pub job: String,
     #[arg(long,help="maximum foreground wait; the job continues afterwards",default_value="90s",value_parser=parse_duration)]
     pub timeout: Duration,
+    #[arg(
+        long = "for",
+        value_enum,
+        value_name = "EVENT",
+        help = "return when an unseen glen_reply arrives (exit 10, data.woke = reply), or when the job ends"
+    )]
+    pub wait_for: Option<WaitFor>,
+    #[arg(
+        long,
+        value_name = "REPLY_ID",
+        requires = "wait_for",
+        help = "skip replies up to this id (the last id from the previous wake)"
+    )]
+    pub after: Option<String>,
 }
 #[derive(Debug, Args)]
 pub struct JobsArgs {
@@ -306,6 +326,21 @@ pub struct InboxArgs {
     pub all: bool,
     #[arg(short = 'f', long, help = "stream new messages as NDJSON")]
     pub follow: bool,
+    #[arg(
+        long,
+        conflicts_with_all = ["follow", "all"],
+        help = "wait for an unread message: exit 0 with it, or exit 10 at --timeout"
+    )]
+    pub wait: bool,
+    #[arg(
+        long,
+        value_name = "DUR",
+        requires = "wait",
+        default_value = "90s",
+        value_parser = parse_duration,
+        help = "maximum --wait (at most 24h)"
+    )]
+    pub timeout: Duration,
 }
 #[derive(Debug, Args)]
 pub struct WatchArgs {
@@ -599,6 +634,75 @@ mod rpc_tests {
                 .get_subcommands()
                 .any(|c| c.get_name() == "__worker")
         );
+    }
+}
+
+#[cfg(test)]
+mod push_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("glen").chain(args.iter().copied()))
+    }
+    fn wait(args: &[&str]) -> WaitArgs {
+        match parse(args).unwrap().command {
+            Command::Wait(a) => a,
+            other => panic!("not wait: {}", other.name()),
+        }
+    }
+    fn inbox(args: &[&str]) -> InboxArgs {
+        match parse(args).unwrap().command {
+            Command::Inbox(a) => a,
+            other => panic!("not inbox: {}", other.name()),
+        }
+    }
+    #[test]
+    fn wait_for_reply_and_after() {
+        let a = wait(&["wait", "j1234567"]);
+        assert_eq!((a.wait_for, a.after), (None, None));
+        let a = wait(&["wait", "j1234567", "--for", "reply", "--after", "r1"]);
+        assert_eq!(a.wait_for, Some(WaitFor::Reply));
+        assert_eq!(a.after.as_deref(), Some("r1"));
+        assert_eq!(a.timeout, Duration::from_secs(90));
+        for bad in [
+            vec!["wait", "j1234567", "--after", "r1"],
+            vec!["wait", "j1234567", "--for", "bogus"],
+            vec!["wait", "j1234567", "--for"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+    }
+    #[test]
+    fn inbox_wait_and_timeout() {
+        let a = inbox(&["inbox"]);
+        assert!(!a.wait);
+        assert_eq!(a.timeout, Duration::from_secs(90));
+        let a = inbox(&["inbox", "--wait"]);
+        assert!(a.wait);
+        assert_eq!(a.timeout, Duration::from_secs(90));
+        let a = inbox(&[
+            "inbox",
+            "--wait",
+            "--timeout",
+            "2m",
+            "--peek",
+            "--session",
+            "c0de",
+        ]);
+        assert!(a.wait && a.peek);
+        assert_eq!(a.timeout, Duration::from_secs(120));
+        assert_eq!(
+            inbox(&["inbox", "--wait", "--timeout", "24h"]).timeout,
+            Duration::from_secs(86_400)
+        );
+        for bad in [
+            vec!["inbox", "--timeout", "5s"],
+            vec!["inbox", "--wait", "-f"],
+            vec!["inbox", "--wait", "--follow"],
+            vec!["inbox", "--wait", "--all"],
+            vec!["inbox", "--wait", "--timeout", "25h"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
     }
 }
 

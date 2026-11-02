@@ -27,7 +27,9 @@ use serde_json::Value;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::reader::{self, A, OmpBox, RestoreMode, hold_lease, set_mtime, snapshot};
-use crate::rpc_support::{RpcBox, data_of, failed, job_handle, job_id, warning_codes};
+use crate::rpc_support::{
+    LONG, RpcBox, data_of, failed, job_handle, job_id, poll_until, warning_codes,
+};
 use crate::support::*;
 
 const AGENTS: [&str; 2] = ["claude", "codex"];
@@ -3220,7 +3222,7 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 33] = [
+const CONTRACT_IDS: [&str; 35] = [
     "ls",
     "show",
     "show.raw",
@@ -3230,6 +3232,8 @@ const CONTRACT_IDS: [&str; 33] = [
     "send.running",
     "send.forked",
     "wait",
+    "wait.reply",
+    "wait.reply.expired",
     "jobs",
     "doctor",
     "completions",
@@ -3663,6 +3667,54 @@ fn ac412_contract_send_running_then_wait() {
         .run();
     data_of(&out, 0);
     assert_contract("wait", &out.json());
+    rb.assert_quiet();
+}
+
+/// v0.2 W2: the reply wake and the bound expiry of `wait --for reply`, on a job held by
+/// `FAKE_OMP_RESULT_RELEASE` after the `progress` scenario's two replies.
+#[test]
+fn ac412_contract_wait_for_reply_wake_and_expiry() {
+    let rb = RpcBox::new();
+    let release = rb.bx.root.join("result-release");
+    let out = rb
+        .glen(["send", A.handle, "hi", "--no-wait", "--json"])
+        .env("FAKE_OMP_SCENARIO", "progress")
+        .env("FAKE_OMP_RESULT_RELEASE", &release)
+        .run();
+    let id = job_id(&data_of(&out, 10));
+    let replies = rb.job_dir(&id).join("replies.ndjson");
+    poll_until("both progress replies", LONG, || {
+        let text = fs::read_to_string(&replies).unwrap_or_default();
+        (text.ends_with('\n') && text.lines().count() == 2).then_some(())
+    });
+    let out = rb
+        .glen(["wait", &job_handle(&id), "--for", "reply", "--json"])
+        .run();
+    let woke = data_of(&out, 10);
+    assert_eq!(woke["woke"], "reply", "{}", out.ctx());
+    assert_contract("wait.reply", &out.json());
+    let last = woke["replies"][1]["id"]
+        .as_str()
+        .expect("two replies")
+        .to_owned();
+    let out = rb
+        .glen([
+            "wait",
+            &job_handle(&id),
+            "--for",
+            "reply",
+            "--after",
+            &last,
+            "--timeout",
+            "300ms",
+            "--json",
+        ])
+        .run();
+    let expired = data_of(&out, 10);
+    assert!(expired.get("woke").is_none(), "{}", out.ctx());
+    assert_contract("wait.reply.expired", &out.json());
+    fs::write(&release, "").unwrap();
+    rb.wait_terminal(&id);
     rb.assert_quiet();
 }
 
