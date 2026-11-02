@@ -504,7 +504,6 @@ fn omp_version_row(
     }
     Some(text)
 }
-/// `probe::BUDGET`; debug builds let `GLEN_PROBE_BUDGET_MS` (100 to 30000) shorten it for tests.
 /// The `warm_workers` check (v0.2 W4): registries only, no probe, never `fail`. A stale
 /// heartbeat or an unreadable registry warns and names the fix.
 fn warm_row(
@@ -542,6 +541,7 @@ fn warm_row(
         ("warn", value, detail.join("; "))
     }
 }
+/// `probe::BUDGET`; debug builds let `GLEN_PROBE_BUDGET_MS` (100 to 30000) shorten it for tests.
 fn probe_budget(env: &Env) -> Duration {
     #[cfg(debug_assertions)]
     if let Some(ms) = env

@@ -81,18 +81,20 @@ pub struct Setting {
     pub explicit: bool,
 }
 
-/// xxh64 (seed 0) of the sorted `KEY=VALUE\n` lines of `env`, without [`VOLATILE_ENV`] and
-/// `GLEN_` variables, as 16 lowercase hex digits. No value is ever recorded, only this digest.
+/// xxh64 (seed 0) of `env`'s variables sorted by name, without [`VOLATILE_ENV`] and `GLEN_`
+/// variables, as 16 lowercase hex digits. Each name and each value is length-prefixed (u64
+/// little-endian), so no value can mimic another variable. No value is ever recorded, only
+/// this digest.
 pub fn env_digest(env: &Env) -> String {
     let mut bytes = Vec::new();
     for (k, v) in env.iter() {
         if VOLATILE_ENV.contains(&k) || k.starts_with("GLEN_") {
             continue;
         }
-        bytes.extend_from_slice(k.as_bytes());
-        bytes.push(b'=');
-        bytes.extend_from_slice(v.as_bytes());
-        bytes.push(b'\n');
+        for part in [k, v] {
+            bytes.extend_from_slice(&(part.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(part.as_bytes());
+        }
     }
     format!("{:016x}", xxhash_rust::xxh64::xxh64(&bytes, 0))
 }
@@ -777,32 +779,34 @@ impl Idler<'_> {
                     self.log(&format!("{} differs from the warm omp", id.handle()));
                     return Reason::Mismatch;
                 }
-                Found::Adopt(id, job) => {
-                    if let Some(reason) = self.adopt(warm, id, *job) {
-                        return reason;
+                Found::Adopt(id, job) => match self.adopt(warm, id, *job) {
+                    Adopted::End(reason) => return reason,
+                    // Nothing ran: the window and its expiry stay as they were.
+                    Adopted::Refused => (),
+                    Adopted::Ran => {
+                        expires = match self.go_idle(warm) {
+                            Ok(t) => t,
+                            Err(reason) => return reason,
+                        };
+                        beat = Instant::now();
                     }
-                    expires = match self.go_idle(warm) {
-                        Ok(t) => t,
-                        Err(reason) => return reason,
-                    };
-                    beat = Instant::now();
-                }
+                },
             }
         }
     }
-    /// Claims and runs one queued job on the warm omp. `None` when the worker stays warm after
-    /// it; a refused claim also returns `None` (the scan moves on next tick).
-    fn adopt(&mut self, warm: &Warm, id: JobId, job: Job) -> Option<Reason> {
+    /// Claims and runs one queued job on the warm omp: `Ran` when the worker stays warm after
+    /// it, `Refused` when the claim lost (nothing ran; the scan moves on next tick).
+    fn adopt(&mut self, warm: &Warm, id: JobId, job: Job) -> Adopted {
         // (1) The omp process still drives the warm session.
         let state = match super::worker::query_state(&warm.client, Duration::from_secs(1)) {
             Ok(s) if s.session_id == warm.session_id => s,
             Ok(s) => {
                 self.log(&format!("omp moved to session {}", s.session_id));
-                return Some(Reason::Moved);
+                return Adopted::End(Reason::Moved);
             }
             Err(e) => {
                 self.log(&format!("cannot check the warm session: {e}"));
-                return Some(Reason::StateError);
+                return Adopted::End(Reason::StateError);
             }
         };
         // (2) The holder names the job before the claim, so a control never sees `warm` while a
@@ -822,7 +826,7 @@ impl Idler<'_> {
             self.start.as_deref(),
         ) {
             self.log(&format!("cannot mark the holder for {}: {e}", id.handle()));
-            return Some(Reason::StateError);
+            return Adopted::End(Reason::StateError);
         }
         let status = match claim(
             &self.first.store,
@@ -832,14 +836,17 @@ impl Idler<'_> {
         ) {
             Ok(Some(status)) => status,
             Ok(None) => {
-                return warm_holder(self).err().map(|e| {
-                    self.log(&format!("cannot mark the warm holder: {e}"));
-                    Reason::StateError
-                });
+                return match warm_holder(self) {
+                    Ok(()) => Adopted::Refused,
+                    Err(e) => {
+                        self.log(&format!("cannot mark the warm holder: {e}"));
+                        Adopted::End(Reason::StateError)
+                    }
+                };
             }
             Err(e) => {
                 self.log(&format!("cannot claim {}: {e}", id.handle()));
-                return Some(Reason::StateError);
+                return Adopted::End(Reason::StateError);
             }
         };
         // (4) Busy: committed to the job from here; any failure ends it through its own path.
@@ -853,13 +860,26 @@ impl Idler<'_> {
         self.last = Some(worker);
         if panicked {
             self.panicked = true;
-            return Some(Reason::StateError);
+            return Adopted::End(Reason::StateError);
         }
         if self.first.cancel.load(Ordering::SeqCst) {
-            return Some(Reason::Signal);
+            return Adopted::End(Reason::Signal);
         }
-        (!keep).then_some(Reason::Ended)
+        if keep {
+            Adopted::Ran
+        } else {
+            Adopted::End(Reason::Ended)
+        }
     }
+}
+/// What [`Idler::adopt`] did with a found job.
+enum Adopted {
+    /// The job ran and the worker stays warm: the window re-arms after it.
+    Ran,
+    /// Another worker claimed the job first; nothing ran.
+    Refused,
+    /// Warmth ends.
+    End(Reason),
 }
 /// Runs a claimed job on the warm omp with its own `Worker`, sink and deadline. A panic fails
 /// that job, never the one that made the worker warm.
@@ -1101,6 +1121,18 @@ mod settings_tests {
         let mut vars = base.to_vec();
         vars.push(("OTHER_API_KEY", "new"));
         assert_ne!(env_digest(&env(&vars)), digest);
+    }
+    #[test]
+    fn env_digest_encoding_is_unambiguous() {
+        // A value holding the separators of a `KEY=VALUE\n` encoding is not a second variable.
+        assert_ne!(
+            env_digest(&env(&[("A", "x\nB=y")])),
+            env_digest(&env(&[("A", "x"), ("B", "y")]))
+        );
+        assert_ne!(
+            env_digest(&env(&[("A=B", "c")])),
+            env_digest(&env(&[("A", "B=c")]))
+        );
     }
     #[test]
     fn key_matches_field_by_field_and_cwd_canonically() {

@@ -131,6 +131,17 @@ impl WarmBox {
         });
         started.elapsed()
     }
+    /// [`Self::wait_cold`] for the worker of job `id`, by the pids in its status, for a window
+    /// that may have ended before any registry was read.
+    fn wait_job_cold(&self, id: &str, within: Duration) {
+        let s = self.job(id).1;
+        let pid = s["worker_pid"].as_u64().unwrap() as u32;
+        let omp = s["omp_pid"].as_u64().map(|p| p as u32);
+        poll(within, || {
+            (self.registry().is_none() && !self.held() && gone(pid) && omp.is_none_or(group_gone))
+                .then_some(())
+        });
+    }
 }
 fn gone(pid: u32) -> bool {
     matches!(liveness::start_token(pid), Probe::Gone)
@@ -147,14 +158,25 @@ fn job_id(doc: &Value) -> String {
         .unwrap()
         .to_owned()
 }
+/// `settled_at` of a job's `result.json`.
+fn settled_at(b: &WarmBox, id: &str) -> jiff::Timestamp {
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(b.job_dir(id).join("result.json")).unwrap()).unwrap();
+    result["settled_at"].as_str().unwrap().parse().unwrap()
+}
+/// Milliseconds from a job's settlement to the end of the registry's window.
+fn window_ms(b: &WarmBox, id: &str, reg: &warm::Indexed) -> i64 {
+    let expires: jiff::Timestamp = reg.entry.expires_at.parse().unwrap();
+    expires.as_millisecond() - settled_at(b, id).as_millisecond()
+}
+
 #[test]
 fn ac_v2_403_a_warm_worker_holds_the_session_then_expires() {
     let b = WarmBox::new();
-    let first = b.send(&["--warm", "1s"]);
+    // The hold, on a window no process start-up can outlast; the registry is observed first.
+    let first = b.send(&["--warm", "60s"]);
     assert_eq!(first["job"]["status"], "completed", "{first}");
     let id = job_id(&first);
-    let (job, _) = b.job(&id);
-    assert_eq!(job["warm_ms"], 1000);
     let reg = b.wait_registry();
     assert_eq!(reg.entry.job_id, id);
     assert!(b.held());
@@ -165,23 +187,36 @@ fn ac_v2_403_a_warm_worker_holds_the_session_then_expires() {
     assert_eq!(holder.pid, reg.entry.pid);
     let omp = reg.entry.omp_pid.unwrap();
     assert!(!group_gone(omp), "omp stays alive while warm");
-    b.wait_cold(&reg.entry, Duration::from_secs(6));
+    let (job, _) = b.job(&id);
+    assert_eq!(job["warm_ms"], 60_000);
     assert!(
-        b.log(&id).contains("warm: cooling (expired)"),
+        window_ms(&b, &id, &reg) >= 60_000,
         "{}",
-        b.log(&id)
+        reg.entry.expires_at
     );
+    release_all(&b);
+    // Expiry, on a 1 s window nothing has to catch while it is open: the worker ends on its own.
+    let second = b.send(&["--warm", "1s"]);
+    assert_eq!(second["job"]["status"], "completed", "{second}");
+    let two = job_id(&second);
+    poll(Duration::from_secs(10), || {
+        b.log(&two)
+            .contains("warm: cooling (expired)")
+            .then_some(())
+    });
+    b.wait_job_cold(&two, Duration::from_secs(6));
     assert!(!warm::release_path(&b.home(), A_ID).exists());
-    assert_eq!(b.starts(), 1);
+    assert_eq!(b.starts(), 2, "one omp per warm worker");
 }
 
 #[test]
 fn ac_v2_402_a_second_send_is_stolen_and_runs_on_the_same_omp() {
     let b = WarmBox::new();
-    let first = b.send(&["--warm", "2s"]);
+    // Windows no process start-up can outlast: the second send always finds the worker warm.
+    let first = b.send(&["--warm", "30s"]);
     let one = job_id(&first);
     let reg = b.wait_registry();
-    let queued = b.no_wait(&["again", "--warm", "2s"]);
+    let queued = b.no_wait(&["again", "--warm", "30s"]);
     let sent = Instant::now();
     let two = job_id(&queued);
     let claimed = poll(Duration::from_secs(5), || {
@@ -203,8 +238,14 @@ fn ac_v2_402_a_second_send_is_stolen_and_runs_on_the_same_omp() {
     assert_eq!(b.frames_in("prompt").len(), 2);
     let reg = b.wait_registry();
     assert_eq!(reg.entry.job_id, two);
-    b.wait_cold(&reg.entry, Duration::from_secs(8));
-    assert!(b.log(&one).contains("warm: cooling (expired)"));
+    // The window re-arms after the adopted job, with that job's own duration.
+    assert!(
+        window_ms(&b, &two, &reg) >= 30_000,
+        "{}",
+        reg.entry.expires_at
+    );
+    release_all(&b);
+    assert!(b.log(&one).contains("warm: cooling (release)"));
     assert!(b.log(&two).contains("warm: adopted"), "{}", b.log(&two));
 }
 
@@ -401,8 +442,14 @@ fn ac_v2_401_off_by_default_flag_beats_env_and_zero_is_off() {
             "{flag:?} {var:?}"
         );
         if want.is_some() {
-            b.wait_registry();
+            // Warm, or already cooled on its own (the 1s row): end it either way, never by
+            // catching a window that may have closed.
+            let id = job_id(&doc);
+            poll(Duration::from_secs(10), || {
+                (b.registry().is_some() || b.log(&id).contains("warm: cooling")).then_some(())
+            });
             release_all(&b);
+            b.wait_job_cold(&id, Duration::from_secs(6));
         } else {
             b.wait_worker_gone(&job_id(&doc));
             assert!(b.registry().is_none(), "{flag:?} {var:?}");
@@ -571,7 +618,16 @@ fn ac_v2_402_a_stolen_job_is_the_claimants_never_lost_while_it_lives() {
         "lost",
         "{lost:?}"
     );
-    let _ = warm::remove(&b.home(), A_ID);
+    // The killed worker never tore down: end its omp group here, then drop its registry so the
+    // box's guard never signals the dead worker's pid (which the OS may reuse).
+    let omp = reg.entry.omp_pid.unwrap();
+    let group = rustix::process::Pid::from_raw(omp as i32).unwrap();
+    match rustix::process::kill_process_group(group, rustix::process::Signal::KILL) {
+        Ok(()) | Err(rustix::io::Errno::SRCH) => (),
+        Err(e) => panic!("cannot kill omp group {omp}: {e}"),
+    }
+    poll(Duration::from_secs(5), || group_gone(omp).then_some(()));
+    warm::remove(&b.home(), A_ID).unwrap();
 }
 fn gate_path() -> (tempfile::TempDir, std::path::PathBuf) {
     let t = tempfile::tempdir().unwrap();
@@ -673,38 +729,55 @@ fn ac_v2_407_an_idle_glen_reply_is_rejected_and_attributed_nowhere() {
 
 #[test]
 fn ac_v2_407_the_window_opens_after_settlement_and_a_long_job_stays_busy() {
-    let (_dir, result) = gate_path();
-    let b = WarmBox::with(&[("FAKE_OMP_RESULT_RELEASE", result.to_str().unwrap())]);
-    std::fs::write(&result, b"go").unwrap();
-    let one = job_id(&b.send(&["--warm", "1s"]));
-    let reg = b.wait_registry();
-    let settled = b.b.job_dir(&one).join("result.json");
-    let settled_at: jiff::Timestamp =
-        serde_json::from_slice::<Value>(&std::fs::read(&settled).unwrap()).unwrap()["settled_at"]
-            .as_str()
-            .unwrap()
-            .parse()
-            .unwrap();
-    let expires: jiff::Timestamp = reg.entry.expires_at.parse().unwrap();
-    assert!(expires.as_millisecond() - settled_at.as_millisecond() >= 1000);
-    // A job held in omp longer than the window keeps the worker: busy, never expired.
-    std::fs::remove_file(&result).unwrap();
-    let two = job_id(&b.no_wait(&["long", "--warm", "1s"]));
-    poll(Duration::from_secs(5), || {
-        b.registry()
-            .filter(|r| r.entry.state == warm::EntryState::Busy)
-            .map(|_| ())
+    let (_run_dir, run) = gate_path();
+    let (_result_dir, result) = gate_path();
+    let b = WarmBox::with(&[
+        ("FAKE_OMP_RUN_RELEASE", run.to_str().unwrap()),
+        ("FAKE_OMP_RESULT_RELEASE", result.to_str().unwrap()),
+    ]);
+    std::fs::write(&run, b"go").unwrap();
+    // Job 1 is held before its result, and job 2 queues behind it: the worker adopts job 2 on
+    // its first idle tick after job 1 settles, so no process start-up races job 1's window.
+    let one = job_id(&b.no_wait(&["first", "--warm", "2s"]));
+    poll(Duration::from_secs(10), || {
+        contains(&b.job_dir(&one).join("replies.ndjson"), "reply: first").then_some(())
     });
-    std::thread::sleep(Duration::from_millis(1500));
-    let busy = b.registry().unwrap();
-    assert_eq!(busy.entry.state, warm::EntryState::Busy);
-    assert_eq!(busy.entry.job_id, two);
+    let two = job_id(&b.no_wait(&["long", "--warm", "30s"]));
+    // Job 1 is past the run gate (its reply is in): closing it holds only job 2.
+    std::fs::remove_file(&run).unwrap();
     std::fs::write(&result, b"go").unwrap();
-    data(&b.run(&["wait", &two, "--json"]));
+    let busy = poll(Duration::from_secs(10), || {
+        b.registry()
+            .filter(|r| r.entry.state == warm::EntryState::Busy && r.entry.job_id == two)
+    });
+    // Job 1's window opened at its settlement and runs its full 2 s.
+    assert!(
+        window_ms(&b, &one, &busy) >= 2000,
+        "{}",
+        busy.entry.expires_at
+    );
+    // Job 2 held in omp past that window keeps the worker busy, never expired.
+    let expires: jiff::Timestamp = busy.entry.expires_at.parse().unwrap();
+    let past = expires.as_millisecond() + 500 - jiff::Timestamp::now().as_millisecond();
+    std::thread::sleep(Duration::from_millis(past.max(0) as u64));
+    let still = b.registry().unwrap();
+    assert_eq!(still.entry.state, warm::EntryState::Busy);
+    assert_eq!(still.entry.job_id, two);
+    assert!(!b.log(&one).contains("warm: cooling"), "{}", b.log(&one));
+    std::fs::write(&run, b"go").unwrap();
+    let done = data(&b.run(&["wait", &two, "--json"]));
+    assert_eq!(done["job"]["omp_reused"], true, "{done}");
+    // The window re-opens after job 2's own settlement, for job 2's own duration.
     let idle = b.wait_registry();
     assert_eq!(idle.entry.job_id, two);
-    b.wait_cold(&idle.entry, Duration::from_secs(5));
-    assert!(b.log(&one).contains("warm: cooling (expired)"));
+    assert!(
+        window_ms(&b, &two, &idle) >= 30_000,
+        "{}",
+        idle.entry.expires_at
+    );
+    release_all(&b);
+    assert!(b.log(&one).contains("warm: cooling (release)"));
+    assert_eq!(b.starts(), 1);
 }
 
 #[test]

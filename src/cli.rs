@@ -403,7 +403,7 @@ pub struct ReleaseArgs {
         help = "kill a worker that does not release in time (after a pid and start-time check)"
     )]
     pub force: bool,
-    #[arg(long,value_name="DUR",default_value="10s",value_parser=parse_control_timeout,help="how long to wait for each worker to release (default 10s)")]
+    #[arg(long,value_name="DUR",default_value="10s",value_parser=parse_control_timeout,help="how long to wait for each worker to release")]
     pub timeout: Duration,
 }
 #[derive(Debug, Args)]
@@ -893,6 +893,16 @@ mod warm_tests {
         assert_eq!(
             parse(&["release", "--all"]).unwrap().command.name(),
             "release"
+        );
+        let help = public_command()
+            .find_subcommand_mut("release")
+            .unwrap()
+            .render_help()
+            .to_string();
+        assert_eq!(
+            help.matches("10s").count(),
+            1,
+            "the default shown once: {help}"
         );
     }
     #[test]

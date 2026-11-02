@@ -590,8 +590,8 @@ pub(crate) fn route_models(
     };
     Ok((Target::Rpc(client), warnings, source))
 }
-/// Asks the idle warm worker named by `holder` to cool, then waits until the session lock is
-/// free (bounded by the command's deadline). The caller then routes as if it had never been warm.
+/// Asks the idle warm worker named by `holder` to cool, then waits until that holder is gone
+/// (bounded by the command's deadline). The caller then routes as if it had never been warm.
 fn cool_for_control(
     env: &Env,
     command: &str,
@@ -608,8 +608,23 @@ fn cool_for_control(
         &crate::rpc::warm::ident(holder.pid, holder.start.as_deref()),
     )
     .map_err(|e| crate::sandbox::map_home_write(env, command, e))?;
-    while lock::is_held(home, id) {
-        stopped(deadline, stop, opened)?;
+    wait_holder_gone(home, id, holder, deadline, || {
+        stopped(deadline, stop, opened)
+    })
+}
+/// Waits while the session lock is held and its recorded holder is still `holder`. A free lock
+/// or any other record (a cold job that took the lock after the warm worker cooled, or the warm
+/// worker itself now running an adopted job) returns at once, so the caller's next `owner()`
+/// routes to whoever holds the session now instead of waiting for it to finish.
+fn wait_holder_gone(
+    home: &glen_home::GlenHome,
+    id: &str,
+    holder: &lock::Holder,
+    deadline: Instant,
+    stopped: impl Fn() -> Result<(), GlenError>,
+) -> Result<(), GlenError> {
+    while lock::is_held(home, id) && lock::holder(home, id).as_ref() == Some(holder) {
+        stopped()?;
         std::thread::sleep(
             Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
         );
@@ -706,5 +721,44 @@ mod tests {
             ),
             Owner::Free
         ));
+    }
+    #[test]
+    fn cooling_waits_only_while_the_warm_holder_itself_holds_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = glen_home::GlenHome {
+            root: temp.path().join("glen"),
+        };
+        let session = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+        let me = liveness::current().unwrap();
+        let warm = lock::Holder {
+            v: 1,
+            kind: lock::HolderKind::Warm,
+            job_id: Some(JobId::new().as_str().into()),
+            pid: me.pid,
+            start: Some("the-cooled-warm-worker".into()),
+        };
+        // The deadline passing is the only way out of a wait that never ends.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let timed_out = || {
+            if Instant::now() >= deadline {
+                Err(GlenError::new(ErrorCode::ControlFailed, "deadline"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(wait_holder_gone(&home, session, &warm, deadline, timed_out).is_ok());
+        let held = lock::try_acquire(&home, session).unwrap().unwrap();
+        // The warm worker cooled and a cold job took the session: return so `owner()` routes to it.
+        let job = lock::Holder {
+            kind: lock::HolderKind::Job,
+            start: Some(me.start.clone()),
+            ..warm.clone()
+        };
+        lock::mark(&held, &job).unwrap();
+        assert!(wait_holder_gone(&home, session, &warm, deadline, timed_out).is_ok());
+        // The warm worker still holding the session: wait until the deadline.
+        lock::mark(&held, &warm).unwrap();
+        let e = wait_holder_gone(&home, session, &warm, deadline, timed_out).unwrap_err();
+        assert_eq!(e.message, "deadline");
     }
 }

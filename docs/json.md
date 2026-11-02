@@ -912,15 +912,17 @@ omp TUI with no job. With `--cwd`, a reply from a session glen has not yet place
 ## `glen release`
 
 Ends warm workers (`glen send --warm`, design §A21). Give exactly one of a target (a session id, a hex tail of 4
-or more, or a job handle, matched against warm workers only) and `--all`. An idle worker is asked to cool and
-waited for until its session lock is free and its registry gone (`released`); a busy one is asked and cools after
-its job (`cooling`, returned at once); a dead or identity-changed registry is removed (`cleaned`). With `--force`,
-a worker whose heartbeat is stale, or that did not release within `--timeout` (default 10s, at most 24h), is killed
-with its omp process group after a pid and start-time check (`forced`); a process glen cannot prove unchanged is
-never signalled. A target that matches no warm worker exits 3 `not_found` with
-`details:{reason:"not_warm",target}`. A worker that did not release in time without `--force` exits 7
-`control_failed` with `details:{reason:"release_timeout",workers}` and a hint naming `--force`. `--all` with no
-warm worker is exit 0 with `total:0`. It creates no glen home.
+or more, or a job handle, matched against warm workers only; a job handle names its session's worker, for `@new`
+the session omp created) and `--all`. An idle worker is asked to cool and waited for until it is gone: its
+registry removed or another worker's, and the session lock free or another process's (`released`); a busy one is
+asked and cools after its job (`cooling`, returned at once); a dead or identity-changed registry is removed
+(`cleaned`), and only while it still names that worker. With `--force`, a worker whose heartbeat is stale, or that
+did not release within `--timeout` (default 10s, at most 24h), is killed with its omp process group after a pid and
+start-time check (`forced`, once both are gone); a process glen cannot prove unchanged is never signalled, and a
+recorded omp it cannot prove keeps the worker from being signalled too (`release_timeout`, registry kept). A
+target that matches no warm worker exits 3 `not_found` with `details:{reason:"not_warm",target}`. A worker that
+did not release in time without `--force` exits 7 `control_failed` with `details:{reason:"release_timeout",workers}`
+and a hint naming `--force`. `--all` with no warm worker is exit 0 with `total:0`. It creates no glen home.
 
 | Field | Meaning |
 |---|---|

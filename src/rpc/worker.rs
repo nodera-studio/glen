@@ -144,8 +144,10 @@ pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .or_else(|| payload.downcast_ref::<&str>().copied())
         .unwrap_or("unknown panic")
 }
-/// The worker's exit. A stolen job ends silently with 0; a job already terminal (a warm worker
-/// whose idle phase failed) is never rewritten; anything else is persisted as the job's failure.
+/// The worker's exit. A stolen job ends silently with 0; a job whose status on disk is already
+/// terminal (a warm worker whose idle phase failed) is never rewritten; a terminal status that
+/// only reached memory (its save failed) is saved again; anything else is persisted as the job's
+/// failure.
 fn conclude(w: &mut Worker, result: std::thread::Result<Result<(), Failure>>) -> ExitCode {
     let (failure, panicked) = match result {
         Ok(Ok(())) => return ExitCode::SUCCESS,
@@ -162,7 +164,10 @@ fn conclude(w: &mut Worker, result: std::thread::Result<Result<(), Failure>>) ->
             true,
         ),
     };
-    if w.status.status.is_terminal() {
+    if w.store
+        .read_status(&w.id)
+        .is_ok_and(|s| s.status.is_terminal())
+    {
         w.log(
             "failed",
             &format!("failed after terminal status: {failure}"),
@@ -170,7 +175,12 @@ fn conclude(w: &mut Worker, result: std::thread::Result<Result<(), Failure>>) ->
         return ExitCode::FAILURE;
     }
     w.log("failed", &failure.to_string());
-    match w.finish_failure(failure) {
+    let persisted = if w.status.status.is_terminal() {
+        w.save().map(|()| w.respond_pending())
+    } else {
+        w.finish_failure(failure)
+    };
+    match persisted {
         Ok(()) if panicked => ExitCode::FAILURE,
         Ok(()) => ExitCode::SUCCESS,
         Err(e) if e.code == STOLEN => {
@@ -2288,6 +2298,30 @@ mod control_tests {
         assert_eq!(
             conclude(&mut w, Ok(Err(Failure::new("io", "x")))),
             ExitCode::SUCCESS
+        );
+    }
+    #[test]
+    fn a_terminal_status_whose_save_failed_is_saved_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        // `finish_failure` set the job's failure in memory, but its save failed: the status on
+        // disk is still queued, and the run ends with that save's error.
+        w.status.status = State::Failed;
+        w.status.error = Some(JobError {
+            code: "timeout".into(),
+            message: "the glen job deadline passed".into(),
+            hint: None,
+            details: None,
+        });
+        assert_eq!(w.store.read_status(&w.id).unwrap().status, State::Queued);
+        let result = Ok(Err(Failure::new("io", "cannot write status.json")));
+        assert_eq!(conclude(&mut w, result), ExitCode::SUCCESS);
+        let disk = w.store.read_status(&w.id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(
+            disk.error.unwrap().code,
+            "timeout",
+            "the failure it meant to save"
         );
     }
     #[test]
