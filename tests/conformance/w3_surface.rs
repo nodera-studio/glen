@@ -37,7 +37,7 @@ fn ac301_help_lists_exactly_the_w3_commands() {
         assert_eq!(listed_commands(&out.out()), want, "{}", out.ctx());
         assert!(!out.out().contains("__worker"), "{}", out.ctx());
     }
-    for name in HIDDEN {
+    for name in NOT_IMPLEMENTED {
         let err = sb.glen([name]).run().error_envelope("not_implemented");
         assert!(err["message"].as_str().unwrap().contains(name), "{err}");
     }

@@ -71,7 +71,7 @@ fn ac201_help_lists_the_w2_commands_and_hides_the_rest() {
         assert_eq!(listed_commands(&out.out()), want, "{}", out.ctx());
         assert!(!out.out().contains("__worker"), "{}", out.ctx());
     }
-    for name in HIDDEN {
+    for name in NOT_IMPLEMENTED {
         let out = sb.glen([name]).run();
         let err = out.error_envelope("not_implemented");
         assert!(

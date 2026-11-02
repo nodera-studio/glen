@@ -20,7 +20,7 @@ use serde_json::Value;
 use std::{
     io::{self, Read},
     path::Path,
-    process::{Child, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -30,13 +30,40 @@ use std::{
 };
 // Glen owns the child before the blocking RPC handshake starts. A startup error or
 // cancellation drops this guard before the session lock can leave spawn's scope.
-pub(super) struct Process {
-    pub(super) child: Child,
-    pub(super) stderr: Option<std::thread::JoinHandle<io::Result<Vec<Warning>>>>,
-    pub(super) reaped: bool,
+pub(crate) struct Process {
+    pub(crate) child: Child,
+    pub(crate) stderr: Option<std::thread::JoinHandle<io::Result<Vec<Warning>>>>,
+    pub(crate) reaped: bool,
 }
 impl Process {
-    pub(super) fn stop(&mut self, grace: Duration) -> io::Result<()> {
+    /// Spawns `command` in its own process group with piped stdio and starts the stderr drain.
+    pub(crate) fn spawn_piped(
+        mut command: std::process::Command,
+    ) -> io::Result<(Self, ChildStdin, ChildStdout)> {
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
+        let child = command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        let mut process = Self {
+            child,
+            stderr: None,
+            reaped: false,
+        };
+        let (Some(stdin), Some(stdout), Some(stderr)) = (
+            process.child.stdin.take(),
+            process.child.stdout.take(),
+            process.child.stderr.take(),
+        ) else {
+            drop(process.finish(Duration::from_millis(100)));
+            return Err(io::Error::other("missing omp pipe"));
+        };
+        process.stderr = Some(std::thread::spawn(move || drain_stderr(stderr)));
+        Ok((process, stdin, stdout))
+    }
+    pub(crate) fn stop(&mut self, grace: Duration) -> io::Result<()> {
         self.stop_with(grace, rustix::process::test_kill_process_group)
     }
     /// `stop` with the `kill(-pgid, 0)` group probe injected, so a test can observe it.
@@ -87,7 +114,7 @@ impl Process {
         }
         Err(io::Error::other("omp process group survived SIGKILL"))
     }
-    pub(super) fn finish(&mut self, grace: Duration) -> Vec<Warning> {
+    pub(crate) fn finish(&mut self, grace: Duration) -> Vec<Warning> {
         let mut warnings = vec![];
         if let Err(error) = self.stop(grace) {
             warnings.push(Warning {
@@ -133,7 +160,7 @@ impl Drop for Process {
         drop(self.finish(Duration::ZERO));
     }
 }
-pub(super) fn drain_stderr(mut stderr: impl Read) -> io::Result<Vec<Warning>> {
+pub(crate) fn drain_stderr(mut stderr: impl Read) -> io::Result<Vec<Warning>> {
     // Keep memory bounded even for a noisy child or an unterminated line, but
     // continue draining after the capture budget so the child cannot block.
     const MAX_LINES: usize = 16;
@@ -559,7 +586,7 @@ impl Drop for Ephemeral {
         self.lock.take();
     }
 }
-fn moved(from: &str, to: &str) -> GlenError {
+pub(crate) fn moved(from: &str, to: &str) -> GlenError {
     GlenError::new(
         ErrorCode::ControlFailed,
         "the session moved before the control could run",

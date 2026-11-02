@@ -44,7 +44,7 @@ fn ac101_ac201_help_lists_the_visible_commands_and_the_rest_stay_hidden() {
         "{}",
         out.ctx()
     );
-    for name in HIDDEN {
+    for name in NOT_IMPLEMENTED {
         bx.glen([name]).run().error_envelope("not_implemented");
     }
     bx.assert_no_state();

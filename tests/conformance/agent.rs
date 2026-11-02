@@ -1138,11 +1138,13 @@ fn ac401_watch_is_visible_and_requires_an_interactive_terminal() {
     let sb = Sandbox::new();
     let listed = command_names(&sb.glen(["--help"]).run().out());
     assert!(listed.iter().any(|name| name == "watch"), "{listed:?}");
-    for name in HIDDEN {
+    for name in HIDDEN.into_iter().chain(NOT_IMPLEMENTED) {
         assert!(
             !listed.iter().any(|c| c == name),
             "{name} is listed: {listed:?}"
         );
+    }
+    for name in NOT_IMPLEMENTED {
         let out = sb.glen([name]).run();
         out.error_envelope("not_implemented");
         out.assert_exit(8).assert_stderr_empty();
