@@ -271,6 +271,9 @@ FLAGS
     let mut reply_index = 0;
     let mut running_queries = 0;
     let mut state_queries = 0;
+    // v0.2 W4 warm-worker knobs (design §A15): several prompts per process, and events while idle.
+    let multi = knob("FAKE_OMP_MULTI").as_deref() == Some("1");
+    let mut idle_reply_sent = false;
     loop {
         if scenario != "wedge" && terminated.load(Ordering::SeqCst) {
             break;
@@ -457,8 +460,15 @@ FLAGS
                             due = None;
                         }
                     }
-                    "prompt" if prompt.is_some() => reject(&f, "second prompt")?,
+                    "prompt" if prompt.is_some() && !(multi && stage == 4) => {
+                        reject(&f, "second prompt")?
+                    }
                     "prompt" => {
+                        // FAKE_OMP_MULTI: the previous prompt settled; this process takes another.
+                        stage = 0;
+                        due = None;
+                        replies.clear();
+                        reply_index = 0;
                         if scenario == "local_result_unsettled" {
                             response(&f, json!({}))?;
                             out(
@@ -525,6 +535,8 @@ FLAGS
                         stage = 1;
                         prompt = Some(f);
                     }
+                    // The idle call's result is logged (as every frame is) and never advances a job.
+                    "host_tool_result" if f["id"] == "htc_idle" => (),
                     "host_tool_result" => {
                         reply_index += 1;
                         if reply_index < replies.len() {
@@ -539,6 +551,19 @@ FLAGS
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             Err(mpsc::RecvTimeoutError::Timeout) => (),
+        }
+        let idle = prompt.is_none() || stage == 4;
+        let released = |key: &str| knob(key).is_some_and(|p| Path::new(&p).exists());
+        if idle && !idle_reply_sent && released("FAKE_OMP_IDLE_REPLY_RELEASE") {
+            idle_reply_sent = true;
+            log(json!({"event":"idle_reply"}))?;
+            out(
+                json!({"type":"host_tool_call","id":"htc_idle","toolName":"glen_reply","toolCallId":"call_idle","arguments":{"text":"idle reply","final":false}}),
+            )?;
+        }
+        if idle && released("FAKE_OMP_IDLE_EXIT_RELEASE") {
+            log(json!({"event":"exit","reason":"idle release"}))?;
+            return Ok(0);
         }
         if due.is_none_or(|t| Instant::now() < t) {
             continue;
