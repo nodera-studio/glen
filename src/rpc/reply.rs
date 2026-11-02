@@ -121,6 +121,13 @@ pub(crate) struct PendingReply {
     done: mpsc::SyncSender<Result<(), GlenError>>,
 }
 impl PendingReply {
+    /// Fails omp's `glen_reply` call at once with `error`, recording nothing: the reply has no
+    /// job to belong to (a warm worker between jobs, design §A21).
+    pub fn discard(self, error: GlenError) {
+        if self.done.send(Err(error)).is_err() {
+            eprintln!("glen_reply handler stopped waiting before the rejection");
+        }
+    }
     pub fn finish(self, sink: &ReplySink, state: Result<(), GlenError>) {
         let result = state.and_then(|()| sink.record(self.text, self.is_final, self.tool_call_id));
         if self.done.send(result).is_err() {
@@ -262,6 +269,22 @@ mod tests {
         assert_eq!(d.name, "glen_reply");
         assert_eq!(d.parameters["required"], json!(["text"]));
         assert_eq!(d.parameters["additionalProperties"], false);
+    }
+    #[test]
+    fn discard_fails_the_pending_call_and_records_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let (done, result) = mpsc::sync_channel(1);
+        PendingReply {
+            text: "idle reply".into(),
+            is_final: false,
+            tool_call_id: "htc_idle".into(),
+            done,
+        }
+        .discard(GlenError::new(ErrorCode::JobFailed, "no job"));
+        let e = result.recv().unwrap().unwrap_err();
+        assert_eq!(e.message, "no job");
+        assert!(!store.home.root.exists(), "nothing written anywhere");
     }
     #[test]
     fn failed_job_write_records_nothing_in_memory() {

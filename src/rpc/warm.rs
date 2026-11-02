@@ -1,5 +1,9 @@
 //! The opt-in warm worker (v0.2 W4, design §A21): settings, the match key, the on-disk
 //! registry and release request, the claim, the idle loop and its one teardown.
+use super::{
+    reply::PendingReply,
+    worker::{Failure, Worker},
+};
 use crate::{
     env::Env,
     error::{ErrorCode, GlenError},
@@ -10,11 +14,13 @@ use crate::{
         lock::lock_key,
     },
 };
+use omp_rpc::{Client, Event};
 use serde::{Deserialize, Serialize};
 use std::{
     fs, io,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime},
+    sync::{atomic::Ordering, mpsc},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// The longest a worker may stay warm after a job (`--warm`, `GLEN_WARM`).
@@ -382,6 +388,219 @@ pub fn claim(
         true
     })?;
     Ok(wrote.then_some(status))
+}
+
+/// Why warmth ended; logged as `warm: cooling (<reason>)` by the one teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reason {
+    Expired,
+    Release,
+    Endpoint,
+    Signal,
+    OmpExited,
+    StateError,
+}
+impl Reason {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Expired => "expired",
+            Self::Release => "release",
+            Self::Endpoint => "endpoint",
+            Self::Signal => "signal",
+            Self::OmpExited => "omp_exited",
+            Self::StateError => "state_error",
+        }
+    }
+}
+/// What one idle tick observed, in the order the loop checks it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct Tick {
+    pub cancelled: bool,
+    pub omp_exited: bool,
+    pub release: bool,
+    pub endpoint: bool,
+    pub expired: bool,
+}
+/// The first ending a tick observed: a signal, omp exiting, a release request, a live endpoint
+/// for the session, expiry. `None` stays warm (and scans for a queued job).
+pub(crate) fn decide(t: &Tick) -> Option<Reason> {
+    [
+        (t.cancelled, Reason::Signal),
+        (t.omp_exited, Reason::OmpExited),
+        (t.release, Reason::Release),
+        (t.endpoint, Reason::Endpoint),
+        (t.expired, Reason::Expired),
+    ]
+    .into_iter()
+    .find_map(|(seen, reason)| seen.then_some(reason))
+}
+/// What an idle warm worker keeps from its last job: omp, its receivers and the session lock.
+pub(crate) struct Warm {
+    pub client: Client,
+    pub events: mpsc::Receiver<Event>,
+    pub replies: mpsc::Receiver<PendingReply>,
+    pub lock: crate::jobs::lock::SessionLock,
+    pub session_id: String,
+}
+/// Drains omp's events; true once the channel is closed (omp exited).
+fn drain_events(events: &mpsc::Receiver<Event>) -> bool {
+    loop {
+        match events.try_recv() {
+            Ok(_) => (),
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => return true,
+        }
+    }
+}
+/// Fails every `glen_reply` that arrived with no job running: it is attributed to nothing.
+fn reject_replies(replies: &mpsc::Receiver<PendingReply>) {
+    for reply in replies.try_iter() {
+        reply.discard(GlenError::new(
+            ErrorCode::JobFailed,
+            "glen_reply: no glen job is running on this session",
+        ));
+    }
+}
+/// A live endpoint registry for the session: a stat, then a read. A live pid or an unreadable
+/// registry yields; a dead one is ignored. No hello probe (it alone could take 1 s).
+fn endpoint_present(home: &GlenHome, session_id: &str) -> bool {
+    use crate::live::registry;
+    if !registry::path(home, session_id).exists() {
+        return false;
+    }
+    match registry::read(home, session_id) {
+        registry::Read::Missing => false,
+        registry::Read::Unreadable(_) => true,
+        registry::Read::Ok(r) => !registry::pid_dead(r.pid),
+    }
+}
+fn timestamp_after(d: Duration) -> String {
+    jiff::Timestamp::now()
+        .checked_add(jiff::SignedDuration::from_millis(
+            d.as_millis().min(i64::MAX as u128) as i64,
+        ))
+        .unwrap_or_else(|_| jiff::Timestamp::now())
+        .to_string()
+}
+/// The idle phase after a job that stays warm (design §A21). It never writes the status of a
+/// job it is not running: every failure here ends warmth through [`teardown`]. `Err` only when
+/// an adopted job panicked, so the worker exits non-zero.
+pub(crate) fn idle(first: &mut Worker, warm: Warm) -> Result<(), Failure> {
+    let home = first.store.home.clone();
+    let me = liveness::current();
+    let my_ident = ident(std::process::id(), me.as_ref().map(|i| i.start.as_str()));
+    let warm_ms = first.job.warm_ms.unwrap_or(0);
+    let omp_pid = warm.client.pid();
+    let entry = Entry {
+        v: 1,
+        pid: std::process::id(),
+        start: me.map(|i| i.start),
+        session_id: warm.session_id.clone(),
+        session_handle: Some(super::session_handle(&warm.session_id)),
+        job_id: first.id.as_str().into(),
+        omp_pid,
+        omp_start: omp_pid.and_then(|p| match liveness::start_token(p) {
+            liveness::Probe::Running(t) => Some(t),
+            _ => None,
+        }),
+        warm_ms,
+        expires_at: timestamp_after(Duration::from_millis(warm_ms)),
+        state: EntryState::Idle,
+        started_at: jiff::Timestamp::now().to_string(),
+    };
+    let log = |line: &str| first.log("warm", line);
+    let reason = (|| {
+        // Registry before the holder flips: a reader that sees holder `warm` finds the entry.
+        if let Err(e) = publish(&home, &entry) {
+            log(&format!(
+                "cannot publish {}: {e}",
+                path(&home, &entry.session_id).display()
+            ));
+            return Reason::StateError;
+        }
+        if let Err(e) = first.mark_holder_as(&warm.lock, crate::jobs::lock::HolderKind::Warm) {
+            log(&format!("cannot mark the warm holder: {e}"));
+            return Reason::StateError;
+        }
+        log(&format!(
+            "idle for {}ms on {}",
+            entry.warm_ms, entry.session_id
+        ));
+        let expires = Instant::now() + Duration::from_millis(entry.warm_ms);
+        let mut beat = Instant::now();
+        loop {
+            let tick = Tick {
+                cancelled: first.cancel.load(Ordering::SeqCst),
+                omp_exited: drain_events(&warm.events),
+                release: {
+                    reject_replies(&warm.replies);
+                    release_requested(&home, &warm.session_id, &my_ident)
+                },
+                endpoint: endpoint_present(&home, &warm.session_id),
+                expired: Instant::now() >= expires,
+            };
+            // A control written for the last job just before it ended is answered `job_ended`.
+            first.respond_pending();
+            if let Some(reason) = decide(&tick) {
+                return reason;
+            }
+            if beat.elapsed() >= HEARTBEAT {
+                touch(&home, &warm.session_id);
+                beat = Instant::now();
+            }
+            std::thread::sleep(CLAIM_TICK);
+        }
+    })();
+    let Warm {
+        client,
+        lock,
+        session_id,
+        ..
+    } = warm;
+    teardown(
+        &home,
+        &session_id,
+        reason,
+        move || client.close().err().map(|e| e.to_string()),
+        move || drop(lock),
+        &log,
+    );
+    Ok(())
+}
+/// The one teardown (design §A21): close omp (bounded by [`TEARDOWN_BOUND`]), remove the
+/// registry and any release request, then free the lock. The registry goes before the lock, so
+/// a reader never sees a free lock with a live registry.
+pub(crate) fn teardown(
+    home: &GlenHome,
+    session_id: &str,
+    reason: Reason,
+    close: impl FnOnce() -> Option<String> + Send + 'static,
+    release_lock: impl FnOnce(),
+    log: &dyn Fn(&str),
+) {
+    log(&format!("cooling ({})", reason.as_str()));
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(close());
+    });
+    match rx.recv_timeout(TEARDOWN_BOUND) {
+        Ok(None) => (),
+        Ok(Some(e)) => log(&format!("close: {e}")),
+        Err(_) => log("close exceeded 3.5s (omp group may survive)"),
+    }
+    if let Err(e) = remove(home, session_id) {
+        log(&format!(
+            "cannot remove {}: {e}",
+            path(home, session_id).display()
+        ));
+    }
+    if let Err(e) = clear_release(home, session_id) {
+        log(&format!(
+            "cannot remove {}: {e}",
+            release_path(home, session_id).display()
+        ));
+    }
+    release_lock();
 }
 
 #[cfg(test)]
@@ -817,5 +1036,145 @@ mod claim_tests {
             });
             assert_eq!(winners, 1);
         }
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+    const ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+    #[test]
+    fn decide_checks_in_the_documented_order() {
+        let t = |cancelled, omp_exited, release, endpoint, expired| Tick {
+            cancelled,
+            omp_exited,
+            release,
+            endpoint,
+            expired,
+        };
+        for (tick, want) in [
+            (t(false, false, false, false, false), None),
+            (t(true, true, true, true, true), Some(Reason::Signal)),
+            (t(true, false, true, false, true), Some(Reason::Signal)),
+            (t(false, true, true, true, true), Some(Reason::OmpExited)),
+            (t(false, false, true, true, true), Some(Reason::Release)),
+            (t(false, false, true, false, true), Some(Reason::Release)),
+            (t(false, false, false, true, true), Some(Reason::Endpoint)),
+            (t(false, false, false, false, true), Some(Reason::Expired)),
+        ] {
+            assert_eq!(decide(&tick), want, "{tick:?}");
+        }
+        assert_eq!(Reason::OmpExited.as_str(), "omp_exited");
+        assert_eq!(Reason::StateError.as_str(), "state_error");
+    }
+    #[test]
+    fn omp_exit_is_a_closed_event_channel() {
+        let (tx, rx) = mpsc::channel::<Event>();
+        assert!(!drain_events(&rx));
+        drop(tx);
+        assert!(drain_events(&rx));
+    }
+    #[test]
+    fn endpoint_check_is_a_stat_then_a_pid_check() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("glen"),
+        };
+        assert!(!endpoint_present(&home, ID));
+        home.ensure_dir("run/live").unwrap();
+        let write = |pid: u32| {
+            let r =
+                serde_json::json!({"v":1,"pid":pid,"session_id":ID,"socket":"/tmp/glen-x.sock"});
+            fs::write(crate::live::registry::path(&home, ID), r.to_string()).unwrap();
+        };
+        write(std::process::id());
+        assert!(endpoint_present(&home, ID));
+        write(liveness::tests_dead_pid());
+        assert!(
+            !endpoint_present(&home, ID),
+            "a dead TUI's registry is ignored"
+        );
+        fs::write(crate::live::registry::path(&home, ID), b"torn").unwrap();
+        assert!(endpoint_present(&home, ID), "unreadable yields");
+    }
+    #[test]
+    fn teardown_is_bounded_and_frees_the_lock_after_the_registry() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("glen"),
+        };
+        let lock = crate::jobs::lock::try_acquire(&home, ID).unwrap().unwrap();
+        let me = liveness::current().unwrap();
+        publish(
+            &home,
+            &Entry {
+                v: 1,
+                pid: me.pid,
+                start: Some(me.start.clone()),
+                session_id: ID.into(),
+                session_handle: None,
+                job_id: "j".into(),
+                omp_pid: None,
+                omp_start: None,
+                warm_ms: 1000,
+                expires_at: timestamp_after(Duration::from_secs(1)),
+                state: EntryState::Idle,
+                started_at: jiff::Timestamp::now().to_string(),
+            },
+        )
+        .unwrap();
+        request_release(&home, ID, &ident(me.pid, Some(&me.start))).unwrap();
+        let lines = std::sync::Mutex::new(vec![]);
+        let order = std::cell::Cell::new(None);
+        let started = Instant::now();
+        teardown(
+            &home,
+            ID,
+            Reason::Release,
+            || {
+                // An omp that never dies: teardown must not wait for it.
+                std::thread::sleep(Duration::from_secs(10));
+                None
+            },
+            || {
+                order.set(Some((
+                    path(&home, ID).exists(),
+                    release_path(&home, ID).exists(),
+                )));
+                drop(lock);
+            },
+            &|l: &str| lines.lock().unwrap().push(l.to_owned()),
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            order.get(),
+            Some((false, false)),
+            "registry gone before the lock"
+        );
+        assert!(!crate::jobs::lock::is_held(&home, ID));
+        let lines = lines.into_inner().unwrap();
+        assert_eq!(lines[0], "cooling (release)");
+        assert!(
+            lines.iter().any(|l| l.contains("exceeded 3.5s")),
+            "{lines:?}"
+        );
+        // A prompt close logs its error only.
+        let lines = std::sync::Mutex::new(vec![]);
+        teardown(
+            &home,
+            ID,
+            Reason::Expired,
+            || Some("group survived".into()),
+            || (),
+            &|l: &str| lines.lock().unwrap().push(l.to_owned()),
+        );
+        assert_eq!(
+            lines.into_inner().unwrap(),
+            ["cooling (expired)", "close: group survived"]
+        );
     }
 }

@@ -402,6 +402,7 @@ mod tests {
                 status,
                 control_in_flight: None,
                 omp_queued: false,
+                settled: false,
                 cancel: Arc::new(AtomicBool::new(false)),
                 deadline: Instant::now() + std::time::Duration::from_secs(20),
             },

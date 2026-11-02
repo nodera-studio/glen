@@ -94,6 +94,8 @@ pub(crate) struct Worker {
     pub(crate) deadline: Instant,
     pub(crate) control_in_flight: Option<std::path::PathBuf>,
     pub(crate) omp_queued: bool,
+    /// The job's final settlement (`result.session_settled`), for the stay-warm decision.
+    pub(crate) settled: bool,
 }
 pub fn main(arg: &str) -> ExitCode {
     let loaded = (|| -> Result<Worker, GlenError> {
@@ -120,6 +122,7 @@ pub fn main(arg: &str) -> ExitCode {
             status,
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + Duration::from_millis(left),
         })
@@ -275,16 +278,26 @@ impl Worker {
         }
     }
     fn mark_holder(&self, lock: &lock::SessionLock) {
-        let holder = lock::Holder {
-            v: 1,
-            kind: lock::HolderKind::Job,
-            job_id: Some(self.id.as_str().into()),
-            pid: std::process::id(),
-            start: liveness::current().map(|i| i.start),
-        };
-        if let Err(e) = lock::mark(lock, &holder) {
+        if let Err(e) = self.mark_holder_as(lock, lock::HolderKind::Job) {
             self.log("holder", &e.to_string());
         }
+    }
+    /// Records this process as the lock's holder for this job (`Warm` while idle after it).
+    pub(crate) fn mark_holder_as(
+        &self,
+        lock: &lock::SessionLock,
+        kind: lock::HolderKind,
+    ) -> std::io::Result<()> {
+        lock::mark(
+            lock,
+            &lock::Holder {
+                v: 1,
+                kind,
+                job_id: Some(self.id.as_str().into()),
+                pid: std::process::id(),
+                start: liveness::current().map(|i| i.start),
+            },
+        )
     }
     fn answer_control(
         &self,
@@ -295,7 +308,7 @@ impl Worker {
             self.log("control", &e.to_string());
         }
     }
-    fn respond_pending(&self) {
+    pub(crate) fn respond_pending(&self) {
         for req in control::poll(&self.store.dir(&self.id)) {
             if self.control_in_flight.as_ref() == Some(&req.path) {
                 continue;
@@ -492,53 +505,103 @@ impl Worker {
         self.save()?;
         // Drain at the source before adding a forwarder, so buffered startup frames cannot lag into the run.
         for _ in events.try_iter() {}
-        let result = (|| -> Result<(), Failure> {
-            if self.job.route == Route::Rpc
-                && Some(&baseline.session_id) != self.job.session_id.as_ref()
-            {
-                return Err(self.moved(&baseline.session_id));
-            }
-            if self.job.route == Route::New {
-                session_lock = Some(
-                    lock::try_acquire(&self.store.home, &baseline.session_id)?
-                        .ok_or_else(|| Failure::new("internal", "cannot lock the new session"))?,
-                );
-            }
-            if self.job.route == Route::New
-                && let Some(lock) = &session_lock
-            {
-                self.mark_holder(lock);
-            }
-            self.status.actual_session_id = Some(baseline.session_id.clone());
-            self.status.actual_session_file =
-                baseline.session_file.clone().map(std::path::PathBuf::from);
-            sink.set_session(baseline.session_id.clone());
-            // Startup recovery can claim our own lease. Only the pre-spawn lease probe is safe.
-            self.check_stop()?;
-            self.status.delivered_as = Some(
-                if !baseline.is_streaming {
-                    "prompt"
-                } else if self.job.deliver_as == Deliver::Steer {
-                    "steer"
-                } else {
-                    "follow_up"
-                }
-                .into(),
-            );
-            self.log("prompt", "sending message");
-            self.drive(&client, &events, &replies, &sink, &baseline.session_id)
-        })();
+        let result = self.execute(
+            &client,
+            &events,
+            &replies,
+            &baseline,
+            &sink,
+            &mut session_lock,
+        );
         // Terminal state must precede teardown, and the session lock stays held through close.
         let result = match result {
             Err(f) => self.finish_failure(f),
             ok => ok,
         };
+        if result.is_ok()
+            && self.keep_warm()
+            && let Some(lock) = session_lock.take()
+        {
+            let session_id = self
+                .status
+                .actual_session_id
+                .clone()
+                .unwrap_or_else(|| baseline.session_id.clone());
+            return rpc::warm::idle(
+                self,
+                rpc::warm::Warm {
+                    client,
+                    events,
+                    replies,
+                    lock,
+                    session_id,
+                },
+            );
+        }
         self.log("close", "closing omp client");
         if let Err(e) = client.close() {
             self.log("close", &e.to_string());
         }
         drop(session_lock);
         result
+    }
+    /// Runs the job on a started omp: the identity check, the `@new` lock, then the prompt. A warm
+    /// worker calls it again for each job it adopts, with that job's own sink.
+    pub(crate) fn execute(
+        &mut self,
+        client: &Client,
+        events: &Receiver<Event>,
+        replies: &Receiver<reply::PendingReply>,
+        baseline: &omp_rpc::SessionState,
+        sink: &ReplySink,
+        session_lock: &mut Option<lock::SessionLock>,
+    ) -> Result<(), Failure> {
+        if self.job.route == Route::Rpc
+            && Some(&baseline.session_id) != self.job.session_id.as_ref()
+        {
+            return Err(self.moved(&baseline.session_id));
+        }
+        if self.job.route == Route::New {
+            *session_lock = Some(
+                lock::try_acquire(&self.store.home, &baseline.session_id)?
+                    .ok_or_else(|| Failure::new("internal", "cannot lock the new session"))?,
+            );
+        }
+        if self.job.route == Route::New
+            && let Some(lock) = session_lock.as_ref()
+        {
+            self.mark_holder(lock);
+        }
+        self.status.actual_session_id = Some(baseline.session_id.clone());
+        self.status.actual_session_file =
+            baseline.session_file.clone().map(std::path::PathBuf::from);
+        sink.set_session(baseline.session_id.clone());
+        // Startup recovery can claim our own lease. Only the pre-spawn lease probe is safe.
+        self.check_stop()?;
+        self.status.delivered_as = Some(
+            if !baseline.is_streaming {
+                "prompt"
+            } else if self.job.deliver_as == Deliver::Steer {
+                "steer"
+            } else {
+                "follow_up"
+            }
+            .into(),
+        );
+        self.log("prompt", "sending message");
+        self.drive(client, events, replies, sink, &baseline.session_id)
+    }
+    /// The stay-warm rule (design §A21): a settled, unforked, uncancelled `completed` RPC or
+    /// `@new` job sent with a warm duration. Failed, aborted, timed-out, unsettled, forked and
+    /// live-route jobs never stay warm.
+    pub(crate) fn keep_warm(&self) -> bool {
+        self.job.warm_ms.is_some_and(|ms| ms > 0)
+            && matches!(self.job.route, Route::Rpc | Route::New)
+            && self.job.env_digest.is_some()
+            && self.status.status == State::Completed
+            && self.settled
+            && self.status.forked.is_none()
+            && !self.cancel.load(Ordering::SeqCst)
     }
     fn start(&mut self) -> Result<Option<Started>, Failure> {
         let abandon = Arc::new(AtomicBool::new(false));
@@ -1049,6 +1112,7 @@ impl Worker {
             session_settled: terminal.settled,
             settled_at: terminal.settled.then(|| jiff::Timestamp::now().to_string()),
         };
+        self.settled = terminal.settled;
         self.status.request_id = turn
             .and_then(|t| t.result.as_ref())
             .and_then(|r| r.id.clone());
@@ -1281,7 +1345,10 @@ use super::polling_command;
 polling_command!(SubmitPrompt, PromptCommand, 100);
 polling_command!(PollState, GetStateCommand, 100);
 polling_command!(StateSecond, GetStateCommand, 1000);
-fn query_state(client: &Client, left: Duration) -> Result<omp_rpc::SessionState, omp_rpc::Error> {
+pub(crate) fn query_state(
+    client: &Client,
+    left: Duration,
+) -> Result<omp_rpc::SessionState, omp_rpc::Error> {
     if left >= rpc::CALL_TIMEOUT {
         client.call(&GetStateCommand {})
     } else if left >= Duration::from_secs(1) {
@@ -1610,6 +1677,7 @@ mod tests {
             job,
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + Duration::from_secs(10),
         };
@@ -1650,6 +1718,7 @@ mod tests {
             job,
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: now - Duration::from_secs(1),
         };
@@ -2076,6 +2145,7 @@ mod control_tests {
             deadline: Instant::now() + Duration::from_secs(10),
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
         }
     }
     fn write(w: &Worker, name: &str, op: Value) -> std::path::PathBuf {
@@ -2227,6 +2297,46 @@ mod control_tests {
             conclude(&mut w, Ok(Err(Failure::new("io", "x")))),
             ExitCode::SUCCESS
         );
+    }
+    #[test]
+    fn keep_warm_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let warm = || {
+            let mut w = worker(temp.path());
+            w.job.warm_ms = Some(2000);
+            w.job.env_digest = Some("0123456789abcdef".into());
+            w.status.status = State::Completed;
+            w.settled = true;
+            w
+        };
+        assert!(warm().keep_warm());
+        let mut new = warm();
+        new.job.route = Route::New;
+        assert!(new.keep_warm(), "@new may stay warm");
+        type Change = fn(&mut Worker);
+        let cases: [(&str, Change); 11] = [
+            ("failed", |w| w.status.status = State::Failed),
+            ("aborted", |w| w.status.status = State::Aborted),
+            ("lost", |w| w.status.status = State::Lost),
+            ("accepted", |w| w.status.status = State::Accepted),
+            ("unsettled", |w| w.settled = false),
+            ("forked", |w| {
+                w.status.forked = Some(Forked {
+                    from: "a".into(),
+                    to: "b".into(),
+                })
+            }),
+            ("cancelled", |w| w.cancel.store(true, Ordering::SeqCst)),
+            ("no warm_ms", |w| w.job.warm_ms = None),
+            ("warm_ms 0", |w| w.job.warm_ms = Some(0)),
+            ("live route", |w| w.job.route = Route::Live),
+            ("no env_digest", |w| w.job.env_digest = None),
+        ];
+        for (name, change) in cases {
+            let mut w = warm();
+            change(&mut w);
+            assert!(!w.keep_warm(), "{name}");
+        }
     }
     #[test]
     fn holder_is_published_on_the_held_inode() {
