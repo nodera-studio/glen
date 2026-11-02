@@ -1,7 +1,7 @@
 use crate::{
     cli::{Cli, InboxArgs},
     env::Env,
-    error::{ErrorCode, GlenError, Warning},
+    error::{ErrorCode, GlenError, OkExit, Warning},
     glen_home::{self, GlenHome},
     inbox::{self, Cursor},
     jobs::Reply,
@@ -232,6 +232,102 @@ fn collect(
     });
     Ok(read)
 }
+/// A value as one shell word: unchanged when it holds only safe characters, else single-quoted.
+/// Shared with `wait --for reply`'s `next`.
+pub(super) fn shell_word(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_@%+=:,./-".contains(&b))
+    {
+        s.to_owned()
+    } else {
+        format!("'{}'", s.replace('\'', r"'\''"))
+    }
+}
+/// A duration in the largest unit that states it exactly, as `--timeout` parses it.
+pub(super) fn duration_flag(d: Duration) -> String {
+    let ms = d.as_millis();
+    [("h", 3_600_000), ("m", 60_000), ("s", 1000)]
+        .into_iter()
+        .find(|(_, n)| ms != 0 && ms.is_multiple_of(*n))
+        .map_or_else(
+            || format!("{ms}ms"),
+            |(unit, n)| format!("{}{unit}", ms / n),
+        )
+}
+/// The command that waits again with the caller's own scope.
+fn wait_again(a: &InboxArgs) -> String {
+    let mut next = format!("glen inbox --wait --timeout {}", duration_flag(a.timeout));
+    if let Some(session) = &a.session {
+        next.push_str(&format!(" --session {}", shell_word(session)));
+    }
+    if let Some(cwd) = &a.cwd {
+        next.push_str(&format!(" --cwd {}", shell_word(&cwd.to_string_lossy())));
+    }
+    if a.peek {
+        next.push_str(" --peek");
+    }
+    next
+}
+/// `inbox --wait`: collect every 250 ms (the `-f` tick) until one record is unread, the bound
+/// passes, or SIGINT. The first collect runs before either check, so unread messages return at
+/// once even with `--timeout 0`. `Err` carries the no-message outcome (exit 10 or 130).
+fn wait_for_unread(
+    home: &GlenHome,
+    a: &InboxArgs,
+    env: &Env,
+    ctx: &OutputCtx,
+    mut scope: Option<&mut Scope>,
+) -> Result<Result<Read, Outcome>, GlenError> {
+    let stop = crate::jobs::wait::install_interrupt()?;
+    let deadline = std::time::Instant::now() + a.timeout;
+    loop {
+        let read = collect(
+            home,
+            a.session.as_deref(),
+            false,
+            None,
+            env,
+            scope.as_deref_mut(),
+        )?;
+        if !read.records.is_empty() {
+            return Ok(Ok(read));
+        }
+        let interrupted = stop.load(std::sync::atomic::Ordering::SeqCst);
+        if interrupted || std::time::Instant::now() >= deadline {
+            let next = wait_again(a);
+            // Quoting keeps the filters' controls; only the terminal line escapes them.
+            let mut outcome = Outcome::new(
+                json!({"total":0,"marked_read":false,"skipped_lines":read.skipped,"messages":[],"next":next,"interrupted":interrupted}),
+                ctx.painter.paint(
+                    Token::Muted,
+                    &render::sanitize(&format!("no messages yet · {next}")),
+                ),
+            );
+            outcome.exit = if interrupted {
+                OkExit::Interrupted
+            } else {
+                OkExit::Running
+            };
+            if read.outside_cwd
+                && let Some(scope) = scope
+            {
+                outcome.warnings.push(outside_cwd(scope));
+            }
+            return Ok(Err(outcome));
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+fn outside_cwd(scope: &Scope) -> Warning {
+    Warning {
+        code: "outside_cwd".into(),
+        message: format!(
+            "matching inbox sessions are outside {}; drop --cwd to include them",
+            scope.cwd.display()
+        ),
+    }
+}
 pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     let home = glen_home::resolve_trusted(env, &["inbox/.read"])?;
     let mut scope = a
@@ -239,14 +335,21 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         .as_deref()
         .map(|dir| Scope::new(cli, env, &home, dir, a.session.as_deref()))
         .transpose()?;
-    let read = collect(
-        &home,
-        a.session.as_deref(),
-        a.all,
-        None,
-        env,
-        scope.as_mut(),
-    )?;
+    let read = if a.wait {
+        match wait_for_unread(&home, a, env, ctx, scope.as_mut())? {
+            Ok(read) => read,
+            Err(none) => return Ok(none),
+        }
+    } else {
+        collect(
+            &home,
+            a.session.as_deref(),
+            a.all,
+            None,
+            env,
+            scope.as_mut(),
+        )?
+    };
     let total = read.records.len();
     // Only cursors this call actually moves are committed and counted as `marked_read`:
     // `--all` re-reads from 0, so its batch ends are often the saved cursors (W8-DOC-7).
@@ -302,13 +405,7 @@ pub fn run(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
     if read.outside_cwd
         && let Some(scope) = &scope
     {
-        outcome.warnings.push(Warning {
-            code: "outside_cwd".into(),
-            message: format!(
-                "matching inbox sessions are outside {}; drop --cwd to include them",
-                scope.cwd.display()
-            ),
-        });
+        outcome.warnings.push(outside_cwd(scope));
     }
     if !moves.is_empty() {
         let env = env.clone();
@@ -419,6 +516,128 @@ pub fn follow(cli: &Cli, a: &InboxArgs, env: &Env, ctx: &OutputCtx) -> ExitCode 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn args(argv: &[&str]) -> InboxArgs {
+        use clap::Parser;
+        match crate::cli::Cli::try_parse_from(argv).unwrap().command {
+            crate::cli::Command::Inbox(a) => a,
+            _ => panic!("not inbox"),
+        }
+    }
+    #[test]
+    fn wait_again_repeats_the_callers_scope_with_one_word_per_value() {
+        assert_eq!(
+            wait_again(&args(&["glen", "inbox", "--wait"])),
+            "glen inbox --wait --timeout 90s"
+        );
+        assert_eq!(
+            wait_again(&args(&[
+                "glen",
+                "inbox",
+                "--wait",
+                "--timeout",
+                "120s",
+                "--session",
+                "c0de",
+                "--cwd",
+                "it's here/a b",
+                "--peek",
+            ])),
+            r"glen inbox --wait --timeout 2m --session c0de --cwd 'it'\''s here/a b' --peek"
+        );
+        for (d, want) in [
+            (Duration::from_secs(3600), "1h"),
+            (Duration::from_secs(5400), "90m"),
+            (Duration::from_secs(90), "90s"),
+            (Duration::from_millis(1500), "1500ms"),
+            (Duration::ZERO, "0ms"),
+            (Duration::from_secs(86_400), "24h"),
+        ] {
+            assert_eq!(duration_flag(d), want);
+            assert_eq!(crate::cli::parse_duration(want).unwrap(), d, "{want}");
+        }
+        for (raw, want) in [
+            (
+                "/work/alpha-1_x@y%z+w=v:u,t./",
+                "/work/alpha-1_x@y%z+w=v:u,t./",
+            ),
+            ("", "''"),
+            ("a b", "'a b'"),
+            ("$HOME", "'$HOME'"),
+            ("x'y", r"'x'\''y'"),
+            ("~/w", "'~/w'"),
+        ] {
+            assert_eq!(shell_word(raw), want);
+        }
+    }
+    /// W2 review 1 (Codex P2): shell quoting keeps escape sequences, so the no-message line
+    /// escapes the caller's filters before painting; `data.next` stays byte-exact.
+    #[test]
+    fn wait_expiry_line_escapes_controls_from_the_callers_filters() {
+        use crate::{
+            output::{Mode, Terminal},
+            render::{
+                palette::{ColorDepth, Theme},
+                style::Painter,
+            },
+        };
+        let tree = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: tree.path().join("glen"),
+        };
+        let env = Env::for_test(None, tree.path(), &[]);
+        let term = Terminal {
+            stdout_tty: true,
+            stderr_tty: false,
+            stdout_cols: None,
+        };
+        let mut ctx = OutputCtx::fallback(Mode::Human, &env, &term);
+        ctx.painter = Painter::new(ColorDepth::Ansi16, Theme::Dark);
+        let session = "\u{1b}]8;;https://x.test\u{7}c0de\r\u{202e}gpj";
+        let a = args(&[
+            "glen",
+            "inbox",
+            "--wait",
+            "--timeout",
+            "0ms",
+            "--session",
+            session,
+            "--cwd",
+            "/w/\u{1b}[2J\u{2066}",
+        ]);
+        let Err(o) = wait_for_unread(&home, &a, &env, &ctx, None).unwrap() else {
+            panic!("an empty inbox has no message")
+        };
+        assert_eq!(o.exit.exit_code(), 10);
+        let next = o.data["next"].as_str().unwrap();
+        assert_eq!(next, wait_again(&a));
+        assert!(next.contains(session) && next.contains("/w/\u{1b}[2J\u{2066}"));
+        assert!(
+            o.human.contains("\u{1b}["),
+            "painted in colour: {:?}",
+            o.human
+        );
+        for raw in [
+            "\u{1b}]",
+            "\u{7}",
+            "\r",
+            "\u{202e}",
+            "\u{1b}[2J",
+            "\u{2066}",
+        ] {
+            assert!(
+                !o.human.contains(raw),
+                "{raw:?} reached the terminal: {:?}",
+                o.human
+            );
+        }
+        assert!(
+            o.human.contains(
+                r"'\x1b]8;;https://x.test\x07c0de\r\u{202e}gpj' --cwd '/w/\x1b[2J\u{2066}'"
+            ),
+            "{:?}",
+            o.human
+        );
+    }
     #[test]
     fn out_of_order_dates_never_mark_an_unprinted_line_read() {
         let mut prefix = PrintedPrefix {

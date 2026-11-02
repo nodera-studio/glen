@@ -37,7 +37,7 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 | 6 | false | `no_route` | refusal: live owner, unknown lease, or sandbox |
 | 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation |
 | 8 | false | `not_implemented` | hidden unfinished command |
-| 10 | true | running | job continues; use wait |
+| 10 | true | running | job continues; use wait. With --for reply, data.woke = "reply" marks new replies, and its absence a bound expiry |
 | 11 | true | forked | use forked.to_handle |
 | 130 | true | interrupted | foreground observer stopped; job continues |
 
@@ -64,9 +64,26 @@ model_change `model`; thinking_level `level`. Consumers dispatch by kind rather 
 Unknown omp records are skipped by the rendered reader and preserved by raw output.
 
 Job views share `id,handle,status,route,deliver_as,delivered_as,session_id,session_handle,actual_session_id,
-created_at,updated_at,elapsed_ms`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
+created_at,updated_at,elapsed_ms,task_state`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
 `auto|steer|follow_up`; `delivered_as` is how omp took it, `prompt|steer|follow_up`, or null until then.
 Replies carry `text,final` and context/sequence metadata; read their field names from the examples below.
+
+`task_state` (v0.2) names the job's state in A2A's task-state vocabulary; glen borrows the names only.
+`status` stays authoritative and keeps its exit mapping. The value is derived from `status` and `error.code`
+(design §A7):
+
+| status | condition | task_state |
+|---|---|---|
+| `queued` | | `submitted` |
+| `accepted` | | `working` |
+| `completed` | forked too (exit 11) | `completed` |
+| `aborted` | any `error.code`: `cancelled`, `aborted`, `session_switched` | `canceled` |
+| `failed` | `error.code` is `no_route` (exit 6) | `rejected` |
+| `failed` | any other `error.code`, or none | `failed` |
+| `lost` | | `failed` |
+
+`canceled` is spelled as A2A spells it; the job error code stays `cancelled`. `input_required` is reserved for
+a later ACP transport and is never produced today.
 
 ## `glen ls`
 
@@ -451,6 +468,7 @@ passes no `--thinking` when the persisted value has none.
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
       "status": "completed",
+      "task_state": "completed",
       "updated_at": "2026-10-30T07:53:12.406814Z"
     },
     "replies": [
@@ -497,6 +515,7 @@ passes no `--thinking` when the persisted value has none.
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
       "status": "accepted",
+      "task_state": "working",
       "updated_at": "2026-10-30T07:53:13.108631Z"
     },
     "next": "glen wait j3f52ae7",
@@ -536,6 +555,7 @@ passes no `--thinking` when the persisted value has none.
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
       "status": "completed",
+      "task_state": "completed",
       "updated_at": "2026-10-30T07:53:12.692935Z"
     },
     "replies": [
@@ -576,6 +596,26 @@ An unknown job handle is `not_found` (exit 3) with the hint "run `glen jobs`".
 |---|---|
 | `data` | same running or completed data as send |
 
+`--for reply` (v0.2) also returns when omp calls `glen_reply` for this job, so a caller is woken by a reply
+instead of polling. Both routes append every reply to the job's `replies.ndjson`, which glen checks every 100 ms.
+A reply is unseen when its `id` is not at or before `--after <REPLY_ID>`; without `--after` every reply is unseen,
+so replies already present return at once. An `--after` id that is not one of the job's replies is exit 2 `usage`
+with `details:{reason:"unknown_reply",job,after}`. `--after` requires `--for`.
+
+- **Reply wake**, exit 10 (`wait.reply`): the running document plus `woke:"reply"` and `replies` (the unseen
+  replies, in order, at least one). `next` is `glen wait <job> --for reply --after <last reply id>`, plus the
+  caller's `--timeout` when it is not 90s: run it to wait for the next one. `job.status` is `queued` or `accepted`.
+- **Bound expiry**, exit 10 (`wait.reply.expired`): the same document without `woke` and with `replies:[]`;
+  `next` repeats the caller's `--after` and `--timeout`. Read `woke` before treating exit 10 as a timeout.
+- **SIGINT**, exit 130: the bound-expiry document with `interrupted:true`.
+- **The job ended first**: the plain terminal outcome (exit 0, 6, 7 or 11). A completed document's `data.replies`
+  and a failed, aborted or lost job's `error.details.replies` (always an array) hold only the unseen replies.
+  When a reply and the end land in the same check, the end wins and its document carries that reply.
+
+A reply returned by `wait` stays unread in `glen inbox`: the reply id is the cursor, so readers never consume each
+other's marker. A caller that reads both deduplicates by `id`. Without `--for`, `wait` documents are unchanged.
+A large wake can spill like any document (`spilled`); `woke` and `next` are then in the spilled file.
+
 <!-- contract: wait -->
 ```json
 {
@@ -596,6 +636,7 @@ An unknown job handle is `not_found` (exit 3) with the hint "run `glen jobs`".
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
       "status": "completed",
+      "task_state": "completed",
       "updated_at": "2026-10-30T07:53:13.888636Z"
     },
     "replies": [
@@ -619,6 +660,98 @@ An unknown job handle is `not_found` (exit 3) with the hint "run `glen jobs`".
     "session_settled": true,
     "status": "completed",
     "stop_reason": "stop"
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: wait.reply -->
+```json
+{
+  "data": {
+    "interrupted": false,
+    "job": {
+      "actual_session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "created_at": "2026-11-02T05:55:20.525798Z",
+      "deliver_as": "auto",
+      "delivered_as": "prompt",
+      "elapsed_ms": 2045,
+      "handle": "jc6ccc17",
+      "id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+      "route": "rpc",
+      "session_handle": "e27c0de",
+      "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "status": "accepted",
+      "task_state": "working",
+      "updated_at": "2026-11-02T05:55:20.688672Z"
+    },
+    "next": "glen wait jc6ccc17 --for reply --after 01a19ad3-989d-7070-9273-90556dd5f602",
+    "replies": [
+      {
+        "at": "2026-11-02T05:55:20.754647Z",
+        "final": false,
+        "id": "01a19ad3-9832-7013-a6b8-266395477783",
+        "job_id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+        "request_id": null,
+        "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+        "text": "progress",
+        "tool_call_id": "call_1",
+        "v": 1
+      },
+      {
+        "at": "2026-11-02T05:55:20.861886Z",
+        "final": true,
+        "id": "01a19ad3-989d-7070-9273-90556dd5f602",
+        "job_id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+        "request_id": null,
+        "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+        "text": "reply: hi",
+        "tool_call_id": "call_2",
+        "v": 1
+      }
+    ],
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "status": "running",
+    "woke": "reply"
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: wait.reply.expired -->
+```json
+{
+  "data": {
+    "interrupted": false,
+    "job": {
+      "actual_session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "created_at": "2026-11-02T05:55:20.525798Z",
+      "deliver_as": "auto",
+      "delivered_as": "prompt",
+      "elapsed_ms": 2387,
+      "handle": "jc6ccc17",
+      "id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+      "route": "rpc",
+      "session_handle": "e27c0de",
+      "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "status": "accepted",
+      "task_state": "working",
+      "updated_at": "2026-11-02T05:55:20.688672Z"
+    },
+    "next": "glen wait jc6ccc17 --for reply --after 01a19ad3-989d-7070-9273-90556dd5f602 --timeout 300ms",
+    "replies": [],
+    "session": {
+      "handle": "e27c0de",
+      "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+      "path": "/tmp/glen-example/agent/sessions/-work-alpha/2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl"
+    },
+    "status": "running"
   },
   "ok": true,
   "v": 1
@@ -654,6 +787,7 @@ warning per job, including jobs the filter then drops.
       "created_at": "2026-10-30T12:00:00Z",
       "updated_at": "2026-10-30T12:00:01Z",
       "elapsed_ms": 1000,
+      "task_state": "completed",
       "text_preview": "hi",
       "error": null,
       "forked": null
@@ -690,6 +824,21 @@ in the project. When `--session` matches only sessions outside the project, the 
 | `skipped_lines` | malformed inbox lines skipped |
 | `messages` | reply records plus session_handle and job_handle (null without a job) |
 
+`--wait` (v0.2) blocks until at least one message is unread, checking every 250 ms like `-f`, for at most
+`--timeout` (default 90s, at most 24h; `--timeout` requires `--wait`). `--wait` conflicts with `-f` and `--all`;
+`--session`, `--cwd` and `--peek` apply as above. Messages already unread return at once. `--peek` marks nothing
+read, so `--peek --wait` returns the existing unread messages at once on every call: a one-shot read, not a receiver.
+
+- **A message arrives**: the normal document above, exit 0, marked read after output unless `--peek`.
+- **The bound passes** (`inbox.wait`), exit 10: `{total:0,marked_read:false,skipped_lines,messages:[],next,
+  interrupted:false}`. Nothing is marked read. `next` is `glen inbox --wait --timeout <T>` with the caller's
+  `--session`, `--cwd` and `--peek` repeated, each value one shell word.
+- **SIGINT**, exit 130: the same document with `interrupted:true`. A second SIGINT exits at once.
+
+`--wait` covers what `wait --for reply` cannot: replies that arrive after their job ended, and messages from the
+omp TUI with no job. With `--cwd`, a reply from a session glen has not yet placed in the project can take up to
+3 s to wake the call (glen rescans the session catalog at most every 3 s); known sessions wake within one check.
+
 <!-- contract: inbox -->
 ```json
 {
@@ -712,6 +861,22 @@ in the project. When `--session` matches only sessions outside the project, the 
     ],
     "skipped_lines": 0,
     "total": 1
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: inbox.wait -->
+```json
+{
+  "data": {
+    "interrupted": false,
+    "marked_read": false,
+    "messages": [],
+    "next": "glen inbox --wait --timeout 300ms --session ffff",
+    "skipped_lines": 0,
+    "total": 0
   },
   "ok": true,
   "v": 1
@@ -937,11 +1102,12 @@ Help and version are text in every output mode, with no JSON envelope.
 
 Usage errors may include clap diagnostics in details; for a missing required argument the message names it
 after the colon (`… were not provided: <MESSAGE>`). Usage `details.reason` values are `missing_cwd` (send,
-with `cwd`) and `invalid_level` (thinking). Not-found errors supply a hint: `glen ls --all` for sessions,
+with `cwd`), `invalid_level` (thinking) and `unknown_reply` (`wait --after` names no reply of the job, with `job`
+and `after`). Not-found errors supply a hint: `glen ls --all` for sessions,
 `glen jobs` for jobs, `glen models <session>` for models. When a session lookup misses while some session file
 or project directory could not be read, the error is `io` (exit 1) naming that path, with `details.unreadable`
 listing every unreadable path. Ambiguous errors include `details.candidates`: session objects for sessions,
-`{provider,id,name}` for models. Job failure has `details:{status,job,error,forked}`. Every exit-6 `no_route` envelope
+`{provider,id,name}` for models. Job failure has `details:{status,job,error,forked}`, plus `replies` (the unseen ones) under `wait --for reply`. Every exit-6 `no_route` envelope
 includes a string `details.reason`; worker-side refusals also copy it beside `status`, `job`, `error` and `forked`.
 Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`, `endpoint_gone`, `endpoint_appeared`, `rpc_job_running`, `sandboxed`, `extension_outdated`, `unknown` (a legacy job record persisted before this list existed; wait normalises it, never a missing reason).
 Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permission-denied glen-home write adds
@@ -1050,6 +1216,7 @@ and the absolute scope directory. File paths bypass project filtering and remain
         "session_handle": "e27c0de",
         "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
         "status": "failed",
+        "task_state": "failed",
         "updated_at": "2026-10-30T07:53:12.901903Z"
       },
       "status": "failed"

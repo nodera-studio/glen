@@ -15,8 +15,9 @@ def target:
   if $i == null then "" else $a[$i+1:] | first_positional end;
 def norm: ascii_downcase | gsub("-"; "");
 def is_target($m;$k):
+  if ($m[$k].id|type) != "string" then false else
   (target|norm) as $t | ($m[$k].id|norm) as $id |
-  ($t != "" and ($id|endswith($t))) or (output).data.job.session_id == $m[$k].id;
+  ($t != "" and ($id|endswith($t))) or (output).data.job.session_id == $m[$k].id end;
 def texts:
   ([(output).data.assistant_text, (output).data.replies[]?.text] | map(strings | select(length>0)) | join("\n")) as $text |
   if $text != "" then $text elif (.stdout|type)=="string" then .stdout|tostring else "" end;
@@ -29,6 +30,35 @@ def final($ends):
 def denied: (tostring|ascii_downcase|test("permission[^\n]*den|denied|not allowed|dontask"));
 def uses($events): [$events[] | .. | objects | select(.type? == "tool_use")];
 def results($events): [$events[] | .. | objects | select(.type? == "tool_result")];
+# Mode p: Bash tool_use events of a stream-json run, and whether a command runs `glen wait --for reply`.
+def runs_glen: type == "string" and test("(^|[\\s/'\"])glen['\"]?(\\s|$)");
+def reply_wait: runs_glen and test("\\swait\\s") and test("--for(=|\\s+)reply");
+def has_nonce($n): $n != null and (tostring | contains($n));
+def bash_uses($events):
+  [$events | to_entries[] | .key as $i | .value | .. | objects | select(.type? == "tool_use" and .name? == "Bash") |
+   {i:$i, id, bg:(.input.run_in_background? == true), cmd:(.input.command? | if type == "string" then . else "" end)}];
+# The task id Claude Code gives a run_in_background Bash call, from its launch result.
+def task_id($events; $launch):
+  [$events[] | select(any(.. | objects; .type? == "tool_result" and .tool_use_id? == $launch.id)) |
+   (.tool_use_result? | objects | .backgroundTaskId? | strings),
+   (.. | objects | select(.type? == "tool_result" and .tool_use_id? == $launch.id) |
+    [.content | .. | strings] | join("\n") | capture("ID: (?<t>[A-Za-z0-9_-]+)").t)] | first;
+# A completion notification for that task (or its launching tool_use): stream-json's system
+# task_notification event, or the <task-notification> XML Claude Code queues as a user message.
+# A stopped or killed task did not complete, so its notification is no wake.
+def notifies($task; $tool):
+  if .type? == "system" then
+    .subtype? == "task_notification" and (.status? | IN("completed", "failed")) and
+    ((.task_id? != null and .task_id? == $task) or (.tool_use_id? != null and .tool_use_id? == $tool))
+  elif .type? == "user" then
+    any(.. | strings | split("<task-notification>")[1:][] | split("</task-notification>")[0];
+      test("<status>(completed|failed)</status>") and
+      (($task != null and contains("<task-id>\($task)</task-id>")) or contains("<tool-use-id>\($tool)</tool-use-id>")))
+  else false end;
+def base_checks($all;$starts;$ends):
+  [check("paired_calls"; (all($starts[]; . as $s | any($ends[]; .id==$s.id and .argv==$s.argv))) and (all($ends[]; . as $e | any($starts[]; .id==$e.id and .argv==$e.argv))) and ([$starts[].id]|unique|length)==($starts|length) and ([$ends[].id]|unique|length)==($ends|length); "unpaired start means killed call"),
+   check("guard_refused"; all($all[];.t!="guard_refused"); "zero guard refusals"),
+   check("call_budget"; ($starts|length)<=40 and ($starts|length)>0 and (([$starts[] | . as $s | $ends[] | select(.id==$s.id) | $s.ts+.ms]|max)-([$starts[].ts]|min))<=1200000; "at most 40 calls within 20 minutes")];
 def probe_success:
   ((has("is_error")|not) or .is_error == false) and
   (try (.content | if type=="string" then fromjson
@@ -51,11 +81,53 @@ $m[0] as $manifest | $calls as $all |
    check("AC-416-control-denied"; any($cc[]; .id as $id | any($cr[]; .tool_use_id==$id and denied)); "otherwise inconclusive; never pass")]
  elif $mode == "a" then
   [check("AC-414-person"; $person.pass == true; $person)]
+ elif $mode == "p" then
+  # AC-v2-206: does a background `glen wait --for reply` wake a `claude -p` run? The class is the
+  # evidence: woke, no_wake, foreground_only or no_wait (Step 13 decides the skill wording by it).
+  $manifest.NONCE_P as $n |
+  bash_uses($discovered) as $bash |
+  ([$bash[] | select(.bg and (.cmd|reply_wait))] | first) as $launch |
+  [$discovered | to_entries[] | select(.value.type? == "result") | .key] as $results |
+  (if $launch == null then null else task_id($discovered; $launch) end) as $task |
+  # Delivery is the launched task's own completion notification, never a tool result.
+  (if $launch == null then null else
+     [$discovered | to_entries[] | select(.key > $launch.i and (.value | notifies($task; $launch.id))) | .key] | first
+   end) as $delivered_at |
+  # The wake is the run acting on that notification: an assistant text or tool_use after it. A
+  # `result` before it does not end the run: Claude Code 2.1.316 keeps a `claude -p` process with
+  # a running background task alive past its first `result`, then resumes it on the notification.
+  (if $delivered_at == null then null else
+     [$discovered | to_entries[] | select(.key > $delivered_at and .value.type? == "assistant" and
+       any(.value.message.content[]?; .type? | IN("text", "tool_use"))) | .key] | first
+   end) as $resumed_at |
+  ([$bash[] | select((.bg|not) and (.cmd|runs_glen)) | .id as $id |
+    $discovered[] | .. | objects | select(.type? == "tool_result" and .tool_use_id? == $id) | has_nonce($n)] | any) as $foreground_carried |
+  # A foreground retrieval before the notification carried the reply, not the wake: a tool result
+  # that returned the nonce, or a TaskOutput or BashOutput naming the task or a Read of its output
+  # file (named after the task id), whatever it returned.
+  ([$discovered | to_entries[] | select(.key < ($delivered_at // infinite)) | .value | .. | objects |
+    select(.type? == "tool_result" and .tool_use_id? != $launch.id) | has_nonce($n)] | any) as $fetched_nonce |
+  ([$discovered | to_entries[] | select(.key < ($delivered_at // infinite)) | .value | .. | objects |
+    select(.type? == "tool_use" and $task != null and
+      (((.name? | IN("TaskOutput", "BashOutput")) and any(.input? | .. | strings; . == $task)) or
+       (.name? == "Read" and (.input.file_path? | if type == "string" then contains($task) else false end))))] |
+   length > 0) as $retrieved |
+  ($fetched_nonce or $retrieved) as $fetched_first |
+  (if $launch != null then
+     (if $delivered_at != null and $resumed_at != null and ($foreground_carried|not) and ($fetched_first|not) then "woke" else "no_wake" end)
+   elif any($bash[]; (.bg|not) and (.cmd|reply_wait)) then "foreground_only"
+   else "no_wait" end) as $wake |
+  [$content[]|select(cmd=="inbox")] as $inbox |
+  [$delivery_attempts[]|select(is_target($manifest;"P"))] as $p |
+  base_checks($all;$starts;$ends) +
+  [check("AC-206-send"; ($p|length)==1 and ($delivery_attempts|length)==1; "exactly one counted send, to P"),
+   check("AC-206-bg-wait-started"; $launch != null; "a Bash tool_use with run_in_background runs glen wait --for reply"),
+   check("AC-206-no-inbox-polling"; ($inbox|length)<=2 and all($inbox[]; any(.argv[]; . == "--wait" or . == "--peek")); "at most two inbox calls, each with --wait or --peek"),
+   check("AC-206-evidence"; ($results|length) > 0; "wake=\($wake) launch_event=\($launch.i) task=\($task) delivered_event=\($delivered_at) resumed_event=\($resumed_at) first_result_event=\($results|first) result_event=\($results|last) foreground_glen_output_had_nonce=\($foreground_carried) fetched_before_delivery=\($fetched_first)"),
+   check("AC-206-nonce"; $wake != "woke" or ($report|has_nonce($n)); "report quotes NONCE_P when woken")]
  else
- [check("paired_calls"; (all($starts[]; . as $s | any($ends[]; .id==$s.id and .argv==$s.argv))) and (all($ends[]; . as $e | any($starts[]; .id==$e.id and .argv==$e.argv))) and ([$starts[].id]|unique|length)==($starts|length) and ([$ends[].id]|unique|length)==($ends|length); "unpaired start means killed call"),
-  check("guard_refused"; all($all[];.t!="guard_refused"); "zero guard refusals"),
-  check("call_budget"; ($starts|length)<=40 and ($starts|length)>0 and (([$starts[] | . as $s | $ends[] | select(.id==$s.id) | $s.ts+.ms]|max)-([$starts[].ts]|min))<=1200000; "at most 40 calls within 20 minutes"),
-  check("list_and_read"; any($content[];cmd=="ls" and .exit==0) and any($content[];(cmd=="show" or cmd=="tail") and .exit==0); "list plus transcript read"),
+ base_checks($all;$starts;$ends) +
+ [check("list_and_read"; any($content[];cmd=="ls" and .exit==0) and any($content[];(cmd=="show" or cmd=="tail") and .exit==0); "list plus transcript read"),
   check("install_extension"; all($content[];cmd!="install-extension"); "zero extension install calls")]
  + (if $mode == "c1" then
     [check("AC-417-sandbox"; ($delivery_attempts|length)>0 and all($delivery_attempts[];.exit==6 and .ms<=5000 and (output).error.details.reason=="sandboxed" and (output).error.details.network==false); "every send refuses within five seconds"),

@@ -165,6 +165,22 @@ pub struct Status {
     #[serde(default)]
     pub warnings: Vec<Warning>,
 }
+impl Status {
+    /// The job's state in A2A's task-state vocabulary (design §A7), derived at view time and
+    /// never stored in `status.json`.
+    pub fn task_state(&self) -> &'static str {
+        match self.status {
+            State::Queued => "submitted",
+            State::Accepted => "working",
+            State::Completed => "completed",
+            State::Aborted => "canceled",
+            State::Failed if self.error.as_ref().is_some_and(|e| e.code == "no_route") => {
+                "rejected"
+            }
+            State::Failed | State::Lost => "failed",
+        }
+    }
+}
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Reply {
     pub v: u32,
@@ -388,6 +404,28 @@ impl JobStore {
             .lines()
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
+    }
+    /// The replies on complete lines only: a tail without its newline (an append in progress, or
+    /// one cut off) is deferred, even when it already parses, so a watcher never sees a reply
+    /// before its writer finished it. Malformed or non-UTF-8 complete lines are skipped.
+    pub fn read_replies_complete(&self, id: &JobId) -> Result<Vec<Reply>, GlenError> {
+        let path = self.replies_path(id);
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(GlenError::read(&path, e)),
+        };
+        let complete = match bytes.iter().rposition(|b| *b == b'\n') {
+            Some(end) => &bytes[..end],
+            None => return Ok(vec![]),
+        };
+        Ok(complete
+            .split(|b| *b == b'\n')
+            .filter_map(|line| serde_json::from_slice(line).ok())
+            .collect())
+    }
+    pub(crate) fn replies_path(&self, id: &JobId) -> PathBuf {
+        self.dir(id).join("replies.ndjson")
     }
     pub fn list(&self) -> Vec<JobId> {
         let mut ids: Vec<_> = fs::read_dir(&self.root)
@@ -722,6 +760,46 @@ pub(crate) mod tests {
             session_settled: true,
             settled_at: Some(jiff::Timestamp::now().to_string()),
         });
+    }
+    #[test]
+    fn task_state_follows_status_and_error_code() {
+        let with = |status: State, code: Option<&str>, forked: bool| Status {
+            status,
+            error: code.map(|code| JobError {
+                code: code.into(),
+                message: "m".into(),
+                hint: None,
+                details: None,
+            }),
+            forked: forked.then(|| Forked {
+                from: "a".into(),
+                to: "b".into(),
+            }),
+            ..Status::default()
+        };
+        for (status, code, forked, want) in [
+            (State::Queued, None, false, "submitted"),
+            (State::Accepted, None, false, "working"),
+            (State::Completed, None, false, "completed"),
+            (State::Completed, None, true, "completed"),
+            (State::Aborted, Some("cancelled"), false, "canceled"),
+            (State::Aborted, Some("aborted"), false, "canceled"),
+            (State::Aborted, Some("session_switched"), false, "canceled"),
+            (State::Failed, Some("no_route"), false, "rejected"),
+            (State::Failed, Some("omp_error"), false, "failed"),
+            (State::Failed, None, false, "failed"),
+            (State::Lost, Some("lost"), false, "failed"),
+            (State::Lost, None, false, "failed"),
+        ] {
+            assert_eq!(
+                with(status, code, forked).task_state(),
+                want,
+                "{status:?} {code:?} forked={forked}"
+            );
+        }
+        // Derived only: never written into status.json.
+        let encoded = serde_json::to_value(with(State::Accepted, None, false)).unwrap();
+        assert!(encoded.get("task_state").is_none(), "{encoded}");
     }
     #[test]
     fn private_creation_and_existing_directory_refused() {

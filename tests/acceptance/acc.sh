@@ -3,6 +3,8 @@
 set -euo pipefail
 A=$(cd -- "$(dirname -- "$0")" && pwd -P)
 ROOT=$(cd -- "$A/../.." && pwd -P)
+# Real-omp legs run under this profile, never the owner's default agent dir (v0.2 W2).
+PROFILE=glen-harness
 die() { printf '%s\n' "$*" >&2; exit 2; }
 need() { command -v "$1" >/dev/null || die "missing prerequisite: $1"; }
 copy_transcript() {
@@ -43,9 +45,50 @@ require_w3_surface() {
     grep -Eq '^  inbox[[:space:]]' <<< "$help" || die 'acceptance needs W3'
     grep -Eq '^  install-extension[[:space:]]' <<< "$help" || die 'acceptance needs W3'
 }
+# Mode p (v0.2 W2, AC-v2-206): `claude -p` against fake_omp, no real omp and no profile. The fixture
+# session moves into the bucket glen assigns the scratch project, so `glen ls` there lists it.
+setup_p() {
+    for tool in jq perl git shasum claude; do need "$tool"; done
+    (cd "$ROOT" && cargo build --release --locked && cargo build --locked --example fake_omp) >&2
+    local binary="$ROOT/target/release/glen"
+    "$binary" wait --help | grep -q -- '--for' || die 'acceptance p needs W2'
+    local S P G fake home agent bucket session from
+    S=$(mktemp -d "${TMPDIR:-/tmp}/ga.XXXXXX"); S=$(cd -- "$S" && pwd -P)
+    P="$S/project"; G="$S/glen-bin/glen"; fake="$S/fake-bin/fake_omp"; home="$S/omp-home"; agent="$S/omp-agent"
+    printf 'scratch: %s\n' "$S" >&2
+    mkdir -p "$S/glen-bin" "$S/bin" "$S/fake-bin" "$P" "$home"
+    cp "$binary" "$G"; cp "$ROOT/target/debug/examples/fake_omp" "$fake"; git init -q "$P"
+    cp -R "$ROOT/tests/fixtures/omp/agent" "$agent"
+    bucket=$(cd "$P" && env -u OMP_PROFILE -u PI_PROFILE HOME="$home" PI_CODING_AGENT_DIR="$S/omp-agent" "$G" ls --cwd "$P" --json | jq -r .data.scope.bucket)
+    [[ $bucket == -* && $bucket != */* ]] || die "unexpected bucket for $P: $bucket"
+    session=2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de
+    from="$agent/sessions/-work-alpha"
+    if [[ $bucket != -work-alpha ]]; then
+        mkdir -p "$agent/sessions/$bucket"
+        mv "$from/$session" "$from/$session.jsonl" "$agent/sessions/$bucket/"
+    fi
+    for dir in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" "$HOME/.agents/skills"; do ls -lad "$dir" "$dir/glen" "$dir/glen/SKILL.md" 2>/dev/null || true; done > "$S/owner-skills.before.txt"
+    jq -n --arg scratch "$S" --arg project "$P" --arg agent "$agent" --arg home "$home" --arg fake "$fake" --arg np "$(nonce P)" \
+      --arg path "$agent/sessions/$bucket/$session.jsonl" \
+      '{mode:"p",scratch:$scratch,project:$project,sessions_dir:($agent+"/sessions"),agent_dir:$agent,
+        P:{id:"01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",handle:"e27c0de",path:$path},NONCE_P:$np,
+        env:{HOME:$home,PI_CODING_AGENT_DIR:$agent,GLEN_OMP_BIN:$fake,FAKE_OMP_SCENARIO:"progress",FAKE_OMP_DELAY_MS:"100000"},
+        buckets:[]}' > "$S/manifest.json"
+    (cd "$P" && "$G" install-skill --project --json) > "$S/skill-install.json"
+    printf '#!/usr/bin/env bash\nACC_S=%q\n' "$S" > "$S/bin/glen"
+    tail -n +2 "$A/glen-wrapper.sh" >> "$S/bin/glen"; chmod 755 "$S/bin/glen"
+    : > "$S/calls.ndjson"
+    jq -nr --rawfile template "$A/prompts/claude-push.md" --arg project "$P" --slurpfile m "$S/manifest.json" \
+      '$template|split("{{PROJECT}}")|join($project)|split("{{NONCE_P}}")|join($m[0].NONCE_P)' > "$S/prompt-p.md"
+    jq -n --arg sha "$(git -C "$ROOT" rev-parse HEAD)" --arg binary_sha "$(shasum -a 256 "$G" | cut -d ' ' -f1)" --arg fake_sha "$(shasum -a 256 "$fake" | cut -d ' ' -f1)" \
+      --arg claude "$(claude --version 2>/dev/null || true)" --arg jq "$(jq --version)" \
+      '{git_sha:$sha,binary_sha256:$binary_sha,fake_omp_sha256:$fake_sha,tools:{claude:$claude,jq:$jq},env_names:["GLEN_HOME","PATH","HOME","PI_CODING_AGENT_DIR","GLEN_OMP_BIN","FAKE_OMP_SCENARIO","FAKE_OMP_DELAY_MS"],credential_copy:false,omp:"fake_omp"}' > "$S/provenance.json"
+    printf '%s\n' "$S"
+}
 setup() {
     local mode=$1
-    [[ $mode =~ ^(a|b|b2|b3|c1|c2)$ ]] || die 'mode must be a, b, b2, b3, c1 or c2'
+    [[ $mode =~ ^(a|b|b2|b3|c1|c2|p)$ ]] || die 'mode must be a, b, b2, b3, c1, c2 or p'
+    if [[ $mode == p ]]; then setup_p; return; fi
     for tool in jq perl screen git shasum; do need "$tool"; done
     case "$mode" in a) need expect;; b|b2|b3) need claude;; c1|c2) need codex;; esac
     if [[ $mode == c2 && ${ACC_C2_CONSENT-} != yes ]]; then die 'c2 owner-pending: explicit owner consent required (ACC_C2_CONSENT=yes)'; fi
@@ -63,17 +106,18 @@ setup() {
     cp "$binary" "$G"; git init -q "$P"
     unset OMP_PROFILE PI_PROFILE
     export GLEN_HOME="$S/home"
-    # O1: keep the owner's normal agent dir/auth. Never export/import credentials.
-    report=$("$G" doctor --json)
+    # O1: omp runs under profile glen-harness with its own auth; never export/import credentials.
+    # doctor resolves the profile's paths without creating them; a missing profile is never created.
+    report=$("$G" doctor --profile "$PROFILE" --json)
     sessions=$(jq -r .data.paths.sessions_dir <<< "$report")
     agent=$(jq -r .data.paths.agent_dir <<< "$report")
-    export PI_CODING_AGENT_DIR="$agent"
-    [[ $sessions == /* && $sessions != null ]] || die 'cannot resolve owner sessions directory'
+    [[ -d $agent ]] || die "profile $PROFILE is missing: run .claude/scripts/omp-profile-setup.sh"
+    [[ $sessions == /* && $sessions != null ]] || die 'cannot resolve profile sessions directory'
     snapshot "$sessions" > "$S/owner-sessions.before.json"
     # Install state is names/metadata only; skills are installed solely in the scratch project.
     for dir in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" "$HOME/.agents/skills"; do ls -lad "$dir" "$dir/glen" "$dir/glen/SKILL.md" 2>/dev/null || true; done > "$S/owner-skills.before.txt"
-    if ! probe=$("$G" send @new 'Reply with the word ready.' --cwd "$S/probe" --wait 120s --json); then
-        printf 'blocked: no usable omp credentials/model in the normal agent dir; scratch: %s\n' "$S" >&2
+    if ! probe=$("$G" send @new 'Reply with the word ready.' --profile "$PROFILE" --cwd "$S/probe" --wait 120s --json); then
+        printf 'blocked: no usable omp credentials/model in profile %s; scratch: %s\n' "$PROFILE" "$S" >&2
         exit 3
     fi
     [[ $(jq -r .data.status <<< "$probe") == completed ]] || die 'credential probe did not complete'
@@ -82,20 +126,20 @@ setup() {
         env PI_CODING_AGENT_DIR="$S/extension-agent" "$G" install-extension --json > "$S/extension-install.json"
         ext="$S/extension-agent/extensions/glen/index.ts"
     fi
-    R=$("$G" send @new 'Acceptance R: reply with the single word ready.' --cwd "$P" --wait 120s --json)
-    L=$("$G" send @new 'Acceptance L: reply with the single word ready.' --cwd "$P" --wait 120s --json)
-    X=$("$G" send @new 'Acceptance X: reply with the single word ready.' --cwd "$P" --wait 120s --json)
-    jq -n --arg mode "$mode" --arg scratch "$S" --arg project "$P" --arg sessions "$sessions" --arg agent "$agent" --arg nr "$(nonce R)" --arg nl "$(nonce L)" --arg nt "$(nonce T)" \
+    R=$("$G" send @new 'Acceptance R: reply with the single word ready.' --profile "$PROFILE" --cwd "$P" --wait 120s --json)
+    L=$("$G" send @new 'Acceptance L: reply with the single word ready.' --profile "$PROFILE" --cwd "$P" --wait 120s --json)
+    X=$("$G" send @new 'Acceptance X: reply with the single word ready.' --profile "$PROFILE" --cwd "$P" --wait 120s --json)
+    jq -n --arg mode "$mode" --arg profile "$PROFILE" --arg scratch "$S" --arg project "$P" --arg sessions "$sessions" --arg agent "$agent" --arg nr "$(nonce R)" --arg nl "$(nonce L)" --arg nt "$(nonce T)" \
       --argjson r "$R" --argjson l "$L" --argjson x "$X" --argjson probe "$probe" \
-      '{mode:$mode,scratch:$scratch,project:$project,sessions_dir:$sessions,agent_dir:$agent,R:$r.data.session,L:$l.data.session,X:$x.data.session,NONCE_R:$nr,NONCE_L:$nl,NONCE_T:$nt,buckets:([$r.data.session.path,$l.data.session.path,$x.data.session.path,$probe.data.session.path]|map(sub("/[^/]+$";""))|unique)}' > "$S/manifest.json"
+      '{mode:$mode,profile:$profile,scratch:$scratch,project:$project,sessions_dir:$sessions,agent_dir:$agent,R:$r.data.session,L:$l.data.session,X:$x.data.session,NONCE_R:$nr,NONCE_L:$nl,NONCE_T:$nt,buckets:([$r.data.session.path,$l.data.session.path,$x.data.session.path,$probe.data.session.path]|map(sub("/[^/]+$";""))|unique)}' > "$S/manifest.json"
     jq -e --arg dir "$sessions/" '[.R,.L,.X]|all(.path|startswith($dir))' "$S/manifest.json" >/dev/null || die 'session outside resolved sessions dir'
     suffix=${S##*.}; screen_l="ga-L-$suffix"; screen_x="ga-X-$suffix"
     jq --arg l "$screen_l" --arg x "$screen_x" '. + {screen_l:$l,screen_x:$x}' "$S/manifest.json" > "$S/manifest.tmp"
     mv "$S/manifest.tmp" "$S/manifest.json"
     if [[ $mode != b2 ]]; then
         # Launcher scripts avoid shell-quoting session paths into screen's command string.
-        printf '#!/usr/bin/env bash\ncd %q\nunset OMP_PROFILE PI_PROFILE\nexport GLEN_HOME=%q\nexport PI_CODING_AGENT_DIR=%q\nexec omp --no-extensions -e %q --resume %q\n' "$P" "$GLEN_HOME" "$agent" "$ext" "$(jq -r .L.path "$S/manifest.json")" > "$S/live.sh"
-        printf '#!/usr/bin/env bash\ncd %q\nunset OMP_PROFILE PI_PROFILE\nexport GLEN_HOME=%q\nexport PI_CODING_AGENT_DIR=%q\nexec omp --no-extensions --resume %q\n' "$P" "$GLEN_HOME" "$agent" "$(jq -r .X.path "$S/manifest.json")" > "$S/held.sh"
+        printf '#!/usr/bin/env bash\ncd %q\nunset OMP_PROFILE PI_PROFILE\nexport GLEN_HOME=%q\nexec omp --profile %q --no-extensions -e %q --resume %q\n' "$P" "$GLEN_HOME" "$PROFILE" "$ext" "$(jq -r .L.path "$S/manifest.json")" > "$S/live.sh"
+        printf '#!/usr/bin/env bash\ncd %q\nunset OMP_PROFILE PI_PROFILE\nexport GLEN_HOME=%q\nexec omp --profile %q --no-extensions --resume %q\n' "$P" "$GLEN_HOME" "$PROFILE" "$(jq -r .X.path "$S/manifest.json")" > "$S/held.sh"
         screen -dmS "$screen_l" bash "$S/live.sh"
         deadline=$((SECONDS+30))
         while [[ ! -f $GLEN_HOME/run/live/$(jq -r .L.id "$S/manifest.json").json ]]; do ((SECONDS<deadline)) || die 'live endpoint timeout'; sleep 0.2; done
@@ -105,7 +149,7 @@ setup() {
         tui "$screen_x" stuff $'Acceptance X: answer with the word ok.\r'
         deadline=$((SECONDS+120))
         while :; do
-            out=$("$G" ls --cwd "$P" --json)
+            out=$("$G" ls --profile "$PROFILE" --cwd "$P" --json)
             if jq -e --arg id "$(jq -r .X.id "$S/manifest.json")" '.data.sessions|any(.id==$id and (.state=="live" or .state=="busy"))' <<< "$out" >/dev/null; then break; fi
             ((SECONDS<deadline)) || die 'X lease timeout'; sleep 0.5
         done
@@ -113,7 +157,7 @@ setup() {
             tui "$screen_l" stuff "Use glen_reply to tell the calling agent: $(jq -r .NONCE_T "$S/manifest.json")"$'\r'
             deadline=$((SECONDS+120))
             while :; do
-                out=$("$G" inbox --peek --json)
+                out=$("$G" inbox --profile "$PROFILE" --peek --json)
                 if jq -e --arg n "$(jq -r .NONCE_T "$S/manifest.json")" 'tostring|contains($n)' <<< "$out" >/dev/null; then break; fi
                 ((SECONDS<deadline)) || die 'talk-back timeout'; sleep 0.5
             done
@@ -130,13 +174,13 @@ setup() {
     jq -nr --rawfile template "$A/prompts/$template.md" --arg glen "$S/bin/glen" --arg project "$P" --arg path "$skill_path" --arg skill "$skill" --slurpfile m "$S/manifest.json" \
       '$template|split("{{GLEN}}")|join($glen)|split("{{PROJECT}}")|join($project)|split("{{SKILL_PATH}}")|join($path)|split("{{SKILL}}")|join($skill)|split("{{NONCE_R}}")|join($m[0].NONCE_R)|split("{{NONCE_L}}")|join($m[0].NONCE_L)|split("{{NONCE_T}}")|join($m[0].NONCE_T)' > "$S/prompt-$mode.md"
     find "$GLEN_HOME/jobs" -mindepth 1 -maxdepth 1 -type d -print 2>/dev/null | sort > "$S/jobs.before.txt"
-    jq -n --arg sha "$(git -C "$ROOT" rev-parse HEAD)" --arg binary_sha "$(shasum -a 256 "$G" | cut -d ' ' -f1)" --arg omp "$(omp --version)" --arg claude "$(claude --version 2>/dev/null || true)" --arg codex "$(codex --version 2>/dev/null || true)" --arg jq "$(jq --version)" --arg screen "$(screen --version)" --arg expect "$(expect -v)" \
-      '{git_sha:$sha,binary_sha256:$binary_sha,tools:{omp:$omp,claude:$claude,codex:$codex,jq:$jq,screen:$screen,expect:$expect},env_names:["GLEN_HOME","PATH","TERM","COLUMNS","OMP_PROFILE","PI_PROFILE","PI_CODING_AGENT_DIR"],credential_copy:false}' > "$S/provenance.json"
+    jq -n --arg profile "$PROFILE" --arg sha "$(git -C "$ROOT" rev-parse HEAD)" --arg binary_sha "$(shasum -a 256 "$G" | cut -d ' ' -f1)" --arg omp "$(omp --version)" --arg claude "$(claude --version 2>/dev/null || true)" --arg codex "$(codex --version 2>/dev/null || true)" --arg jq "$(jq --version)" --arg screen "$(screen --version)" --arg expect "$(expect -v)" \
+      '{git_sha:$sha,binary_sha256:$binary_sha,tools:{omp:$omp,claude:$claude,codex:$codex,jq:$jq,screen:$screen,expect:$expect},env_names:["GLEN_HOME","PATH","TERM","COLUMNS","OMP_PROFILE","PI_PROFILE"],profile:$profile,credential_copy:false}' > "$S/provenance.json"
     printf '%s\n' "$S"
 }
 check_mode() {
     local mode=$1 S=$2
-    [[ $mode =~ ^(a|b|b2|b3|c1|c2)$ ]] || die 'unknown check mode'
+    [[ $mode =~ ^(a|b|b2|b3|c1|c2|p)$ ]] || die 'unknown check mode'
     [[ -f $S/manifest.json ]] || die 'missing manifest'
     if [[ ! -f $S/calls.ndjson ]]; then
         # Reuse the mode's check IDs, but fail every check when setup left no recording.
@@ -152,7 +196,8 @@ check_mode() {
     # Empty optional inputs are arrays; required evidence is checked by its mode.
     local empty
     empty=$(mktemp "${TMPDIR:-/tmp}/ga-check.XXXXXX"); printf '' > "$empty"
-    local report='' person='{}' jobs=true config=false
+    local report='' person='{}' jobs=true config=false discovered="$S/b3.jsonl"
+    [[ $mode != p ]] || discovered="$S/p.jsonl"
     [[ ! -f $S/report.md ]] || report=$(cat "$S/report.md")
     [[ ! -f $S/person-verdict.json ]] || person=$(cat "$S/person-verdict.json")
     if [[ $mode == c1 ]]; then
@@ -165,7 +210,7 @@ check_mode() {
     jq -n --arg mode "$mode" --arg scratch "$S" --arg report "$report" --argjson person "$person" --argjson jobs_unchanged "$jobs" --argjson config_restored "$config" \
       --slurpfile m "$S/manifest.json" --slurpfile calls "${S}/calls.ndjson" \
       --slurpfile transcript "$([[ -f $S/transcript.jsonl ]] && printf '%s' "$S/transcript.jsonl" || printf '%s' "$empty")" \
-      --slurpfile discovered "$([[ -f $S/b3.jsonl ]] && printf '%s' "$S/b3.jsonl" || printf '%s' "$empty")" \
+      --slurpfile discovered "$([[ -f $discovered ]] && printf '%s' "$discovered" || printf '%s' "$empty")" \
       --slurpfile probe "$([[ -f $S/b2-probe.jsonl ]] && printf '%s' "$S/b2-probe.jsonl" || printf '%s' "$empty")" \
       --slurpfile control "$([[ -f $S/b2-control.jsonl ]] && printf '%s' "$S/b2-control.jsonl" || printf '%s' "$empty")" \
       -f "$A/check.jq" > "$S/verdict.json"
@@ -187,22 +232,28 @@ teardown() {
         [[ -n $name && $name == ga-* ]] || continue
         screen -S "$name" -X quit 2>/dev/null || true
     done
-    local status=0 sessions
+    local status=0 sessions mode
     sessions=$(jq -r .sessions_dir "$S/manifest.json")
+    mode=$(jq -r .mode "$S/manifest.json")
     if [[ -d $S/home/run/live ]] && [[ -n $(find "$S/home/run/live" -type f -print -quit) ]]; then printf 'FAIL live endpoints remain\n' >&2; status=1; fi
-    snapshot "$sessions" > "$S/owner-sessions.after.json"
-    if ! jq -en --slurpfile before "$S/owner-sessions.before.json" --slurpfile after "$S/owner-sessions.after.json" --slurpfile m "$S/manifest.json" '
-      all($before[0][]; . as $old | any($after[0][]; .==$old)) and
-      all($after[0][]; . as $new | any($before[0][];.==$new) or any($m[0].buckets[]; . as $bucket | $new.path|startswith($bucket+"/")))' >/dev/null; then printf 'FAIL owner_session_snapshot\n' >&2; status=1; fi
+    # Mode p's sessions are scratch fixture copies that fake_omp legitimately changes.
+    if [[ $mode != p ]]; then
+        snapshot "$sessions" > "$S/owner-sessions.after.json"
+        if ! jq -en --slurpfile before "$S/owner-sessions.before.json" --slurpfile after "$S/owner-sessions.after.json" --slurpfile m "$S/manifest.json" '
+          all($before[0][]; . as $old | any($after[0][]; .==$old)) and
+          all($after[0][]; . as $new | any($before[0][];.==$new) or any($m[0].buckets[]; . as $bucket | $new.path|startswith($bucket+"/")))' >/dev/null; then printf 'FAIL owner_session_snapshot\n' >&2; status=1; fi
+    fi
     for dir in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills" "$HOME/.agents/skills"; do ls -lad "$dir" "$dir/glen" "$dir/glen/SKILL.md" 2>/dev/null || true; done > "$S/owner-skills.after.txt"
     cmp -s "$S/owner-skills.before.txt" "$S/owner-skills.after.txt" || { printf 'FAIL owner skills changed\n' >&2; status=1; }
     mkdir -p "$evidence"
     local file
-    for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
+    for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl p.jsonl b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
     copy_transcript "$S/transcript.jsonl" "$evidence/transcript.jsonl" || { printf 'FAIL transcript copy\n' >&2; status=1; }
     for file in "$S"/prompt-*.md "$S"/*.typescript "$S"/*.screen.txt; do [[ ! -f $file ]] || cp "$file" "$evidence/"; done
     jq -r '.buckets[]' "$S/manifest.json" > "$evidence/scratch-buckets.txt"
-    jq -r --slurpfile m "$S/manifest.json" '.[] | .path as $path | select(any($m[0].buckets[]; . as $b|$path|startswith($b+"/"))) | .path' "$S/owner-sessions.after.json" > "$evidence/sessions-left.txt"
+    if [[ $mode != p ]]; then
+        jq -r --slurpfile m "$S/manifest.json" '.[] | .path as $path | select(any($m[0].buckets[]; . as $b|$path|startswith($b+"/"))) | .path' "$S/owner-sessions.after.json" > "$evidence/sessions-left.txt"
+    fi
     local secrets_clean=true
     gitleaks dir --no-banner --redact "$evidence" || { secrets_clean=false; status=1; }
     if [[ -f $evidence/verdict.json ]]; then

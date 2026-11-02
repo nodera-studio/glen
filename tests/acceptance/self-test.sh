@@ -281,6 +281,156 @@ jq -se '[.[]|select(.t=="guard_refused")]|length==6' "$S/calls.ndjson" >/dev/nul
 if "$S/bin/glen" send @new hi --cwd "$S/project/../.." >/dev/null 2>&1; then echo 'escape allowed' >&2; exit 1; fi
 if "$S/bin/glen" send deadbeef hi >/dev/null 2>&1; then echo 'foreign session allowed' >&2; exit 1; fi
 if "$S/bin/glen" install-extension >/dev/null 2>&1; then echo 'extension install allowed' >&2; exit 1; fi
+# Mode p (v0.2 W2, AC-v2-206): one send to P, then the background reply wait and its wake class.
+Q="$S/p"
+mkdir -p "$Q/bin" "$Q/glen-bin"
+jq -n --arg s "$Q" '{mode:"p",scratch:$s,project:($s+"/project"),P:{id:"01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",handle:"e27c0de"},NONCE_P:"P-nonce",
+  env:{HOME:($s+"/omp-home"),PI_CODING_AGENT_DIR:($s+"/omp-agent"),GLEN_OMP_BIN:($s+"/fake-bin/fake_omp"),FAKE_OMP_SCENARIO:"progress",FAKE_OMP_DELAY_MS:"100000",LD_PRELOAD:"/nonexistent/acc-preload.so"},buckets:[]}' > "$Q/manifest.json"
+p_calls() { # extra argv arrays (JSON) appended after the send and the reply wait
+    jq -cn --slurpfile m "$Q/manifest.json" --argjson extra "${1:-[]}" '
+      $m[0] as $m |
+      ([ {a:["send","e27c0de","Call your reply tool with exactly P-nonce","--no-wait"],out:{data:{job:{session_id:$m.P.id,handle:"j1234567"}}},exit:10},
+         {a:["wait","j1234567","--for","reply"],out:{data:{woke:"reply",replies:[{text:"reply: P-nonce"}]}},exit:10} ]
+       + [$extra[] | {a:.,out:{data:{messages:[]}},exit:0}]) | to_entries[] | .key as $i | .value as $v |
+      {t:"start",id:($i|tostring),argv:$v.a,ts:($i*10)},
+      {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$Q/calls.ndjson"
+}
+p_events() { # $1: the reply wait's run_in_background; $2: its task b1's completion notification:
+    # none, system (stream-json's task_notification event) or xml (the <task-notification> user
+    # message), after which the run reads the output file; $3: a foreground retrieval of b1's
+    # output before that notification: none, TaskOutput, BashOutput or Read; $4: live (the
+    # notification arrives inside the turn) or resumed (the shape Claude Code 2.1.316 recorded: the
+    # turn ends with a first result, then task_updated, the notification, a new init and the
+    # resumed turn, which ends with the final result).
+    jq -cn --argjson bg "$1" --arg note "${2:-none}" --arg fetch "${3:-none}" --arg shape "${4:-live}" '
+      "{\"data\":{\"woke\":\"reply\",\"replies\":[{\"text\":\"reply: P-nonce\"}]}}" as $out |
+      "Background command \"glen wait j1234567 --for reply\" failed with exit code 10" as $summary |
+      {type:"system",subtype:"init"},
+      {type:"assistant",message:{content:[{type:"tool_use",id:"send",name:"Bash",input:{command:"glen send e27c0de \"Call your reply tool with exactly P-nonce\" --no-wait"}}]}},
+      {type:"user",message:{content:[{type:"tool_result",tool_use_id:"send",content:"{\"v\":1,\"ok\":true,\"data\":{\"status\":\"running\"}}"}]}},
+      {type:"assistant",message:{content:[{type:"tool_use",id:"wait",name:"Bash",input:({command:"glen wait j1234567 --for reply"} + if $bg then {run_in_background:true} else {} end)}]}},
+      {type:"user",message:{content:[{type:"tool_result",tool_use_id:"wait",content:(if $bg then "Command running in background with ID: b1. Output is being written to: /tmp/tasks/b1.output" else $out end)}]},
+       tool_use_result:(if $bg then {stdout:"",stderr:"",interrupted:false,backgroundTaskId:"b1"} else {stdout:$out,stderr:"",interrupted:false} end)},
+      (if $fetch == "none" then empty else
+        {type:"assistant",message:{content:[{type:"tool_use",id:"fetch",name:$fetch,input:(if $fetch == "TaskOutput" then {task_id:"b1",block:true,timeout:600000} elif $fetch == "BashOutput" then {bash_id:"b1"} else {file_path:"/tmp/tasks/b1.output"} end)}]}},
+        {type:"user",message:{content:[{type:"tool_result",tool_use_id:"fetch",content:"<retrieval_status>success</retrieval_status>\n<task_id>b1</task_id>\n<status>failed</status>\n<exit_code>10</exit_code>\n<output>\($out)</output>"}]}} end),
+      (if $shape == "resumed" then
+        {type:"assistant",message:{content:[{type:"text",text:"Waiting for the reply."}]}},
+        {type:"result",result:"Waiting for the reply."},
+        (if $bg and $note != "none" then {type:"system",subtype:"task_updated",task_id:"b1",patch:{status:"failed"}} else empty end)
+       else empty end),
+      (if ($bg|not) or $note == "none" then empty else
+        (if $note == "system" then
+          {type:"system",subtype:"task_notification",task_id:"b1",tool_use_id:"wait",status:"failed",output_file:"/tmp/tasks/b1.output",summary:$summary}
+        else
+          {type:"user",message:{role:"user",content:[{type:"text",text:"<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>wait</tool-use-id>\n<output-file>/tmp/tasks/b1.output</output-file>\n<status>failed</status>\n<summary>\($summary)</summary>\n</task-notification>"}]}}
+        end),
+        (if $shape == "resumed" then {type:"system",subtype:"init"} else empty end),
+        {type:"assistant",message:{content:[{type:"tool_use",id:"read",name:"Read",input:{file_path:"/tmp/tasks/b1.output"}}]}},
+        {type:"user",message:{content:[{type:"tool_result",tool_use_id:"read",content:$out}]}} end),
+      {type:"assistant",message:{content:[{type:"text",text:"done"}]}},
+      {type:"result",result:"reply: P-nonce"}' > "$Q/p.jsonl"
+}
+p_verdict() { # $1: expected wake class, $2: the checks expected to fail (JSON array)
+    "$A/acc.sh" check p "$Q" >/dev/null || true
+    jq -e --arg wake "$1" --argjson failing "$2" '
+      (.checks|map(select(.pass|not).id)) == $failing and (.pass == ($failing|length == 0)) and
+      (.checks|any(.id=="AC-206-evidence" and (.evidence|startswith("wake="+$wake+" "))))' "$Q/verdict.json" >/dev/null ||
+      { echo "mode p: expected wake=$1 failing=$2" >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+}
+printf 'reply: P-nonce\n' > "$Q/report.md"
+p_calls; p_events true system; p_verdict woke '[]'
+p_events true xml; p_verdict woke '[]'
+p_events true none; p_verdict no_wake '[]'
+# Only b1's own completion notification is a wake: output a foreground retrieval returned first
+# (TaskOutput blocking on b1, or BashOutput), another task's notification and a stopped or killed
+# b1 are no wake.
+p_events true none TaskOutput; p_verdict no_wake '[]'
+p_events true xml TaskOutput; p_verdict no_wake '[]'
+p_events true system BashOutput; p_verdict no_wake '[]'
+p_events true system
+jq -c 'if .subtype?=="task_notification" then .task_id="b9" | .tool_use_id="other" else . end' "$Q/p.jsonl" > "$Q/p-other.jsonl"
+mv "$Q/p-other.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+p_events true system; jq -c 'if .subtype?=="task_notification" then .status="stopped" else . end' "$Q/p.jsonl" > "$Q/p-stop.jsonl"
+mv "$Q/p-stop.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+p_events true xml; jq -c 'walk(if type=="string" then sub("<status>failed</status>";"<status>killed</status>") else . end)' "$Q/p.jsonl" > "$Q/p-kill.jsonl"
+mv "$Q/p-kill.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+# The recorded shape: a first result ends the turn, the process stays alive, and b1's notification
+# resumes the run (an assistant tool_use after it). A result before the notification is no bar.
+p_events true system none resumed; p_verdict woke '[]'
+jq -e '.checks[] | select(.id=="AC-206-evidence").evidence |
+  capture("delivered_event=(?<d>[0-9]+) resumed_event=(?<r>[0-9]+) first_result_event=(?<f>[0-9]+) result_event=(?<l>[0-9]+)") |
+  map_values(tonumber) | .f < .d and .d < .r and .r < .l' "$Q/verdict.json" >/dev/null ||
+  { echo 'mode p: resumed evidence fields out of order' >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+p_events true xml none resumed; p_verdict woke '[]'
+# No resumed activity is no wake: the run ends at the notification, or only an init and the
+# final result follow it.
+p_events true system none resumed
+jq -sc '(map(.subtype? == "task_notification") | index(true)) as $k | .[:$k+1][]' "$Q/p.jsonl" > "$Q/p-end.jsonl"
+mv "$Q/p-end.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+for shape in live resumed; do
+    p_events true system none "$shape"
+    jq -sc '(map(.subtype? == "task_notification") | index(true)) as $k | to_entries[] |
+      select(.key <= $k or (.value.type | IN("assistant", "user") | not)) | .value' "$Q/p.jsonl" > "$Q/p-idle.jsonl"
+    mv "$Q/p-idle.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+done
+# A foreground retrieval of b1 before its notification is no wake even when the output it got
+# lacks the nonce (the fake's first reply is `progress`); another task's notification neither.
+for fetch in TaskOutput BashOutput Read; do
+    p_events true system "$fetch" resumed
+    jq -c 'walk(if type=="string" then gsub("reply: P-nonce"; "progress") else . end)' "$Q/p.jsonl" > "$Q/p-progress.jsonl"
+    mv "$Q/p-progress.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+    jq -e '.checks|any(.id=="AC-206-evidence" and (.evidence|contains("fetched_before_delivery=true")))' "$Q/verdict.json" >/dev/null ||
+      { echo "mode p: $fetch before the notification was not a retrieval" >&2; exit 1; }
+done
+p_events true system none resumed
+jq -c 'if .subtype?=="task_notification" then .task_id="b9" | .tool_use_id="other" else . end' "$Q/p.jsonl" > "$Q/p-other.jsonl"
+mv "$Q/p-other.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+p_events false; p_verdict foreground_only '["AC-206-bg-wait-started"]'
+jq -c 'select(.message.content[0].tool_use_id? != "wait" and .message.content[0].id? != "wait")' "$Q/p.jsonl" > "$Q/p-none.jsonl"
+mv "$Q/p-none.jsonl" "$Q/p.jsonl"; p_verdict no_wait '["AC-206-bg-wait-started"]'
+# A woken run must quote the nonce; three inbox calls, or one without --wait/--peek, is polling.
+p_events true system; printf 'no nonce here\n' > "$Q/report.md"; p_verdict woke '["AC-206-nonce"]'
+printf 'reply: P-nonce\n' > "$Q/report.md"
+p_calls '[["inbox","--peek"],["inbox","--wait"],["inbox","--peek"]]'; p_verdict woke '["AC-206-no-inbox-polling"]'
+p_calls '[["inbox"]]'; p_verdict woke '["AC-206-no-inbox-polling"]'
+p_calls '[["inbox","--wait","--timeout","90s"],["inbox","--peek"]]'; p_verdict woke '[]'
+# A foreground glen call that carries the nonce means the background wait did not deliver it.
+jq -c 'if .type=="user" and .message.content[0].tool_use_id?=="send" then .message.content[0].content="reply: P-nonce" else . end' "$Q/p.jsonl" > "$Q/p-fg.jsonl"
+mv "$Q/p-fg.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+# A run that never ended has no result event; a second send is not exactly one.
+p_events true system; jq -c 'select(.type!="result")' "$Q/p.jsonl" > "$Q/p-open.jsonl"; mv "$Q/p-open.jsonl" "$Q/p.jsonl"
+p_verdict woke '["AC-206-evidence"]'
+p_events true system
+jq -c 'select(.t!="end" or .argv[0]!="send"), (select(.t=="end" and .argv[0]=="send") | ., (.id="again" | .)), (select(.t=="start" and .argv[0]=="send") | .id="again")' "$Q/calls.ndjson" > "$Q/calls-two.ndjson"
+mv "$Q/calls-two.ndjson" "$Q/calls.ndjson"; p_verdict woke '["AC-206-send"]'
+p_calls
+rm "$Q/calls.ndjson"
+if "$A/acc.sh" check p "$Q" >/dev/null; then echo 'missing p recording passed' >&2; exit 1; fi
+jq -e '(.pass|not) and (.checks|length)==8 and all(.checks[]; (.pass|not) and (.evidence|contains("missing recording")))' "$Q/verdict.json" >/dev/null
+# The wrapper passes only whitelisted manifest env names, accepts P, records the receivers' argv
+# intact, and adds --profile only for a manifest that names glen-harness.
+cat > "$Q/glen-bin/glen" <<'EOF'
+#!/usr/bin/env bash
+jq -cn --args '{v:1,ok:true,data:{argv:$ARGS.positional,preload:($ENV.LD_PRELOAD // null),scenario:($ENV.FAKE_OMP_SCENARIO // null),home:($ENV.HOME // null),agent:($ENV.PI_CODING_AGENT_DIR // null)}}' -- "$@"
+EOF
+chmod +x "$Q/glen-bin/glen"
+printf '#!/usr/bin/env bash\nACC_S=%q\n' "$Q" > "$Q/bin/glen"
+tail -n +2 "$A/glen-wrapper.sh" >> "$Q/bin/glen"; chmod +x "$Q/bin/glen"
+: > "$Q/calls.ndjson"
+out=$(env -u LD_PRELOAD "$Q/bin/glen" send e27c0de hi --no-wait)
+jq -e --arg q "$Q" '.data.argv==["send","e27c0de","hi","--no-wait"] and .data.preload==null and .data.scenario=="progress" and
+  .data.home==($q+"/omp-home") and .data.agent==($q+"/omp-agent")' <<< "$out" >/dev/null || { echo "mode p wrapper env: $out" >&2; exit 1; }
+"$Q/bin/glen" wait j1234567 --for reply --after r1 >/dev/null
+"$Q/bin/glen" inbox --wait --timeout 90s >/dev/null
+jq -se 'all(.[];.t!="guard_refused") and ([.[]|select(.t=="end")|.argv]==[["send","e27c0de","hi","--no-wait"],["wait","j1234567","--for","reply","--after","r1"],["inbox","--wait","--timeout","90s"]])' "$Q/calls.ndjson" >/dev/null
+if "$Q/bin/glen" send deadbeef hi >/dev/null 2>&1; then echo 'foreign P-mode target allowed' >&2; exit 1; else [[ $? == 99 ]]; fi
+jq '. + {profile:"glen-harness"}' "$Q/manifest.json" > "$Q/manifest.tmp"; mv "$Q/manifest.tmp" "$Q/manifest.json"
+out=$("$Q/bin/glen" ls --json)
+jq -e '.data.argv==["--profile","glen-harness","ls","--json"]' <<< "$out" >/dev/null || { echo "profile not prepended: $out" >&2; exit 1; }
+jq -se '[.[]|select(.t=="end")]|last|.argv==["ls","--json"]' "$Q/calls.ndjson" >/dev/null
+jq '.profile="default"' "$Q/manifest.json" > "$Q/manifest.tmp"; mv "$Q/manifest.tmp" "$Q/manifest.json"
+if "$Q/bin/glen" ls >/dev/null 2>&1; then echo 'foreign profile allowed' >&2; exit 1; else [[ $? == 99 ]]; fi
 # Fake token is assembled at runtime so the repository does not itself contain a credential-shaped string.
 mkdir "$S/leak"
 printf 'token = "sk-ant-%s-%s"\n' api03 "$(printf 'a1B2c3D4e5F6g7H8i9J0%.0s' {1..5} | head -c 93)AA" > "$S/leak/fake.txt"

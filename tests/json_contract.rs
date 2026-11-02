@@ -334,6 +334,14 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     let out = b.glen(&["inbox", "--peek"], &b.alpha());
     assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
     all.insert("inbox".into(), vec![json(&out)]);
+    // v0.2 W2: `inbox --wait` reaching its bound with nothing unread for the session.
+    let out = b.glen(
+        &["inbox", "--wait", "--timeout", "300ms", "--session", "ffff"],
+        &b.alpha(),
+    );
+    assert_eq!(out.status.code(), Some(10), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    all.insert("inbox.wait".into(), vec![json(&out)]);
     let out = b
         .command(&["show", "e27c0de"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "200")
@@ -490,6 +498,63 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     assert_eq!(v["data"]["job_status"], "aborted");
     r.wait_worker_gone(job);
     all.insert("abort.aborted".into(), vec![v]);
+    // v0.2 W2: `wait --for reply` on a job held after its two progress replies.
+    let r = RpcBox::new();
+    let release = r.omp.tmp.path().join("result-release");
+    let out = r
+        .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        .env("FAKE_OMP_SCENARIO", "progress")
+        .env("FAKE_OMP_RESULT_RELEASE", &release)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10), "{out:?}");
+    let launched = json(&out);
+    let job = launched["data"]["job"]["id"].as_str().unwrap();
+    let handle = launched["data"]["job"]["handle"].as_str().unwrap();
+    let replies = r.job_dir(job).join("replies.ndjson");
+    poll(Duration::from_secs(10), || {
+        let text = fs::read_to_string(&replies).unwrap_or_default();
+        (text.ends_with('\n') && text.lines().count() == 2).then_some(())
+    });
+    poll(Duration::from_secs(5), || {
+        (r.job(job).1["status"] == "accepted").then_some(())
+    });
+    let out = r
+        .glen(&["wait", handle, "--for", "reply", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10), "{out:?}");
+    assert!(out.stderr.is_empty());
+    let woke = json(&out);
+    assert_eq!(woke["data"]["woke"], "reply", "{woke}");
+    assert_eq!(woke["data"]["replies"].as_array().unwrap().len(), 2);
+    let last = woke["data"]["replies"][1]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let out = r
+        .glen(&[
+            "wait",
+            handle,
+            "--for",
+            "reply",
+            "--after",
+            &last,
+            "--timeout",
+            "300ms",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(10), "{out:?}");
+    assert!(out.stderr.is_empty());
+    let expired = json(&out);
+    assert!(expired["data"].get("woke").is_none(), "{expired}");
+    assert_eq!(expired["data"]["replies"], serde_json::json!([]));
+    fs::write(&release, "").unwrap();
+    r.wait_worker_gone(job);
+    all.insert("wait.reply".into(), vec![woke]);
+    all.insert("wait.reply.expired".into(), vec![expired]);
     let r = RpcBox::new();
     let mut lease = r.hold_lease(A_ID);
     let out = r.glen(&["send", "e27c0de", "hi"]).output().unwrap();

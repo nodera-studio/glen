@@ -20,7 +20,7 @@ fn watch_warning_is_one_guarded_line_and_survives_both_agent_renders() {
         "exits 2 without a terminal",
         "agents should not run it",
         "glen tail <handle> -f",
-        "glen inbox -f",
+        "Replies without polling",
     ] {
         assert!(line.contains(phrase), "{line}");
     }
@@ -423,6 +423,7 @@ fn ac404_checker_mutations() {
             format!("{text}\n`glen show <handle> --tools bogus`"),
             "bogus",
         ),
+        (format!("{text}\n`glen wait <job> --for bogus`"), "bogus"),
     ] {
         let errors = check_skill(&mutation, &c);
         assert!(
@@ -517,6 +518,7 @@ fn ac404_numeric_defaults() {
         ("ls", "limit", "20", "default 20"),
         ("jobs", "limit", "20", "default 20 rows"),
         ("tail", "lines", "10", "default 10"),
+        ("inbox", "timeout", "90s", "90 s"),
     ] {
         let a = c
             .find_subcommand(sub)
@@ -584,4 +586,146 @@ fn cycle2_option_only_and_nearest_prose_anchor_mutations() {
             "{valid}"
         );
     }
+}
+
+/// The rendered `## Replies without polling` section (v0.2 W2, design §A20).
+fn replies_section(text: &str) -> &str {
+    let start = text
+        .find("\n## Replies without polling\n")
+        .expect("the skill has `## Replies without polling`");
+    let rest = &text[start + 1..];
+    rest.find("\n## ").map_or(rest, |end| &rest[..end])
+}
+#[test]
+fn w2_replies_without_polling_section() {
+    for agent in Agent::ALL {
+        let text = skill::render_current(agent).unwrap();
+        let section = replies_section(&text);
+        for term in [
+            "--for reply",
+            "--after",
+            "run_in_background",
+            "exec_command",
+            "`glen inbox --peek`",
+            "`glen inbox --wait`",
+            "no push",
+            "Claude Code subagent",
+            "data.woke",
+            "data.next",
+        ] {
+            assert!(section.contains(term), "{agent:?}: {term}\n{section}");
+        }
+        // The section sits after "Sending well" and before "Shell timeouts and sandboxes".
+        let at = |h: &str| text.find(&format!("\n## {h}\n")).unwrap();
+        assert!(at("Sending well") < at("Replies without polling"));
+        assert!(at("Replies without polling") < at("Shell timeouts and sandboxes"));
+    }
+}
+/// `glen inbox` invocations in the skill's code spans, as their words after the subcommand.
+fn inbox_spans(text: &str) -> Vec<Vec<String>> {
+    let c = command();
+    invoked(text)
+        .into_iter()
+        .filter_map(|tokens| {
+            let i = subcommand_index(&tokens, &c)?;
+            (tokens[i].text == "inbox")
+                .then(|| tokens[i + 1..].iter().map(|w| w.text.clone()).collect())
+        })
+        .collect()
+}
+fn without_receiver_flag(text: &str) -> Vec<Vec<String>> {
+    inbox_spans(text)
+        .into_iter()
+        .filter(|args| {
+            !args
+                .iter()
+                .any(|a| matches!(a.as_str(), "--wait" | "--peek" | "-f" | "--follow"))
+        })
+        .collect()
+}
+#[test]
+fn w2_every_inbox_span_names_a_receiver_flag() {
+    for agent in Agent::ALL {
+        let text = skill::render_current(agent).unwrap();
+        assert!(!inbox_spans(&text).is_empty(), "{agent:?}");
+        assert_eq!(
+            without_receiver_flag(&text),
+            Vec::<Vec<String>>::new(),
+            "{agent:?}: a bare `glen inbox` invites a polling loop"
+        );
+        // The rule catches the old wording.
+        assert_eq!(
+            without_receiver_flag(&format!(
+                "{text}\n- Later: `glen inbox` shows late replies."
+            )),
+            [Vec::<String>::new()]
+        );
+    }
+}
+#[test]
+fn w2_bodies_are_byte_identical() {
+    let body = |agent| {
+        let text = skill::render_current(agent).unwrap();
+        let marker = text
+            .lines()
+            .position(|l| l.starts_with("<!-- glen-skill "))
+            .expect("rendered skill has its marker");
+        text.lines().skip(marker + 1).collect::<Vec<_>>().join("\n")
+    };
+    assert_eq!(body(Agent::Claude), body(Agent::Codex));
+}
+/// The push cell of design §A20's `claude -p` row.
+fn a20_headless_push(design: &str) -> String {
+    let a20 = design
+        .split("\n## §A20 ")
+        .nth(1)
+        .expect("docs/design.md has §A20")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let row = a20
+        .lines()
+        .find(|l| l.starts_with("| Claude Code, `claude -p`"))
+        .expect("§A20's per-caller table has a `claude -p` row");
+    let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+    cells.last().unwrap().to_string()
+}
+/// Why the skill disagrees with the §A20 push cell, if it does (Step 13 flips them together).
+fn headless_mismatch(push: &str, skill: &str) -> Option<String> {
+    let lines: Vec<&str> = skill.lines().filter(|l| l.contains("claude -p")).collect();
+    if push.starts_with("yes") {
+        (!lines.is_empty()).then(|| format!("§A20 says push {push:?}, yet the skill has {lines:?}"))
+    } else if push.starts_with("no") {
+        match lines.as_slice() {
+            [line] if line.contains("foreground") && !line.contains("run_in_background") => None,
+            _ => Some(format!(
+                "§A20 says {push:?}: one `claude -p` line with a foreground wait, got {lines:?}"
+            )),
+        }
+    } else {
+        Some(format!(
+            "§A20 `claude -p` push cell is neither yes nor no: {push:?}"
+        ))
+    }
+}
+#[test]
+fn w2_headless_bullet_matches_the_a20_row() {
+    let push = a20_headless_push(include_str!("../docs/design.md"));
+    for agent in Agent::ALL {
+        let text = skill::render_current(agent).unwrap();
+        assert_eq!(headless_mismatch(&push, &text), None, "{agent:?}");
+    }
+    // Both branches of the check bite.
+    let fallback =
+        "- `claude -p` (headless): no push; run the receiver in the foreground (`--timeout 90s`).";
+    assert!(headless_mismatch("yes", fallback).is_some());
+    assert!(headless_mismatch("no (foreground wait)", fallback).is_none());
+    assert!(headless_mismatch("no (foreground wait)", "nothing").is_some());
+    assert!(
+        headless_mismatch(
+            "no (foreground wait)",
+            "- `claude -p`: run_in_background, foreground"
+        )
+        .is_some()
+    );
 }

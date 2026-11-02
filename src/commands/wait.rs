@@ -1,18 +1,22 @@
+use super::inbox::{duration_flag, shell_word};
 use crate::{
-    cli::{Cli, WaitArgs},
+    cli::{Cli, WaitArgs, WaitFor},
     env::Env,
     error::{ErrorCode, GlenError, OkExit},
     glen_home,
     jobs::{
-        Job, JobId, JobStore, Route, State, Status,
-        wait::{self, Waited},
+        Job, JobId, JobStore, Reply, Route, State, Status,
+        wait::{self, ReplyWatch, Waited},
     },
     output::{Mode, Outcome, OutputCtx},
     render::{palette::Token, spinner::Spinner, text},
     rpc::session_handle,
 };
 use serde_json::{Value, json};
-use std::time::Instant;
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 pub(crate) fn progress(s: &Status) -> &'static str {
     match s.status {
         State::Queued if s.waiting_for_lock => "queued behind another glen job",
@@ -61,7 +65,7 @@ pub(crate) fn job_view(job: &Job, s: &Status, now: jiff::Timestamp) -> Value {
                 .max(0)
         })
         .unwrap_or(0);
-    json!({"id":job.id,"handle":job.handle,"status":s.status,"route":job.route,"deliver_as":job.deliver_as,"delivered_as":s.delivered_as,"session_id":job.session_id,"session_handle":job.session_handle,"actual_session_id":s.actual_session_id,"created_at":job.created_at,"updated_at":s.updated_at,"elapsed_ms":elapsed})
+    json!({"id":job.id,"handle":job.handle,"status":s.status,"route":job.route,"deliver_as":job.deliver_as,"delivered_as":s.delivered_as,"session_id":job.session_id,"session_handle":job.session_handle,"actual_session_id":s.actual_session_id,"created_at":job.created_at,"updated_at":s.updated_at,"elapsed_ms":elapsed,"task_state":s.task_state()})
 }
 fn session(job: &Job, s: &Status) -> Value {
     if job.route != Route::New {
@@ -133,16 +137,73 @@ pub(crate) fn completed_summary(job: &Job, s: &Status, now: jiff::Timestamp) -> 
     let elapsed = duration(job_view(job, s, now)["elapsed_ms"].as_i64().unwrap_or(0));
     format!("✓ completed · {} · {label} · {elapsed}", job.handle)
 }
+/// `wait --timeout`'s default (`cli::WaitArgs`); a reply `next` states any other bound.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(90);
+/// What a `wait --for reply` caller has seen already: the ids up to its `--after`, and its
+/// `--timeout`, which `next` repeats.
+pub(crate) struct ReplyView {
+    pub(crate) seen: HashSet<String>,
+    pub(crate) after: Option<String>,
+    pub(crate) timeout: Duration,
+}
+impl ReplyView {
+    fn unseen(&self, replies: Vec<Reply>) -> Vec<Reply> {
+        replies
+            .into_iter()
+            .filter(|r| !self.seen.contains(&r.id))
+            .collect()
+    }
+}
+/// The `↩ …` lines of reply records (`✓` on a final one), muted and wrapped.
+fn reply_lines(ctx: &OutputCtx, replies: &[Reply]) -> Vec<String> {
+    let mut human = vec![];
+    for reply in replies {
+        let mut first = true;
+        for l in text::clean_lines(&reply.text) {
+            for part in text::wrap(
+                &l,
+                ctx.width.map(|w| usize::from(w).saturating_sub(4).max(1)),
+            ) {
+                let line = if first {
+                    format!("↩ {part}{}", if reply.is_final { " ✓" } else { "" })
+                } else {
+                    format!("  {part}")
+                };
+                human.push(ctx.painter.paint(Token::Muted, &line));
+                first = false;
+            }
+        }
+    }
+    human
+}
+fn stored_id(job: &Job) -> Result<JobId, GlenError> {
+    JobId::parse(&job.id)
+        .ok_or_else(|| GlenError::new(ErrorCode::Internal, "invalid stored job id"))
+}
 pub(crate) fn outcome(
     store: &JobStore,
     job: &Job,
     waited: Waited,
     ctx: &OutputCtx,
 ) -> Result<Outcome, GlenError> {
+    outcome_with(store, job, waited, ctx, None)
+}
+/// [`outcome`] for `wait --for reply` when `reply` is given (design §A20): replies are the unseen
+/// subset, a running document adds `replies` and a `--for reply` `next`, and a reply wake adds
+/// `woke:"reply"`. Without `reply` a `Replied` wake cannot occur; it reads as `Running`.
+pub(crate) fn outcome_with(
+    store: &JobStore,
+    job: &Job,
+    waited: Waited,
+    ctx: &OutputCtx,
+    reply: Option<&ReplyView>,
+) -> Result<Outcome, GlenError> {
     let interrupted = matches!(&waited, Waited::Interrupted(_));
     let terminal = matches!(&waited, Waited::Terminal(_));
-    let s = match waited {
-        Waited::Terminal(s) | Waited::Running(s) | Waited::Interrupted(s) => s,
+    let woke = reply.is_some() && matches!(&waited, Waited::Replied(..));
+    let (s, woken) = match waited {
+        Waited::Replied(s, replies) => (s, replies),
+        Waited::Terminal(s) | Waited::Running(s) | Waited::Interrupted(s) => (s, vec![]),
     };
     let now = jiff::Timestamp::now();
     let view = job_view(job, &s, now);
@@ -151,15 +212,21 @@ pub(crate) fn outcome(
         .as_ref()
         .map(|f| json!({"from":f.from,"to":f.to,"to_handle":session_handle(&f.to)}));
     if terminal && s.status != State::Completed {
-        return Err(job_error(store, job, &s)?);
+        let mut e = job_error(store, job, &s)?;
+        if let Some(reply) = reply {
+            let replies = reply.unseen(store.read_replies_complete(&stored_id(job)?)?);
+            e = e.with_detail("replies", json!(replies));
+        }
+        return Err(e);
     }
     let session = session(job, &s);
     let session_label = session["handle"].as_str().unwrap_or("@new");
     let mut human = vec![];
     let (data, exit) = if terminal {
-        let id = JobId::parse(&job.id)
-            .ok_or_else(|| GlenError::new(ErrorCode::Internal, "invalid stored job id"))?;
-        let r = store.read_result(&id)?;
+        let mut r = store.read_result(&stored_id(job)?)?;
+        if let Some(reply) = reply {
+            r.replies = reply.unseen(r.replies);
+        }
         let heading = format!("✓ completed · {} · {}", job.handle, session_label);
         let elapsed = duration(view["elapsed_ms"].as_i64().unwrap_or(0));
         let summary = completed_summary(job, &s, now);
@@ -178,23 +245,7 @@ pub(crate) fn outcome(
                 human.extend(text::wrap(&format!("  {l}"), ctx.width.map(usize::from)));
             }
         }
-        for reply in &r.replies {
-            let mut first = true;
-            for l in text::clean_lines(&reply.text) {
-                for part in text::wrap(
-                    &l,
-                    ctx.width.map(|w| usize::from(w).saturating_sub(4).max(1)),
-                ) {
-                    let line = if first {
-                        format!("↩ {part}{}", if reply.is_final { " ✓" } else { "" })
-                    } else {
-                        format!("  {part}")
-                    };
-                    human.push(ctx.painter.paint(Token::Muted, &line));
-                    first = false;
-                }
-            }
-        }
+        human.extend(reply_lines(ctx, &r.replies));
         for output in &r.command_output {
             human.extend(painted_lines(ctx, Token::Muted, output));
         }
@@ -219,16 +270,26 @@ pub(crate) fn outcome(
             },
         )
     } else {
+        let next = match reply {
+            None => format!("glen wait {}", job.handle),
+            Some(reply) => {
+                let mut next = format!("glen wait {} --for reply", job.handle);
+                if let Some(after) = woken.last().map(|r| &r.id).or(reply.after.as_ref()) {
+                    next.push_str(&format!(" --after {}", shell_word(after)));
+                }
+                if reply.timeout != DEFAULT_TIMEOUT {
+                    next.push_str(&format!(" --timeout {}", duration_flag(reply.timeout)));
+                }
+                next
+            }
+        };
+        human.extend(reply_lines(ctx, &woken));
         human.extend(painted_lines(
             ctx,
             Token::Focus,
             &format!("◐ running · {} · {}", job.handle, session_label),
         ));
-        human.extend(painted_lines(
-            ctx,
-            Token::Muted,
-            &format!("glen wait {}", job.handle),
-        ));
+        human.extend(painted_lines(ctx, Token::Muted, &next));
         if interrupted {
             human.extend(painted_lines(
                 ctx,
@@ -236,8 +297,15 @@ pub(crate) fn outcome(
                 "interrupted; the job keeps running",
             ));
         }
+        let mut data = json!({"status":"running","job":view,"session":session,"next":next,"interrupted":interrupted});
+        if reply.is_some() {
+            data["replies"] = json!(woken);
+        }
+        if woke {
+            data["woke"] = json!("reply");
+        }
         (
-            json!({"status":"running","job":view,"session":session,"next":format!("glen wait {}",job.handle),"interrupted":interrupted}),
+            data,
             if interrupted {
                 OkExit::Interrupted
             } else {
@@ -260,22 +328,51 @@ pub fn run(_cli: &Cli, args: &WaitArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
     let store = JobStore::new(glen_home::resolve_trusted(env, &["jobs"])?);
     let id = store.resolve(&args.job)?;
     let job = store.read_job(&id)?;
+    let mut watch = match args.wait_for {
+        Some(WaitFor::Reply) => Some(
+            ReplyWatch::new(&store, &id, args.after.as_deref())?
+                .ok_or_else(|| unknown_reply(&job.handle, args.after.as_deref().unwrap_or("")))?,
+        ),
+        None => None,
+    };
+    let reply = watch.as_ref().map(|w| ReplyView {
+        seen: w.seen().clone(),
+        after: args.after.clone(),
+        timeout: args.timeout,
+    });
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
         ctx.mode == Mode::Human && ctx.stderr_tty,
-        &format!("waiting for {}", id.handle()),
+        &if watch.is_some() {
+            format!("waiting for a reply · {}", id.handle())
+        } else {
+            format!("waiting for {}", id.handle())
+        },
     );
-    let waited = wait::observe(
+    let waited = wait::observe_with(
         &store,
         &id,
         Instant::now(),
         args.timeout,
         &flag,
         None,
+        watch.as_mut(),
         |s| spinner.set_message(&job_progress(&job, s)),
     );
     spinner.finish();
-    outcome(&store, &job, waited?, ctx)
+    outcome_with(&store, &job, waited?, ctx, reply.as_ref())
+}
+/// `--after` names no reply of this job: a stale or foreign cursor would otherwise make every
+/// reply look unseen.
+fn unknown_reply(handle: &str, after: &str) -> GlenError {
+    GlenError::new(
+        ErrorCode::Usage,
+        format!("no reply {after} in job {handle}"),
+    )
+    .with_details(json!({"reason":"unknown_reply","job":handle,"after":after}))
+    .with_hint(format!(
+        "run `glen wait {handle} --for reply` without --after"
+    ))
 }
 
 #[cfg(test)]
@@ -464,6 +561,274 @@ mod tests {
         assert_eq!(o.data["session"]["path"], "/new.jsonl");
         assert!(!o.human.contains('\x1b'));
         assert!(o.human.lines().all(|l| text::width(l) <= 30), "{}", o.human);
+    }
+    fn reply(job: &Job, id: &str, text: &str, is_final: bool) -> Reply {
+        Reply {
+            v: 1,
+            id: id.into(),
+            session_id: "s".into(),
+            job_id: Some(job.id.clone()),
+            request_id: None,
+            tool_call_id: None,
+            text: text.into(),
+            is_final,
+            at: "2026-11-02T00:00:00Z".into(),
+        }
+    }
+    fn texts(v: &Value) -> Vec<&str> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["text"].as_str().unwrap())
+            .collect()
+    }
+    #[test]
+    fn outcome_with_reply_view_table() {
+        let t = tempfile::tempdir().unwrap();
+        let store = fixtures::store(t.path());
+        let j = fixtures::job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let (r1, r2) = (reply(&j, "r1", "one", false), reply(&j, "r2", "two", true));
+        for r in [&r1, &r2] {
+            store.append_reply(&id, r).unwrap();
+        }
+        let ctx = ctx(t.path(), false);
+        let mut s = store.read_status(&id).unwrap();
+        s.status = State::Accepted;
+        let fresh = ReplyView {
+            seen: HashSet::new(),
+            after: None,
+            timeout: Duration::from_secs(90),
+        };
+        let after_r1 = ReplyView {
+            seen: HashSet::from(["r1".to_owned()]),
+            after: Some("r1".into()),
+            timeout: Duration::from_secs(90),
+        };
+        // A reply wake: exit 10, woke, the woken replies and a next that continues after them.
+        let o = outcome_with(
+            &store,
+            &j,
+            Waited::Replied(s.clone(), vec![r1.clone(), r2.clone()]),
+            &ctx,
+            Some(&fresh),
+        )
+        .unwrap();
+        assert_eq!(o.exit.exit_code(), 10);
+        assert_eq!(o.data["woke"], "reply");
+        assert_eq!(o.data["status"], "running");
+        assert_eq!(o.data["interrupted"], false);
+        assert_eq!(o.data["job"]["task_state"], "working");
+        assert_eq!(texts(&o.data["replies"]), ["one", "two"]);
+        assert_eq!(
+            o.data["next"],
+            format!("glen wait {} --for reply --after r2", j.handle)
+        );
+        // Bound expiry and SIGINT: no woke, no replies, next keeps the caller's --after.
+        for (waited, code, interrupted) in [
+            (Waited::Running(s.clone()), 10, false),
+            (Waited::Interrupted(s.clone()), 130, true),
+        ] {
+            let o = outcome_with(&store, &j, waited, &ctx, Some(&after_r1)).unwrap();
+            assert_eq!(o.exit.exit_code(), code);
+            assert!(o.data.get("woke").is_none(), "{}", o.data);
+            assert_eq!(o.data["replies"], json!([]));
+            assert_eq!(o.data["interrupted"], interrupted);
+            assert_eq!(
+                o.data["next"],
+                format!("glen wait {} --for reply --after r1", j.handle)
+            );
+        }
+        let o = outcome_with(&store, &j, Waited::Running(s.clone()), &ctx, Some(&fresh)).unwrap();
+        assert_eq!(
+            o.data["next"],
+            format!("glen wait {} --for reply", j.handle)
+        );
+        // Without a view a Replied wake reads as Running: the plain document.
+        let o = outcome(
+            &store,
+            &j,
+            Waited::Replied(s.clone(), vec![r1.clone()]),
+            &ctx,
+        )
+        .unwrap();
+        assert_eq!(o.exit.exit_code(), 10);
+        assert!(o.data.get("woke").is_none() && o.data.get("replies").is_none());
+        assert_eq!(o.data["next"], format!("glen wait {}", j.handle));
+        // Completed (and forked): data.replies is only the unseen subset.
+        store
+            .write_result(
+                &id,
+                &JobResult {
+                    v: 1,
+                    prompt_status: Some("completed".into()),
+                    agent_invoked: true,
+                    assistant_text: Some("pong".into()),
+                    replies: vec![r1.clone(), r2.clone()],
+                    command_output: vec![],
+                    stop_reason: Some("stop".into()),
+                    session_settled: true,
+                    settled_at: None,
+                },
+            )
+            .unwrap();
+        for forked in [false, true] {
+            let mut done = s.clone();
+            done.status = State::Completed;
+            done.forked = forked.then(|| Forked {
+                from: "from".into(),
+                to: "01a00000-0000-7000-8000-000001234567".into(),
+            });
+            let o = outcome_with(
+                &store,
+                &j,
+                Waited::Terminal(done.clone()),
+                &ctx,
+                Some(&after_r1),
+            )
+            .unwrap();
+            assert_eq!(o.exit.exit_code(), if forked { 11 } else { 0 });
+            assert_eq!(texts(&o.data["replies"]), ["two"]);
+            assert_eq!(o.data["job"]["task_state"], "completed");
+            assert!(o.data.get("woke").is_none() && o.data.get("next").is_none());
+            let plain = outcome(&store, &j, Waited::Terminal(done), &ctx).unwrap();
+            assert_eq!(texts(&plain.data["replies"]), ["one", "two"]);
+        }
+        // Failed, aborted and lost: today's envelope plus error.details.replies (unseen).
+        for (state, code, exit, task_state) in [
+            (State::Failed, "no_route", 6, "rejected"),
+            (State::Failed, "omp_error", 7, "failed"),
+            (State::Aborted, "cancelled", 7, "canceled"),
+            (State::Lost, "lost", 7, "failed"),
+        ] {
+            let mut end = s.clone();
+            end.status = state;
+            end.error = Some(JobError {
+                code: code.into(),
+                message: "m".into(),
+                hint: None,
+                details: None,
+            });
+            for (view, want) in [(&fresh, vec!["one", "two"]), (&after_r1, vec!["two"])] {
+                let e = outcome_with(&store, &j, Waited::Terminal(end.clone()), &ctx, Some(view))
+                    .err()
+                    .unwrap();
+                assert_eq!(e.code.exit_code(), exit);
+                let details = e.details.unwrap();
+                assert_eq!(texts(&details["replies"]), want);
+                assert_eq!(details["job"]["task_state"], task_state);
+                assert_eq!(details["status"], state.as_str());
+            }
+            let e = outcome(&store, &j, Waited::Terminal(end), &ctx)
+                .err()
+                .unwrap();
+            assert!(e.details.unwrap().get("replies").is_none());
+        }
+    }
+    #[test]
+    fn reply_wake_human_output_lists_replies_then_the_next_command() {
+        let t = tempfile::tempdir().unwrap();
+        let store = fixtures::store(t.path());
+        let j = fixtures::job();
+        store.create(&j).unwrap();
+        let s = Status {
+            status: State::Accepted,
+            ..Status::default()
+        };
+        let view = ReplyView {
+            seen: HashSet::new(),
+            after: None,
+            timeout: Duration::from_secs(90),
+        };
+        let o = outcome_with(
+            &store,
+            &j,
+            Waited::Replied(
+                s,
+                vec![
+                    reply(&j, "r1", "half done", false),
+                    reply(&j, "r2", "done", true),
+                ],
+            ),
+            &ctx(t.path(), true),
+            Some(&view),
+        )
+        .unwrap();
+        assert_eq!(
+            o.human.lines().collect::<Vec<_>>(),
+            [
+                "↩ half done".to_owned(),
+                "↩ done ✓".to_owned(),
+                format!("◐ running · {} · e27c0de", j.handle),
+                format!("glen wait {} --for reply --after r2", j.handle),
+            ]
+        );
+    }
+    /// W2 review 1 (LOW-001, LOW-004): a reply `next` repeats a non-default `--timeout`, as
+    /// inbox's does, and passes the reply id as one shell word.
+    #[test]
+    fn reply_next_repeats_the_callers_timeout_and_quotes_the_reply_id() {
+        let t = tempfile::tempdir().unwrap();
+        let store = fixtures::store(t.path());
+        let j = fixtures::job();
+        store.create(&j).unwrap();
+        let s = Status {
+            status: State::Accepted,
+            ..Status::default()
+        };
+        let ctx = ctx(t.path(), false);
+        let view = |after: Option<&str>, timeout: Duration| ReplyView {
+            seen: HashSet::new(),
+            after: after.map(Into::into),
+            timeout,
+        };
+        let uuid = "01a19ad3-989d-7070-9273-90556dd5f602";
+        let h = &j.handle;
+        for (waited, v, want) in [
+            (
+                Waited::Running(s.clone()),
+                view(None, Duration::from_secs(90)),
+                format!("glen wait {h} --for reply"),
+            ),
+            (
+                Waited::Running(s.clone()),
+                view(None, Duration::from_secs(120)),
+                format!("glen wait {h} --for reply --timeout 2m"),
+            ),
+            (
+                Waited::Interrupted(s.clone()),
+                view(Some("r1"), Duration::from_millis(300)),
+                format!("glen wait {h} --for reply --after r1 --timeout 300ms"),
+            ),
+            (
+                Waited::Replied(s.clone(), vec![reply(&j, uuid, "one", false)]),
+                view(None, Duration::from_secs(90)),
+                format!("glen wait {h} --for reply --after {uuid}"),
+            ),
+            (
+                Waited::Replied(s.clone(), vec![reply(&j, "r 2;$x", "two", false)]),
+                view(None, Duration::from_secs(3600)),
+                format!("glen wait {h} --for reply --after 'r 2;$x' --timeout 1h"),
+            ),
+        ] {
+            let o = outcome_with(&store, &j, waited, &ctx, Some(&v)).unwrap();
+            assert_eq!(o.data["next"], want);
+        }
+    }
+    #[test]
+    fn unknown_reply_is_a_usage_error_with_its_reason() {
+        let e = unknown_reply("j1234567", "nope");
+        assert_eq!(e.code, ErrorCode::Usage);
+        assert_eq!(e.code.exit_code(), 2);
+        assert_eq!(
+            *e.details.unwrap(),
+            json!({"reason":"unknown_reply","job":"j1234567","after":"nope"})
+        );
+        assert_eq!(
+            e.hint.as_deref(),
+            Some("run `glen wait j1234567 --for reply` without --after")
+        );
     }
 }
 

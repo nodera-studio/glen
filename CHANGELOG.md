@@ -8,14 +8,21 @@ All notable changes to glen are listed here, newest first.
 
 - `glen doctor --probe` starts omp briefly, with no session and no prompt, and checks its RPC capabilities: the negotiated protocol, host tools and the event filter. They appear in a new `omp_capabilities` row and in `data.omp.capabilities`. Only a missing host-tool capability fails doctor; an omp that cannot start (for example with no model selected) is a warning. RPC jobs also record the negotiated protocol as `rpc_protocol` in their `status.json`.
 - The nightly `omp-latest` workflow runs glen's omp surface contract and source facts against the latest omp release, with a scratch home and no credentials, and reports a bump candidate. It never gates a pull request or a release.
+- `glen wait <job> --for reply [--after <reply-id>]` returns within a second of the omp model calling `glen_reply`: exit 10 with `data.woke` set to `reply`, the replies you have not seen yet, and a `data.next` command that skips them. If the job ends first it returns the job's usual exit (0, 6, 7 or 11) with those replies; an unknown `--after` id is exit 2.
+- `glen inbox --wait [--timeout DUR]` waits (90 s by default, at most 24 h) for one unread message: exit 0 with the messages, or exit 10 with none and a `next` command. It honours `--session`, `--cwd` and `--peek`, and marks messages read only after printing them.
+- Job views in `send`, `wait`, `jobs` and job error details carry `task_state`, the job's state in A2A's vocabulary (`submitted`, `working`, `completed`, `canceled`, `rejected`, `failed`). `status` is unchanged and still decides the exit code.
+- The agent skill has a "Replies without polling" section: Claude Code starts `glen wait <job> --for reply` as a background command and is woken when it finishes; a subagent waits in the foreground or hands the job to its parent; Codex runs a blocking wait and peeks the inbox at the start of each turn. Codex: blocking wait, not push.
 
 ### Changed
 
+- The agent skill no longer tells agents to poll `glen inbox`: every inbox instruction uses `--wait`, `--peek` or `-f`, and the loop points at the new receivers.
+- Exit 10 now has two documents under `glen wait --for reply`: a reply wake (`data.woke` is `reply`) and a bound expiry (no `woke`). Read `woke` before treating exit 10 as a timeout. Exit 10 without `--for reply` is unchanged.
 - `glen doctor` judges omp against a supported range declared in `src/omp/compat.json` and reports it in `data.omp.supported`. A version older than the minimum warns with the new code `omp_version_unsupported`; one newer than the newest tested version still warns `omp_version_untested`. `omp --version` output that cannot be parsed is now a warning (`omp_version_untested`, row value `unprobed`), not exit 5; an `omp --version` that fails or times out is still exit 5 `omp_unavailable`.
 
 ### Documentation
 
 - `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). The CLI is unchanged.
+- §A20 describes push to the calling agent as shipped in v0.2 W2: the two receivers, the unseen-reply rule, why `wait` leaves the inbox marker alone, the two exit-10 documents and the per-caller delivery table. A background wait also wakes a headless `claude -p` run: verified on Claude Code 2.1.316 in stream-json mode, where the completion notification resumed the run after its first result. The skill's allowed-tools may not apply to that resumed turn under `--permission-mode dontAsk`.
 
 ## v0.1.1 — 2026-11-01
 

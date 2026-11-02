@@ -5,22 +5,37 @@ the W4-only binary. `setup` requires visible `inbox` and `install-extension` and
 “acceptance needs W3” until W3 merges. W3b controls are optional. Do not interpret offline fixture
 checks as real omp, Claude Code or Codex acceptance.
 
-Prerequisites: Rust toolchain, omp/18.14.0 with a working normal model/auth configuration, jq,
-perl, GNU screen, expect for person mode, Claude Code for b/b2/b3, Codex plus the
-`codex:codex-rescue` companion for c1/c2, shasum, and gitleaks. No download or package upgrade is
-performed by the harness. **Close other omp sessions first**, so the owner-session snapshot
-can attribute all changes to the recorded scratch buckets. Build, version checks and setup progress go to stderr; setup prints
-only its scratch path to stdout.
+Prerequisites: Rust toolchain, omp/18.14.0 with the `glen-harness` profile configured
+(`.claude/scripts/omp-profile-setup.sh`, its own model and auth), jq, perl, GNU screen, expect for
+person mode, Claude Code for b/b2/b3/p, Codex plus the `codex:codex-rescue` companion for c1/c2,
+shasum, and gitleaks. No download or package upgrade is performed by the harness.
+**Close other omp sessions first**, including other omp runs and `omp-engine.sh` reviews under the same profile:
+they share the profile's session dir, so the session snapshot could not attribute their changes
+to the recorded scratch buckets. Build, version checks and setup progress go to stderr; setup
+prints only its scratch path to stdout. Mode p needs no omp, screen or expect (below).
 
 Final orchestrator decisions override the draft plan's credential-copy design:
 
-- O1: **never export, import or copy credentials**. omp uses the owner's normal agent dir and
-  auth, with scratch project/probe cwd under `$TMPDIR/ga.XXXXXX`. Only omp writes session files.
-  The before/after snapshot records names, mtimes and sizes. Existing files must be identical;
-  new files must lie in this run's recorded scratch bucket(s). Evidence lists those buckets
-  and the session files left there. Sessions are retained; the harness never deletes them.
-- Extension installation alone uses `PI_CODING_AGENT_DIR=$S/extension-agent`; the TUI explicitly
-  loads that scratch extension with `--no-extensions -e`. The owner's extensions are untouched.
+- O1 (v0.2 W2): **never export, import or copy credentials, and never use the owner's default
+  agent dir**. Every real-omp leg (a, b, b2, b3, c1, c2) runs under profile `glen-harness`
+  (`PROFILE=glen-harness` in `acc.sh`): `--profile "$PROFILE"` on every `doctor`, `send`, `ls`
+  and `inbox` call and on the `live.sh`/`held.sh` TUIs (`exec omp --profile glen-harness …`); the
+  recording wrapper adds `--profile glen-harness` to the real binary when the manifest names the
+  profile, and `person.exp` defines `glen() { command glen --profile glen-harness "$@"; }`.
+  `setup` dies with "profile glen-harness is missing: run .claude/scripts/omp-profile-setup.sh"
+  when the agent dir `doctor --profile glen-harness` reports is not a directory; it never creates
+  it. Named profiles ignore `PI_CODING_AGENT_DIR`, so no leg exports it; the manifest keeps
+  `agent_dir` as evidence. The project and probe cwds are under `$TMPDIR/ga.XXXXXX`, so new
+  sessions land only in the profile's scratch buckets of `$TMPDIR/ga.XXXXXX/project` and
+  `…/probe`. Only omp writes session files. The before/after snapshot of the profile's sessions
+  dir records names, mtimes and sizes. Existing files must be identical; new files must lie in
+  this run's recorded scratch bucket(s). Evidence lists those buckets and the session files left
+  there. Sessions are retained; the harness never deletes them.
+- Extension installation alone uses `PI_CODING_AGENT_DIR=$S/extension-agent` and **no**
+  `--profile`: under a profile it would write the profile's real extensions dir, while the default
+  profile with the scratch agent dir writes only under `$S`. The TUI explicitly loads that
+  scratch extension with `--no-extensions -e`. The profile's and the owner's extensions are
+  untouched.
 - Skills install only with `--project` in `$S/project`, initialized as a git repo for Codex
   discovery. Owner skill metadata is compared at teardown. No user skill install is allowed
   through the recording wrapper. `OMP_PROFILE`/`PI_PROFILE` are unset for consistency.
@@ -50,8 +65,19 @@ bash tests/acceptance/self-test.sh
 The self-test uses hand-made recordings and a fake executable only. It checks a passing b
 recording, then missing NONCE_R, an unpaired start and guard_refused (all fail by name); a b3
 permission denial after skill load fails AC-420. It also checks wrapper target guards and that
-gitleaks detects a generated fake Anthropic-shaped token. Its scratch directory is owned by
-that self-test and removed on exit. It never calls setup/person/teardown or an actual agent.
+gitleaks detects a generated fake Anthropic-shaped token. For mode p it checks two `woke` (the
+task's completion as stream-json's `task_notification` event and as `<task-notification>` XML),
+eight `no_wake` (no notification; a blocking `TaskOutput` with and without a later notification; a
+`BashOutput` before it; another task's notification; a stopped and a killed task; a foreground glen
+output carrying the nonce), a `foreground_only` and a `no_wait` recording (both fail
+`AC-206-bg-wait-started`), inbox polling (three calls, or one
+without `--wait`/`--peek`, fails `AC-206-no-inbox-polling`), a woken report without the nonce, a
+run without a `result` event and a second send; and that the wrapper passes only the whitelisted
+manifest `env` names (`LD_PRELOAD` is ignored), accepts P, refuses a foreign handle and a foreign
+profile (exit 99), records `wait <job> --for reply --after <id>` and `inbox --wait --timeout 90s`
+unchanged, and prepends `--profile glen-harness` only when the manifest names it. Its scratch
+directory is owned by that self-test and removed on exit. It never calls setup/person/teardown
+or an actual agent.
 
 ## Real runs — orchestrator only, after W3 merges
 
@@ -140,6 +166,54 @@ independently hashes the restored file. Do not copy the config into evidence. c2
 live L reply and RPC R refusal with network:true. Teardown to `$E/c2-codex-network`.
 If consent is absent, record `owner-pending` / `not run: no consent`.
 
+(p) `claude -p` push evidence (v0.2 W2, AC-v2-206). No real omp: `setup p` builds `fake_omp`,
+copies the fixture agent dir to `$S/omp-agent`, moves fixture session P (`e27c0de`) into the
+bucket glen assigns `$S/project`, and bakes `HOME=$S/omp-home`, `PI_CODING_AGENT_DIR`,
+`GLEN_OMP_BIN` and `FAKE_OMP_SCENARIO=progress`, `FAKE_OMP_DELAY_MS=100000` into the manifest's
+`env`, which the wrapper exports (only those names) for every glen call. The fake reply arrives
+about 100 seconds after the send. The prompt (`prompts/claude-push.md`) is uncoached: it never
+names the receiver or how to run it. Give the `claude -p` call a 600-second shell timeout.
+
+```bash
+S=$($A/acc.sh setup p)
+(cd "$S/project" && PATH="$S/bin:$PATH" claude -p "$(cat "$S/prompt-p.md")" \
+  --permission-mode dontAsk --allowedTools "Skill(glen)" --output-format stream-json --verbose) > "$S/p.jsonl"
+jq -r 'select(.type=="result") | .result' "$S/p.jsonl" > "$S/report.md"
+$A/acc.sh check p "$S"
+# The fake job may still run after claude exits: wait up to 150 s for no active job.
+for _ in $(seq 150); do
+  [[ $(env GLEN_HOME="$S/home" "$S/glen-bin/glen" jobs --active --json | jq '.data.jobs | length') == 0 ]] && break
+  sleep 1
+done
+$A/acc.sh teardown "$S" "$E/p-claude-push"
+```
+
+Checks: `paired_calls`, `guard_refused`, `call_budget`; `AC-206-send` (exactly one counted send,
+to P); `AC-206-bg-wait-started` (a Bash tool_use with `run_in_background: true` runs `glen wait`
+with `--for reply`); `AC-206-no-inbox-polling` (at most two `inbox` calls, each with `--wait` or
+`--peek`); `AC-206-evidence` (a `result` event exists); `AC-206-nonce` (a woken run's report
+quotes `NONCE_P`). The `AC-206-evidence` string carries the outcome: `wake=<class>
+launch_event=<i> task=<id> delivered_event=<i> resumed_event=<i> first_result_event=<i>
+result_event=<i> foreground_glen_output_had_nonce=<bool> fetched_before_delivery=<bool>` (0-based
+indices into `p.jsonl`, so line = index + 1; `task` is the background task id from the launch
+result; `resumed_event` is the first assistant text or tool_use after the notification;
+`first_result_event` and `result_event` are the first and the last `result`). Classes: `woke` (a
+background reply wait was launched, its task's own completion notification, a `system`
+`task_notification` event or a user `<task-notification>` with status `completed` or `failed` (a
+`glen wait` that exits 10 is `failed`), arrives, and an assistant text or tool_use follows it; no
+foreground glen output carried `NONCE_P`, no tool result carried it before that notification, and
+nothing retrieved the task's output before it, so a `TaskOutput` or `BashOutput` naming the task or
+a `Read` of its output file is not a wake), `no_wake` (launched, but no such notification, only
+another task's, a stopped or killed task, a retrieval first, or no assistant activity after the
+notification), `foreground_only` (a reply wait without
+`run_in_background`) and `no_wait` (none). A `result` before the notification does not rule out
+`woke`: Claude Code 2.1.316 keeps a `claude -p` process with a running background task alive past
+its first `result`, then resumes the run on the notification with a new `init`, and a second
+`result` ends it (recorded 2026-11-02). The class decides the skill's `claude -p` wording
+(plan Step 13); `no_wake` passes the checks but is not push. Read every tool call of `p.jsonl`
+as for b/b3. Teardown keeps gitleaks and the owner-skills comparison and skips the owner-session
+snapshot (mode p touches only scratch sessions).
+
 For every agent mode, before teardown, also run:
 
 ```bash
@@ -159,7 +233,9 @@ Stdout is parsed JSON where possible or a string, capped only in the recording a
 Logging failures preserve the subprocess exit. Targets are manifest IDs or hex suffixes,
 `@new` with canonical cwd under `$S`, or `@latest` in `$S/project`; controls use the same guard.
 Directory traversal/symlink cwd escapes and user-scope skill installation are refused (exit 99).
-Every glen invocation sets GLEN_HOME under scratch; normal omp auth stays in place, never copied.
+Every glen invocation sets GLEN_HOME under scratch; the `glen-harness` profile's auth stays in
+place, never copied. Mode p's manifest `env` passes only `HOME`, `PI_CODING_AGENT_DIR`,
+`GLEN_OMP_BIN` and `FAKE_OMP_*`; any other name is ignored.
 
 `check` is read-only with respect to agents/sessions and writes only verdict evidence. Missing
 transcript or missing nonce fails; unpaired start means a killed call. `verdict.json` names
@@ -172,7 +248,7 @@ recordings/prompts/reports/provenance/verdict into evidence, and runs `gitleaks 
 tool versions and env **names only**, never values. Never include credential stores in evidence.
 Evidence `transcript.jsonl` and verdict input retain only `user`, `assistant`, `system`, and `summary` lines, excluding `api-request` telemetry.
 Scratch extension/skills/home remain in TMPDIR for inspection; session files remain in the
-normal agent dir's scratch bucket(s). The harness never removes omp data or owner credentials.
+`glen-harness` profile's scratch bucket(s) (mode p: under `$S/omp-agent`). The harness never removes omp data or owner credentials.
 
 Create an evidence README with per-mode verdicts, tool versions, retained scratch bucket paths,
 and limitations. A missing runtime/tool/network/credential is blocked/unverified, never passed.
