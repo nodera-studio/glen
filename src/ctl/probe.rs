@@ -135,7 +135,10 @@ pub fn run(
         return probe;
     };
     process.stderr = Some(std::thread::spawn(move || drain_stderr(stderr)));
-    let shared = Arc::new(Mutex::new(Probe::unknown(String::new())));
+    let shared = Arc::new(Mutex::new(Shared {
+        probe: Probe::unknown(String::new()),
+        stage: "startup",
+    }));
     let (done_tx, done) = mpsc::channel();
     let worker = Arc::clone(&shared);
     std::thread::spawn(move || {
@@ -150,10 +153,17 @@ pub fn run(
             .clone()
     };
     loop {
-        let late = match done.recv_timeout(POLL.min(remaining(deadline, Instant::now()))) {
-            Ok((wants_stderr, finished)) if finished < deadline => {
+        let waited = done.recv_timeout(POLL.min(remaining(deadline, Instant::now())));
+        match next(
+            waited,
+            Instant::now(),
+            deadline,
+            stop.load(Ordering::SeqCst),
+        ) {
+            Next::Wait => (),
+            Next::Finished { wants_stderr } => {
                 // The worker closed the client, so omp sees stdin EOF and can exit on its own.
-                let mut probe = snapshot();
+                let mut probe = snapshot().probe;
                 teardown(
                     &mut probe,
                     &mut process,
@@ -162,30 +172,55 @@ pub fn run(
                 );
                 return probe;
             }
-            // A clamped call times out at the deadline, never before it: that is the deadline.
-            Ok(_) => true,
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                let mut probe = snapshot();
+            Next::Lost => {
+                let mut probe = snapshot().probe;
                 probe.note("probe thread ended unexpectedly");
                 teardown(&mut probe, &mut process, Duration::from_millis(100), false);
                 return probe;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) if stop.load(Ordering::SeqCst) => {
+            Next::Interrupted => {
                 let mut probe = Probe::unknown("interrupted".into());
                 teardown(&mut probe, &mut process, Duration::from_millis(100), false);
                 return probe;
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => Instant::now() >= deadline,
-        };
-        if late {
-            // Final at the deadline: what the worker learned so far is the result.
-            let mut probe = snapshot();
-            let learned = std::mem::take(&mut probe.detail);
-            probe.note(&format!("probe exceeded the {budget:?} budget"));
-            probe.note(&learned);
-            teardown(&mut probe, &mut process, Duration::from_millis(100), false);
-            return probe;
+            Next::Late => {
+                // Final at the deadline: what the worker published before it is the result.
+                let Shared { mut probe, stage } = snapshot();
+                let learned = std::mem::take(&mut probe.detail);
+                probe.note(&format!(
+                    "probe exceeded the {budget:?} budget during {stage}"
+                ));
+                probe.note(&learned);
+                teardown(&mut probe, &mut process, Duration::from_millis(100), false);
+                return probe;
+            }
         }
+    }
+}
+/// What the main thread does after one wait on the worker.
+#[derive(Debug, PartialEq, Eq)]
+enum Next {
+    Wait,
+    Finished { wants_stderr: bool },
+    Lost,
+    Interrupted,
+    Late,
+}
+fn next(
+    waited: Result<(bool, Instant), mpsc::RecvTimeoutError>,
+    now: Instant,
+    deadline: Instant,
+    stop: bool,
+) -> Next {
+    match waited {
+        Ok((wants_stderr, finished)) if !is_late(finished, deadline) => {
+            Next::Finished { wants_stderr }
+        }
+        Ok(_) => Next::Late,
+        Err(mpsc::RecvTimeoutError::Disconnected) => Next::Lost,
+        Err(mpsc::RecvTimeoutError::Timeout) if stop => Next::Interrupted,
+        Err(mpsc::RecvTimeoutError::Timeout) if is_late(now, deadline) => Next::Late,
+        Err(mpsc::RecvTimeoutError::Timeout) => Next::Wait,
     }
 }
 /// Stops the process group and joins the stderr drain. A failed teardown is noted; the last
@@ -199,15 +234,33 @@ fn teardown(probe: &mut Probe, process: &mut Process, grace: Duration, wants_std
         probe.note(&format!("teardown: {}", w.message));
     }
 }
-/// Runs on the worker thread. Each stage updates `shared`, so a deadline still returns what
-/// was learned. Returns whether the reason needs omp's last stderr line.
+/// What the worker thread has published: the probe so far and the stage in flight.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Shared {
+    probe: Probe,
+    stage: &'static str,
+}
+/// At or after the deadline is late: a clamped call times out at the deadline, never before
+/// it, so the deadline is what ended it.
+fn is_late(at: Instant, deadline: Instant) -> bool {
+    at >= deadline
+}
+/// Applies one stage's result unless it is late. The clock is read under the lock, so nothing
+/// lands after the main thread has seen the deadline: the result is final at the budget.
+fn publish(shared: &Mutex<Shared>, deadline: Instant, stage: impl FnOnce(&mut Shared)) {
+    let mut state = shared.lock().unwrap_or_else(PoisonError::into_inner);
+    if !is_late(Instant::now(), deadline) {
+        stage(&mut state);
+    }
+}
+/// Runs on the worker thread. Each stage is published to `shared`, so a deadline still returns
+/// what was learned. Returns whether the reason needs omp's last stderr line.
 fn handshake(
     stdout: ChildStdout,
     stdin: ChildStdin,
     deadline: Instant,
-    shared: &Mutex<Probe>,
+    shared: &Mutex<Shared>,
 ) -> bool {
-    let probe = || shared.lock().unwrap_or_else(PoisonError::into_inner);
     let left = remaining(deadline, Instant::now());
     let (mut client, _events) = match Client::from_io(
         stdout,
@@ -222,33 +275,38 @@ fn handshake(
         Ok(connected) => connected,
         Err(e) => {
             let (detail, wants_stderr) = start_failure(&e);
-            probe().note(&detail);
+            publish(shared, deadline, |s| s.probe.note(&detail));
             return wants_stderr;
         }
     };
     let protocol = client.protocol_version();
-    probe().capabilities.protocol = Some(protocol);
+    publish(shared, deadline, |s| {
+        s.probe.capabilities.protocol = Some(protocol);
+        s.stage = "set_host_tools";
+    });
     // The receiver is dropped: no prompt is ever sent, so omp has no reason to call the tool.
     let (replies, _) = mpsc::channel();
     client.set_default_timeout(remaining(deadline, Instant::now()));
     let (cap, reason) = host_tools(&client.set_custom_tools(vec![reply::glen_reply_tool(replies)]));
-    {
-        let mut p = probe();
-        p.capabilities.host_tools = cap;
-        p.note(&reason);
-    }
+    publish(shared, deadline, |s| {
+        s.probe.capabilities.host_tools = cap;
+        s.probe.note(&reason);
+        s.stage = "set_event_filter";
+    });
     client.set_default_timeout(remaining(deadline, Instant::now()));
     let (cap, reason) = event_filter(&client.call(&SetEventFilterCommand {
         events: Some(rpc::EVENT_ALLOWLIST.iter().map(|s| (*s).into()).collect()),
     }));
-    {
-        let mut p = probe();
-        p.capabilities.event_filter = cap;
-        p.note(&reason);
-    }
+    publish(shared, deadline, |s| {
+        s.probe.capabilities.event_filter = cap;
+        s.probe.note(&reason);
+        s.stage = "close";
+    });
     // Close before signalling completion so omp sees stdin EOF inside the teardown grace.
     if let Err(e) = client.close() {
-        probe().note(&format!("cannot close the omp client: {e}"));
+        publish(shared, deadline, |s| {
+            s.probe.note(&format!("cannot close the omp client: {e}"));
+        });
     }
     false
 }
@@ -387,6 +445,55 @@ mod tests {
             Duration::ZERO
         );
         assert!(remaining(now + BUDGET, now) < rpc::READY_TIMEOUT);
+    }
+    #[test]
+    fn the_deadline_itself_is_late() {
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(is_late(deadline, deadline));
+        assert!(is_late(deadline + Duration::from_nanos(1), deadline));
+        assert!(!is_late(deadline - Duration::from_nanos(1), deadline));
+    }
+    #[test]
+    fn a_handshake_finished_at_the_deadline_is_late() {
+        use mpsc::RecvTimeoutError::{Disconnected, Timeout};
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let before = deadline - Duration::from_nanos(1);
+        // The worker's own finish time decides, not when the main thread reads it.
+        let after = deadline + Duration::from_secs(1);
+        assert_eq!(
+            next(Ok((true, deadline)), before, deadline, false),
+            Next::Late
+        );
+        assert_eq!(
+            next(Ok((true, before)), after, deadline, false),
+            Next::Finished { wants_stderr: true }
+        );
+        assert_eq!(next(Err(Timeout), before, deadline, false), Next::Wait);
+        assert_eq!(next(Err(Timeout), deadline, deadline, false), Next::Late);
+        assert_eq!(next(Err(Timeout), after, deadline, true), Next::Interrupted);
+        assert_eq!(next(Err(Disconnected), after, deadline, true), Next::Lost);
+    }
+    #[test]
+    fn a_stage_published_at_or_after_the_deadline_is_discarded() {
+        let shared = Mutex::new(Shared {
+            probe: Probe::unknown(String::new()),
+            stage: "startup",
+        });
+        let start = Instant::now();
+        publish(&shared, start + Duration::from_secs(3600), |s| {
+            s.probe.capabilities.protocol = Some(2);
+            s.stage = "set_host_tools";
+        });
+        let on_time = shared.lock().unwrap().clone();
+        assert_eq!(on_time.probe.capabilities.protocol, Some(2));
+        assert_eq!(on_time.stage, "set_host_tools");
+        // `start` has passed by the time publish reads the clock: the stage is late.
+        publish(&shared, start, |s| {
+            s.probe.capabilities.host_tools = Cap::Ok;
+            s.probe.note("timed out");
+            s.stage = "set_event_filter";
+        });
+        assert_eq!(*shared.lock().unwrap(), on_time);
     }
     #[test]
     fn details_stay_single_line() {

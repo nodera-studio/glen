@@ -496,7 +496,15 @@ fn a_stalled_call_returns_within_the_budget() {
     assert_eq!(code, 0, "{v}");
     assert_eq!(capabilities(&v)["protocol"], 2);
     assert_eq!(capabilities(&v)["host_tools"], "unknown");
-    assert_eq!(row(report(&v), "omp_capabilities")["status"], "warn");
+    let check = row(report(&v), "omp_capabilities");
+    assert_eq!(check["status"], "warn");
+    // The stalled call times out at the deadline, so the deadline arm reports it.
+    let detail = check["detail"].as_str().unwrap();
+    assert!(
+        detail.starts_with("probe exceeded the 1.5s budget"),
+        "{detail}"
+    );
+    assert!(detail.contains("set_host_tools"), "{detail}");
 }
 #[cfg(debug_assertions)]
 #[test]
@@ -516,11 +524,10 @@ fn a_late_ready_returns_within_the_budget_and_tears_omp_down() {
     );
     let check = row(report(&v), "omp_capabilities");
     assert_eq!(check["status"], "warn");
-    // The worker's clamped ready wait ends at the same instant and may add its own note.
-    let detail = check["detail"].as_str().unwrap();
-    assert!(
-        detail.starts_with("probe exceeded the 1.5s budget"),
-        "{detail}"
+    // The worker's clamped ready wait ends at the deadline too; its late note is discarded.
+    assert_eq!(
+        check["detail"],
+        "probe exceeded the 1.5s budget during startup"
     );
     // ProbeBox::probe already waited for the fake's process group to disappear.
     assert_eq!(b.log().iter().filter(|e| e["event"] == "start").count(), 1);
