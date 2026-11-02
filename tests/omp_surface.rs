@@ -16,7 +16,7 @@ use serde_json::{Map, json};
 use std::{
     io::Read,
     path::Path,
-    process::{Child, ChildStderr, Command, Stdio},
+    process::{Child, Command, Stdio},
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -108,7 +108,7 @@ fn end_group(child: &mut Child, grace: Duration) -> bool {
     }
     exited
 }
-fn read_stderr(mut stderr: ChildStderr) -> JoinHandle<String> {
+fn read_stderr(mut stderr: impl Read + Send + 'static) -> JoinHandle<String> {
     std::thread::spawn(move || {
         let mut text = String::new();
         let _ = stderr.read_to_string(&mut text);
@@ -286,6 +286,47 @@ fn teardown_kills_descendants_and_bounds_the_stderr_join() {
         let elapsed = start.elapsed();
         assert!(elapsed < Duration::from_secs(5), "{case}: {elapsed:?}");
     }
+}
+#[test]
+fn stderr_join_is_bounded_when_a_writer_outside_the_group_holds_the_pipe() {
+    // The test itself is the writer outside omp's group: it keeps a copy of the pipe's write
+    // end past the join, so group teardown cannot close the pipe and only the bound ends it.
+    let (pipe_read, holder) = std::io::pipe().unwrap();
+    let mut c = Command::new("/bin/sh");
+    c.args(["-c", "sleep 30 & exit 0"])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(holder.try_clone().unwrap());
+    std::os::unix::process::CommandExt::process_group(&mut c, 0);
+    let mut child = c.spawn().unwrap();
+    let pid = child.id();
+    // The spawn's own copy of the write end is gone once `c` is.
+    drop(c);
+    let reader = read_stderr(pipe_read);
+    assert!(end_group(&mut child, Duration::from_millis(500)));
+    assert!(group_gone(pid), "the group survived teardown");
+    // An outer bound, so an unbounded join fails here instead of hanging the suite.
+    let timeout = Duration::from_millis(500);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let start = Instant::now();
+    let joiner = std::thread::spawn(move || {
+        let _ = tx.send(join_stderr(reader, timeout));
+    });
+    let joined = rx.recv_timeout(timeout + Duration::from_secs(1));
+    let elapsed = start.elapsed();
+    // Closing the last write end lets the reader, and an unbounded join, finish.
+    drop(holder);
+    joiner.join().unwrap();
+    assert_eq!(
+        joined.ok(),
+        Some(format!(
+            "<omp stderr still open {timeout:?} after teardown>"
+        )),
+        "the join did not return within its bound plus 1 s: {elapsed:?}"
+    );
+    assert!(elapsed >= timeout, "{elapsed:?}");
 }
 #[test]
 fn surface_against_fake_omp() {

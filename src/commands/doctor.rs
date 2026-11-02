@@ -517,7 +517,9 @@ fn probe_budget(env: &Env) -> Duration {
     probe::BUDGET
 }
 /// Doctor has no interrupted document (§A11), so once the probe has torn omp down a stop
-/// signal ends glen through SIGINT's default disposition (status 130 in a shell).
+/// signal ends glen through SIGINT's default disposition (status 130 in a shell). SIGTERM and
+/// SIGHUP share SIGINT's flag, as in controls, so they too end `doctor --probe` this way: a
+/// supervisor that sent SIGTERM observes SIGINT, not 143.
 fn interrupted() -> ! {
     #[cfg(unix)]
     signal_hook::low_level::emulate_default_handler(signal_hook::consts::SIGINT).ok();
