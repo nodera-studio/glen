@@ -281,6 +281,86 @@ jq -se '[.[]|select(.t=="guard_refused")]|length==6' "$S/calls.ndjson" >/dev/nul
 if "$S/bin/glen" send @new hi --cwd "$S/project/../.." >/dev/null 2>&1; then echo 'escape allowed' >&2; exit 1; fi
 if "$S/bin/glen" send deadbeef hi >/dev/null 2>&1; then echo 'foreign session allowed' >&2; exit 1; fi
 if "$S/bin/glen" install-extension >/dev/null 2>&1; then echo 'extension install allowed' >&2; exit 1; fi
+# Mode p (v0.2 W2, AC-v2-206): one send to P, then the background reply wait and its wake class.
+Q="$S/p"
+mkdir -p "$Q/bin" "$Q/glen-bin"
+jq -n --arg s "$Q" '{mode:"p",scratch:$s,project:($s+"/project"),P:{id:"01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",handle:"e27c0de"},NONCE_P:"P-nonce",
+  env:{HOME:($s+"/omp-home"),PI_CODING_AGENT_DIR:($s+"/omp-agent"),GLEN_OMP_BIN:($s+"/fake-bin/fake_omp"),FAKE_OMP_SCENARIO:"progress",FAKE_OMP_DELAY_MS:"100000",LD_PRELOAD:"/nonexistent/acc-preload.so"},buckets:[]}' > "$Q/manifest.json"
+p_calls() { # extra argv arrays (JSON) appended after the send and the reply wait
+    jq -cn --slurpfile m "$Q/manifest.json" --argjson extra "${1:-[]}" '
+      $m[0] as $m |
+      ([ {a:["send","e27c0de","Call your reply tool with exactly P-nonce","--no-wait"],out:{data:{job:{session_id:$m.P.id,handle:"j1234567"}}},exit:10},
+         {a:["wait","j1234567","--for","reply"],out:{data:{woke:"reply",replies:[{text:"reply: P-nonce"}]}},exit:10} ]
+       + [$extra[] | {a:.,out:{data:{messages:[]}},exit:0}]) | to_entries[] | .key as $i | .value as $v |
+      {t:"start",id:($i|tostring),argv:$v.a,ts:($i*10)},
+      {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$Q/calls.ndjson"
+}
+p_events() { # $1: the reply wait's run_in_background, $2: whether its completion is delivered
+    jq -cn --argjson bg "$1" --argjson delivered "$2" '
+      {type:"system",subtype:"init"},
+      {type:"assistant",message:{content:[{type:"tool_use",id:"send",name:"Bash",input:{command:"glen send e27c0de \"Call your reply tool with exactly P-nonce\" --no-wait"}}]}},
+      {type:"user",message:{content:[{type:"tool_result",tool_use_id:"send",content:"{\"v\":1,\"ok\":true,\"data\":{\"status\":\"running\"}}"}]}},
+      {type:"assistant",message:{content:[{type:"tool_use",id:"wait",name:"Bash",input:({command:"glen wait j1234567 --for reply"} + if $bg then {run_in_background:true} else {} end)}]}},
+      {type:"user",message:{content:[{type:"tool_result",tool_use_id:"wait",content:(if $bg then "Command running in background with ID: b1" else "{\"data\":{\"woke\":\"reply\",\"replies\":[{\"text\":\"reply: P-nonce\"}]}}" end)}]}},
+      (if $bg and $delivered then {type:"user",message:{content:[{type:"text",text:"Background command b1 completed: reply: P-nonce"}]}} else empty end),
+      {type:"assistant",message:{content:[{type:"text",text:"done"}]}},
+      {type:"result",result:"reply: P-nonce"}' > "$Q/p.jsonl"
+}
+p_verdict() { # $1: expected wake class, $2: the checks expected to fail (JSON array)
+    "$A/acc.sh" check p "$Q" >/dev/null || true
+    jq -e --arg wake "$1" --argjson failing "$2" '
+      (.checks|map(select(.pass|not).id)) == $failing and (.pass == ($failing|length == 0)) and
+      (.checks|any(.id=="AC-206-evidence" and (.evidence|startswith("wake="+$wake+" "))))' "$Q/verdict.json" >/dev/null ||
+      { echo "mode p: expected wake=$1 failing=$2" >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+}
+printf 'reply: P-nonce\n' > "$Q/report.md"
+p_calls; p_events true true; p_verdict woke '[]'
+p_events true false; p_verdict no_wake '[]'
+p_events false true; p_verdict foreground_only '["AC-206-bg-wait-started"]'
+jq -c 'select(.message.content[0].tool_use_id? != "wait" and .message.content[0].id? != "wait")' "$Q/p.jsonl" > "$Q/p-none.jsonl"
+mv "$Q/p-none.jsonl" "$Q/p.jsonl"; p_verdict no_wait '["AC-206-bg-wait-started"]'
+# A woken run must quote the nonce; three inbox calls, or one without --wait/--peek, is polling.
+p_events true true; printf 'no nonce here\n' > "$Q/report.md"; p_verdict woke '["AC-206-nonce"]'
+printf 'reply: P-nonce\n' > "$Q/report.md"
+p_calls '[["inbox","--peek"],["inbox","--wait"],["inbox","--peek"]]'; p_verdict woke '["AC-206-no-inbox-polling"]'
+p_calls '[["inbox"]]'; p_verdict woke '["AC-206-no-inbox-polling"]'
+p_calls '[["inbox","--wait","--timeout","90s"],["inbox","--peek"]]'; p_verdict woke '[]'
+# A foreground glen call that carries the nonce means the background wait did not deliver it.
+jq -c 'if .type=="user" and .message.content[0].tool_use_id?=="send" then .message.content[0].content="reply: P-nonce" else . end' "$Q/p.jsonl" > "$Q/p-fg.jsonl"
+mv "$Q/p-fg.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+# A run that never ended has no result event; a second send is not exactly one.
+p_events true true; jq -c 'select(.type!="result")' "$Q/p.jsonl" > "$Q/p-open.jsonl"; mv "$Q/p-open.jsonl" "$Q/p.jsonl"
+p_verdict woke '["AC-206-evidence"]'
+p_events true true
+jq -c 'select(.t!="end" or .argv[0]!="send"), (select(.t=="end" and .argv[0]=="send") | ., (.id="again" | .)), (select(.t=="start" and .argv[0]=="send") | .id="again")' "$Q/calls.ndjson" > "$Q/calls-two.ndjson"
+mv "$Q/calls-two.ndjson" "$Q/calls.ndjson"; p_verdict woke '["AC-206-send"]'
+p_calls
+rm "$Q/calls.ndjson"
+if "$A/acc.sh" check p "$Q" >/dev/null; then echo 'missing p recording passed' >&2; exit 1; fi
+jq -e '(.pass|not) and (.checks|length)==8 and all(.checks[]; (.pass|not) and (.evidence|contains("missing recording")))' "$Q/verdict.json" >/dev/null
+# The wrapper passes only whitelisted manifest env names, accepts P, records the receivers' argv
+# intact, and adds --profile only for a manifest that names glen-harness.
+cat > "$Q/glen-bin/glen" <<'EOF'
+#!/usr/bin/env bash
+jq -cn --args '{v:1,ok:true,data:{argv:$ARGS.positional,preload:($ENV.LD_PRELOAD // null),scenario:($ENV.FAKE_OMP_SCENARIO // null),home:($ENV.HOME // null),agent:($ENV.PI_CODING_AGENT_DIR // null)}}' -- "$@"
+EOF
+chmod +x "$Q/glen-bin/glen"
+printf '#!/usr/bin/env bash\nACC_S=%q\n' "$Q" > "$Q/bin/glen"
+tail -n +2 "$A/glen-wrapper.sh" >> "$Q/bin/glen"; chmod +x "$Q/bin/glen"
+: > "$Q/calls.ndjson"
+out=$(env -u LD_PRELOAD "$Q/bin/glen" send e27c0de hi --no-wait)
+jq -e --arg q "$Q" '.data.argv==["send","e27c0de","hi","--no-wait"] and .data.preload==null and .data.scenario=="progress" and
+  .data.home==($q+"/omp-home") and .data.agent==($q+"/omp-agent")' <<< "$out" >/dev/null || { echo "mode p wrapper env: $out" >&2; exit 1; }
+"$Q/bin/glen" wait j1234567 --for reply --after r1 >/dev/null
+"$Q/bin/glen" inbox --wait --timeout 90s >/dev/null
+jq -se 'all(.[];.t!="guard_refused") and ([.[]|select(.t=="end")|.argv]==[["send","e27c0de","hi","--no-wait"],["wait","j1234567","--for","reply","--after","r1"],["inbox","--wait","--timeout","90s"]])' "$Q/calls.ndjson" >/dev/null
+if "$Q/bin/glen" send deadbeef hi >/dev/null 2>&1; then echo 'foreign P-mode target allowed' >&2; exit 1; else [[ $? == 99 ]]; fi
+jq '. + {profile:"glen-harness"}' "$Q/manifest.json" > "$Q/manifest.tmp"; mv "$Q/manifest.tmp" "$Q/manifest.json"
+out=$("$Q/bin/glen" ls --json)
+jq -e '.data.argv==["--profile","glen-harness","ls","--json"]' <<< "$out" >/dev/null || { echo "profile not prepended: $out" >&2; exit 1; }
+jq -se '[.[]|select(.t=="end")]|last|.argv==["ls","--json"]' "$Q/calls.ndjson" >/dev/null
+jq '.profile="default"' "$Q/manifest.json" > "$Q/manifest.tmp"; mv "$Q/manifest.tmp" "$Q/manifest.json"
+if "$Q/bin/glen" ls >/dev/null 2>&1; then echo 'foreign profile allowed' >&2; exit 1; else [[ $? == 99 ]]; fi
 # Fake token is assembled at runtime so the repository does not itself contain a credential-shaped string.
 mkdir "$S/leak"
 printf 'token = "sk-ant-%s-%s"\n' api03 "$(printf 'a1B2c3D4e5F6g7H8i9J0%.0s' {1..5} | head -c 93)AA" > "$S/leak/fake.txt"

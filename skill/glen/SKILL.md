@@ -20,7 +20,8 @@ Every command has `--help`.
    `glen send @new "message" --cwd DIR` starts a new one.
 4. Answer: `data.assistant_text` is omp's final answer; `data.replies` holds its `glen_reply` messages.
    Exit 10 means still working: `glen wait <job>` using `data.job.handle` (starts with `j`).
-5. Later: `glen inbox` shows late replies and messages from the omp TUI; `--peek` leaves them unread. <!-- glen:if inbox -->
+   To be woken by each reply instead, see "Replies without polling".
+5. Later: replies after the job ended and messages from the omp TUI: see "Replies without polling". <!-- glen:if inbox -->
 
 ## Exit codes
 | exit | code | do this |
@@ -34,7 +35,7 @@ Every command has `--help`.
 | 6 | `no_route` | refused safely; see below |
 | 7 | `job_failed`, `control_failed` | report `error.details` |
 | 8 | `not_implemented` | this version lacks the command |
-| 10 | running | `glen wait <job>`; the job keeps running |
+| 10 | running | `glen wait <job>`; the job keeps running. With `--for reply`, `data.woke` of `reply` means new replies; no `woke` means only the bound passed |
 | 11 | forked | done; read `data`, then use `data.forked.to_handle` |
 | 130 | interrupted | send/wait: `glen wait <job>`; tail -f: stream ended |
 
@@ -60,10 +61,26 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   `glen jobs --active` lists running jobs (default 20 rows).
 - omp has `glen_reply` (`text`, optional `final`) in sessions glen reaches. Ask for it for progress or specific answers;
   replies arrive in `data.replies`.
-- Replies also land in `glen inbox`, with `job_id` naming their job. <!-- glen:if inbox -->
+- Every reply also lands in the inbox (`glen inbox --peek` lists it), with `job_id` naming its job. <!-- glen:if inbox -->
 - Send quoted text: `glen send <handle> -- "-v is broken"`; `--` lets a message start with `-`.
 - Never send the same message twice. After exit 10, exit 130 or a call your shell cut off, it is still queued or
   running: `glen jobs --active`, then `glen wait <job>`.
+
+## Replies without polling
+Never poll the inbox in a loop or re-run `glen wait` on a timer: start one receiver that returns when something arrives.
+- `glen wait <job> --for reply` returns when omp calls `glen_reply` for that job. Exit 10 with `data.woke` of
+  `reply`: read `data.replies`, then run `data.next` (it adds `--after <last reply id>`, so nothing repeats).
+  Exit 10 without `woke`: only the bound passed; run `data.next` again. Exit 0, 6, 7 or 11: the job ended, and
+  `data.replies` (or `error.details.replies`) holds every reply you have not seen.
+- Claude Code: after `glen send <handle> "…" --no-wait`, start the receiver as a background Bash command
+  (`run_in_background`) and end your turn; its completion wakes you.
+- Claude Code subagent: nothing wakes you. Run the receiver in the foreground with `--timeout 90s` (Bash stops
+  at 2 minutes), or return the job handle and the last reply id to the parent, which starts the background wait.
+- Codex: no push. Run `glen wait <job> --for reply --timeout 25s` through `exec_command`; if the call yields
+  first, poll that session until it ends. On exit 10 act on `data.replies` and repeat with `data.next`.
+  Run `glen inbox --peek` once at the start of each turn for TUI messages and late replies. <!-- glen:if inbox -->
+- Late and TUI replies (no job to wait on): `glen inbox --wait` waits up to 90 s (`--timeout DUR`, at most 24 h): <!-- glen:if inbox -->
+  exit 0 with unread messages, exit 10 with none. Replies seen through `glen wait` stay unread there; skip ids you have. <!-- glen:if inbox -->
 
 ## Shell timeouts and sandboxes
 - `glen send` and `glen wait` default to 90 s; give them a shell timeout of at least 100 s.
@@ -81,7 +98,7 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
   refuses exit 6 `sandboxed` with `lease:"unknown"`. Escalating cannot fix that: use the live route (the session
   open in the omp TUI with glen's extension), a new session (`@new`), or ask the user to run glen outside Codex.
 - Network-enabled sandboxes support live sessions only, with writable `GLEN_HOME`. <!-- glen:if install-extension -->
-- Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker; if the marker cannot be written, `glen inbox` exits 6 and leaves them unread. <!-- glen:if inbox -->
+- Read sandboxed replies with `glen inbox --peek` to avoid writing a read marker; if the marker cannot be written, `glen inbox --wait` exits 6 and leaves them unread. <!-- glen:if inbox -->
 
 <!-- glen:if abort stop models model thinking compact -->
 ## Session controls
@@ -105,5 +122,5 @@ Exit 6: read `error.hint` and `error.details.reason`, tell the user, and do not 
 - Don't send into a session someone is using unless asked; on a busy session prefer default follow-up.
 - Setup: `glen doctor`. Update: `glen install-skill`. Completions for people: `glen completions zsh`.
 <!-- glen:if watch -->
-- For people in an interactive terminal: `glen watch <handle>` (exits 2 without a terminal); agents should not run it and use `glen tail <handle> -f` and `glen inbox -f` instead.
+- For people in an interactive terminal: `glen watch <handle>` (exits 2 without a terminal); agents should not run it and use `glen tail <handle> -f` for a transcript and the receivers under Replies without polling for replies.
 <!-- glen:end -->

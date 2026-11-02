@@ -62,7 +62,6 @@ proc step {command code {pattern {}} {human 1}} {
 }
 unset -nocomplain env(OMP_PROFILE) env(PI_PROFILE)
 set env(GLEN_HOME) "$S/home"
-set env(PI_CODING_AGENT_DIR) [field .agent_dir]
 set env(TERM) xterm-256color
 set env(COLUMNS) 100
 set env(PATH) "$S/glen-bin:$env(PATH)"
@@ -72,6 +71,11 @@ spawn bash --norc --noprofile -i
 set timeout 10
 expect -re {[$#] }
 send -- "PS1='acc> '\r"
+expect -re {\r?\n}
+expect -exact "acc> "
+# Every plan step runs omp under profile glen-harness, never the owner's default agent dir.
+send -- {glen() { command glen --profile glen-harness "$@"; }}
+send -- "\r"
 expect -re {\r?\n}
 expect -exact "acc> "
 step {glen --version} 0 {glen [0-9]}

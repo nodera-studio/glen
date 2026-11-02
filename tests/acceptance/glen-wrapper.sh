@@ -7,8 +7,13 @@ MANIFEST="$ACC_S/manifest.json"
 LOG="$ACC_S/calls.ndjson"
 unset OMP_PROFILE PI_PROFILE
 export GLEN_HOME="$ACC_S/home"
-agent_dir=$(jq -r '.agent_dir // empty' "$MANIFEST")
-if [[ -n $agent_dir ]]; then export PI_CODING_AGENT_DIR="$agent_dir"; fi
+# Mode p bakes its fake omp environment into the manifest; only these names pass, never others.
+while IFS= read -r pair; do
+    if [[ ${pair%%=*} =~ ^(HOME|PI_CODING_AGENT_DIR|GLEN_OMP_BIN|FAKE_OMP_[A-Z0-9_]+)$ ]]; then export "${pair?}"; fi
+done < <(jq -r '.env // {} | to_entries[] | "\(.key)=\(.value)"' "$MANIFEST")
+# Real-omp modes name their profile; the real binary then runs under it (named profiles ignore
+# PI_CODING_AGENT_DIR, so the owner's default agent dir is never used).
+profile=$(jq -r '.profile // empty' "$MANIFEST")
 now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f",time*1000'; }
 argv=$(jq -cn --args '$ARGS.positional' -- "$@")
 refuse() {
@@ -16,6 +21,7 @@ refuse() {
     printf 'guard refused: %s\n' "$1" >&2
     exit 99
 }
+[[ -z $profile || $profile == glen-harness ]] || refuse 'manifest profile is not glen-harness'
 command_name='' target='' cwd='' dry=false project=false
 args=("$@")
 help=false
@@ -55,7 +61,7 @@ if ! $help; then
                 *)
                     normalized=$(printf '%s' "$target" | tr '[:upper:]' '[:lower:]' | tr -d '-')
                     [[ $normalized =~ ^[0-9a-f]{4,}$ ]] || refuse 'target is not a manifest handle'
-                    jq -e --arg t "$normalized" '[.R,.L,.X] | map(select((.id|ascii_downcase|gsub("-";""))|endswith($t))) | length == 1' "$MANIFEST" >/dev/null || refuse 'target is outside manifest'
+                    jq -e --arg t "$normalized" '[.R,.L,.X,.P] | map(select(. != null) | select((.id|ascii_downcase|gsub("-";""))|endswith($t))) | length == 1' "$MANIFEST" >/dev/null || refuse 'target is outside manifest'
                     ;;
             esac
             ;;
@@ -66,6 +72,8 @@ start=$(now_ms)
 call_id="$$-$start"
 jq -cn --arg id "$call_id" --argjson argv "$argv" --argjson ts "$start" '{t:"start",id:$id,argv:$argv,ts:$ts}' >> "$LOG" 2>/dev/null || :
 tmp=$(mktemp "$ACC_S/call.XXXXXX") || exit 1
+# The recorded argv stays the caller's; only the real call gains the profile.
+if [[ -n $profile ]]; then set -- --profile "$profile" "$@"; fi
 "$REAL" "$@" | tee "$tmp"
 status=${PIPESTATUS[0]}
 end=$(now_ms)
