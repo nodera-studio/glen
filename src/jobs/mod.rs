@@ -91,6 +91,12 @@ pub struct Job {
     pub owners_dir: PathBuf,
     pub job_timeout_ms: u64,
     pub deadline_at: String,
+    /// How long the worker stays warm after this job (v0.2 W4, `--warm`); RPC and `@new` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_ms: Option<u64>,
+    /// `rpc::warm::env_digest` of the send's environment; every RPC and `@new` job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_digest: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -164,6 +170,9 @@ pub struct Status {
     pub error: Option<JobError>,
     #[serde(default)]
     pub warnings: Vec<Warning>,
+    /// The job ran on an omp a warm worker kept from an earlier job (v0.2 W4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub omp_reused: bool,
 }
 impl Status {
     /// The job's state in A2A's task-state vocabulary (design §A7), derived at view time and
@@ -286,15 +295,22 @@ impl JobStore {
         (rows, warnings)
     }
     pub fn create(&self, job: &Job) -> Result<(), GlenError> {
-        self.create_mapped(job, |path, e| {
+        self.create_mapped(job, vec![], |path, e| {
             GlenError::new(
                 ErrorCode::Io,
                 format!("cannot write {}: {e}", path.display()),
             )
         })
     }
-    pub fn create_for_send(&self, job: &Job, env: &crate::env::Env) -> Result<(), GlenError> {
-        self.create_mapped(job, |path, e| {
+    /// `send`'s create: `warnings` go into the first `status.json`, so they are on disk before
+    /// a warm worker can claim the job and the sender never rewrites the status afterwards.
+    pub fn create_for_send(
+        &self,
+        job: &Job,
+        warnings: Vec<Warning>,
+        env: &crate::env::Env,
+    ) -> Result<(), GlenError> {
+        self.create_mapped(job, warnings, |path, e| {
             let mut error = crate::sandbox::map_home_write(env, "send", e);
             error.message = format!("{} (write target {})", error.message, path.display());
             error
@@ -303,6 +319,7 @@ impl JobStore {
     fn create_mapped(
         &self,
         job: &Job,
+        warnings: Vec<Warning>,
         map: impl Fn(&Path, io::Error) -> GlenError,
     ) -> Result<(), GlenError> {
         let id = JobId::parse(&job.id)
@@ -335,6 +352,7 @@ impl JobStore {
                 v: 1,
                 status: State::Queued,
                 updated_at: job.created_at.clone(),
+                warnings,
                 ..Status::default()
             },
             &map,
@@ -385,6 +403,24 @@ impl JobStore {
             )
         })?;
         Ok(file)
+    }
+    /// Read, decide and write under the status lock: `f` edits the on-disk status and returns
+    /// whether to write it. Returns the status (as written, or as read when `f` refused) and
+    /// whether it was written.
+    pub fn update_status_if(
+        &self,
+        id: &JobId,
+        f: impl FnOnce(&mut Status) -> bool,
+    ) -> Result<(Status, bool), GlenError> {
+        let _lock = self.status_lock(id)?;
+        let mut s = self.read_status(id)?;
+        let before = s.clone();
+        if f(&mut s) {
+            self.write_status_locked(id, &s)?;
+            Ok((s, true))
+        } else {
+            Ok((before, false))
+        }
     }
     pub(crate) fn write_status_locked(&self, id: &JobId, s: &Status) -> Result<(), GlenError> {
         write_json(&self.dir(id).join("status.json"), s)
@@ -596,6 +632,8 @@ pub(crate) mod tests {
             owners_dir: "/fixture/owners".into(),
             job_timeout_ms: 30000,
             deadline_at: jiff::Timestamp::now().to_string(),
+            warm_ms: None,
+            env_digest: None,
         }
     }
     pub fn store(root: &Path) -> JobStore {
@@ -628,6 +666,9 @@ pub(crate) mod tests {
         let job: Job = serde_json::from_value(encoded).unwrap();
         assert_eq!(job.profile_flag, None);
         assert_eq!(job.thinking_flag, None);
+        // Nor do jobs written before v0.2 W4 carry the warm fields.
+        assert_eq!(job.warm_ms, None);
+        assert_eq!(job.env_digest, None);
     }
     #[test]
     fn ids_and_handles() {
@@ -678,6 +719,17 @@ pub(crate) mod tests {
     #[test]
     fn schemas_roundtrip_and_lenient_status() {
         roundtrip(&job());
+        let warm = Job {
+            warm_ms: Some(2000),
+            env_digest: Some("0123456789abcdef".into()),
+            ..job()
+        };
+        roundtrip(&warm);
+        let encoded = serde_json::to_value(&warm).unwrap();
+        assert_eq!(encoded["warm_ms"], 2000);
+        assert_eq!(encoded["env_digest"], "0123456789abcdef");
+        let cold = serde_json::to_value(job()).unwrap();
+        assert!(cold.get("warm_ms").is_none() && cold.get("env_digest").is_none());
         for route in [Route::New, Route::Rpc, Route::Live] {
             roundtrip(&route);
         }
@@ -729,13 +781,23 @@ pub(crate) mod tests {
                     code: "test".into(),
                     message: "warning".into(),
                 }],
+                omp_reused: true,
             };
             roundtrip(&s);
+            assert_eq!(serde_json::to_value(&s).unwrap()["omp_reused"], true);
         }
         let s:Status=serde_json::from_value(json!({"v":1,"status":"queued","updated_at":"2026-10-30T00:00:00Z","future":{"anything":1}})).unwrap();
         assert!(s.worker_pid.is_none());
         assert!(s.rpc_protocol.is_none());
         assert!(s.warnings.is_empty());
+        assert!(!s.omp_reused);
+        // Omitted when false, so a cold job's status.json is unchanged.
+        assert!(
+            serde_json::to_value(&s)
+                .unwrap()
+                .get("omp_reused")
+                .is_none()
+        );
         let reply = Reply {
             v: 1,
             id: JobId::new().as_str().into(),
@@ -800,6 +862,34 @@ pub(crate) mod tests {
         // Derived only: never written into status.json.
         let encoded = serde_json::to_value(with(State::Accepted, None, false)).unwrap();
         assert!(encoded.get("task_state").is_none(), "{encoded}");
+    }
+    #[test]
+    fn update_status_if_writes_only_when_asked() {
+        let t = tempfile::tempdir().unwrap();
+        let store = store(t.path());
+        let j = job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let path = store.dir(&id).join("status.json");
+        let before = fs::read(&path).unwrap();
+        let (s, wrote) = store
+            .update_status_if(&id, |s| {
+                s.status = State::Failed;
+                false
+            })
+            .unwrap();
+        assert!(!wrote);
+        assert_eq!(s.status, State::Queued, "a refused edit is not returned");
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing written");
+        let (s, wrote) = store
+            .update_status_if(&id, |s| {
+                s.omp_reused = true;
+                true
+            })
+            .unwrap();
+        assert!(wrote && s.omp_reused);
+        assert!(store.read_status(&id).unwrap().omp_reused);
+        assert!(store.update_status_if(&JobId::new(), |_| true).is_err());
     }
     #[test]
     fn private_creation_and_existing_directory_refused() {

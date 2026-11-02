@@ -166,16 +166,19 @@ impl Reader {
                         status
                     }
                 };
+                // A job a warm worker claimed (v0.2 W4) is the claimant's: its exited child is
+                // no reason to mark it lost, and the row keeps polling until the claimant ends it.
                 if !entry.status.status.is_terminal()
-                    && self
-                        .children
-                        .get(id)
-                        .and_then(|child| child.exited)
-                        .is_some_and(|at| {
-                            now.saturating_duration_since(at) >= Duration::from_millis(100)
-                        })
+                    && let Some(tracked) = self.children.get(id)
+                    && tracked.exited.is_some_and(|at| {
+                        now.saturating_duration_since(at) >= Duration::from_millis(100)
+                    })
                 {
-                    match liveness::try_mark_lost(&self.store, id, false) {
+                    match liveness::try_mark_lost_unless_claimed(
+                        &self.store,
+                        id,
+                        tracked.child.id(),
+                    ) {
                         Ok(status) => entry.status = status,
                         Err(e) => warn(&mut entry.status, "lost_write_failed", e),
                     }
@@ -454,6 +457,40 @@ mod tests {
             matches!(row.done, Some(Done::Failed(e)) if e.code == "job_failed" && e.message.contains("exited without reporting"))
         );
         assert_eq!(reader.store.read_status(&id).unwrap().status, State::Lost);
+    }
+    #[test]
+    fn a_job_a_live_warm_worker_stole_stays_the_claimants_after_its_child_exits() {
+        let rig = Rig::new(false);
+        let (mut reader, id) = setup(&rig);
+        // The submitted child exited on the steal; this process is the live claimant.
+        let me = liveness::current().unwrap();
+        crate::rpc::warm::claim(&reader.store, &id, me.pid, Some(&me.start))
+            .unwrap()
+            .unwrap();
+        reader.track(id.clone(), exited_child());
+        let now = Instant::now();
+        for at in [now, now + POLL, now + 2 * POLL] {
+            assert!(reader.poll(at).is_empty());
+            let row = reader.snapshot().rows.remove(0);
+            assert_eq!(row.status.status, State::Queued, "never lost while claimed");
+            assert!(row.done.is_none() && row.ours);
+        }
+        let disk = reader.store.read_status(&id).unwrap();
+        assert_eq!(
+            (disk.status, disk.worker_pid),
+            (State::Queued, Some(me.pid))
+        );
+        // The row follows the claimant: accepted, then its own terminal status.
+        status(&reader.store, &id, State::Accepted);
+        assert!(reader.poll(now + 3 * POLL).is_empty());
+        assert_eq!(reader.snapshot().rows[0].status.status, State::Accepted);
+        reader.store.write_result(&id, &result()).unwrap();
+        status(&reader.store, &id, State::Completed);
+        assert!(reader.poll(now + 4 * POLL).is_empty());
+        let row = reader.snapshot().rows.remove(0);
+        assert_eq!(row.status.status, State::Completed);
+        assert!(matches!(row.done, Some(Done::Completed(_))));
+        assert!(reader.children.is_empty());
     }
     #[test]
     fn lost_write_failure_is_row_warning_not_output_or_a_lost_snapshot() {

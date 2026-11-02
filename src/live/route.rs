@@ -218,6 +218,15 @@ pub(crate) fn rpc_job_running(handle: &str, command: &str) -> GlenError {
     ))
 }
 
+/// [`rpc_job_running`] while an idle warm worker (v0.2 W4) holds the lock: the hint adds how to
+/// end it.
+pub(crate) fn rpc_warm_held(handle: &str, command: &str) -> GlenError {
+    let mut e = rpc_job_running(handle, command);
+    e.hint = e
+        .hint
+        .map(|h| format!("{h}, or end the warm worker with `glen release {handle}`"));
+    e
+}
 /// Warns when the live session's glen extension is not this glen's version.
 pub(crate) fn extension_version_warning(hello: &Hello) -> Option<Warning> {
     let ours = env!("CARGO_PKG_VERSION");
@@ -247,6 +256,17 @@ mod tests {
                 .ends_with("then retry `glen compact`")
         );
         assert!(!compact.hint.unwrap().contains("send again"));
+    }
+    #[test]
+    fn rpc_warm_held_adds_the_release_command() {
+        let e = rpc_warm_held("e27c0de", "send");
+        assert_eq!(e.details.as_ref().unwrap()["reason"], "rpc_job_running");
+        let hint = e.hint.unwrap();
+        assert!(hint.contains("then send again"), "{hint}");
+        assert!(
+            hint.ends_with("or end the warm worker with `glen release e27c0de`"),
+            "{hint}"
+        );
     }
     #[test]
     fn lease_refusal_maps_held_and_unknown() {

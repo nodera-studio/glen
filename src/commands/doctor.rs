@@ -269,6 +269,8 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
             }
         }),
     );
+    let (status, value, detail) = warm_row(&glen_home, env, std::time::SystemTime::now());
+    add("warm_workers", status, value, detail);
     let (status, value, detail) = omp::dotenv::describe(env, &paths);
     add("omp_env_files", status, value.join(", "), detail);
     let env_files = value;
@@ -502,6 +504,43 @@ fn omp_version_row(
     }
     Some(text)
 }
+/// The `warm_workers` check (v0.2 W4): registries only, no probe, never `fail`. A stale
+/// heartbeat or an unreadable registry warns and names the fix.
+fn warm_row(
+    home: &glen_home::GlenHome,
+    env: &Env,
+    now: std::time::SystemTime,
+) -> (&'static str, String, String) {
+    use crate::rpc::warm::{self, Class};
+    let (entries, unreadable) = warm::index(home);
+    let bound = warm::stale_bound(env);
+    let (mut fresh, mut dead, mut stale) = (0, 0, vec![]);
+    for i in &entries {
+        match i.entry.class(i.mtime, now, bound) {
+            Class::Fresh => fresh += 1,
+            Class::Dead => dead += 1,
+            Class::Stale => stale.push(crate::rpc::session_handle(&i.entry.session_id)),
+        }
+    }
+    let value = format!("{fresh} warm, {} stale, {dead} dead", stale.len());
+    let mut detail = stale
+        .iter()
+        .map(|h| format!("warm worker {h} has no heartbeat; run `glen release {h} --force`"))
+        .collect::<Vec<_>>();
+    if unreadable > 0 {
+        detail.push("a warm worker registry is unreadable".into());
+    }
+    if detail.is_empty() {
+        let detail = if dead > 0 {
+            "`glen release --all` removes the dead entries".into()
+        } else {
+            String::new()
+        };
+        ("info", value, detail)
+    } else {
+        ("warn", value, detail.join("; "))
+    }
+}
 /// `probe::BUDGET`; debug builds let `GLEN_PROBE_BUDGET_MS` (100 to 30000) shorten it for tests.
 fn probe_budget(env: &Env) -> Duration {
     #[cfg(debug_assertions)]
@@ -535,4 +574,64 @@ fn wrap(text: &str, width: Option<u16>) -> String {
         .map(|s| s.iter().collect::<String>())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use crate::rpc::warm::{self, Entry, EntryState};
+    const ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+    #[test]
+    fn warm_workers_row_counts_and_warns_on_stale_or_unreadable() {
+        let t = tempfile::tempdir().unwrap();
+        let home = glen_home::GlenHome {
+            root: t.path().join("glen"),
+        };
+        let env = Env::for_test(None, t.path(), &[]);
+        let now = std::time::SystemTime::now();
+        assert_eq!(
+            warm_row(&home, &env, now),
+            ("info", "0 warm, 0 stale, 0 dead".into(), String::new())
+        );
+        assert!(!home.root.exists(), "doctor creates nothing");
+        let me = crate::jobs::liveness::current().unwrap();
+        let mut e = Entry {
+            v: 1,
+            pid: me.pid,
+            start: Some(me.start.clone()),
+            session_id: ID.into(),
+            session_handle: None,
+            job_id: "j".into(),
+            omp_pid: None,
+            omp_start: None,
+            warm_ms: 1000,
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            state: EntryState::Idle,
+            started_at: "2026-11-02T00:00:00Z".into(),
+        };
+        warm::publish(&home, &e).unwrap();
+        assert_eq!(warm_row(&home, &env, now).0, "info");
+        assert_eq!(warm_row(&home, &env, now).1, "1 warm, 0 stale, 0 dead");
+        let later = now + Duration::from_secs(60);
+        let (status, value, detail) = warm_row(&home, &env, later);
+        assert_eq!(
+            (status, value.as_str()),
+            ("warn", "0 warm, 1 stale, 0 dead")
+        );
+        assert!(detail.contains("glen release e27c0de --force"), "{detail}");
+        e.start = Some("reused".into());
+        warm::publish(&home, &e).unwrap();
+        assert_eq!(
+            warm_row(&home, &env, now),
+            (
+                "info",
+                "0 warm, 0 stale, 1 dead".into(),
+                "`glen release --all` removes the dead entries".into()
+            )
+        );
+        std::fs::write(home.root.join("run/warm/torn.json"), b"{").unwrap();
+        let (status, _, detail) = warm_row(&home, &env, now);
+        assert_eq!(status, "warn");
+        assert!(detail.contains("unreadable"), "{detail}");
+    }
 }

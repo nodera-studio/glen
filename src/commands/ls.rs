@@ -40,6 +40,8 @@ struct Row {
     state: State,
     source: &'static str,
     detail: Option<String>,
+    /// A warm worker holds the session (v0.2 W4); `glen ls` adds it to the state.
+    warm: Option<crate::rpc::warm::Class>,
 }
 #[cfg(test)]
 fn read_row(summary: Summary, owners: &Path, env: &Env) -> Option<Row> {
@@ -72,7 +74,34 @@ fn read_endpoint_row(
         state,
         source,
         detail,
+        warm: None,
     })
+}
+/// Disk rows of sessions a live warm worker holds: `state_detail` reads `warm worker, …` and the
+/// human state gains ` (warm)`. Registries only; nothing is probed or created.
+fn annotate_warm(rows: &mut [Row], home: &crate::glen_home::GlenHome, env: &Env, now: SystemTime) {
+    use crate::rpc::warm;
+    let (entries, _) = warm::index(home);
+    if entries.is_empty() {
+        return;
+    }
+    let bound = warm::stale_bound(env);
+    for r in rows.iter_mut().filter(|r| r.source == "disk") {
+        if let Some(i) = entries.iter().find(|i| i.entry.session_id == r.summary.id) {
+            let class = i.entry.class(i.mtime, now, bound);
+            if let Some(detail) = i.entry.detail(class, i.mtime, now) {
+                r.detail = Some(detail);
+                r.warm = Some(class);
+            }
+        }
+    }
+}
+fn warm_suffix(warm: Option<crate::rpc::warm::Class>) -> &'static str {
+    match warm {
+        Some(crate::rpc::warm::Class::Stale) => " (warm, stale)",
+        Some(_) => " (warm)",
+        None => "",
+    }
 }
 pub(crate) struct RowState {
     pub lease: Lease,
@@ -161,7 +190,7 @@ fn read_endpoint_rows(
 fn row_json(r: &Row, now: SystemTime) -> Value {
     let mut v = session_json(&r.summary, &r.handle, &r.lease, r.state, now);
     v["state_source"] = json!(r.source);
-    if r.source == "extension" {
+    if r.source == "extension" || r.warm.is_some() {
         v["state_detail"] = json!(r.detail);
     }
     if !r.summary.file.path.exists() {
@@ -205,7 +234,7 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
                     .is_none_or(|d| now.duration_since(s.file.mtime).unwrap_or_default() <= d)
         })
         .collect::<Vec<_>>();
-    let (rows, total, total_all) = read_endpoint_rows(
+    let (mut rows, total, total_all) = read_endpoint_rows(
         &catalog,
         candidates,
         args,
@@ -213,6 +242,9 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         &endpoints,
         env,
     );
+    if let Some(home) = &home {
+        annotate_warm(&mut rows, home, env, now);
+    }
     spinner.finish();
     if ctx.mode == Mode::Json {
         let mut outcome = Outcome::new(
@@ -257,13 +289,16 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
             let s = &r.summary;
             plain.push(vec![
                 text::single_line(&r.handle),
-                match r.state {
-                    State::Idle => "○ idle",
-                    State::Live => "● live",
-                    State::Busy => "◐ busy",
-                    State::Unknown => "? unknown",
-                }
-                .to_owned(),
+                format!(
+                    "{}{}",
+                    match r.state {
+                        State::Idle => "○ idle",
+                        State::Live => "● live",
+                        State::Busy => "◐ busy",
+                        State::Unknown => "? unknown",
+                    },
+                    warm_suffix(r.warm)
+                ),
                 text::truncate(
                     &s.cwd
                         .as_deref()
@@ -322,7 +357,16 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
                         let cell = text::truncate(&cells[*i], budgets[*i]);
                         match *i {
                             0 => p.paint(Token::Focus, &cell),
-                            1 if cell == cells[1] => state_text(r.state, p),
+                            1 if cell == cells[1] => match warm_suffix(r.warm) {
+                                "" => state_text(r.state, p),
+                                suffix => {
+                                    format!(
+                                        "{}{}",
+                                        state_text(r.state, p),
+                                        p.paint(Token::Muted, suffix)
+                                    )
+                                }
+                            },
                             1 => p.paint(Token::Muted, &cell),
                             4 => p.paint(
                                 match r.summary.last_turn {
@@ -410,6 +454,13 @@ fn column_budget(widths: &[usize], all: bool, width: Option<usize>) -> (Vec<usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn warm_suffix_marks_warm_and_stale_rows_only() {
+        use crate::rpc::warm::Class;
+        assert_eq!(warm_suffix(None), "");
+        assert_eq!(warm_suffix(Some(Class::Fresh)), " (warm)");
+        assert_eq!(warm_suffix(Some(Class::Stale)), " (warm, stale)");
+    }
     #[test]
     fn budget() {
         let (c, b) = column_budget(&[7, 9, 24, 50, 11, 10, 20], true, Some(60));

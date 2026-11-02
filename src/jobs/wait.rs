@@ -151,13 +151,25 @@ pub fn observe_with(
         if s.status.is_terminal() {
             return Ok(Waited::Terminal(s));
         }
-        if let Some(c) = &mut child
-            && c.try_wait()?.is_some()
-        {
+        let exited = match &mut child {
+            Some(c) => c.try_wait()?.map(|_| c.id()),
+            None => None,
+        };
+        if let Some(child_pid) = exited {
             std::thread::sleep(Duration::from_millis(100));
             s = store.read_status(id)?;
             if !s.status.is_terminal() {
-                s = liveness::mark_lost(store, id, s);
+                // A warm worker claimed the job (v0.2 W4): its blocked child exits, and the
+                // claimant's pid and start token decide liveness from here on.
+                if s.worker_pid.is_some_and(|p| p != child_pid) {
+                    child = None;
+                    continue;
+                }
+                s = liveness::mark_lost_unless_claimed(store, id, child_pid, s);
+                if !s.status.is_terminal() {
+                    child = None;
+                    continue;
+                }
             }
             return Ok(Waited::Terminal(s));
         }
@@ -300,6 +312,93 @@ mod tests {
         ));
         assert_eq!(store.read_status(&id).unwrap().status, State::Lost);
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn observer_follows_a_claimant_after_its_child_exits() {
+        let t = tempfile::tempdir().unwrap();
+        let store = tests::store(t.path());
+        let flag = AtomicBool::new(false);
+        let me = liveness::current().unwrap();
+        let exited = || {
+            let mut c = std::process::Command::new("/bin/sh")
+                .args(["-c", "exit 0"])
+                .spawn()
+                .unwrap();
+            while c.try_wait().unwrap().is_none() {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            c
+        };
+        let job_named = |pid: u32, start: String| {
+            let j = tests::job();
+            let id = JobId::parse(&j.id).unwrap();
+            store.create(&j).unwrap();
+            let mut s = store.read_status(&id).unwrap();
+            s.worker_pid = Some(pid);
+            s.worker_start = Some(start);
+            s.omp_reused = true;
+            store.write_status(&id, &s).unwrap();
+            id
+        };
+        // A live claimant (this process): the exited child is not a reason to mark it lost.
+        let id = job_named(me.pid, me.start.clone());
+        let mut child = exited();
+        let started = Instant::now();
+        let waited = observe(
+            &store,
+            &id,
+            started,
+            Duration::from_millis(400),
+            &flag,
+            Some(&mut child),
+            |_| {},
+        )
+        .unwrap();
+        assert!(matches!(waited, Waited::Running(_)));
+        assert!(started.elapsed() >= Duration::from_millis(400));
+        assert_eq!(store.read_status(&id).unwrap().status, State::Queued);
+        // A dead claimant is lost through liveness, not the child.
+        let id = job_named(me.pid, "reused".into());
+        let mut child = exited();
+        assert!(matches!(
+            observe(
+                &store,
+                &id,
+                Instant::now(),
+                Duration::from_secs(5),
+                &flag,
+                Some(&mut child),
+                |_| {}
+            )
+            .unwrap(),
+            Waited::Terminal(Status {
+                status: State::Lost,
+                ..
+            })
+        ));
+        // The child itself named as the worker keeps today's lost mapping.
+        let mut child = exited();
+        let id = job_named(child.id(), "child".into());
+        let mut s = store.read_status(&id).unwrap();
+        s.worker_start = None;
+        store.write_status(&id, &s).unwrap();
+        assert!(matches!(
+            observe(
+                &store,
+                &id,
+                Instant::now(),
+                Duration::from_secs(5),
+                &flag,
+                Some(&mut child),
+                |_| {}
+            )
+            .unwrap(),
+            Waited::Terminal(Status {
+                status: State::Lost,
+                ..
+            })
+        ));
     }
 
     fn reply(id: &str) -> Reply {

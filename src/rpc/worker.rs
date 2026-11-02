@@ -65,6 +65,15 @@ impl Failure {
             ..Self::new("cancelled", "the glen job was cancelled")
         }
     }
+    /// Not a job outcome: a warm worker claimed the job, so this worker exits 0 and writes nothing.
+    pub(crate) fn stolen() -> Self {
+        Self::new(STOLEN, "a warm worker claimed the job")
+    }
+}
+pub(crate) const STOLEN: &str = "stolen";
+/// The on-disk status names another worker: a warm worker claimed the job (design §A21).
+fn claimed_by_other(s: &Status) -> bool {
+    s.worker_pid.is_some_and(|p| p != std::process::id())
 }
 impl From<GlenError> for Failure {
     fn from(e: GlenError) -> Self {
@@ -85,6 +94,8 @@ pub(crate) struct Worker {
     pub(crate) deadline: Instant,
     pub(crate) control_in_flight: Option<std::path::PathBuf>,
     pub(crate) omp_queued: bool,
+    /// The job's final settlement (`result.session_settled`), for the stay-warm decision.
+    pub(crate) settled: bool,
 }
 pub fn main(arg: &str) -> ExitCode {
     let loaded = (|| -> Result<Worker, GlenError> {
@@ -111,6 +122,7 @@ pub fn main(arg: &str) -> ExitCode {
             status,
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + Duration::from_millis(left),
         })
@@ -123,30 +135,60 @@ pub fn main(arg: &str) -> ExitCode {
         }
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.run()));
-    match result {
-        Ok(Ok(())) => ExitCode::SUCCESS,
-        Ok(Err(e)) => {
-            w.log("failed", &e.to_string());
-            match w.finish_failure(e) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("cannot persist worker failure: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+    conclude(&mut w, result)
+}
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
+}
+/// The worker's exit. A stolen job ends silently with 0; a job whose status on disk is already
+/// terminal (a warm worker whose idle phase failed) is never rewritten; a terminal status that
+/// only reached memory (its save failed) is saved again; anything else is persisted as the job's
+/// failure.
+fn conclude(w: &mut Worker, result: std::thread::Result<Result<(), Failure>>) -> ExitCode {
+    let (failure, panicked) = match result {
+        Ok(Ok(())) => return ExitCode::SUCCESS,
+        Ok(Err(e)) if e.code == STOLEN => {
+            w.log("claim", "claimed by another worker, exiting");
+            return ExitCode::SUCCESS;
         }
-        Err(payload) => {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            if let Err(e) = w.finish_failure(Failure::new(
+        Ok(Err(e)) => (e, false),
+        Err(payload) => (
+            Failure::new(
                 "internal",
-                format!("worker panicked: {message}"),
-            )) {
-                eprintln!("cannot persist worker panic: {e}");
-            }
+                format!("worker panicked: {}", panic_message(payload.as_ref())),
+            ),
+            true,
+        ),
+    };
+    if w.store
+        .read_status(&w.id)
+        .is_ok_and(|s| s.status.is_terminal())
+    {
+        w.log(
+            "failed",
+            &format!("failed after terminal status: {failure}"),
+        );
+        return ExitCode::FAILURE;
+    }
+    w.log("failed", &failure.to_string());
+    let persisted = if w.status.status.is_terminal() {
+        w.save().map(|()| w.respond_pending())
+    } else {
+        w.finish_failure(failure)
+    };
+    match persisted {
+        Ok(()) if panicked => ExitCode::FAILURE,
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.code == STOLEN => {
+            w.log("claim", "claimed by another worker, exiting");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("cannot persist worker failure: {e}");
             ExitCode::FAILURE
         }
     }
@@ -159,10 +201,34 @@ impl Worker {
             self.job.handle
         );
     }
+    /// Every status write of a worker: refused (`Failure::stolen`) once the on-disk status names
+    /// another worker, so a blocked worker can never clobber a job a warm worker claimed.
     pub(crate) fn save(&mut self) -> Result<(), Failure> {
         self.status.updated_at = jiff::Timestamp::now().to_string();
-        self.store.write_status(&self.id, &self.status)?;
-        Ok(())
+        if self.write_if_mine(&self.status)? {
+            Ok(())
+        } else {
+            Err(Failure::stolen())
+        }
+    }
+    fn write_if_mine(&self, status: &Status) -> Result<bool, GlenError> {
+        let _lock = self.store.status_lock(&self.id)?;
+        // An unreadable status is still overwritten, as before W4: only a proven claim refuses.
+        if self
+            .store
+            .read_status(&self.id)
+            .is_ok_and(|disk| claimed_by_other(&disk))
+        {
+            return Ok(false);
+        }
+        self.store.write_status_locked(&self.id, status)?;
+        Ok(true)
+    }
+    /// A warm worker claimed this job while this worker waited for the session lock.
+    fn stolen(&self) -> bool {
+        self.store
+            .read_status(&self.id)
+            .is_ok_and(|s| claimed_by_other(&s))
     }
     fn controls(&self) -> (bool, Vec<control::Request>) {
         let mut abort = false;
@@ -242,7 +308,7 @@ impl Worker {
             self.log("control", &e.to_string());
         }
     }
-    fn respond_pending(&self) {
+    pub(crate) fn respond_pending(&self) {
         for req in control::poll(&self.store.dir(&self.id)) {
             if self.control_in_flight.as_ref() == Some(&req.path) {
                 continue;
@@ -364,15 +430,22 @@ impl Worker {
                 .to_owned();
             self.log("lock", "waiting for glen session lock");
             let home = self.store.home.clone();
-            let acquired =
-                lock::acquire(&home, &id, self.deadline, &|| self.stop_requested(), || {
+            // A claim is checked before any stop: a stolen job's control requests are the
+            // claimant's to answer.
+            let acquired = lock::acquire(
+                &home,
+                &id,
+                self.deadline,
+                &|| self.stolen() || self.stop_requested(),
+                || {
                     let mut status = self.status.clone();
                     status.waiting_for_lock = true;
                     status.waited_ms = Some(1);
-                    self.store
-                        .write_status(&self.id, &status)
+                    self.write_if_mine(&status)
+                        .map(drop)
                         .map_err(std::io::Error::other)
-                })?;
+                },
+            )?;
             match acquired {
                 lock::Acquired::Locked { lock, waited } => {
                     self.mark_holder(&lock);
@@ -390,6 +463,7 @@ impl Worker {
                         "waited for another glen job on this session until the job deadline",
                     ));
                 }
+                lock::Acquired::Cancelled if self.stolen() => return Err(Failure::stolen()),
                 lock::Acquired::Cancelled => return Err(Failure::cancelled()),
             }
             self.log("continuation", "re-following after lock");
@@ -431,53 +505,105 @@ impl Worker {
         self.save()?;
         // Drain at the source before adding a forwarder, so buffered startup frames cannot lag into the run.
         for _ in events.try_iter() {}
-        let result = (|| -> Result<(), Failure> {
-            if self.job.route == Route::Rpc
-                && Some(&baseline.session_id) != self.job.session_id.as_ref()
-            {
-                return Err(self.moved(&baseline.session_id));
-            }
-            if self.job.route == Route::New {
-                session_lock = Some(
-                    lock::try_acquire(&self.store.home, &baseline.session_id)?
-                        .ok_or_else(|| Failure::new("internal", "cannot lock the new session"))?,
-                );
-            }
-            if self.job.route == Route::New
-                && let Some(lock) = &session_lock
-            {
-                self.mark_holder(lock);
-            }
-            self.status.actual_session_id = Some(baseline.session_id.clone());
-            self.status.actual_session_file =
-                baseline.session_file.clone().map(std::path::PathBuf::from);
-            sink.set_session(baseline.session_id.clone());
-            // Startup recovery can claim our own lease. Only the pre-spawn lease probe is safe.
-            self.check_stop()?;
-            self.status.delivered_as = Some(
-                if !baseline.is_streaming {
-                    "prompt"
-                } else if self.job.deliver_as == Deliver::Steer {
-                    "steer"
-                } else {
-                    "follow_up"
-                }
-                .into(),
-            );
-            self.log("prompt", "sending message");
-            self.drive(&client, &events, &replies, &sink, &baseline.session_id)
-        })();
+        let result = self.execute(
+            &client,
+            &events,
+            &replies,
+            &baseline,
+            &sink,
+            &mut session_lock,
+        );
         // Terminal state must precede teardown, and the session lock stays held through close.
         let result = match result {
             Err(f) => self.finish_failure(f),
             ok => ok,
         };
+        if result.is_ok()
+            && self.keep_warm()
+            && let Some(key) = rpc::warm::Key::of(&self.job)
+            && let Some(lock) = session_lock.take()
+        {
+            let session_id = self
+                .status
+                .actual_session_id
+                .clone()
+                .unwrap_or_else(|| baseline.session_id.clone());
+            return rpc::warm::idle(
+                self,
+                rpc::warm::Warm {
+                    client,
+                    events,
+                    replies,
+                    lock,
+                    session_id,
+                    key,
+                },
+            );
+        }
         self.log("close", "closing omp client");
         if let Err(e) = client.close() {
             self.log("close", &e.to_string());
         }
         drop(session_lock);
         result
+    }
+    /// Runs the job on a started omp: the identity check, the `@new` lock, then the prompt. A warm
+    /// worker calls it again for each job it adopts, with that job's own sink.
+    pub(crate) fn execute(
+        &mut self,
+        client: &Client,
+        events: &Receiver<Event>,
+        replies: &Receiver<reply::PendingReply>,
+        baseline: &omp_rpc::SessionState,
+        sink: &ReplySink,
+        session_lock: &mut Option<lock::SessionLock>,
+    ) -> Result<(), Failure> {
+        if self.job.route == Route::Rpc
+            && Some(&baseline.session_id) != self.job.session_id.as_ref()
+        {
+            return Err(self.moved(&baseline.session_id));
+        }
+        if self.job.route == Route::New {
+            *session_lock = Some(
+                lock::try_acquire(&self.store.home, &baseline.session_id)?
+                    .ok_or_else(|| Failure::new("internal", "cannot lock the new session"))?,
+            );
+        }
+        if self.job.route == Route::New
+            && let Some(lock) = session_lock.as_ref()
+        {
+            self.mark_holder(lock);
+        }
+        self.status.actual_session_id = Some(baseline.session_id.clone());
+        self.status.actual_session_file =
+            baseline.session_file.clone().map(std::path::PathBuf::from);
+        sink.set_session(baseline.session_id.clone());
+        // Startup recovery can claim our own lease. Only the pre-spawn lease probe is safe.
+        self.check_stop()?;
+        self.status.delivered_as = Some(
+            if !baseline.is_streaming {
+                "prompt"
+            } else if self.job.deliver_as == Deliver::Steer {
+                "steer"
+            } else {
+                "follow_up"
+            }
+            .into(),
+        );
+        self.log("prompt", "sending message");
+        self.drive(client, events, replies, sink, &baseline.session_id)
+    }
+    /// The stay-warm rule (design §A21): a settled, unforked, uncancelled `completed` RPC or
+    /// `@new` job sent with a warm duration. Failed, aborted, timed-out, unsettled, forked and
+    /// live-route jobs never stay warm.
+    pub(crate) fn keep_warm(&self) -> bool {
+        self.job.warm_ms.is_some_and(|ms| ms > 0)
+            && matches!(self.job.route, Route::Rpc | Route::New)
+            && self.job.env_digest.is_some()
+            && self.status.status == State::Completed
+            && self.settled
+            && self.status.forked.is_none()
+            && !self.cancel.load(Ordering::SeqCst)
     }
     fn start(&mut self) -> Result<Option<Started>, Failure> {
         let abandon = Arc::new(AtomicBool::new(false));
@@ -988,6 +1114,7 @@ impl Worker {
             session_settled: terminal.settled,
             settled_at: terminal.settled.then(|| jiff::Timestamp::now().to_string()),
         };
+        self.settled = terminal.settled;
         self.status.request_id = turn
             .and_then(|t| t.result.as_ref())
             .and_then(|r| r.id.clone());
@@ -1220,7 +1347,10 @@ use super::polling_command;
 polling_command!(SubmitPrompt, PromptCommand, 100);
 polling_command!(PollState, GetStateCommand, 100);
 polling_command!(StateSecond, GetStateCommand, 1000);
-fn query_state(client: &Client, left: Duration) -> Result<omp_rpc::SessionState, omp_rpc::Error> {
+pub(crate) fn query_state(
+    client: &Client,
+    left: Duration,
+) -> Result<omp_rpc::SessionState, omp_rpc::Error> {
     if left >= rpc::CALL_TIMEOUT {
         client.call(&GetStateCommand {})
     } else if left >= Duration::from_secs(1) {
@@ -1549,6 +1679,7 @@ mod tests {
             job,
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: Instant::now() + Duration::from_secs(10),
         };
@@ -1589,6 +1720,7 @@ mod tests {
             job,
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
             cancel: Arc::new(AtomicBool::new(false)),
             deadline: now - Duration::from_secs(1),
         };
@@ -2015,6 +2147,7 @@ mod control_tests {
             deadline: Instant::now() + Duration::from_secs(10),
             control_in_flight: None,
             omp_queued: false,
+            settled: false,
         }
     }
     fn write(w: &Worker, name: &str, op: Value) -> std::path::PathBuf {
@@ -2086,6 +2219,150 @@ mod control_tests {
         w.control_in_flight = None;
         w.respond_pending();
         assert_eq!(done(&inflight)["error"]["code"], crate::ops::JOB_ENDED);
+    }
+    fn claim_on_disk(w: &Worker, pid: u32) -> Vec<u8> {
+        let mut s = w.store.read_status(&w.id).unwrap();
+        s.worker_pid = Some(pid);
+        s.worker_start = Some("warm".into());
+        s.omp_reused = true;
+        w.store.write_status(&w.id, &s).unwrap();
+        std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap()
+    }
+    fn panic(message: &'static str) -> std::thread::Result<Result<(), Failure>> {
+        Err(Box::new(message))
+    }
+    #[test]
+    fn a_stolen_job_is_never_written_by_its_blocked_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        w.save().unwrap();
+        let before = claim_on_disk(&w, 1);
+        let status = || std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap();
+        // The deadline passing during the lock wait (`Acquired::TimedOut`) and any other failure.
+        let mut cold = worker(temp.path());
+        cold.store = w.store.clone();
+        cold.id = w.id.clone();
+        for failure in [
+            Failure::new("timeout", "waited until the job deadline"),
+            Failure::cancelled(),
+            Failure::new("io", "forced"),
+        ] {
+            assert_eq!(cold.finish_failure(failure).unwrap_err().code, STOLEN);
+            assert_eq!(status(), before);
+        }
+        assert_eq!(cold.save().unwrap_err().code, STOLEN);
+        cold.status.status = State::Queued;
+        for result in [
+            Ok(Err(Failure::new("timeout", "deadline"))),
+            Ok(Err(Failure::stolen())),
+            panic("boom"),
+        ] {
+            assert_eq!(conclude(&mut cold, result), ExitCode::SUCCESS);
+            cold.status.status = State::Queued;
+            assert_eq!(status(), before);
+        }
+        assert!(cold.stolen());
+    }
+    #[test]
+    fn an_adopted_jobs_own_worker_still_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        claim_on_disk(&w, std::process::id());
+        assert!(!w.stolen());
+        w.finish_failure(Failure::new("io", "own failure")).unwrap();
+        let disk = w.store.read_status(&w.id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(disk.error.unwrap().message, "own failure");
+    }
+    #[test]
+    fn a_failure_after_terminal_status_never_rewrites_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        w.status.status = State::Completed;
+        w.save().unwrap();
+        let before = std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap();
+        for result in [Ok(Err(Failure::new("io", "idle phase"))), panic("idle")] {
+            assert_eq!(conclude(&mut w, result), ExitCode::FAILURE);
+            assert_eq!(
+                std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap(),
+                before
+            );
+        }
+        // Not terminal: a panic is persisted as the job's failure, as before W4.
+        let mut w = worker(temp.path());
+        assert_eq!(conclude(&mut w, panic("boom")), ExitCode::FAILURE);
+        let disk = w.store.read_status(&w.id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(disk.error.unwrap().message, "worker panicked: boom");
+        let mut w = worker(temp.path());
+        assert_eq!(
+            conclude(&mut w, Ok(Err(Failure::new("io", "x")))),
+            ExitCode::SUCCESS
+        );
+    }
+    #[test]
+    fn a_terminal_status_whose_save_failed_is_saved_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        // `finish_failure` set the job's failure in memory, but its save failed: the status on
+        // disk is still queued, and the run ends with that save's error.
+        w.status.status = State::Failed;
+        w.status.error = Some(JobError {
+            code: "timeout".into(),
+            message: "the glen job deadline passed".into(),
+            hint: None,
+            details: None,
+        });
+        assert_eq!(w.store.read_status(&w.id).unwrap().status, State::Queued);
+        let result = Ok(Err(Failure::new("io", "cannot write status.json")));
+        assert_eq!(conclude(&mut w, result), ExitCode::SUCCESS);
+        let disk = w.store.read_status(&w.id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(
+            disk.error.unwrap().code,
+            "timeout",
+            "the failure it meant to save"
+        );
+    }
+    #[test]
+    fn keep_warm_table() {
+        let temp = tempfile::tempdir().unwrap();
+        let warm = || {
+            let mut w = worker(temp.path());
+            w.job.warm_ms = Some(2000);
+            w.job.env_digest = Some("0123456789abcdef".into());
+            w.status.status = State::Completed;
+            w.settled = true;
+            w
+        };
+        assert!(warm().keep_warm());
+        let mut new = warm();
+        new.job.route = Route::New;
+        assert!(new.keep_warm(), "@new may stay warm");
+        type Change = fn(&mut Worker);
+        let cases: [(&str, Change); 11] = [
+            ("failed", |w| w.status.status = State::Failed),
+            ("aborted", |w| w.status.status = State::Aborted),
+            ("lost", |w| w.status.status = State::Lost),
+            ("accepted", |w| w.status.status = State::Accepted),
+            ("unsettled", |w| w.settled = false),
+            ("forked", |w| {
+                w.status.forked = Some(Forked {
+                    from: "a".into(),
+                    to: "b".into(),
+                })
+            }),
+            ("cancelled", |w| w.cancel.store(true, Ordering::SeqCst)),
+            ("no warm_ms", |w| w.job.warm_ms = None),
+            ("warm_ms 0", |w| w.job.warm_ms = Some(0)),
+            ("live route", |w| w.job.route = Route::Live),
+            ("no env_digest", |w| w.job.env_digest = None),
+        ];
+        for (name, change) in cases {
+            let mut w = warm();
+            change(&mut w);
+            assert!(!w.keep_warm(), "{name}");
+        }
     }
     #[test]
     fn holder_is_published_on_the_held_inode() {

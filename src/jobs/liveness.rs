@@ -106,6 +106,29 @@ pub fn is_lost(s: &Status, now: jiff::Timestamp) -> bool {
 pub fn mark_lost(store: &JobStore, id: &JobId, s: Status) -> Status {
     report_lost(id, s, try_mark_lost(store, id, false))
 }
+/// [`mark_lost`] for an observer whose `__worker` child (`child_pid`) exited: under the status
+/// lock, a job a warm worker claimed meanwhile (its `worker_pid` names another process) or a
+/// terminal one is returned unchanged; only then is `lost` written.
+pub fn mark_lost_unless_claimed(store: &JobStore, id: &JobId, child_pid: u32, s: Status) -> Status {
+    report_lost(id, s, try_mark_lost_unless_claimed(store, id, child_pid))
+}
+/// [`mark_lost_unless_claimed`] without the in-memory fallback: `Err` when the status cannot be
+/// read or written, for a caller that reports the failure its own way (`glen watch`).
+pub(crate) fn try_mark_lost_unless_claimed(
+    store: &JobStore,
+    id: &JobId,
+    child_pid: u32,
+) -> Result<Status, crate::error::GlenError> {
+    let _lock = store.status_lock(id)?;
+    let mut s = store.read_status(id)?;
+    if s.status.is_terminal() || s.worker_pid.is_some_and(|p| p != child_pid) {
+        return Ok(s);
+    }
+    s = lost(s);
+    s.updated_at = jiff::Timestamp::now().to_string();
+    store.write_status_locked(id, &s)?;
+    Ok(s)
+}
 /// Re-read and publish under the worker's status lock; never reports to stderr.
 pub(crate) fn try_mark_lost(
     store: &JobStore,
@@ -173,6 +196,17 @@ pub fn refresh(store: &JobStore, id: &JobId, s: Status) -> Status {
     report_lost(id, s, result)
 }
 
+/// A pid that is certainly not running (a reaped child of this test process).
+#[cfg(test)]
+pub(crate) fn tests_dead_pid() -> u32 {
+    let mut c = std::process::Command::new("/bin/sh")
+        .args(["-c", "exit 0"])
+        .spawn()
+        .unwrap();
+    let pid = c.id();
+    c.wait().unwrap();
+    pid
+}
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -185,6 +219,33 @@ mod tests {
             panic!("own process missing")
         };
         assert_eq!(token, identity.start);
+    }
+    #[test]
+    fn mark_lost_unless_claimed_keeps_a_claimed_job() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let j = crate::jobs::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let mut s = store.read_status(&id).unwrap();
+        s.worker_pid = Some(4242);
+        store.write_status(&id, &s).unwrap();
+        // The claim is already on disk: the exited child (pid 7) is not the job's worker.
+        let kept = mark_lost_unless_claimed(&store, &id, 7, s.clone());
+        assert_eq!(kept.status, State::Queued);
+        assert_eq!(store.read_status(&id).unwrap().status, State::Queued);
+        let lost = mark_lost_unless_claimed(&store, &id, 4242, s.clone());
+        assert_eq!(lost.status, State::Lost);
+        assert_eq!(store.read_status(&id).unwrap().status, State::Lost);
+        // A child that died before writing its pid is lost as before.
+        let j = crate::jobs::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let s = store.read_status(&id).unwrap();
+        assert_eq!(
+            mark_lost_unless_claimed(&store, &id, 7, s).status,
+            State::Lost
+        );
     }
     #[test]
     fn mismatched_start_is_dead() {

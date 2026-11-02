@@ -65,7 +65,7 @@ pub(crate) fn job_view(job: &Job, s: &Status, now: jiff::Timestamp) -> Value {
                 .max(0)
         })
         .unwrap_or(0);
-    json!({"id":job.id,"handle":job.handle,"status":s.status,"route":job.route,"deliver_as":job.deliver_as,"delivered_as":s.delivered_as,"session_id":job.session_id,"session_handle":job.session_handle,"actual_session_id":s.actual_session_id,"created_at":job.created_at,"updated_at":s.updated_at,"elapsed_ms":elapsed,"task_state":s.task_state()})
+    json!({"id":job.id,"handle":job.handle,"status":s.status,"route":job.route,"deliver_as":job.deliver_as,"delivered_as":s.delivered_as,"session_id":job.session_id,"session_handle":job.session_handle,"actual_session_id":s.actual_session_id,"created_at":job.created_at,"updated_at":s.updated_at,"elapsed_ms":elapsed,"task_state":s.task_state(),"omp_reused":s.omp_reused})
 }
 fn session(job: &Job, s: &Status) -> Value {
     if job.route != Route::New {

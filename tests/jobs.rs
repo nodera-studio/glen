@@ -35,6 +35,8 @@ fn make(b: &RpcBox, state: State, raw: Option<&str>) -> JobId {
         owners_dir: b.owners(),
         job_timeout_ms: 30000,
         deadline_at: now.to_string(),
+        warm_ms: None,
+        env_digest: None,
     };
     s.create(&j).unwrap();
     let own = liveness::current().unwrap();

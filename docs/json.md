@@ -35,7 +35,7 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 | 4 | false | `ambiguous` | use a candidate handle |
 | 5 | false | `omp_unavailable` | omp missing, broken or timed out, or `doctor --probe` proved a required capability missing |
 | 6 | false | `no_route` | refusal: live owner, unknown lease, or sandbox |
-| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation |
+| 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation (including `release_timeout`) |
 | 8 | false | `not_implemented` | hidden unfinished command |
 | 10 | true | running | job continues; use wait. With --for reply, data.woke = "reply" marks new replies, and its absence a bound expiry |
 | 11 | true | forked | use forked.to_handle |
@@ -53,6 +53,8 @@ JSON's own escapes, glen writes U+007F–U+009F, U+061C, U+200E–U+200F, U+202A
 
 Session objects have `handle,id,path,bucket,cwd,title,first_message,created_at,updated_at,age_ms,size_bytes,model,
 last_turn,state,state_source,state_detail,continuation_of,parent_session`. State is `idle|live|busy|unknown`.
+A disk row of a session a warm worker holds (v0.2, design §A21) has `state_detail`
+`warm worker, idle, <N>s left`, `warm worker, busy` or `warm worker, no heartbeat for <N>s`.
 Handles are unique catalog suffixes, normally 7 hex characters. Nullable model and continuation fields stay null.
 
 Transcript items share `kind,id,timestamp`. Kind-specific fields are: user `text,images`; assistant
@@ -64,9 +66,11 @@ model_change `model`; thinking_level `level`. Consumers dispatch by kind rather 
 Unknown omp records are skipped by the rendered reader and preserved by raw output.
 
 Job views share `id,handle,status,route,deliver_as,delivered_as,session_id,session_handle,actual_session_id,
-created_at,updated_at,elapsed_ms,task_state`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
+created_at,updated_at,elapsed_ms,task_state,omp_reused`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
 `auto|steer|follow_up`; `delivered_as` is how omp took it, `prompt|steer|follow_up`, or null until then.
 Replies carry `text,final` and context/sequence metadata; read their field names from the examples below.
+`omp_reused` (v0.2) is true only for a job that ran on an omp process a warm worker kept from an earlier job
+(design §A21); every other job, including every live-route job, reads false.
 
 `task_state` (v0.2) names the job's state in A2A's task-state vocabulary; glen borrows the names only.
 `status` stays authoritative and keeps its exit mapping. The value is derived from `status` and `error.code`
@@ -436,6 +440,15 @@ a `<model-id>:<level>` suffix on `modelRoles.default` (honoured by omp itself); 
 `omp-profile-setup.sh` writes that suffix for its model ladder, and `omp-engine.sh` repeats
 exactly that suffix as `--thinking` on every dispatch, as belt and braces on top of it, and
 passes no `--thinking` when the persisted value has none.
+`--warm <DUR>` (v0.2, design §A21; at most 10m, `0` is off) keeps the worker's omp alive for DUR after a
+completed, settled, unforked job, so the next send to the same session runs on it without omp's startup.
+`GLEN_WARM` sets the same duration when the flag is absent; the flag wins, even `--warm 0`. A bad `--warm` exits 2
+`usage` and a bad `GLEN_WARM` exits 2 `invalid_env`, both before a job exists. `job.json` records `warm_ms` when
+warm is on and `env_digest` (16 hex digits of the send's environment, never its values) on every RPC and `@new`
+job. A queued job whose binary, profile, thinking level, cwd or `env_digest` differs makes the warm worker cool
+and runs cold. A job that ran on the warm omp has `omp_reused:true` in its job view. On the live route an explicit
+`--warm` is ignored with an `ignored_flag` warning. While warm, the worker holds the session (and omp's lease), so
+the omp TUI cannot open it until the window ends or `glen release <handle>` ends it.
 
 | Field | Meaning |
 |---|---|
@@ -464,6 +477,7 @@ passes no `--thinking` when the persisted value has none.
       "elapsed_ms": 614,
       "handle": "j6977273",
       "id": "01a18bcc-6970-7685-8f03-0ecc16977273",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -511,6 +525,7 @@ passes no `--thinking` when the persisted value has none.
       "elapsed_ms": 133,
       "handle": "j3f52ae7",
       "id": "01a18bcc-6e57-7495-aa65-cf0d73f52ae7",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -551,6 +566,7 @@ passes no `--thinking` when the persisted value has none.
       "elapsed_ms": 197,
       "handle": "j1ddc744",
       "id": "01a18bcc-6c2f-733f-98ed-59c791ddc744",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -632,6 +648,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "elapsed_ms": 841,
       "handle": "j3f52ae7",
       "id": "01a18bcc-6e57-7495-aa65-cf0d73f52ae7",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -679,6 +696,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "elapsed_ms": 2045,
       "handle": "jc6ccc17",
       "id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -737,6 +755,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "elapsed_ms": 2387,
       "handle": "jc6ccc17",
       "id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -778,6 +797,7 @@ warning per job, including jobs the filter then drops.
       "id": "01a18bcc-6d3e-75f2-b9cf-6ffc7656f7d4",
       "handle": "j656f7d4",
       "status": "completed",
+      "omp_reused": false,
       "route": "rpc",
       "deliver_as": "auto",
       "delivered_as": "prompt",
@@ -889,6 +909,64 @@ omp TUI with no job. With `--cwd`, a reply from a session glen has not yet place
 {"event":"end","ok":true,"v":1}
 ```
 
+## `glen release`
+
+Ends warm workers (`glen send --warm`, design §A21). Give exactly one of a target (a session id, a hex tail of 4
+or more, or a job handle, matched against warm workers only; a job handle names its session's worker, for `@new`
+the session omp created) and `--all`. An idle worker is asked to cool and waited for until it is gone: its
+registry removed or another worker's, and the session lock free or another process's (`released`); a busy one is
+asked and cools after its job (`cooling`, returned at once, and only once the request is written: when another
+process holds the session's warm metadata lock past its 1s bound, the worker is waited for as one that never
+answers); a dead or identity-changed registry is removed (`cleaned`), and only while it still names that worker.
+With `--force`, a worker whose heartbeat is stale, or that did not release within `--timeout` (default 10s, at most
+24h), is killed with its omp process group after a pid and start-time check (`forced`, once both are gone and its
+files removed); a process glen cannot prove unchanged is never signalled, and a recorded omp it cannot prove keeps
+the worker from being signalled too (`release_timeout`, registry kept). A removal the metadata lock blocks past its
+bound is `release_timeout` too, with the files kept for a later `glen release`. A
+target that matches no warm worker exits 3 `not_found` with `details:{reason:"not_warm",target}`. A worker that
+did not release in time without `--force` exits 7 `control_failed` with `details:{reason:"release_timeout",workers}`
+and a hint naming `--force`. `--all` with no warm worker is exit 0 with `total:0`. It creates no glen home.
+
+| Field | Meaning |
+|---|---|
+| `total` | warm workers processed |
+| `workers` | `{session:{id,handle},job,pid,state,outcome}`: `state` idle, busy, stale or dead as found; `outcome` released, cooling, forced or cleaned |
+
+<!-- contract: release -->
+```json
+{
+  "data": {
+    "total": 1,
+    "workers": [
+      {
+        "job": "j6977273",
+        "outcome": "released",
+        "pid": 4242,
+        "session": {
+          "handle": "e27c0de",
+          "id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de"
+        },
+        "state": "idle"
+      }
+    ]
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: release.all.empty -->
+```json
+{
+  "data": {
+    "total": 0,
+    "workers": []
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
 ## `glen doctor`
 
 Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
@@ -985,7 +1063,7 @@ object (not a contract block):
 ```
 
 Check order: omp_binary, omp_version, omp_capabilities, profile, agent_dir, sessions_dir,
-glen_home, extension, live_endpoints, omp_env_files, skill_claude, skill_codex, sandbox.
+glen_home, extension, live_endpoints, warm_workers, omp_env_files, skill_claude, skill_codex, sandbox.
 `omp_version` is `ok` inside the supported range, `warn` with detail `untested` above
 `max_tested` or `unsupported` below `min`, and `warn` with value `unprobed` when the output cannot
 be parsed; it is `fail` only when `omp --version` cannot run. `omp_capabilities` is `info`
@@ -996,6 +1074,8 @@ all three are known and ok, `warn` otherwise (an omp that exits before `ready`, 
 no usable model, is `warn`).
 `extension.state` is
 current/not_installed/outdated/newer/different_home/modified/foreign; `live_endpoints` reports live and stale counts.
+`warm_workers` (v0.2) reports `<w> warm, <s> stale, <d> dead` warm-worker registries: `info`, or `warn`
+naming the session and `glen release <handle> --force` when a heartbeat is stale or a registry unreadable.
 The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
 
 ## `glen completions`
@@ -1103,7 +1183,8 @@ Help and version are text in every output mode, with no JSON envelope.
 Usage errors may include clap diagnostics in details; for a missing required argument the message names it
 after the colon (`… were not provided: <MESSAGE>`). Usage `details.reason` values are `missing_cwd` (send,
 with `cwd`), `invalid_level` (thinking) and `unknown_reply` (`wait --after` names no reply of the job, with `job`
-and `after`). Not-found errors supply a hint: `glen ls --all` for sessions,
+and `after`). Not-found `details.reason` `not_warm` (release, with `target`) means no warm worker matched.
+Not-found errors supply a hint: `glen ls --all` for sessions,
 `glen jobs` for jobs, `glen models <session>` for models. When a session lookup misses while some session file
 or project directory could not be read, the error is `io` (exit 1) naming that path, with `details.unreadable`
 listing every unreadable path. Ambiguous errors include `details.candidates`: session objects for sessions,
@@ -1212,6 +1293,7 @@ and the absolute scope directory. File paths bypass project filtering and remain
         "elapsed_ms": 135,
         "handle": "j656f7d4",
         "id": "01a18bcc-6d3e-75f2-b9cf-6ffc7656f7d4",
+        "omp_reused": false,
         "route": "rpc",
         "session_handle": "e27c0de",
         "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -1785,7 +1867,7 @@ On Linux, command-line instructions are limited by the OS to 128 KiB (`MAX_ARG_S
 
 All controls use one 90s default command deadline, accept a positive `--timeout DUR`, and route live → owning job → unowned RPC. JSON emits one envelope and empty stderr. Mutations never persist global settings. A changed post-op session id exits 11 with `forked:{from,to,to_handle}`; otherwise forked is null. Model/thinking changes on endpoint-only sessions warn `not_yet_persisted` until omp's first answer writes the file.
 
-`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol|outcome_unknown. Missing credentials include an omp-login hint. `outcome_unknown` means omp went away after glen submitted the change: the change may have been applied, so check `glen models <session>` before retrying. RPC deadlines and SIGINT, SIGTERM or SIGHUP stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT, SIGTERM and SIGHUP exit 130 with `{status:"interrupted",session,route,interrupted:true,hint}`; a second signal exits at once (130, 143 or 129). A model, thinking or compact change that succeeds after the deadline keeps its result and adds the top-level warning `deadline_passed_after_apply`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
+`control_failed` exits 7 with details.reason no_auth|busy|omp_error|timeout|session_moved|job_ended|protocol|outcome_unknown, and `glen release` adds release_timeout (with `workers`). Missing credentials include an omp-login hint. `outcome_unknown` means omp went away after glen submitted the change: the change may have been applied, so check `glen models <session>` before retrying. RPC deadlines and SIGINT, SIGTERM or SIGHUP stop the process group without a queued abort. Live deadlines close the socket and warn that the op may still finish. Job deadlines report outcome unknown with the job handle; expired inbox requests never run. SIGINT, SIGTERM and SIGHUP exit 130 with `{status:"interrupted",session,route,interrupted:true,hint}`; a second signal exits at once (130, 143 or 129). A model, thinking or compact change that succeeds after the deadline keeps its result and adds the top-level warning `deadline_passed_after_apply`. Old extensions refuse controls with no_route, details.reason extension_outdated and ext_version, with install/restart guidance.
 
 <!-- contract: error.control_failed -->
 ```json

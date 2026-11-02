@@ -167,6 +167,8 @@ fn demo_capture_matches() -> Result<(), GlenError> {
         owners_dir: owners,
         job_timeout_ms: 30000,
         deadline_at: updated.into(),
+        warm_ms: None,
+        env_digest: None,
     })?;
     store.write_result(
         &id,

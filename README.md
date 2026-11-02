@@ -74,10 +74,13 @@ glen send e27c0de "run the tests"    # send a message, wait up to 90 s for the r
 glen wait ja3c9f41                   # keep waiting for a job
 glen wait ja3c9f41 --for reply       # return as soon as the omp model replies
 glen jobs                            # recent jobs, newest first
+glen send e27c0de "…" --warm 5m      # keep omp alive for the next send
+glen release ja3c9f41                # end that warm worker now
 ```
 
 A session handle is the last 7 hex digits of its id; job handles start with `j`. `@latest` picks
-the newest session in this project and `@new` starts one.
+the newest session in this project and `@new` starts one. `--warm` holds the session (the omp TUI
+cannot open it) until the window expires or `glen release` ends it.
 
 For agents, pass `--json` (or pipe the output): a command prints one v1 JSON envelope (`tail -f`
 streams one JSON object per line), and the exit code says what to do next. 0 means the reply is in `data`, 10 means the job is still running

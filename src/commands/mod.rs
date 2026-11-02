@@ -9,6 +9,7 @@ pub mod install_skill;
 pub mod jobs;
 pub mod ls;
 pub(crate) mod open;
+pub mod release;
 pub mod send;
 pub mod show;
 pub mod tail;
@@ -23,6 +24,7 @@ use crate::{
 pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
     match &cli.command {
         Command::Inbox(a) => inbox::run(cli, a, env, ctx),
+        Command::Release(a) => release::run(cli, a, env, ctx),
         Command::InstallExtension(a) => install_extension::run(cli, a, env, ctx),
         Command::Send(a) => send::run(cli, a, env, ctx),
         Command::Wait(a) => wait::run(cli, a, env, ctx),

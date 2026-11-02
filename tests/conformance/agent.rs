@@ -28,7 +28,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::reader::{self, A, OmpBox, RestoreMode, hold_lease, set_mtime, snapshot};
 use crate::rpc_support::{
-    LONG, RpcBox, data_of, failed, job_handle, job_id, poll_until, warning_codes,
+    LONG, RpcBox, data_of, failed, job_handle, job_id, poll_until, read_json, warning_codes,
 };
 use crate::support::*;
 
@@ -3223,8 +3223,10 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // AC-412 — docs/json.md against the real binary.
 // ---------------------------------------------------------------------------------------------
 
-/// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 36] = [
+/// Every contract example ID in docs/json.md that this suite runs. `release` and
+/// `release.all.empty` (v0.2 W4) run in `ac412_contract_release*` below, as well as in
+/// `tests/json_contract.rs`.
+const CONTRACT_IDS: [&str; 38] = [
     "ls",
     "show",
     "show.raw",
@@ -3243,6 +3245,8 @@ const CONTRACT_IDS: [&str; 36] = [
     "inbox",
     "inbox.wait",
     "inbox.follow",
+    "release",
+    "release.all.empty",
     "install-extension",
     "models",
     "models.session",
@@ -3733,6 +3737,45 @@ fn ac412_contract_wait_for_reply_wake_and_expiry() {
     fs::write(&release, "").unwrap();
     rb.wait_terminal(&id);
     rb.assert_quiet();
+}
+
+/// v0.2 W4: `glen release` of an idle warm worker.
+#[test]
+fn ac412_contract_release() {
+    let rb = RpcBox::new();
+    let out = rb
+        .glen([
+            "send", A.handle, "hi", "--warm", "30s", "--wait", "20s", "--json",
+        ])
+        .run();
+    data_of(&out, 0);
+    // The worker publishes its registry just after the job's terminal status.
+    let registry = rb
+        .bx
+        .glen_home
+        .join("run/warm")
+        .join(format!("{}.json", A.id));
+    poll_until("the warm registry", LONG, || {
+        read_json(&registry)
+            .filter(|r| r["state"] == "idle")
+            .map(|_| ())
+    });
+    let out = rb.glen(["release", A.handle, "--json"]).run();
+    let d = data_of(&out, 0);
+    assert_eq!(d["workers"][0]["outcome"], "released", "{}", out.ctx());
+    assert_contract("release", &out.json());
+    rb.assert_quiet();
+}
+
+/// v0.2 W4: `glen release --all` with no warm worker is exit 0 and `total:0`.
+#[test]
+fn ac412_contract_release_all_empty() {
+    let ws = Ws::new();
+    let out = ws.glen(["release", "--all", "--json"]).run();
+    let d = out.ok_data();
+    assert_eq!(d["total"], 0, "{}", out.ctx());
+    assert_contract("release.all.empty", &out.json());
+    ws.assert_no_side_effects("release --all");
 }
 
 #[test]

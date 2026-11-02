@@ -21,7 +21,7 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
 /// Shared public-command order, including session controls and watch.
-pub const VISIBLE: [&str; 18] = [
+pub const VISIBLE: [&str; 19] = [
     "ls",
     "show",
     "tail",
@@ -34,6 +34,7 @@ pub const VISIBLE: [&str; 18] = [
     "thinking",
     "compact",
     "inbox",
+    "release",
     "watch",
     "install-extension",
     "install-skill",
@@ -48,7 +49,7 @@ pub const HIDDEN: [&str; 1] = ["__acp"];
 pub const NOT_IMPLEMENTED: [&str; 0] = [];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
-pub const DOCTOR_CHECKS: [&str; 13] = [
+pub const DOCTOR_CHECKS: [&str; 14] = [
     "omp_binary",
     "omp_version",
     "omp_capabilities",
@@ -58,6 +59,7 @@ pub const DOCTOR_CHECKS: [&str; 13] = [
     "glen_home",
     "extension",
     "live_endpoints",
+    "warm_workers",
     "omp_env_files",
     "skill_claude",
     "skill_codex",

@@ -444,10 +444,14 @@ impl Effects {
                                     handle: submitted.job.handle,
                                 };
                                 // Dropping a child after shutdown never kills the durable worker.
-                                if let Err(_closed) = jobs.send(sources::jobs::Command::Track {
-                                    id: submitted.id,
-                                    child: submitted.child,
-                                }) {
+                                // No child: a warm worker claimed the job, and the jobs list
+                                // shows it like any other job.
+                                if let Some(child) = submitted.child
+                                    && let Err(_closed) = jobs.send(sources::jobs::Command::Track {
+                                        id: submitted.id,
+                                        child,
+                                    })
+                                {
                                     ctx.error("jobs", GlenError::new(ErrorCode::Io,
                                         format!("job {} was submitted but its watch tracker disconnected",job.handle))
                                         .with_hint(format!("the job continues; run `glen wait {}`",job.handle)));
@@ -521,7 +525,17 @@ fn submit(
     if ctx.stopped() {
         return Err(cancelled());
     }
-    send::submit(&ctx.cli, &ctx.env, Some(&opened), cwd, text, mode, None)
+    // `watch` sends never go warm (design §A21).
+    send::submit(
+        &ctx.cli,
+        &ctx.env,
+        Some(&opened),
+        cwd,
+        text,
+        mode,
+        None,
+        None,
+    )
 }
 fn reap(tasks: &mut Vec<JoinHandle<()>>) -> Result<(), GlenError> {
     let mut index = 0;

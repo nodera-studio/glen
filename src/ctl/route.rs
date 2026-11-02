@@ -206,6 +206,8 @@ fn open_error(error: OpenError, opened: Option<&Opened>) -> GlenError {
 enum Owner {
     Job(JobId),
     Control,
+    /// An idle warm worker (v0.2 W4) holds the lock: it cools on request, or keeps omp for abort.
+    Warm(lock::Holder),
     Finishing,
     Unknown,
     Free,
@@ -225,6 +227,17 @@ fn owner(store: &JobStore, session_id: &str, deadline: Instant, stop: &AtomicBoo
         {
             match holder.kind {
                 lock::HolderKind::Control => return Owner::Control,
+                // Idle only when no active job names the holder: right after a claim the
+                // holder already says `job`, so this is the flip's microsecond window.
+                lock::HolderKind::Warm
+                    if !store
+                        .active_for_session(session_id)
+                        .iter()
+                        .any(|(_, _, status)| status.worker_pid == Some(holder.pid)) =>
+                {
+                    return Owner::Warm(holder);
+                }
+                lock::HolderKind::Warm => (),
                 lock::HolderKind::Job => {
                     finishing = holder
                         .job_id
@@ -328,7 +341,13 @@ pub(crate) fn route(
                         "set_thinking_level" => "thinking",
                         other => other,
                     };
-                    return Err(live::route::rpc_job_running(&opened.handle, command));
+                    return Err(
+                        if lock::holder_kind(&home, id) == Some(lock::HolderKind::Warm) {
+                            live::route::rpc_warm_held(&opened.handle, command)
+                        } else {
+                            live::route::rpc_job_running(&opened.handle, command)
+                        },
+                    );
                 }
                 if !hello.ops.iter().any(|op| op == op_name) {
                     let ctx = super::ErrCtx {
@@ -372,6 +391,20 @@ pub(crate) fn route(
             match holder {
                 Owner::Job(job) => return Ok((job_target(store, job, id, deadline, stop), vec![])),
                 Owner::Free => continue,
+                // Nothing runs on an idle warm session; it stays warm (design §A21).
+                Owner::Warm(_) if op_name == "abort" => return Ok((Target::Idle, vec![])),
+                Owner::Warm(holder) => {
+                    cool_for_control(
+                        env,
+                        cli.command.name(),
+                        &home,
+                        opened,
+                        &holder,
+                        deadline,
+                        &stop,
+                    )?;
+                    continue;
+                }
                 Owner::Finishing if op_name == "abort" => {
                     return Err(super::to_glen_error(
                         OpError::new(ops::BUSY, "a glen job is finishing; retry"),
@@ -510,14 +543,23 @@ pub(crate) fn route_models(
             _ => (),
         }
         crate::sandbox::refuse_rpc(env, "models")?;
-        if lock::is_held(&home, id)
-            && let Owner::Job(job) = owner(&store, id, deadline, &stop)
-        {
-            return Ok((
-                job_target(store, job, id, deadline, stop),
-                warnings,
-                ModelsSource::Session,
-            ));
+        // A cooled warm worker's holder may now be an adopted or successor job: ask again, so
+        // an active job answers from its inbox rather than the profile list and the disk.
+        while lock::is_held(&home, id) {
+            match owner(&store, id, deadline, &stop) {
+                Owner::Job(job) => {
+                    return Ok((
+                        job_target(store, job, id, deadline, stop),
+                        warnings,
+                        ModelsSource::Session,
+                    ));
+                }
+                Owner::Warm(holder) => {
+                    cool_for_control(env, "models", &home, opened, &holder, deadline, &stop)?;
+                    stopped(deadline, &stop, opened)?;
+                }
+                _ => break,
+            }
         }
         let probe = lease::probe(&paths.session_owners_dir, id);
         // A hidden lease (Linux under a Codex marker) is unknown whatever it probes as.
@@ -550,6 +592,49 @@ pub(crate) fn route_models(
         Some(o) => ModelsSource::Disk(o.session.selection()),
     };
     Ok((Target::Rpc(client), warnings, source))
+}
+/// Asks the idle warm worker named by `holder` to cool, then waits until that holder is gone
+/// (bounded by the command's deadline). The caller then routes as if it had never been warm.
+fn cool_for_control(
+    env: &Env,
+    command: &str,
+    home: &glen_home::GlenHome,
+    opened: &Opened,
+    holder: &lock::Holder,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Result<(), GlenError> {
+    let id = &opened.session.header.id;
+    // Written or not (a stopped metadata-lock holder keeps it out), the control waits for the
+    // holder to go, bounded by its own deadline (design §A21).
+    crate::rpc::warm::request_release(
+        home,
+        id,
+        &crate::rpc::warm::ident(holder.pid, holder.start.as_deref()),
+    )
+    .map_err(|e| crate::sandbox::map_home_write(env, command, e))?;
+    wait_holder_gone(home, id, holder, deadline, || {
+        stopped(deadline, stop, opened)
+    })
+}
+/// Waits while the session lock is held and its recorded holder is still `holder`. A free lock
+/// or any other record (a cold job that took the lock after the warm worker cooled, or the warm
+/// worker itself now running an adopted job) returns at once, so the caller's next `owner()`
+/// routes to whoever holds the session now instead of waiting for it to finish.
+fn wait_holder_gone(
+    home: &glen_home::GlenHome,
+    id: &str,
+    holder: &lock::Holder,
+    deadline: Instant,
+    stopped: impl Fn() -> Result<(), GlenError>,
+) -> Result<(), GlenError> {
+    while lock::is_held(home, id) && lock::holder(home, id).as_ref() == Some(holder) {
+        stopped()?;
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    Ok(())
 }
 pub fn not_persisted() -> Warning {
     Warning {
@@ -608,6 +693,27 @@ mod tests {
             owner(&store, session_id, Instant::now(), &stop),
             Owner::Finishing
         ));
+        // An idle warm holder (v0.2 W4): `Warm`, unless an active job already names its pid.
+        holder.kind = lock::HolderKind::Warm;
+        lock::mark(&lock, &holder).unwrap();
+        assert!(
+            matches!(owner(&store, session_id, Instant::now(), &stop), Owner::Warm(h) if h == holder)
+        );
+        status.status = jobs::State::Queued;
+        status.omp_reused = true;
+        store.write_status(&id, &status).unwrap();
+        assert!(
+            matches!(owner(&store, session_id, Instant::now(), &stop), Owner::Job(found) if found == id),
+            "a claimed job is the owner, never Target::Idle"
+        );
+        status.status = jobs::State::Completed;
+        store.write_status(&id, &status).unwrap();
+        holder.start = Some("reused".into());
+        lock::mark(&lock, &holder).unwrap();
+        assert!(matches!(
+            owner(&store, session_id, Instant::now(), &stop),
+            Owner::Unknown
+        ));
         drop(lock);
         // Parallel tests may fork while the lock is held; allow their inherited
         // descriptors to close at exec before requiring the lock to be free.
@@ -620,5 +726,44 @@ mod tests {
             ),
             Owner::Free
         ));
+    }
+    #[test]
+    fn cooling_waits_only_while_the_warm_holder_itself_holds_the_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = glen_home::GlenHome {
+            root: temp.path().join("glen"),
+        };
+        let session = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+        let me = liveness::current().unwrap();
+        let warm = lock::Holder {
+            v: 1,
+            kind: lock::HolderKind::Warm,
+            job_id: Some(JobId::new().as_str().into()),
+            pid: me.pid,
+            start: Some("the-cooled-warm-worker".into()),
+        };
+        // The deadline passing is the only way out of a wait that never ends.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        let timed_out = || {
+            if Instant::now() >= deadline {
+                Err(GlenError::new(ErrorCode::ControlFailed, "deadline"))
+            } else {
+                Ok(())
+            }
+        };
+        assert!(wait_holder_gone(&home, session, &warm, deadline, timed_out).is_ok());
+        let held = lock::try_acquire(&home, session).unwrap().unwrap();
+        // The warm worker cooled and a cold job took the session: return so `owner()` routes to it.
+        let job = lock::Holder {
+            kind: lock::HolderKind::Job,
+            start: Some(me.start.clone()),
+            ..warm.clone()
+        };
+        lock::mark(&held, &job).unwrap();
+        assert!(wait_holder_gone(&home, session, &warm, deadline, timed_out).is_ok());
+        // The warm worker still holding the session: wait until the deadline.
+        lock::mark(&held, &warm).unwrap();
+        let e = wait_holder_gone(&home, session, &warm, deadline, timed_out).unwrap_err();
+        assert_eq!(e.message, "deadline");
     }
 }
