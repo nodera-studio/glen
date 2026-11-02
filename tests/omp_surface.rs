@@ -16,7 +16,8 @@ use serde_json::{Map, json};
 use std::{
     io::Read,
     path::Path,
-    process::{Command, Stdio},
+    process::{Child, ChildStderr, Command, Stdio},
+    thread::JoinHandle,
     time::{Duration, Instant},
 };
 const FLAGS: [&str; 8] = [
@@ -71,8 +72,59 @@ fn glen_reply() -> HostTool {
 fn kill_group(pid: u32) {
     if let Some(pid) = rustix::process::Pid::from_raw(pid as i32)
         && let Err(e) = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL)
+        && e != rustix::io::Errno::SRCH
     {
         eprintln!("omp_surface: cannot kill omp group {pid:?}: {e}");
+    }
+}
+fn group_gone(pid: u32) -> bool {
+    rustix::process::Pid::from_raw(pid as i32).is_none_or(|group| {
+        rustix::process::test_kill_process_group(group) == Err(rustix::io::Errno::SRCH)
+    })
+}
+/// Waits up to `grace` for the leader to exit and its process group to empty, then SIGKILLs
+/// what is left of the group, so no descendant outlives the run or holds omp's stderr. Returns
+/// whether the leader exited by itself within `grace`.
+fn end_group(child: &mut Child, grace: Duration) -> bool {
+    let pid = child.id();
+    let end = Instant::now() + grace;
+    let mut exited = false;
+    loop {
+        // Reaping the leader first keeps a zombie from counting as a live member.
+        exited = exited || child.try_wait().unwrap().is_some();
+        if exited && group_gone(pid) {
+            return true;
+        }
+        if Instant::now() >= end {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    kill_group(pid);
+    let _ = child.wait();
+    let end = Instant::now() + Duration::from_secs(5);
+    while !group_gone(pid) && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    exited
+}
+fn read_stderr(mut stderr: ChildStderr) -> JoinHandle<String> {
+    std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = stderr.read_to_string(&mut text);
+        text
+    })
+}
+/// omp's stderr, or a note when something outside the group still holds the pipe at `timeout`.
+fn join_stderr(reader: JoinHandle<String>, timeout: Duration) -> String {
+    let end = Instant::now() + timeout;
+    while !reader.is_finished() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if reader.is_finished() {
+        reader.join().unwrap_or_default()
+    } else {
+        format!("<omp stderr still open {timeout:?} after teardown>")
     }
 }
 fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> Seen {
@@ -104,13 +156,7 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
         .stderr(Stdio::piped());
     std::os::unix::process::CommandExt::process_group(&mut c, 0);
     let mut child = c.spawn().unwrap();
-    let pid = child.id();
-    let mut stderr = child.stderr.take().unwrap();
-    let stderr = std::thread::spawn(move || {
-        let mut text = String::new();
-        let _ = stderr.read_to_string(&mut text);
-        text
-    });
+    let stderr = read_stderr(child.stderr.take().unwrap());
     let connected = Client::from_io(
         child.stdout.take().unwrap(),
         child.stdin.take().unwrap(),
@@ -124,11 +170,10 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
     let (client, _events) = match connected {
         Ok(c) => c,
         Err(e) => {
-            kill_group(pid);
-            let _ = child.wait();
+            end_group(&mut child, Duration::ZERO);
             panic!(
                 "{who} did not reach ready: {e}\nstderr: {}",
-                stderr.join().unwrap_or_default()
+                join_stderr(stderr, Duration::from_secs(5))
             );
         }
     };
@@ -182,21 +227,11 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
             .map_err(|e| format!("get_available_thinking_levels: {e}"))?;
         Ok((protocol, models.len()))
     })();
-    // (9) Closing stdin ends omp within 10 s; otherwise the group is killed and the test fails.
+    // (9) Closing stdin ends omp within 10 s; otherwise the test fails. Either way whatever is
+    // left of the group is killed and the stderr join is bounded.
     let closed = client.close();
-    let end = Instant::now() + Duration::from_secs(10);
-    let exited = loop {
-        match child.try_wait().unwrap() {
-            Some(_) => break true,
-            None if Instant::now() >= end => break false,
-            None => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    if !exited {
-        kill_group(pid);
-        let _ = child.wait();
-    }
-    let stderr = stderr.join().unwrap_or_default();
+    let exited = end_group(&mut child, Duration::from_secs(10));
+    let stderr = join_stderr(stderr, Duration::from_secs(5));
     let (protocol, models) = checks.unwrap_or_else(|e| panic!("{who}: {e}\nstderr: {stderr}"));
     assert!(closed.is_ok(), "{who}: close: {closed:?}");
     assert!(
@@ -217,6 +252,39 @@ fn lists_flag_matches_words_only() {
     }
     for flag in ["--no-ui", "--mod", "--session"] {
         assert!(!lists_flag(help, flag), "{flag}");
+    }
+}
+#[test]
+fn teardown_kills_descendants_and_bounds_the_stderr_join() {
+    for (case, script, leader_exits) in [
+        // The leader exits at once; a descendant keeps the inherited stderr pipe open.
+        ("inherited pipe", "sleep 30 & exit 0", true),
+        // The descendant closed stderr, so the reader ends while the group lives on.
+        ("closed pipe", "sleep 30 2>&- & exit 0", true),
+        // A wedged leader that ignores stdin EOF.
+        ("wedged leader", "exec sleep 30", false),
+    ] {
+        let mut c = Command::new("/bin/sh");
+        c.args(["-c", script])
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        std::os::unix::process::CommandExt::process_group(&mut c, 0);
+        let mut child = c.spawn().unwrap();
+        let pid = child.id();
+        let reader = read_stderr(child.stderr.take().unwrap());
+        let start = Instant::now();
+        assert_eq!(
+            end_group(&mut child, Duration::from_millis(500)),
+            leader_exits,
+            "{case}"
+        );
+        assert!(group_gone(pid), "{case}: the group survived teardown");
+        assert_eq!(join_stderr(reader, Duration::from_secs(2)), "", "{case}");
+        let elapsed = start.elapsed();
+        assert!(elapsed < Duration::from_secs(5), "{case}: {elapsed:?}");
     }
 }
 #[test]
