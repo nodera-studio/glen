@@ -69,13 +69,21 @@ struct Group {
     text: String,
     truncated: bool,
 }
+#[derive(Debug, Default)]
+enum Phase {
+    #[default]
+    Before,
+    During,
+    After,
+}
 /// Rebuilds the turn's assistant text from `session/update` notifications (design §A23 "Text
-/// rebuild"). Only updates for the chosen session that arrive after [`Updates::begin_turn`]
-/// count; earlier ones (history replay, bootstrap) are only counted as `replayed`.
+/// rebuild"). Only updates for the chosen session that arrive between [`Updates::begin_turn`]
+/// and [`Updates::end_turn`] count; earlier ones (history replay, bootstrap) are only counted as
+/// `replayed`, later ones not at all.
 #[derive(Debug, Default)]
 pub struct Updates {
     session: Option<String>,
-    in_turn: bool,
+    phase: Phase,
     current: Option<Group>,
     last: Option<Group>,
     closed_messages: u64,
@@ -92,7 +100,11 @@ impl Updates {
         self.session.as_deref()
     }
     pub fn begin_turn(&mut self) {
-        self.in_turn = true;
+        self.phase = Phase::During;
+    }
+    /// Freezes the turn: later updates (during `session/close`, say) change nothing.
+    pub fn end_turn(&mut self) {
+        self.phase = Phase::After;
     }
     /// Applies a `session/update` notification's params. Malformed params are ignored.
     pub fn apply(&mut self, params: &Value) {
@@ -106,9 +118,13 @@ impl Updates {
         let Some(kind) = update.get("sessionUpdate").and_then(Value::as_str) else {
             return;
         };
-        if !self.in_turn {
-            self.replayed += 1;
-            return;
+        match self.phase {
+            Phase::Before => {
+                self.replayed += 1;
+                return;
+            }
+            Phase::After => return,
+            Phase::During => (),
         }
         self.during_turn += 1;
         *self.kinds.entry(kind.to_owned()).or_default() += 1;

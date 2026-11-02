@@ -538,6 +538,15 @@ fn prompt_ending(result: Result<PromptOutcome, CallError>, cancel: Option<Cancel
             confirmed: false,
         },
         (Err(_), Some(c)) => Ending::Failed(deadline_error(None, &c)),
+        // `prompt` starts no turn once the deadline has passed: nothing was sent.
+        (Err(CallError::Timeout), None) => Ending::Failed(
+            acp::error(
+                Stage::Session,
+                Reason::AcpTimeout,
+                "the __acp deadline (GLEN_JOB_TIMEOUT) passed before the prompt was sent",
+            )
+            .with_detail("task_state", "failed"),
+        ),
         (Err(e), None) => match call_failed(Stage::Session, "session/prompt", e) {
             Ending::Failed(error) => Ending::Failed(error.with_detail("task_state", "failed")),
             other => other,
@@ -743,6 +752,19 @@ mod tests {
                 ..
             }
         ));
+        // A stop or a passed deadline before the turn: nothing was sent, nothing cancelled.
+        match prompt_ending(Err(CallError::Interrupted), None) {
+            Ending::Interrupted {
+                stop_reason: None,
+                cancel,
+                confirmed: false,
+            } => assert_eq!(cancel["sent"], false),
+            other => panic!("{other:?}"),
+        }
+        let e = failed(prompt_ending(Err(CallError::Timeout), None));
+        assert_eq!((e.code.exit_code(), reason(&e)), (7, "acp_timeout"));
+        assert!(e.message.contains("before the prompt was sent"), "{e:?}");
+        assert_eq!(e.details.unwrap()["task_state"], "failed");
     }
     fn ctx() -> OutputCtx {
         let env = Env::for_test(None, Path::new("/w"), &[]);
@@ -933,13 +955,20 @@ mod tests {
         existing: Option<&str>,
         vars: &[(&str, &str)],
     ) -> (Ending, Facts, Option<SessionLock>) {
+        converse_on(answer, existing, vars, &AtomicBool::new(false))
+    }
+    fn converse_on(
+        answer: impl Fn(&Value) -> Vec<String> + Send + 'static,
+        existing: Option<&str>,
+        vars: &[(&str, &str)],
+        stop: &AtomicBool,
+    ) -> (Ending, Facts, Option<SessionLock>) {
         let tree = tempfile::tempdir().unwrap();
         let env = Env::for_test(Some(tree.path()), tree.path(), vars);
         let home = GlenHome {
             root: tree.path().join("glen"),
         };
         let args = args(AcpPermission::Deny);
-        let stop = AtomicBool::new(false);
         let turn = Turn {
             env: &env,
             home: &home,
@@ -947,7 +976,7 @@ mod tests {
             cwd: tree.path().to_str().unwrap(),
             existing,
             deadline: Instant::now() + Duration::from_secs(30),
-            stop: &stop,
+            stop,
         };
         let mut client = scripted(answer, AcpPermission::Deny);
         let mut facts = Facts {
@@ -1007,6 +1036,34 @@ mod tests {
             reason(&acp_cwd(&env, relative).unwrap_err()),
             "non_utf8_cwd"
         );
+    }
+    #[test]
+    fn a_stop_that_lands_during_session_new_starts_no_turn() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let flag = std::sync::Arc::clone(&stop);
+        let (seen, methods) = std::sync::mpsc::channel();
+        let script = move |frame: &Value| {
+            seen.send(frame["method"].clone()).unwrap();
+            if frame["method"] == "session/new" {
+                // The signal arrives while omp answers session/new.
+                flag.store(true, Ordering::SeqCst);
+            }
+            turn_script(frame)
+        };
+        let (ending, _, _) = converse_on(script, None, &[], &stop);
+        match ending {
+            Ending::Interrupted {
+                stop_reason: None,
+                cancel,
+                confirmed: false,
+            } => assert_eq!(
+                cancel,
+                json!({"sent":false,"confirmed":false,"reason":"interrupt"})
+            ),
+            other => panic!("{other:?}"),
+        }
+        let methods: Vec<_> = methods.iter().collect();
+        assert_eq!(methods, [json!("initialize"), json!("session/new")]);
     }
     #[test]
     fn the_failure_table_through_a_scripted_client() {
@@ -1157,6 +1214,16 @@ mod tests {
                 &[],
                 7,
                 "acp_stop_reason",
+            ),
+            (
+                "noise in the trailing drain",
+                None,
+                on("session/prompt", |f| {
+                    vec![ok(f, json!({"stopReason":"end_turn"})), "noise".into()]
+                }),
+                &[],
+                7,
+                "acp_malformed",
             ),
         ];
         for (name, existing, script, vars, exit, want) in cases {

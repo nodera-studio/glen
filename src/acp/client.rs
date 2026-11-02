@@ -170,8 +170,9 @@ impl Client {
     }
     /// Processes at most one frame, waiting up to `wait` for it. A frame with `method` is a
     /// request (with `id`) or a notification (without); one with `result` or `error` and no
-    /// `method` is a response, returned to the caller unmatched.
-    pub fn pump(&mut self, wait: Duration) -> Pump {
+    /// `method` is a response, returned to the caller unmatched. `stop` and `deadline` are read
+    /// when a request is answered: once either is reached, a cancel is due.
+    pub fn pump(&mut self, wait: Duration, stop: &AtomicBool, deadline: Instant) -> Pump {
         let value = match self.frames.recv_timeout(wait) {
             Ok(Frame::Json(value)) => value,
             Ok(Frame::Malformed(reason)) => return Pump::Malformed(reason),
@@ -183,7 +184,10 @@ impl Client {
                 return Pump::Malformed("a frame's method is not a string".into());
             };
             match value.get("id") {
-                Some(id) => self.answer_request(method, id.clone(), &value["params"]),
+                Some(id) => {
+                    let halted = stop.load(Ordering::SeqCst) || Instant::now() >= deadline;
+                    self.answer_request(method, id.clone(), &value["params"], halted);
+                }
                 None if method == "session/update" => self.updates.apply(&value["params"]),
                 // Unknown notifications (including `$/cancel_request`) are ignored.
                 None => (),
@@ -202,10 +206,11 @@ impl Client {
         }
         Pump::Malformed("a frame is neither a request, a notification nor a response".into())
     }
-    fn answer_request(&mut self, method: &str, id: Value, params: &Value) {
+    fn answer_request(&mut self, method: &str, id: Value, params: &Value, halted: bool) {
         let reply = if method == "session/request_permission" {
-            // Once glen has asked to cancel, nothing is allowed any more.
-            let answer = if self.cancel.is_some() {
+            // Once glen has asked to cancel, or is about to (`halted`: the stop or the deadline
+            // came before the tick that writes the cancel), nothing is allowed any more.
+            let answer = if halted || self.cancel.is_some() {
                 Answer::Cancelled
             } else {
                 let options = params["options"].as_array().map_or(&[][..], Vec::as_slice);
@@ -224,7 +229,8 @@ impl Client {
         // A gone writer shows up as EOF on a later pump.
         self.send(&reply);
     }
-    /// One request, answered within `timeout` and `deadline`, interruptible every tick.
+    /// One request, answered within `timeout` and `deadline`, interruptible every tick. A stop or
+    /// a bound already reached writes nothing.
     pub fn call(
         &mut self,
         method: &str,
@@ -237,6 +243,9 @@ impl Client {
             return Err(CallError::Interrupted);
         }
         let end = (Instant::now() + timeout).min(deadline);
+        if end <= Instant::now() {
+            return Err(CallError::Timeout);
+        }
         let id = self.request(method, params)?;
         loop {
             if stop.load(Ordering::SeqCst) {
@@ -246,7 +255,7 @@ impl Client {
             if left.is_zero() {
                 return Err(CallError::Timeout);
             }
-            match self.pump(TICK.min(left)) {
+            match self.pump(TICK.min(left), stop, deadline) {
                 Pump::Response { id: got, result } if got == id => {
                     return result.map_err(CallError::Rpc);
                 }
@@ -256,8 +265,10 @@ impl Client {
             }
         }
     }
-    /// One `session/prompt` turn. On the first tick that sees `stop` (or the deadline) it writes
-    /// `session/cancel` once and waits at most `grace` more for the prompt response.
+    /// One `session/prompt` turn. A stop or a deadline already reached starts no turn and writes
+    /// nothing (`Interrupted`, `Timeout`). Otherwise, on the first tick that sees `stop` (or the
+    /// deadline) it queues `session/cancel` once and waits at most `grace` more for the prompt
+    /// response. When it returns, the turn's updates are frozen.
     pub fn prompt(
         &mut self,
         session_id: &str,
@@ -266,11 +277,30 @@ impl Client {
         deadline: Instant,
         grace: Duration,
     ) -> Result<PromptOutcome, CallError> {
+        if stop.load(Ordering::SeqCst) {
+            return Err(CallError::Interrupted);
+        }
+        if Instant::now() >= deadline {
+            return Err(CallError::Timeout);
+        }
         self.updates.begin_turn();
-        let id = self.request(
-            "session/prompt",
-            json!({"sessionId":session_id,"prompt":[{"type":"text","text":text}]}),
-        )?;
+        let outcome = self
+            .request(
+                "session/prompt",
+                json!({"sessionId":session_id,"prompt":[{"type":"text","text":text}]}),
+            )
+            .and_then(|id| self.turn(&id, session_id, stop, deadline, grace));
+        self.updates.end_turn();
+        outcome
+    }
+    fn turn(
+        &mut self,
+        id: &Value,
+        session_id: &str,
+        stop: &AtomicBool,
+        deadline: Instant,
+        grace: Duration,
+    ) -> Result<PromptOutcome, CallError> {
         let mut grace_end = None;
         loop {
             let now = Instant::now();
@@ -300,41 +330,46 @@ impl Client {
                     cancel: self.cancel.clone(),
                 });
             }
-            match self.pump(TICK.min(left)) {
-                Pump::Response { id: got, result } if got == id => {
-                    let result = result.map_err(CallError::Rpc)?;
-                    let stop_reason = result
-                        .get("stopReason")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned);
-                    if let Some(cancel) = &mut self.cancel {
-                        cancel.confirmed = stop_reason.as_deref() == Some("cancelled");
-                    }
-                    self.drain();
-                    return Ok(PromptOutcome {
-                        stop_reason,
-                        usage: result.get("usage").filter(|u| u.is_object()).cloned(),
-                        cancel: self.cancel.clone(),
-                    });
+            let result = match self.pump(TICK.min(left), stop, deadline) {
+                Pump::Response { id: got, result } if got == *id => result.map_err(CallError::Rpc),
+                Pump::Response { .. } | Pump::Handled | Pump::Idle => continue,
+                Pump::Closed => Err(CallError::Exited),
+                Pump::Malformed(reason) => Err(CallError::Malformed(reason)),
+            };
+            let outcome = result.and_then(|result| {
+                let stop_reason = result
+                    .get("stopReason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(cancel) = &mut self.cancel {
+                    cancel.confirmed = stop_reason.as_deref() == Some("cancelled");
                 }
-                Pump::Response { .. } | Pump::Handled | Pump::Idle => (),
-                Pump::Closed => return Err(CallError::Exited),
-                Pump::Malformed(reason) => return Err(CallError::Malformed(reason)),
-            }
+                self.drain(stop, deadline)?;
+                Ok(PromptOutcome {
+                    stop_reason,
+                    usage: result.get("usage").filter(|u| u.is_object()).cloned(),
+                    cancel: None,
+                })
+            });
+            return outcome.map(|outcome| PromptOutcome {
+                cancel: self.cancel.clone(),
+                ..outcome
+            });
         }
     }
     /// The trailing drain: an update that overtook the prompt response is still applied, for
-    /// at most one tick.
-    fn drain(&mut self) {
+    /// at most one tick. A malformed frame in it fails the turn like one before the response.
+    fn drain(&mut self, stop: &AtomicBool, deadline: Instant) -> Result<(), CallError> {
         let end = Instant::now() + TICK;
         loop {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return;
+                return Ok(());
             }
-            match self.pump(left) {
+            match self.pump(left, stop, deadline) {
                 Pump::Handled | Pump::Response { .. } => (),
-                Pump::Idle | Pump::Closed | Pump::Malformed(_) => return,
+                Pump::Idle | Pump::Closed => return Ok(()),
+                Pump::Malformed(reason) => return Err(CallError::Malformed(reason)),
             }
         }
     }
@@ -489,6 +524,10 @@ mod tests {
     }
     fn far() -> Instant {
         Instant::now() + Duration::from_secs(60)
+    }
+    /// One pump with no stop and no deadline in sight.
+    fn pump(client: &mut Client, wait: Duration) -> Pump {
+        client.pump(wait, &AtomicBool::new(false), far())
     }
     fn response(id: Value, result: Value) -> Value {
         json!({"jsonrpc":"2.0","id":id,"result":result})
@@ -673,6 +712,20 @@ mod tests {
         assert!(set_at.elapsed() < TICK + Duration::from_millis(150));
     }
     #[test]
+    fn a_call_past_the_deadline_writes_nothing() {
+        let (mut client, peer) = pair(AcpPermission::Deny);
+        let stop = AtomicBool::new(false);
+        assert_eq!(
+            client.call("x", json!({}), WAIT, &stop, Instant::now()),
+            Err(CallError::Timeout)
+        );
+        assert_eq!(
+            client.call("y", json!({}), Duration::ZERO, &stop, far()),
+            Err(CallError::Timeout)
+        );
+        assert!(peer.quiet(), "no request was written");
+    }
+    #[test]
     fn permission_requests_follow_the_policy() {
         for (policy, kinds, want) in [
             (
@@ -698,7 +751,7 @@ mod tests {
         ] {
             let (mut client, mut peer) = pair(policy);
             peer.send(permission(json!("p-7"), kinds));
-            assert!(matches!(client.pump(WAIT), Pump::Handled));
+            assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
             let answered = peer.next();
             assert_eq!(answered["id"], "p-7");
             assert_eq!(answered["result"]["outcome"], want, "{policy:?} {kinds:?}");
@@ -713,7 +766,7 @@ mod tests {
         let (mut client, mut peer) = pair(AcpPermission::Allow);
         for i in 0..(MAX_EVENTS + 3) {
             peer.send(permission(json!(i), &ALL));
-            assert!(matches!(client.pump(WAIT), Pump::Handled));
+            assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
         }
         assert_eq!(client.events().len(), MAX_EVENTS);
         assert_eq!(client.events_dropped(), 3);
@@ -745,7 +798,7 @@ mod tests {
         let (mut client, mut peer) = pair(AcpPermission::Deny);
         client.updates.for_session("s1");
         peer.send(chunk("s1", "REPLAYED ANSWER", "replay-1"));
-        assert!(matches!(client.pump(WAIT), Pump::Handled));
+        assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
         peer.send(chunk("s1", "first", "m1"));
         peer.send(response(
             json!(1),
@@ -754,18 +807,23 @@ mod tests {
         // Overtakes nothing but lands right after the response: inside the drain.
         peer.send(chunk("s1", "after", "m2"));
         let Peer { inbox, mut out } = peer;
+        let (returned, has_returned) = mpsc::channel();
+        // Written only once `prompt()` has returned, so outside the drain by construction.
         let late = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(600));
+            has_returned.recv_timeout(WAIT).unwrap();
             writeln!(out, "{}", chunk("s1", "too late", "m3")).unwrap();
             out
         });
         let outcome = client
             .prompt("s1", "hi", &AtomicBool::new(false), far(), WAIT)
             .unwrap();
+        returned.send(()).unwrap();
         assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
         assert_eq!(outcome.usage, Some(json!({"totalTokens":3})));
         assert_eq!(outcome.cancel, None);
         let _out = late.join().unwrap();
+        // The late chunk is still read, but the turn is over: it changes nothing.
+        assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
         assert_eq!(client.updates.assistant_text(), Some("after"));
         assert_eq!(client.updates.replayed, 1);
         assert_eq!(client.updates.during_turn, 2);
@@ -907,7 +965,134 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         let started = Instant::now();
         assert!(client.notify("session/cancel", json!({"sessionId":"s1"})));
-        assert!(matches!(client.pump(TICK), Pump::Idle));
+        assert!(matches!(pump(&mut client, TICK), Pump::Idle));
         assert!(started.elapsed() < TICK + Duration::from_millis(150));
+    }
+    #[test]
+    fn a_stop_or_an_expired_deadline_before_the_turn_writes_nothing() {
+        let (mut client, peer) = pair(AcpPermission::Deny);
+        let grace = Duration::from_millis(300);
+        let stopped = client.prompt("s1", "hi", &AtomicBool::new(true), far(), grace);
+        assert!(
+            matches!(stopped, Err(CallError::Interrupted)),
+            "{stopped:?}"
+        );
+        let expired = client.prompt("s1", "hi", &AtomicBool::new(false), Instant::now(), grace);
+        assert!(matches!(expired, Err(CallError::Timeout)), "{expired:?}");
+        assert!(
+            peer.quiet(),
+            "neither session/prompt nor session/cancel was written"
+        );
+        assert_eq!(client.cancel(), None);
+    }
+    #[test]
+    fn a_permission_request_that_lands_with_the_stop_is_answered_cancelled_under_allow() {
+        let (mut client, peer) = pair(AcpPermission::Allow);
+        let stop = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&stop);
+        let Peer { inbox, mut out } = peer;
+        let agent = thread::spawn(move || {
+            let prompt = inbox.recv_timeout(WAIT).unwrap();
+            // The client is inside a tick wait: the signal and the request land in it together,
+            // before the next tick could write the cancel.
+            thread::sleep(Duration::from_millis(30));
+            flag.store(true, Ordering::SeqCst);
+            writeln!(out, "{}", permission(json!(100), &ALL)).unwrap();
+            let answer = loop {
+                let frame = inbox.recv_timeout(WAIT).unwrap();
+                if frame["id"] == 100 {
+                    break frame;
+                }
+            };
+            writeln!(
+                out,
+                "{}",
+                response(prompt["id"].clone(), json!({"stopReason":"cancelled"}))
+            )
+            .unwrap();
+            (answer, out)
+        });
+        let outcome = client.prompt("s1", "hi", &stop, far(), WAIT).unwrap();
+        let (answer, _out) = agent.join().unwrap();
+        assert_eq!(answer["result"], json!({"outcome":{"outcome":"cancelled"}}));
+        assert_eq!(client.events()[0]["answer"], "cancelled");
+        assert!(outcome.cancel.is_some());
+    }
+    #[test]
+    fn a_queued_permission_request_is_answered_cancelled_once_stop_or_deadline_is_reached() {
+        let (mut client, mut peer) = pair(AcpPermission::Allow);
+        let cancelled = json!({"outcome":{"outcome":"cancelled"}});
+        // Already queued, with no cancel written yet (`client.cancel()` is `None`).
+        peer.send(permission(json!(1), &ALL));
+        peer.send(permission(json!(2), &ALL));
+        let stop = AtomicBool::new(true);
+        assert!(matches!(client.pump(WAIT, &stop, far()), Pump::Handled));
+        assert_eq!(peer.next()["result"], cancelled);
+        let passed = Instant::now();
+        let running = AtomicBool::new(false);
+        assert!(matches!(client.pump(WAIT, &running, passed), Pump::Handled));
+        assert_eq!(peer.next()["result"], cancelled);
+        assert_eq!(client.cancel(), None);
+        assert!(client.events().iter().all(|e| e["answer"] == "cancelled"));
+        // Neither reached: the policy answers.
+        peer.send(permission(json!(3), &ALL));
+        assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
+        assert_eq!(peer.next()["result"]["outcome"]["optionId"], "allow_once");
+    }
+    #[test]
+    fn a_malformed_frame_in_the_trailing_drain_fails_the_turn() {
+        let (mut client, mut peer) = pair(AcpPermission::Deny);
+        client.updates.for_session("s1");
+        peer.send(chunk("s1", "answer", "m1"));
+        peer.send(response(json!(1), json!({"stopReason":"end_turn"})));
+        peer.raw(b"not json\n");
+        match client.prompt("s1", "hi", &AtomicBool::new(false), far(), WAIT) {
+            Err(CallError::Malformed(reason)) => assert!(reason.contains("JSON"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+    #[test]
+    fn updates_during_session_close_do_not_change_the_turn() {
+        let (mut client, peer) = pair(AcpPermission::Deny);
+        client.updates.for_session("s1");
+        let Peer { inbox, mut out } = peer;
+        let agent = thread::spawn(move || {
+            let prompt = inbox.recv_timeout(WAIT).unwrap();
+            writeln!(out, "{}", chunk("s1", "answer", "m1")).unwrap();
+            writeln!(
+                out,
+                "{}",
+                response(prompt["id"].clone(), json!({"stopReason":"end_turn"}))
+            )
+            .unwrap();
+            let close = inbox.recv_timeout(WAIT).unwrap();
+            assert_eq!(close["method"], "session/close");
+            // After session/close arrives and before its response: a late chunk, and a request
+            // that must still be answered.
+            writeln!(out, "{}", chunk("s1", "late", "m2")).unwrap();
+            writeln!(
+                out,
+                "{}",
+                json!({"jsonrpc":"2.0","id":"r1","method":"fs/read_text_file","params":{}})
+            )
+            .unwrap();
+            writeln!(out, "{}", response(close["id"].clone(), json!({}))).unwrap();
+            let answered = inbox.recv_timeout(WAIT).unwrap();
+            (answered, out)
+        });
+        let stop = AtomicBool::new(false);
+        client.prompt("s1", "hi", &stop, far(), WAIT).unwrap();
+        client.close_session("s1", &stop).unwrap();
+        let (answered, _out) = agent.join().unwrap();
+        assert_eq!(answered["id"], "r1");
+        assert_eq!(answered["error"]["code"], -32601);
+        assert_eq!(client.updates.assistant_text(), Some("answer"));
+        assert_eq!(client.updates.during_turn, 1);
+        assert_eq!(client.updates.messages(), 1);
+        assert_eq!(client.updates.replayed, 0);
+        assert_eq!(
+            client.updates.json()["kinds"],
+            json!({"agent_message_chunk":1})
+        );
     }
 }
