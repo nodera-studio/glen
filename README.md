@@ -72,6 +72,7 @@ glen show e27c0de                    # a session's transcript
 glen tail -f e27c0de                 # follow it as it grows
 glen send e27c0de "run the tests"    # send a message, wait up to 90 s for the reply
 glen wait ja3c9f41                   # keep waiting for a job
+glen wait ja3c9f41 --for reply       # return as soon as the omp model replies
 glen jobs                            # recent jobs, newest first
 ```
 
@@ -80,7 +81,8 @@ the newest session in this project and `@new` starts one.
 
 For agents, pass `--json` (or pipe the output): a command prints one v1 JSON envelope (`tail -f`
 streams one JSON object per line), and the exit code says what to do next. 0 means the reply is in `data`, 10 means the job is still running
-(run `glen wait`), and 11 means omp moved the session to a new handle. The envelope and every exit
+(run `glen wait`; with `--for reply`, `data.woke` set to `reply` means new replies arrived), and 11
+means omp moved the session to a new handle. The envelope and every exit
 code are in [docs/design.md](docs/design.md#a10-output-contract).
 
 ## Watch sessions (`glen watch`)
@@ -108,7 +110,8 @@ Use `--all` for every project or `--cwd DIR` for one project (the flags conflict
 | q | Quit from the sessions or transcript pane |
 
 Watch is for humans only and needs interactive stdin and stdout. Agents use `glen tail -f <session>`
-and `glen inbox -f`. Watch only peeks at replies; it never marks them read.
+for a transcript and `glen wait <job> --for reply` or `glen inbox --wait` for replies. Watch only
+peeks at replies; it never marks them read.
 
 If a forced stop (such as SIGKILL) or suspension (SIGTSTP) leaves the terminal looking broken,
 run `reset` in the shell. Watch does not handle suspend/resume in this release.
@@ -141,6 +144,7 @@ answer the agent that asked; its replies come back in `data.replies`. A reply th
 glen inbox                           # unread replies; reading marks them read
 glen inbox --peek                    # read without marking
 glen inbox -f                        # stream new replies, one JSON object per line
+glen inbox --wait                    # wait up to 90 s for one unread reply
 ```
 
 Without the extension, `glen send` to an open session refuses with exit 6 and says what to
@@ -152,7 +156,8 @@ install. `glen doctor` shows whether the extension is current.
 
 The glen skill teaches Claude Code and Codex the loop above: find a session, read it, send, wait,
 read the inbox, what each exit code means and the sandbox rules. It also lets the agent run
-`glen` commands without asking each time.
+`glen` commands without asking each time. Replies need no polling: Claude Code is woken by a
+background `glen wait <job> --for reply`, while Codex blocks on that wait instead (Codex: no push).
 
 ```sh
 glen install-skill                   # Claude Code and Codex, for your user

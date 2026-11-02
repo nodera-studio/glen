@@ -674,3 +674,58 @@ fn w2_bodies_are_byte_identical() {
     };
     assert_eq!(body(Agent::Claude), body(Agent::Codex));
 }
+/// The push cell of design §A20's `claude -p` row.
+fn a20_headless_push(design: &str) -> String {
+    let a20 = design
+        .split("\n## §A20 ")
+        .nth(1)
+        .expect("docs/design.md has §A20")
+        .split("\n## ")
+        .next()
+        .unwrap();
+    let row = a20
+        .lines()
+        .find(|l| l.starts_with("| Claude Code, `claude -p`"))
+        .expect("§A20's per-caller table has a `claude -p` row");
+    let cells: Vec<&str> = row.trim_matches('|').split('|').map(str::trim).collect();
+    cells.last().unwrap().to_string()
+}
+/// Why the skill disagrees with the §A20 push cell, if it does (Step 13 flips them together).
+fn headless_mismatch(push: &str, skill: &str) -> Option<String> {
+    let lines: Vec<&str> = skill.lines().filter(|l| l.contains("claude -p")).collect();
+    if push.starts_with("yes") {
+        (!lines.is_empty()).then(|| format!("§A20 says push {push:?}, yet the skill has {lines:?}"))
+    } else if push.starts_with("no") {
+        match lines.as_slice() {
+            [line] if line.contains("foreground") && !line.contains("run_in_background") => None,
+            _ => Some(format!(
+                "§A20 says {push:?}: one `claude -p` line with a foreground wait, got {lines:?}"
+            )),
+        }
+    } else {
+        Some(format!(
+            "§A20 `claude -p` push cell is neither yes nor no: {push:?}"
+        ))
+    }
+}
+#[test]
+fn w2_headless_bullet_matches_the_a20_row() {
+    let push = a20_headless_push(include_str!("../docs/design.md"));
+    for agent in Agent::ALL {
+        let text = skill::render_current(agent).unwrap();
+        assert_eq!(headless_mismatch(&push, &text), None, "{agent:?}");
+    }
+    // Both branches of the check bite.
+    let fallback =
+        "- `claude -p` (headless): no push; run the receiver in the foreground (`--timeout 90s`).";
+    assert!(headless_mismatch("yes", fallback).is_some());
+    assert!(headless_mismatch("no (foreground wait)", fallback).is_none());
+    assert!(headless_mismatch("no (foreground wait)", "nothing").is_some());
+    assert!(
+        headless_mismatch(
+            "no (foreground wait)",
+            "- `claude -p`: run_in_background, foreground"
+        )
+        .is_some()
+    );
+}
