@@ -915,11 +915,14 @@ Ends warm workers (`glen send --warm`, design §A21). Give exactly one of a targ
 or more, or a job handle, matched against warm workers only; a job handle names its session's worker, for `@new`
 the session omp created) and `--all`. An idle worker is asked to cool and waited for until it is gone: its
 registry removed or another worker's, and the session lock free or another process's (`released`); a busy one is
-asked and cools after its job (`cooling`, returned at once); a dead or identity-changed registry is removed
-(`cleaned`), and only while it still names that worker. With `--force`, a worker whose heartbeat is stale, or that
-did not release within `--timeout` (default 10s, at most 24h), is killed with its omp process group after a pid and
-start-time check (`forced`, once both are gone); a process glen cannot prove unchanged is never signalled, and a
-recorded omp it cannot prove keeps the worker from being signalled too (`release_timeout`, registry kept). A
+asked and cools after its job (`cooling`, returned at once, and only once the request is written: when another
+process holds the session's warm metadata lock past its 1s bound, the worker is waited for as one that never
+answers); a dead or identity-changed registry is removed (`cleaned`), and only while it still names that worker.
+With `--force`, a worker whose heartbeat is stale, or that did not release within `--timeout` (default 10s, at most
+24h), is killed with its omp process group after a pid and start-time check (`forced`, once both are gone and its
+files removed); a process glen cannot prove unchanged is never signalled, and a recorded omp it cannot prove keeps
+the worker from being signalled too (`release_timeout`, registry kept). A removal the metadata lock blocks past its
+bound is `release_timeout` too, with the files kept for a later `glen release`. A
 target that matches no warm worker exits 3 `not_found` with `details:{reason:"not_warm",target}`. A worker that
 did not release in time without `--force` exits 7 `control_failed` with `details:{reason:"release_timeout",workers}`
 and a hint naming `--force`. `--all` with no warm worker is exit 0 with `total:0`. It creates no glen home.

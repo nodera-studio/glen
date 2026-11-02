@@ -160,18 +160,19 @@ fn release_one(
     stale: Duration,
 ) -> Result<(&'static str, bool), GlenError> {
     let e = &t.entry;
+    let io = |err| crate::sandbox::map_home_write(env, "release", err);
     let class = e.class(t.mtime, SystemTime::now(), stale);
     if class == Class::Dead {
-        cleanup(home, e);
-        return Ok(("cleaned", true));
+        return cleaned(home, e, "cleaned").map_err(io);
     }
-    warm::request_release(home, &e.session_id, &e.ident())
-        .map_err(|err| crate::sandbox::map_home_write(env, "release", err))?;
-    if class == Class::Fresh && e.state == EntryState::Busy {
+    let delivered = warm::request_release(home, &e.session_id, &e.ident()).map_err(io)?;
+    // Only a written request makes a busy worker cool after its job; one the metadata lock kept
+    // out leaves it to the wait below, as a worker that never answers.
+    if delivered && class == Class::Fresh && e.state == EntryState::Busy {
         return Ok(("cooling", true));
     }
     if class == Class::Stale && args.force {
-        return Ok(force(home, t));
+        return force(home, t).map_err(io);
     }
     let end = Instant::now() + args.timeout;
     loop {
@@ -179,11 +180,11 @@ fn release_one(
             return Ok(("released", true));
         }
         if Instant::now() >= end {
-            return Ok(if args.force {
-                force(home, t)
+            return if args.force {
+                force(home, t).map_err(io)
             } else {
-                ("timeout", false)
-            });
+                Ok(("timeout", false))
+            };
         }
         std::thread::sleep(POLL.min(end.saturating_duration_since(Instant::now())));
     }
@@ -222,51 +223,47 @@ fn signal(target: Kill) -> std::io::Result<()> {
         }
     }
 }
-fn force(home: &GlenHome, t: &Indexed) -> (&'static str, bool) {
+fn force(home: &GlenHome, t: &Indexed) -> std::io::Result<(&'static str, bool)> {
     force_with(home, &t.entry, &signal, FORCE_BOUND)
 }
 /// SIGKILL the omp group and the worker, but only when every recorded process is proven by pid
 /// and start token (binding J11): an `Unknown` worker or omp is never signalled, and a failed
 /// signal or a worker still alive after `bound` falls to `release_timeout` with the registry kept.
-/// `forced` only once the worker is proven dead and the recorded omp group is gone, whether or
-/// not its leader was alive to be signalled.
+/// `forced` only once the worker is proven dead, the recorded omp group is gone, whether or not
+/// its leader was alive to be signalled, and its files are removed (see [`cleaned`]).
 fn force_with(
     home: &GlenHome,
     e: &warm::Entry,
     kill: &dyn Fn(Kill) -> std::io::Result<()>,
     bound: Duration,
-) -> (&'static str, bool) {
+) -> std::io::Result<(&'static str, bool)> {
     let identity = warm::kill_identity(e);
     match identity.worker {
-        Liveness::Dead => {
-            cleanup(home, e);
-            return ("cleaned", true);
-        }
-        Liveness::Unknown => return ("timeout", false),
+        Liveness::Dead => return cleaned(home, e, "cleaned"),
+        Liveness::Unknown => return Ok(("timeout", false)),
         Liveness::Alive => (),
     }
     // Only a proven omp leader's group is signalled: once the leader is gone its pid may be
     // reused, so its group cannot be proven omp's. An unproven leader blocks the kill. The
     // recorded group must be gone either way, since omp's descendants can outlive their leader.
     let (signalled, recorded) = match (e.omp_pid, identity.omp) {
-        (_, Some(Liveness::Unknown)) => return ("timeout", false),
+        (_, Some(Liveness::Unknown)) => return Ok(("timeout", false)),
         (Some(pid), Some(Liveness::Alive)) => (Some(pid), Some(pid)),
         (pid, _) => (None, pid),
     };
     if signalled.is_some_and(|pid| kill(Kill::Group(pid)).is_err())
         || kill(Kill::Process(e.pid)).is_err()
     {
-        return ("timeout", false);
+        return Ok(("timeout", false));
     }
     let end = Instant::now() + bound;
     while !(warm::kill_identity(e).worker == Liveness::Dead && recorded.is_none_or(group_gone)) {
         if Instant::now() >= end {
-            return ("timeout", false);
+            return Ok(("timeout", false));
         }
         std::thread::sleep(POLL);
     }
-    cleanup(home, e);
-    ("forced", true)
+    cleaned(home, e, "forced")
 }
 fn group_gone(pid: u32) -> bool {
     rustix::process::Pid::from_raw(pid as i32).is_none_or(|pid| {
@@ -274,12 +271,23 @@ fn group_gone(pid: u32) -> bool {
     })
 }
 
-/// Removes `e`'s registry and release request, each only while it still names `e`: a successor's
-/// files survive, even ones written as this runs. No session lock is taken, so a registry whose
-/// identity is not that of the process holding the lock is removed too.
-fn cleanup(home: &GlenHome, e: &warm::Entry) {
-    let _ = warm::remove_if(home, &e.session_id, &e.ident());
-    let _ = warm::clear_release_if(home, &e.session_id, &e.ident());
+/// `outcome` once `e`'s registry and release request are removed, each only while it still names
+/// `e`: a successor's files survive, even ones written as this runs, and sparing them is still
+/// success. No session lock is taken, so a registry whose identity is not that of the process
+/// holding the lock is removed too. A metadata lock still busy after its bound (a stopped
+/// holder) removes nothing more and is `release_timeout`, with the files kept for a later run.
+fn cleaned(
+    home: &GlenHome,
+    e: &warm::Entry,
+    outcome: &'static str,
+) -> std::io::Result<(&'static str, bool)> {
+    match warm::remove_if(home, &e.session_id, &e.ident())
+        .and_then(|_| warm::clear_release_if(home, &e.session_id, &e.ident()))
+    {
+        Ok(_) => Ok((outcome, true)),
+        Err(err) if err.kind() == std::io::ErrorKind::TimedOut => Ok(("timeout", false)),
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(test)]
@@ -382,7 +390,7 @@ mod tests {
             entry: e,
             mtime: SystemTime::now() - Duration::from_secs(60),
         };
-        assert_eq!(force(&h, &indexed), ("timeout", false));
+        assert_eq!(force(&h, &indexed).unwrap(), ("timeout", false));
     }
     fn me() -> crate::jobs::liveness::Identity {
         crate::jobs::liveness::current().unwrap()
@@ -526,7 +534,7 @@ mod tests {
         warm::publish(&h, &e).unwrap();
         let never = |k: Kill| -> std::io::Result<()> { panic!("signalled {k:?}") };
         assert_eq!(
-            force_with(&h, &e, &never, Duration::ZERO),
+            force_with(&h, &e, &never, Duration::ZERO).unwrap(),
             ("timeout", false)
         );
         assert_eq!(warm::read(&h, A).unwrap().entry, e, "the registry is kept");
@@ -541,7 +549,7 @@ mod tests {
         let refused =
             |_: Kill| -> std::io::Result<()> { Err(std::io::ErrorKind::PermissionDenied.into()) };
         assert_eq!(
-            force_with(&h, &e, &refused, Duration::ZERO),
+            force_with(&h, &e, &refused, Duration::ZERO).unwrap(),
             ("timeout", false)
         );
         assert_eq!(warm::read(&h, A).unwrap().entry, e);
@@ -554,7 +562,7 @@ mod tests {
             Ok(())
         };
         assert_eq!(
-            force_with(&h, &e, &ignored, Duration::from_millis(100)),
+            force_with(&h, &e, &ignored, Duration::from_millis(100)).unwrap(),
             ("timeout", false)
         );
         assert_eq!(sent.take(), [Kill::Process(me.pid)]);
@@ -566,7 +574,10 @@ mod tests {
         let h = home(&t);
         let (mut child, e) = sleeper();
         warm::publish(&h, &e).unwrap();
-        assert_eq!(force_with(&h, &e, &signal, FORCE_BOUND), ("forced", true));
+        assert_eq!(
+            force_with(&h, &e, &signal, FORCE_BOUND).unwrap(),
+            ("forced", true)
+        );
         assert!(warm::read(&h, A).is_none());
         assert!(!child.wait().unwrap().success(), "killed");
     }
@@ -607,7 +618,7 @@ mod tests {
             signal(k)
         };
         assert_eq!(
-            force_with(&h, &e, &recorded, Duration::from_millis(300)),
+            force_with(&h, &e, &recorded, Duration::from_millis(300)).unwrap(),
             ("timeout", false)
         );
         assert_eq!(
@@ -632,9 +643,108 @@ mod tests {
         e.omp_pid = Some(group.0);
         e.omp_start = Some("the-exited-leader".into());
         warm::publish(&h, &e).unwrap();
-        assert_eq!(force_with(&h, &e, &signal, FORCE_BOUND), ("forced", true));
+        assert_eq!(
+            force_with(&h, &e, &signal, FORCE_BOUND).unwrap(),
+            ("forced", true)
+        );
         assert!(warm::read(&h, A).is_none());
         assert!(!worker.wait().unwrap().success(), "killed");
+    }
+    #[test]
+    fn a_release_request_that_cannot_be_written_is_never_reported_cooling() {
+        for force in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let h = home(&t);
+            let env = Env::for_test(None, t.path(), &[]);
+            let (mut child, mut e) = sleeper();
+            e.state = EntryState::Busy;
+            warm::publish(&h, &e).unwrap();
+            let snapshot = warm::read(&h, A).unwrap();
+            // A holder stopped inside its step keeps the metadata lock past its bound.
+            let stopped = warm::hold_meta_lock(&h, A);
+            let got = release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(force, Duration::from_millis(100)),
+                warm::STALE,
+            )
+            .unwrap();
+            assert_eq!(got, ("timeout", false), "force {force}");
+            assert!(!warm::release_path(&h, A).exists(), "force {force}");
+            assert_eq!(warm::read(&h, A).unwrap().entry, e, "force {force}");
+            drop(stopped);
+            if force {
+                assert!(!child.wait().unwrap().success(), "killed after the timeout");
+                continue;
+            }
+            assert!(child.try_wait().unwrap().is_none(), "never signalled");
+            // Once the lock is free, the request is written and the busy worker cools.
+            let got = release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(false, Duration::from_millis(100)),
+                warm::STALE,
+            )
+            .unwrap();
+            assert_eq!(got, ("cooling", true));
+            assert!(warm::release_requested(&h, A, &e.ident()));
+            child.kill().unwrap();
+            child.wait().unwrap();
+        }
+    }
+    #[test]
+    fn a_removal_the_metadata_lock_blocks_is_a_timeout_and_keeps_the_files() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let env = Env::for_test(None, t.path(), &[]);
+        let dead = entry(A, crate::jobs::liveness::tests_dead_pid(), None);
+        warm::publish(&h, &dead).unwrap();
+        warm::request_release(&h, A, &dead.ident()).unwrap();
+        let snapshot = warm::read(&h, A).unwrap();
+        let release = |force| {
+            release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(force, Duration::from_millis(100)),
+                warm::STALE,
+            )
+            .unwrap()
+        };
+        let stopped = warm::hold_meta_lock(&h, A);
+        for force in [false, true] {
+            assert_eq!(release(force), ("timeout", false), "force {force}");
+            assert_eq!(warm::read(&h, A).unwrap().entry, dead, "force {force}");
+            assert!(warm::release_requested(&h, A, &dead.ident()));
+        }
+        // `--force` kills a proven worker, but is not `forced` while its files cannot go.
+        let (mut child, mut live) = sleeper();
+        live.session_id = B.into();
+        warm::publish(&h, &live).unwrap();
+        let stopped_b = warm::hold_meta_lock(&h, B);
+        assert_eq!(
+            force_with(&h, &live, &signal, FORCE_BOUND).unwrap(),
+            ("timeout", false)
+        );
+        assert!(!child.wait().unwrap().success(), "killed");
+        assert_eq!(
+            warm::read(&h, B).unwrap().entry,
+            live,
+            "the registry is kept"
+        );
+        // Once the holders let go, the next release cleans.
+        drop(stopped);
+        drop(stopped_b);
+        assert_eq!(release(false), ("cleaned", true));
+        assert!(warm::read(&h, A).is_none() && !warm::release_path(&h, A).exists());
+        let dead_b = warm::read(&h, B).unwrap();
+        assert_eq!(
+            release_one(&env, &h, &dead_b, &args(false, Duration::ZERO), warm::STALE).unwrap(),
+            ("cleaned", true)
+        );
+        assert!(warm::read(&h, B).is_none());
     }
     #[test]
     fn an_at_new_job_handle_finds_its_worker_after_a_follow_up_was_adopted() {

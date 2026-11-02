@@ -516,6 +516,87 @@ fn ac_v2_405_a_mismatched_registry_is_cleaned_and_never_signalled() {
     sleeper.wait().unwrap();
 }
 
+/// A flock on session A's metadata lock file from this process, as a holder stopped inside its
+/// step keeps it: glen's own acquisitions give up after their bound.
+fn hold_meta_lock(b: &WarmBox) -> std::fs::File {
+    let path = b
+        .home()
+        .root
+        .join("run/warm")
+        .join(format!("{}.lock", lock::lock_key(A_ID)));
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .unwrap();
+    file.lock().unwrap();
+    file
+}
+
+#[test]
+fn ac_v2_405_a_blocked_metadata_lock_is_never_reported_cooling_or_cleaned() {
+    let b = WarmBox::new();
+    std::fs::create_dir_all(&b.omp.glen_home).unwrap();
+    // A busy worker glen can prove by pid and start token.
+    let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let Probe::Running(start) = liveness::start_token(sleeper.id()) else {
+        panic!("no start token for the sleeper")
+    };
+    let busy = warm::Entry {
+        v: 1,
+        pid: sleeper.id(),
+        start: Some(start),
+        session_id: A_ID.into(),
+        session_handle: None,
+        job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+        omp_pid: None,
+        omp_start: None,
+        warm_ms: 1000,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        state: warm::EntryState::Busy,
+        started_at: "2026-11-02T00:00:00Z".into(),
+    };
+    warm::publish(&b.home(), &busy).unwrap();
+    let release_file = warm::release_path(&b.home(), A_ID);
+    let timed_out = |out: &Output, state: &str| {
+        assert_eq!(out.status.code(), Some(7), "{out:?}");
+        let e = json(out);
+        assert_eq!(e["error"]["code"], "control_failed", "{e}");
+        assert_eq!(e["error"]["details"]["reason"], "release_timeout", "{e}");
+        let w = &e["error"]["details"]["workers"][0];
+        assert_eq!(
+            (w["state"].as_str(), w["outcome"].as_str()),
+            (Some(state), Some("timeout")),
+            "{e}"
+        );
+    };
+    // The request cannot be written: the busy worker is waited for, never reported `cooling`.
+    let held = hold_meta_lock(&b);
+    timed_out(
+        &b.run(&["release", "e27c0de", "--timeout", "200ms", "--json"]),
+        "busy",
+    );
+    assert!(!release_file.exists());
+    assert!(sleeper.try_wait().unwrap().is_none(), "never signalled");
+    drop(held);
+    let out = data(&b.run(&["release", "e27c0de", "--json"]));
+    assert_eq!(out["workers"][0]["outcome"], "cooling", "{out}");
+    assert!(release_file.exists());
+    // Its worker is gone now: a dead registry whose removal the lock blocks is kept.
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+    let held = hold_meta_lock(&b);
+    timed_out(&b.run(&["release", "e27c0de", "--json"]), "dead");
+    assert_eq!(b.registry().unwrap().entry, busy, "the registry is kept");
+    assert!(release_file.exists());
+    drop(held);
+    let out = data(&b.run(&["release", "e27c0de", "--json"]));
+    assert_eq!(out["workers"][0]["outcome"], "cleaned", "{out}");
+    assert!(b.registry().is_none() && !release_file.exists());
+}
+
 fn no_job_created(b: &WarmBox) -> bool {
     std::fs::read_dir(b.omp.glen_home.join("jobs")).map_or(true, |d| d.count() == 0)
 }

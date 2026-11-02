@@ -34,6 +34,9 @@ pub const HEARTBEAT: Duration = Duration::from_secs(1);
 pub const STALE: Duration = Duration::from_secs(5);
 /// The longest teardown waits for `Client::close` before it frees the session anyway.
 pub const TEARDOWN_BOUND: Duration = Duration::from_millis(3500);
+/// Teardown's one deadline, from its start to the session lock's release: the close gets at most
+/// [`TEARDOWN_BOUND`] of it and the metadata cleanup the rest (never more than its own bound).
+pub const TEARDOWN_DEADLINE: Duration = Duration::from_millis(3600);
 /// Variables that differ between otherwise equal environments; `env_digest` skips them, and
 /// every `GLEN_` variable.
 pub const VOLATILE_ENV: &[&str] = &[
@@ -275,7 +278,7 @@ const META_BOUND: Duration = Duration::from_secs(1);
 /// every publication and removal of the registry and the release request and held only for that
 /// one step, never across a wait. A conditional removal therefore unlinks exactly the file it
 /// compared: no publish or other removal can land in between.
-struct MetaLock {
+pub(crate) struct MetaLock {
     fd: std::os::fd::OwnedFd,
     path: PathBuf,
     /// The registry and the release request it guards.
@@ -297,6 +300,15 @@ impl Drop for MetaLock {
 /// Takes the metadata lock, waiting at most [`META_BOUND`]. `None` when `run/warm` does not
 /// exist: there is nothing to remove, and a publish fails on its own write.
 fn meta_lock(home: &GlenHome, session_id: &str) -> io::Result<Option<MetaLock>> {
+    meta_lock_until(home, session_id, Instant::now() + META_BOUND)
+}
+/// [`meta_lock`], waiting until `end` (one attempt even when `end` has passed). A lock still busy
+/// then is a `TimedOut` error.
+fn meta_lock_until(
+    home: &GlenHome,
+    session_id: &str,
+    end: Instant,
+) -> io::Result<Option<MetaLock>> {
     use rustix::{
         fs::{FlockOperation, Mode, OFlags, flock, fstat, lstat, open},
         io::Errno,
@@ -308,7 +320,7 @@ fn meta_lock(home: &GlenHome, session_id: &str) -> io::Result<Option<MetaLock>> 
             format!("cannot {what} {}: {e}", file.display()),
         )
     };
-    let end = Instant::now() + META_BOUND;
+    let started = Instant::now();
     loop {
         let fd = match open(
             &file,
@@ -319,6 +331,10 @@ fn meta_lock(home: &GlenHome, session_id: &str) -> io::Result<Option<MetaLock>> 
             Err(Errno::NOENT) => return Ok(None),
             Err(e) => return Err(context("open", e)),
         };
+        #[cfg(test)]
+        if let Some(hook) = BETWEEN_OPEN_AND_FLOCK.take() {
+            hook();
+        }
         match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
             Ok(()) => {
                 // The holder before this one may have unlinked the file this fd locks.
@@ -341,10 +357,28 @@ fn meta_lock(home: &GlenHome, session_id: &str) -> io::Result<Option<MetaLock>> 
         if Instant::now() >= end {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                format!("cannot lock {}: held for over 1s", file.display()),
+                format!(
+                    "cannot lock {}: still held after {}ms",
+                    file.display(),
+                    started.elapsed().as_millis()
+                ),
             ));
         }
     }
+}
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: runs once, in this thread's next [`meta_lock`] attempt, between its open
+    /// and its flock, so a test can replace the file the attempt just opened.
+    static BETWEEN_OPEN_AND_FLOCK: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+/// Test-only: the session's metadata lock, held until dropped, as by a holder stopped inside its
+/// step (another fd's flock, so this process's own callers contend for it too).
+#[cfg(test)]
+pub(crate) fn hold_meta_lock(home: &GlenHome, session_id: &str) -> MetaLock {
+    home.ensure_dir("run/warm").unwrap();
+    meta_lock(home, session_id).unwrap().unwrap()
 }
 /// Atomic 0600 write in the 0700 `run/warm` directory, under the metadata lock.
 pub fn publish(home: &GlenHome, entry: &Entry) -> io::Result<()> {
@@ -435,17 +469,18 @@ pub fn index(home: &GlenHome) -> (Vec<Indexed>, usize) {
     entries.sort_by(|a, b| a.entry.session_id.cmp(&b.entry.session_id));
     (entries, unreadable)
 }
-/// Asks the worker named by `ident` (see [`ident`]) to cool, under the metadata lock. Rewriting
-/// refreshes the request. A lock still busy after [`META_BOUND`] has a stopped holder (such as a
-/// worker SIGSTOPped as it published): the request is not written, and the caller's own wait, or
-/// `glen release --force`, decides as for a worker that never answers.
-pub fn request_release(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<()> {
+/// Asks the worker named by `ident` (see [`ident`]) to cool, under the metadata lock; true once
+/// the request is written. Rewriting refreshes the request. A lock still busy after
+/// [`META_BOUND`] has a stopped holder (such as a worker SIGSTOPped as it published): nothing is
+/// written and the result is false, so the caller never reports the request delivered; its own
+/// wait, or `glen release --force`, decides as for a worker that never answers.
+pub fn request_release(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
     home.ensure_dir("run/warm")?;
     let _meta = match meta_lock(home, session_id) {
-        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Ok(false),
         held => held?,
     };
-    write_private_atomic(&release_path(home, session_id), ident.as_bytes())
+    write_private_atomic(&release_path(home, session_id), ident.as_bytes()).map(|()| true)
 }
 /// True only for a request addressed to this worker's own identity: a request meant for an
 /// earlier worker of the session, or a malformed one, is ignored.
@@ -470,6 +505,15 @@ pub fn clear_release_if(home: &GlenHome, session_id: &str, ident: &str) -> io::R
         return Ok(false);
     }
     remove_file(&release_path(home, session_id)).map(|()| true)
+}
+/// Teardown's cleanup: removes the registry and the release request under one acquisition of the
+/// metadata lock, waited for until `end`.
+fn remove_both(home: &GlenHome, session_id: &str, end: Instant) -> io::Result<()> {
+    let Some(_meta) = meta_lock_until(home, session_id, end)? else {
+        return Ok(());
+    };
+    remove_file(&path(home, session_id))?;
+    remove_file(&release_path(home, session_id))
 }
 /// What `glen release --force` may signal: only a process whose pid and start token are proven
 /// unchanged (`Alive`). `Unknown` never signals.
@@ -1092,10 +1136,13 @@ fn guarded(mut w: Worker, body: impl FnOnce(&mut Worker) -> Result<(), Failure>)
     }
     (w, panicked)
 }
-/// The one teardown (design §A21): close omp (bounded by [`TEARDOWN_BOUND`]), remove the
-/// registry and any release request (each under the metadata lock, so a cleanup's removal never
-/// interleaves with them), then free the session lock. The registry goes before the lock, so a
-/// reader never sees a free lock with a live registry.
+/// The one teardown (design §A21), within [`TEARDOWN_DEADLINE`]: close omp (bounded by
+/// [`TEARDOWN_BOUND`]), remove the registry and any release request under one acquisition of the
+/// metadata lock (so a cleanup's removal never interleaves with them; waited for at most
+/// [`META_BOUND`] and never past the deadline), then free the session lock. Normally the registry
+/// goes before the lock, so a reader never sees a free lock with a live registry; only a holder
+/// that keeps the metadata lock past that wait (a stopped process) leaves both files behind,
+/// logged, and the lock is freed anyway within the deadline.
 pub(crate) fn teardown(
     home: &GlenHome,
     session_id: &str,
@@ -1104,6 +1151,7 @@ pub(crate) fn teardown(
     release_lock: impl FnOnce(),
     log: &dyn Fn(&str),
 ) {
+    let deadline = Instant::now() + TEARDOWN_DEADLINE;
     log(&format!("cooling ({})", reason.as_str()));
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
@@ -1114,15 +1162,10 @@ pub(crate) fn teardown(
         Ok(Some(e)) => log(&format!("close: {e}")),
         Err(_) => log("close exceeded 3.5s (omp group may survive)"),
     }
-    if let Err(e) = remove(home, session_id) {
+    if let Err(e) = remove_both(home, session_id, deadline.min(Instant::now() + META_BOUND)) {
         log(&format!(
-            "cannot remove {}: {e}",
-            path(home, session_id).display()
-        ));
-    }
-    if let Err(e) = clear_release(home, session_id) {
-        log(&format!(
-            "cannot remove {}: {e}",
+            "cannot remove {} and {}: {e} (the session lock is freed anyway)",
+            path(home, session_id).display(),
             release_path(home, session_id).display()
         ));
     }
@@ -1650,6 +1693,36 @@ mod registry_tests {
         drop(now);
     }
     #[test]
+    fn an_acquisition_whose_file_was_replaced_retries_on_the_file_at_the_path() {
+        use std::{cell::Cell, rc::Rc};
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        publish(&h, &me(EntryState::Idle)).unwrap();
+        let lock_file = meta_path(&h, ID);
+        let replaced = Rc::new(Cell::new(false));
+        // Between this acquisition's open and its flock, the previous holder unlinks the file it
+        // opened and the next caller creates a new one at the path.
+        BETWEEN_OPEN_AND_FLOCK.set(Some(Box::new({
+            let (lock_file, replaced) = (lock_file.clone(), Rc::clone(&replaced));
+            move || {
+                fs::remove_file(&lock_file).unwrap();
+                fs::File::create(&lock_file).unwrap();
+                replaced.set(true);
+            }
+        })));
+        let held = meta_lock(&h, ID).unwrap().unwrap();
+        assert!(
+            replaced.get(),
+            "the seam ran between the open and the flock"
+        );
+        assert!(
+            fs::File::open(&lock_file).unwrap().try_lock().is_err(),
+            "the lock is held on the file now at the path, not on the unlinked one opened first"
+        );
+        drop(held);
+        assert!(fs::File::open(&lock_file).unwrap().try_lock().is_ok());
+    }
+    #[test]
     fn a_stopped_holder_bounds_every_wait_and_a_release_request_is_not_written() {
         let t = tempfile::tempdir().unwrap();
         let h = home(&t);
@@ -1658,7 +1731,10 @@ mod registry_tests {
         // A holder that never lets go, as a worker stopped inside its publish.
         let stopped = meta_lock(&h, ID).unwrap().unwrap();
         let started = Instant::now();
-        request_release(&h, ID, &e.ident()).unwrap();
+        assert!(
+            !request_release(&h, ID, &e.ident()).unwrap(),
+            "reported as not written"
+        );
         assert!(started.elapsed() >= META_BOUND, "{:?}", started.elapsed());
         assert!(
             !release_path(&h, ID).exists(),
@@ -1921,6 +1997,106 @@ mod idle_tests {
             lines.into_inner().unwrap(),
             ["cooling (expired)", "close: group survived"]
         );
+    }
+    #[test]
+    fn a_stopped_metadata_holder_costs_teardown_one_wait_within_its_deadline() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("glen"),
+        };
+        let me = liveness::current().unwrap();
+        let mine = ident(me.pid, Some(&me.start));
+        publish(
+            &home,
+            &Entry {
+                v: 1,
+                pid: me.pid,
+                start: Some(me.start.clone()),
+                session_id: ID.into(),
+                session_handle: None,
+                job_id: "j".into(),
+                omp_pid: None,
+                omp_start: None,
+                warm_ms: 1000,
+                expires_at: timestamp_after(Duration::from_secs(1)),
+                state: EntryState::Idle,
+                started_at: jiff::Timestamp::now().to_string(),
+            },
+        )
+        .unwrap();
+        assert!(request_release(&home, ID, &mine).unwrap());
+        // Another process keeps the metadata lock, as one stopped inside its step would.
+        let stopped = hold_meta_lock(&home, ID);
+        let files = || (path(&home, ID).exists(), release_path(&home, ID).exists());
+        // A prompt close: one bounded acquisition for both files, never one per file.
+        let lock = crate::jobs::lock::try_acquire(&home, ID).unwrap().unwrap();
+        let lines = std::sync::Mutex::new(vec![]);
+        let seen = std::cell::Cell::new(None);
+        let started = Instant::now();
+        teardown(
+            &home,
+            ID,
+            Reason::Release,
+            || None,
+            || {
+                seen.set(Some(files()));
+                drop(lock);
+            },
+            &|l: &str| lines.lock().unwrap().push(l.to_owned()),
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= META_BOUND && took < META_BOUND + META_BOUND / 2,
+            "one wait of the metadata bound: {took:?}"
+        );
+        assert!(!crate::jobs::lock::is_held(&home, ID));
+        assert_eq!(
+            seen.get(),
+            Some((true, true)),
+            "the documented failure path: both files outlive the session lock"
+        );
+        let lines = lines.into_inner().unwrap();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines[1].starts_with("cannot remove") && lines[1].contains("freed anyway"),
+            "{lines:?}"
+        );
+        // A close that uses its whole bound leaves the cleanup only what remains of the deadline.
+        let lock = crate::jobs::lock::try_acquire(&home, ID).unwrap().unwrap();
+        let started = Instant::now();
+        teardown(
+            &home,
+            ID,
+            Reason::Expired,
+            || {
+                std::thread::sleep(Duration::from_secs(10));
+                None
+            },
+            move || drop(lock),
+            &|_: &str| (),
+        );
+        let took = started.elapsed();
+        assert!(
+            took >= TEARDOWN_BOUND && took < TEARDOWN_DEADLINE + Duration::from_millis(250),
+            "teardown keeps its deadline: {took:?}"
+        );
+        assert!(!crate::jobs::lock::is_held(&home, ID));
+        // Once the holder lets go, the next teardown removes both before the lock.
+        drop(stopped);
+        let lock = crate::jobs::lock::try_acquire(&home, ID).unwrap().unwrap();
+        let seen = std::cell::Cell::new(None);
+        teardown(
+            &home,
+            ID,
+            Reason::Release,
+            || None,
+            || {
+                seen.set(Some(files()));
+                drop(lock);
+            },
+            &|_: &str| (),
+        );
+        assert_eq!(seen.get(), Some((false, false)));
     }
 }
 

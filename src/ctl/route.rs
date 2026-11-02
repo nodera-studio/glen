@@ -605,6 +605,8 @@ fn cool_for_control(
     stop: &AtomicBool,
 ) -> Result<(), GlenError> {
     let id = &opened.session.header.id;
+    // Written or not (a stopped metadata-lock holder keeps it out), the control waits for the
+    // holder to go, bounded by its own deadline (design §A21).
     crate::rpc::warm::request_release(
         home,
         id,
