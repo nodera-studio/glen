@@ -50,10 +50,17 @@ impl Drop for WarmBox {
     }
 }
 impl WarmBox {
+    /// Every command of the box shares the fake's knobs, so the env digest matches (a knob
+    /// changed between two sends makes the second run cold, AC-v2-404).
     fn new() -> Self {
+        Self::with(&[])
+    }
+    fn with(vars: &[(&str, &str)]) -> Self {
+        let mut extra = vec![("FAKE_OMP_MULTI".to_owned(), "1".to_owned())];
+        extra.extend(vars.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())));
         Self {
             b: RpcBox::new(),
-            extra: vec![],
+            extra,
         }
     }
     fn home(&self) -> GlenHome {
@@ -76,6 +83,15 @@ impl WarmBox {
         let mut args = vec!["send", "e27c0de", "hi", "--json"];
         args.extend(extra);
         data(&self.run(&args))
+    }
+    /// `send e27c0de <text> --no-wait --json`: exit 10 while the job runs; its `data`.
+    fn no_wait(&self, args: &[&str]) -> Value {
+        let mut all = vec!["send", "e27c0de"];
+        all.extend(args);
+        all.extend(["--no-wait", "--json"]);
+        let out = self.run(&all);
+        assert_eq!(out.status.code(), Some(10), "{out:?}");
+        json(&out)["data"].clone()
     }
     fn registry(&self) -> Option<warm::Indexed> {
         warm::read(&self.home(), A_ID)
@@ -154,4 +170,37 @@ fn ac_v2_403_a_warm_worker_holds_the_session_then_expires() {
     );
     assert!(!warm::release_path(&b.home(), A_ID).exists());
     assert_eq!(b.starts(), 1);
+}
+
+#[test]
+fn ac_v2_402_a_second_send_is_stolen_and_runs_on_the_same_omp() {
+    let b = WarmBox::new();
+    let first = b.send(&["--warm", "2s"]);
+    let one = job_id(&first);
+    let reg = b.wait_registry();
+    let queued = b.no_wait(&["again", "--warm", "2s"]);
+    let sent = Instant::now();
+    let two = job_id(&queued);
+    let claimed = poll(Duration::from_secs(5), || {
+        let s = b.job(&two).1;
+        (s["omp_reused"] == true).then_some(s)
+    });
+    assert!(
+        sent.elapsed() < Duration::from_millis(500),
+        "{:?}",
+        sent.elapsed()
+    );
+    assert_eq!(claimed["worker_pid"], reg.entry.pid);
+    assert_eq!(claimed["worker_start"], reg.entry.start.clone().unwrap());
+    let done = data(&b.run(&["wait", &two, "--json"]));
+    assert_eq!(done["job"]["status"], "completed", "{done}");
+    assert_eq!(done["job"]["omp_reused"], true);
+    assert_eq!(done["assistant_text"], "pong: again");
+    assert_eq!(b.starts(), 1);
+    assert_eq!(b.frames_in("prompt").len(), 2);
+    let reg = b.wait_registry();
+    assert_eq!(reg.entry.job_id, two);
+    b.wait_cold(&reg.entry, Duration::from_secs(8));
+    assert!(b.log(&one).contains("warm: cooling (expired)"));
+    assert!(b.log(&two).contains("warm: adopted"), "{}", b.log(&two));
 }

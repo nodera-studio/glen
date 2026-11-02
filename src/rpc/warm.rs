@@ -17,9 +17,10 @@ use crate::{
 use omp_rpc::{Client, Event};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
-    sync::{atomic::Ordering, mpsc},
+    sync::{Arc, atomic::Ordering, mpsc},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -398,7 +399,10 @@ pub(crate) enum Reason {
     Endpoint,
     Signal,
     OmpExited,
+    Mismatch,
+    Moved,
     StateError,
+    Ended,
 }
 impl Reason {
     pub(crate) fn as_str(self) -> &'static str {
@@ -408,7 +412,10 @@ impl Reason {
             Self::Endpoint => "endpoint",
             Self::Signal => "signal",
             Self::OmpExited => "omp_exited",
+            Self::Mismatch => "mismatch",
+            Self::Moved => "moved",
             Self::StateError => "state_error",
+            Self::Ended => "ended",
         }
     }
 }
@@ -441,6 +448,8 @@ pub(crate) struct Warm {
     pub replies: mpsc::Receiver<PendingReply>,
     pub lock: crate::jobs::lock::SessionLock,
     pub session_id: String,
+    /// The match key of the job that made the worker warm.
+    pub key: Key,
 }
 /// Drains omp's events; true once the channel is closed (omp exited).
 fn drain_events(events: &mpsc::Receiver<Event>) -> bool {
@@ -482,81 +491,167 @@ fn timestamp_after(d: Duration) -> String {
         .unwrap_or_else(|_| jiff::Timestamp::now())
         .to_string()
 }
+/// Appends one line to a job's own `worker.log` (the process stderr is the first job's log).
+fn append_log(store: &JobStore, id: &JobId, handle: &str, line: &str) {
+    use std::io::Write;
+    let path = store.dir(id).join("worker.log");
+    let mut opts = fs::OpenOptions::new();
+    opts.append(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    if let Err(e) = opts
+        .open(&path)
+        .and_then(|mut f| writeln!(f, "{} {handle} {line}", jiff::Timestamp::now()))
+    {
+        eprintln!("cannot write {}: {e}", path.display());
+    }
+}
+/// Records this process as the lock's holder: `Warm` while idle, `Job` for an adopted job (so a
+/// control reaches that job through its control inbox).
+fn hold(
+    lock: &crate::jobs::lock::SessionLock,
+    kind: crate::jobs::lock::HolderKind,
+    job_id: &JobId,
+    start: Option<&str>,
+) -> io::Result<()> {
+    crate::jobs::lock::mark(
+        lock,
+        &crate::jobs::lock::Holder {
+            v: 1,
+            kind,
+            job_id: Some(job_id.as_str().into()),
+            pid: std::process::id(),
+            start: start.map(str::to_owned),
+        },
+    )
+}
+/// The steal scan's outcome: the oldest queued RPC job of the warm session, if any.
+#[derive(Debug)]
+pub(crate) enum Found {
+    Nothing,
+    Adopt(JobId, Box<Job>),
+    /// The oldest candidate differs in its match key: the worker cools and it runs cold.
+    Mismatch(JobId),
+}
+enum Seen {
+    Candidate(Box<Job>),
+    Irrelevant,
+    Retry,
+}
+/// The steal scan with its cache (design §A21): ids classified for good (terminal, not queued,
+/// reused, another route or session) are skipped, so an idle tick costs one `read_dir`. A read
+/// error is retried on the next tick, at most [`Scan::RETRIES`] times: a job directory is
+/// visible before `create` wrote both of its files.
+#[derive(Default)]
+pub(crate) struct Scan {
+    settled: BTreeSet<JobId>,
+    errors: BTreeMap<JobId, u32>,
+}
+impl Scan {
+    pub(crate) const RETRIES: u32 = 20;
+    pub(crate) fn next(&mut self, store: &JobStore, session_id: &str, key: &Key) -> Found {
+        let mut oldest: Option<(JobId, Box<Job>)> = None;
+        for id in store.list() {
+            if self.settled.contains(&id) {
+                continue;
+            }
+            match seen(store, &id, session_id) {
+                Seen::Candidate(job) => {
+                    if oldest.as_ref().is_none_or(|(o, _)| id < *o) {
+                        oldest = Some((id, job));
+                    }
+                }
+                Seen::Irrelevant => {
+                    self.errors.remove(&id);
+                    self.settled.insert(id);
+                }
+                Seen::Retry => {
+                    let n = self.errors.entry(id.clone()).or_default();
+                    *n += 1;
+                    if *n >= Self::RETRIES {
+                        self.errors.remove(&id);
+                        self.settled.insert(id);
+                    }
+                }
+            }
+        }
+        match oldest {
+            None => Found::Nothing,
+            Some((id, job)) if key.matches(&job) => Found::Adopt(id, job),
+            Some((id, _)) => Found::Mismatch(id),
+        }
+    }
+}
+fn seen(store: &JobStore, id: &JobId, session_id: &str) -> Seen {
+    let Ok(s) = store.read_status(id) else {
+        return Seen::Retry;
+    };
+    if s.status != State::Queued || s.omp_reused {
+        return Seen::Irrelevant;
+    }
+    let Ok(job) = store.read_job(id) else {
+        return Seen::Retry;
+    };
+    if job.route != crate::jobs::Route::Rpc || job.session_id.as_deref() != Some(session_id) {
+        return Seen::Irrelevant;
+    }
+    Seen::Candidate(Box::new(job))
+}
 /// The idle phase after a job that stays warm (design §A21). It never writes the status of a
 /// job it is not running: every failure here ends warmth through [`teardown`]. `Err` only when
 /// an adopted job panicked, so the worker exits non-zero.
-pub(crate) fn idle(first: &mut Worker, warm: Warm) -> Result<(), Failure> {
-    let home = first.store.home.clone();
+pub(crate) fn idle(first: &Worker, warm: Warm) -> Result<(), Failure> {
     let me = liveness::current();
-    let my_ident = ident(std::process::id(), me.as_ref().map(|i| i.start.as_str()));
-    let warm_ms = first.job.warm_ms.unwrap_or(0);
-    let omp_pid = warm.client.pid();
-    let entry = Entry {
-        v: 1,
-        pid: std::process::id(),
-        start: me.map(|i| i.start),
-        session_id: warm.session_id.clone(),
-        session_handle: Some(super::session_handle(&warm.session_id)),
-        job_id: first.id.as_str().into(),
-        omp_pid,
-        omp_start: omp_pid.and_then(|p| match liveness::start_token(p) {
-            liveness::Probe::Running(t) => Some(t),
-            _ => None,
-        }),
-        warm_ms,
-        expires_at: timestamp_after(Duration::from_millis(warm_ms)),
-        state: EntryState::Idle,
-        started_at: jiff::Timestamp::now().to_string(),
+    let mut idler = Idler {
+        first,
+        home: first.store.home.clone(),
+        start: me.as_ref().map(|i| i.start.clone()),
+        my_ident: ident(std::process::id(), me.as_ref().map(|i| i.start.as_str())),
+        entry: Entry {
+            v: 1,
+            pid: std::process::id(),
+            start: me.map(|i| i.start),
+            session_id: warm.session_id.clone(),
+            session_handle: Some(super::session_handle(&warm.session_id)),
+            job_id: first.id.as_str().into(),
+            omp_pid: warm.client.pid(),
+            omp_start: warm
+                .client
+                .pid()
+                .and_then(|p| match liveness::start_token(p) {
+                    liveness::Probe::Running(t) => Some(t),
+                    _ => None,
+                }),
+            warm_ms: first.job.warm_ms.unwrap_or(0),
+            expires_at: String::new(),
+            state: EntryState::Idle,
+            started_at: jiff::Timestamp::now().to_string(),
+        },
+        last: None,
+        panicked: false,
     };
-    let log = |line: &str| first.log("warm", line);
-    let reason = (|| {
-        // Registry before the holder flips: a reader that sees holder `warm` finds the entry.
-        if let Err(e) = publish(&home, &entry) {
-            log(&format!(
-                "cannot publish {}: {e}",
-                path(&home, &entry.session_id).display()
-            ));
-            return Reason::StateError;
-        }
-        if let Err(e) = first.mark_holder_as(&warm.lock, crate::jobs::lock::HolderKind::Warm) {
-            log(&format!("cannot mark the warm holder: {e}"));
-            return Reason::StateError;
-        }
-        log(&format!(
-            "idle for {}ms on {}",
-            entry.warm_ms, entry.session_id
-        ));
-        let expires = Instant::now() + Duration::from_millis(entry.warm_ms);
-        let mut beat = Instant::now();
-        loop {
-            let tick = Tick {
-                cancelled: first.cancel.load(Ordering::SeqCst),
-                omp_exited: drain_events(&warm.events),
-                release: {
-                    reject_replies(&warm.replies);
-                    release_requested(&home, &warm.session_id, &my_ident)
-                },
-                endpoint: endpoint_present(&home, &warm.session_id),
-                expired: Instant::now() >= expires,
-            };
-            // A control written for the last job just before it ended is answered `job_ended`.
-            first.respond_pending();
-            if let Some(reason) = decide(&tick) {
-                return reason;
-            }
-            if beat.elapsed() >= HEARTBEAT {
-                touch(&home, &warm.session_id);
-                beat = Instant::now();
-            }
-            std::thread::sleep(CLAIM_TICK);
-        }
-    })();
+    let reason = idler.run(&warm);
+    let Idler {
+        home,
+        last,
+        panicked,
+        ..
+    } = idler;
     let Warm {
         client,
         lock,
         session_id,
         ..
     } = warm;
+    let log = |line: &str| {
+        first.log("warm", line);
+        if let Some(w) = &last {
+            append_log(&w.store, &w.id, &w.job.handle, &format!("warm: {line}"));
+        }
+    };
     teardown(
         &home,
         &session_id,
@@ -565,7 +660,289 @@ pub(crate) fn idle(first: &mut Worker, warm: Warm) -> Result<(), Failure> {
         move || drop(lock),
         &log,
     );
-    Ok(())
+    if panicked {
+        Err(Failure::new(
+            "internal",
+            "a job the warm worker adopted panicked",
+        ))
+    } else {
+        Ok(())
+    }
+}
+struct Idler<'a> {
+    first: &'a Worker,
+    home: GlenHome,
+    start: Option<String>,
+    my_ident: String,
+    entry: Entry,
+    /// The last job the worker adopted; its control inbox is answered while idle.
+    last: Option<Worker>,
+    panicked: bool,
+}
+impl Idler<'_> {
+    fn log(&self, line: &str) {
+        self.first.log("warm", line);
+    }
+    fn last(&self) -> &Worker {
+        self.last.as_ref().unwrap_or(self.first)
+    }
+    /// Publishes the idle registry, then flips the holder to `warm` (a reader that sees holder
+    /// `warm` finds the entry). The window opens now, after the last job's terminal status.
+    fn go_idle(&mut self, warm: &Warm) -> Result<Instant, Reason> {
+        let (job_id, warm_ms) = {
+            let last = self.last();
+            (last.id.as_str().to_owned(), last.job.warm_ms.unwrap_or(0))
+        };
+        self.entry.job_id = job_id;
+        self.entry.warm_ms = warm_ms;
+        let window = Duration::from_millis(self.entry.warm_ms);
+        self.entry.expires_at = timestamp_after(window);
+        self.entry.state = EntryState::Idle;
+        let expires = Instant::now() + window;
+        if let Err(e) = publish(&self.home, &self.entry) {
+            self.log(&format!(
+                "cannot publish {}: {e}",
+                path(&self.home, &self.entry.session_id).display()
+            ));
+            return Err(Reason::StateError);
+        }
+        let id = self.last().id.clone();
+        if let Err(e) = hold(
+            &warm.lock,
+            crate::jobs::lock::HolderKind::Warm,
+            &id,
+            self.start.as_deref(),
+        ) {
+            self.log(&format!("cannot mark the warm holder: {e}"));
+            return Err(Reason::StateError);
+        }
+        // Settlement barrier: nothing the last job left behind reaches the next one.
+        drain_events(&warm.events);
+        reject_replies(&warm.replies);
+        self.log(&format!(
+            "idle for {}ms on {}",
+            self.entry.warm_ms, self.entry.session_id
+        ));
+        Ok(expires)
+    }
+    fn run(&mut self, warm: &Warm) -> Reason {
+        let mut expires = match self.go_idle(warm) {
+            Ok(t) => t,
+            Err(reason) => return reason,
+        };
+        let mut beat = Instant::now();
+        let mut scan = Scan::default();
+        loop {
+            let tick = Tick {
+                cancelled: self.first.cancel.load(Ordering::SeqCst),
+                omp_exited: drain_events(&warm.events),
+                release: {
+                    reject_replies(&warm.replies);
+                    release_requested(&self.home, &warm.session_id, &self.my_ident)
+                },
+                endpoint: endpoint_present(&self.home, &warm.session_id),
+                expired: Instant::now() >= expires,
+            };
+            // A control written for the last job just before it ended is answered `job_ended`.
+            self.last().respond_pending();
+            if let Some(reason) = decide(&tick) {
+                return reason;
+            }
+            if beat.elapsed() >= HEARTBEAT {
+                touch(&self.home, &warm.session_id);
+                beat = Instant::now();
+            }
+            match scan.next(&self.first.store, &warm.session_id, &warm.key) {
+                Found::Nothing => std::thread::sleep(CLAIM_TICK),
+                Found::Mismatch(id) => {
+                    self.log(&format!("{} differs from the warm omp", id.handle()));
+                    return Reason::Mismatch;
+                }
+                Found::Adopt(id, job) => {
+                    if let Some(reason) = self.adopt(warm, id, *job) {
+                        return reason;
+                    }
+                    expires = match self.go_idle(warm) {
+                        Ok(t) => t,
+                        Err(reason) => return reason,
+                    };
+                    beat = Instant::now();
+                }
+            }
+        }
+    }
+    /// Claims and runs one queued job on the warm omp. `None` when the worker stays warm after
+    /// it; a refused claim also returns `None` (the scan moves on next tick).
+    fn adopt(&mut self, warm: &Warm, id: JobId, job: Job) -> Option<Reason> {
+        // (1) The omp process still drives the warm session.
+        let state = match super::worker::query_state(&warm.client, Duration::from_secs(1)) {
+            Ok(s) if s.session_id == warm.session_id => s,
+            Ok(s) => {
+                self.log(&format!("omp moved to session {}", s.session_id));
+                return Some(Reason::Moved);
+            }
+            Err(e) => {
+                self.log(&format!("cannot check the warm session: {e}"));
+                return Some(Reason::StateError);
+            }
+        };
+        // (2) The holder names the job before the claim, so a control never sees `warm` while a
+        // claimed job is about to run; (3) the claim itself.
+        let warm_holder = |this: &Self| {
+            hold(
+                &warm.lock,
+                crate::jobs::lock::HolderKind::Warm,
+                &this.last().id,
+                this.start.as_deref(),
+            )
+        };
+        if let Err(e) = hold(
+            &warm.lock,
+            crate::jobs::lock::HolderKind::Job,
+            &id,
+            self.start.as_deref(),
+        ) {
+            self.log(&format!("cannot mark the holder for {}: {e}", id.handle()));
+            return Some(Reason::StateError);
+        }
+        let status = match claim(
+            &self.first.store,
+            &id,
+            std::process::id(),
+            self.start.as_deref(),
+        ) {
+            Ok(Some(status)) => status,
+            Ok(None) => {
+                return warm_holder(self).err().map(|e| {
+                    self.log(&format!("cannot mark the warm holder: {e}"));
+                    Reason::StateError
+                });
+            }
+            Err(e) => {
+                self.log(&format!("cannot claim {}: {e}", id.handle()));
+                return Some(Reason::StateError);
+            }
+        };
+        // (4) Busy: committed to the job from here; any failure ends it through its own path.
+        self.entry.state = EntryState::Busy;
+        self.entry.job_id = id.as_str().into();
+        if let Err(e) = publish(&self.home, &self.entry) {
+            self.log(&format!("cannot publish the busy registry: {e}"));
+        }
+        let (worker, panicked) = run_adopted(self.first, warm, id, job, status, &state);
+        let keep = worker.keep_warm();
+        self.last = Some(worker);
+        if panicked {
+            self.panicked = true;
+            return Some(Reason::StateError);
+        }
+        if self.first.cancel.load(Ordering::SeqCst) {
+            return Some(Reason::Signal);
+        }
+        (!keep).then_some(Reason::Ended)
+    }
+}
+/// Runs a claimed job on the warm omp with its own `Worker`, sink and deadline. A panic fails
+/// that job, never the one that made the worker warm.
+fn run_adopted(
+    first: &Worker,
+    warm: &Warm,
+    id: JobId,
+    job: Job,
+    status: Status,
+    state: &omp_rpc::SessionState,
+) -> (Worker, bool) {
+    let now = jiff::Timestamp::now();
+    let left = job
+        .deadline_at
+        .parse::<jiff::Timestamp>()
+        .map(|d| {
+            d.as_millisecond()
+                .saturating_sub(now.as_millisecond())
+                .max(0) as u64
+        })
+        .unwrap_or(0);
+    let waited = job
+        .created_at
+        .parse::<jiff::Timestamp>()
+        .map(|c| {
+            now.as_millisecond()
+                .saturating_sub(c.as_millisecond())
+                .max(0) as u64
+        })
+        .unwrap_or(0);
+    let mut w = Worker {
+        store: first.store.clone(),
+        id,
+        job,
+        status,
+        cancel: Arc::clone(&first.cancel),
+        deadline: Instant::now() + Duration::from_millis(left),
+        control_in_flight: None,
+        omp_queued: state.queued_message_count > 0,
+        settled: false,
+    };
+    append_log(
+        &w.store,
+        &w.id,
+        &w.job.handle,
+        &format!(
+            "warm: adopted {} (warm worker pid {})",
+            w.job.handle,
+            std::process::id()
+        ),
+    );
+    w.log("warm", "adopted on the warm omp");
+    w.status.omp_pid = warm.client.pid();
+    w.status.rpc_protocol = Some(warm.client.protocol_version());
+    w.status.waited_ms = Some(waited);
+    if w.job.deliver_as == crate::jobs::Deliver::Steer
+        && Duration::from_millis(waited) >= super::TICK
+    {
+        w.status.warnings.push(crate::error::Warning {
+            code: "steer_queued".into(),
+            message: "another glen job held the session, so the steer message waited and was sent as a prompt".into(),
+        });
+    }
+    // Barrier: frames and replies from before this job are never its own.
+    drain_events(&warm.events);
+    reject_replies(&warm.replies);
+    let sink = super::reply::ReplySink::new(w.store.clone(), w.store.home.clone(), w.id.clone());
+    guarded(w, |w| {
+        w.save()?;
+        w.execute(
+            &warm.client,
+            &warm.events,
+            &warm.replies,
+            state,
+            &sink,
+            &mut None,
+        )
+    })
+}
+/// Runs `body` for an adopted job under its own `catch_unwind`: a failure or a panic is that
+/// job's own (`finish_failure`); true when it panicked.
+fn guarded(mut w: Worker, body: impl FnOnce(&mut Worker) -> Result<(), Failure>) -> (Worker, bool) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| body(&mut w)));
+    let (failure, panicked) = match result {
+        Ok(Ok(())) => return (w, false),
+        Ok(Err(f)) => (f, false),
+        Err(payload) => (
+            Failure::new(
+                "internal",
+                format!(
+                    "worker panicked: {}",
+                    super::worker::panic_message(payload.as_ref())
+                ),
+            ),
+            true,
+        ),
+    };
+    w.log("failed", &failure.to_string());
+    if let Err(e) = w.finish_failure(failure) {
+        w.log("failed", &format!("cannot persist the failure: {e}"));
+    }
+    (w, panicked)
 }
 /// The one teardown (design §A21): close omp (bounded by [`TEARDOWN_BOUND`]), remove the
 /// registry and any release request, then free the lock. The registry goes before the lock, so
@@ -1176,5 +1553,166 @@ mod idle_tests {
             lines.into_inner().unwrap(),
             ["cooling (expired)", "close: group survived"]
         );
+    }
+}
+
+#[cfg(test)]
+mod adopt_tests {
+    use super::*;
+    const SESSION: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
+    fn key() -> Key {
+        let mut j = crate::jobs::tests::job();
+        j.env_digest = Some("0123456789abcdef".into());
+        Key::of(&j).unwrap()
+    }
+    fn queued(store: &JobStore, edit: impl FnOnce(&mut Job)) -> JobId {
+        let mut j = crate::jobs::tests::job();
+        j.env_digest = Some("0123456789abcdef".into());
+        edit(&mut j);
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        id
+    }
+    #[test]
+    fn scan_takes_the_oldest_matching_queued_job_of_the_session() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut scan = Scan::default();
+        assert!(matches!(scan.next(&store, SESSION, &key()), Found::Nothing));
+        // Not candidates, cached for good: another session, the live route, a reused job.
+        queued(&store, |j| j.session_id = Some("other".into()));
+        queued(&store, |j| j.route = crate::jobs::Route::Live);
+        let reused = queued(&store, |_| ());
+        store
+            .update_status_if(&reused, |s| {
+                s.omp_reused = true;
+                true
+            })
+            .unwrap();
+        assert!(matches!(scan.next(&store, SESSION, &key()), Found::Nothing));
+        assert_eq!(scan.settled.len(), 3);
+        let first = queued(&store, |_| ());
+        std::thread::sleep(Duration::from_millis(2));
+        queued(&store, |_| ());
+        match scan.next(&store, SESSION, &key()) {
+            Found::Adopt(id, _) => assert_eq!(id, first, "the oldest first"),
+            other => panic!("{other:?}"),
+        }
+        let mut s = store.read_status(&first).unwrap();
+        s.status = State::Completed;
+        store.write_status(&first, &s).unwrap();
+        assert!(matches!(
+            scan.next(&store, SESSION, &key()),
+            Found::Adopt(..)
+        ));
+        assert!(scan.settled.contains(&first));
+    }
+    #[test]
+    fn scan_cools_on_a_mismatching_oldest_job() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let other = queued(&store, |j| j.thinking_flag = Some("high".into()));
+        std::thread::sleep(Duration::from_millis(2));
+        queued(&store, |_| ());
+        match Scan::default().next(&store, SESSION, &key()) {
+            Found::Mismatch(id) => assert_eq!(id, other),
+            found => panic!("{found:?}"),
+        }
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        queued(&store, |j| j.env_digest = None);
+        assert!(matches!(
+            Scan::default().next(&store, SESSION, &key()),
+            Found::Mismatch(_)
+        ));
+    }
+    #[test]
+    fn scan_retries_a_job_seen_before_its_files_exist() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let j = crate::jobs::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        // Tick 1: the directory exists, neither file yet (`create` is mid-way).
+        store
+            .home
+            .ensure_dir(&format!("jobs/{}", id.as_str()))
+            .unwrap();
+        let mut scan = Scan::default();
+        assert!(matches!(scan.next(&store, SESSION, &key()), Found::Nothing));
+        assert!(!scan.settled.contains(&id), "a read error is never cached");
+        // Tick 2: both files.
+        std::fs::remove_dir(store.dir(&id)).unwrap();
+        queued(&store, |job| {
+            *job = Job {
+                env_digest: Some("0123456789abcdef".into()),
+                ..j.clone()
+            }
+        });
+        match scan.next(&store, SESSION, &key()) {
+            Found::Adopt(found, _) => assert_eq!(found, id),
+            other => panic!("{other:?}"),
+        }
+        // A directory that never becomes a job is given up after the retry bound.
+        let broken = JobId::new();
+        store
+            .home
+            .ensure_dir(&format!("jobs/{}", broken.as_str()))
+            .unwrap();
+        let mut scan = Scan::default();
+        for _ in 0..Scan::RETRIES {
+            scan.next(&store, "none", &key());
+        }
+        assert!(scan.settled.contains(&broken));
+    }
+    #[test]
+    fn a_panic_in_an_adopted_job_fails_that_job_only() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let one = queued(&store, |_| ());
+        let mut s = store.read_status(&one).unwrap();
+        s.status = State::Completed;
+        s.worker_pid = Some(std::process::id());
+        store.write_status(&one, &s).unwrap();
+        let before = std::fs::read(store.dir(&one).join("status.json")).unwrap();
+        let two = queued(&store, |_| ());
+        let me = liveness::current().unwrap();
+        let claimed = claim(&store, &two, me.pid, Some(&me.start))
+            .unwrap()
+            .unwrap();
+        let w = Worker {
+            store: store.clone(),
+            id: two.clone(),
+            job: store.read_job(&two).unwrap(),
+            status: claimed,
+            cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            deadline: Instant::now() + Duration::from_secs(10),
+            control_in_flight: None,
+            omp_queued: false,
+            settled: false,
+        };
+        let (w, panicked) = guarded(w, |_| panic!("boom"));
+        assert!(panicked);
+        assert!(!w.keep_warm());
+        let failed = store.read_status(&two).unwrap();
+        assert_eq!(failed.status, State::Failed);
+        assert_eq!(failed.error.unwrap().message, "worker panicked: boom");
+        assert_eq!(
+            std::fs::read(store.dir(&one).join("status.json")).unwrap(),
+            before
+        );
+        // An ordinary failure is the adopted job's own too, without the panic flag.
+        let three = queued(&store, |_| ());
+        let claimed = claim(&store, &three, me.pid, Some(&me.start))
+            .unwrap()
+            .unwrap();
+        let w = Worker {
+            id: three.clone(),
+            job: store.read_job(&three).unwrap(),
+            status: claimed,
+            ..w
+        };
+        let (_, panicked) = guarded(w, |_| Err(Failure::new("omp_exited", "gone")));
+        assert!(!panicked);
+        assert_eq!(store.read_status(&three).unwrap().status, State::Failed);
     }
 }

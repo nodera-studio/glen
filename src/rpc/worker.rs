@@ -278,26 +278,16 @@ impl Worker {
         }
     }
     fn mark_holder(&self, lock: &lock::SessionLock) {
-        if let Err(e) = self.mark_holder_as(lock, lock::HolderKind::Job) {
+        let holder = lock::Holder {
+            v: 1,
+            kind: lock::HolderKind::Job,
+            job_id: Some(self.id.as_str().into()),
+            pid: std::process::id(),
+            start: liveness::current().map(|i| i.start),
+        };
+        if let Err(e) = lock::mark(lock, &holder) {
             self.log("holder", &e.to_string());
         }
-    }
-    /// Records this process as the lock's holder for this job (`Warm` while idle after it).
-    pub(crate) fn mark_holder_as(
-        &self,
-        lock: &lock::SessionLock,
-        kind: lock::HolderKind,
-    ) -> std::io::Result<()> {
-        lock::mark(
-            lock,
-            &lock::Holder {
-                v: 1,
-                kind,
-                job_id: Some(self.id.as_str().into()),
-                pid: std::process::id(),
-                start: liveness::current().map(|i| i.start),
-            },
-        )
     }
     fn answer_control(
         &self,
@@ -520,6 +510,7 @@ impl Worker {
         };
         if result.is_ok()
             && self.keep_warm()
+            && let Some(key) = rpc::warm::Key::of(&self.job)
             && let Some(lock) = session_lock.take()
         {
             let session_id = self
@@ -535,6 +526,7 @@ impl Worker {
                     replies,
                     lock,
                     session_id,
+                    key,
                 },
             );
         }
