@@ -174,7 +174,10 @@ unless you pass `--force`; `--dry-run` works as it does for the extension.
 
 Headless Claude Code needs the skill itself allowed: `claude -p --permission-mode dontAsk` denies
 a skill that is not on the allow list, so pass `--allowedTools "Skill(glen)"`. The skill's own
-`allowed-tools: Bash(glen *)` grants the glen commands once the skill has loaded.
+`allowed-tools: Bash(glen *)` grants the glen commands once the skill has loaded. Under `dontAsk`
+that grant did not reach a turn resumed by a background task's completion notification (observed
+on Claude Code 2.1.316), so a headless run that waits in the background may need `Bash(glen *)`
+on `--allowedTools` as well.
 <!-- W4:end -->
 
 ## Website
