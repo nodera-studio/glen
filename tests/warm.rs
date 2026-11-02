@@ -716,3 +716,162 @@ fn ac_v2_407_an_unsettled_completed_job_does_not_stay_warm() {
     assert!(b.registry().is_none() && !b.held());
     assert!(!b.log(&job_id(&one)).contains("warm:"));
 }
+
+fn signal(pid: u32, sig: rustix::process::Signal) {
+    rustix::process::kill_process(rustix::process::Pid::from_raw(pid as i32).unwrap(), sig)
+        .unwrap();
+}
+
+#[test]
+fn ac_v2_403_every_ending_goes_through_one_teardown() {
+    for ending in ["release-all", "sigterm", "sighup", "omp-exit"] {
+        let (_dir, exit) = gate_path();
+        let b = WarmBox::with(&[("FAKE_OMP_IDLE_EXIT_RELEASE", exit.to_str().unwrap())]);
+        let one = job_id(&b.send(&["--warm", "60s"]));
+        let reg = b.wait_registry();
+        let reason = match ending {
+            "release-all" => {
+                assert!(b.run(&["release", "--all", "--json"]).status.success());
+                "release"
+            }
+            "sigterm" => {
+                signal(reg.entry.pid, rustix::process::Signal::TERM);
+                "signal"
+            }
+            "sighup" => {
+                signal(reg.entry.pid, rustix::process::Signal::HUP);
+                "signal"
+            }
+            _ => {
+                std::fs::write(&exit, b"go").unwrap();
+                "omp_exited"
+            }
+        };
+        let took = b.wait_cold(&reg.entry, Duration::from_secs(4));
+        assert!(took < Duration::from_secs(4), "{ending}: {took:?}");
+        assert!(!warm::release_path(&b.home(), A_ID).exists(), "{ending}");
+        assert!(
+            b.log(&one).contains(&format!("warm: cooling ({reason})")),
+            "{ending}: {}",
+            b.log(&one)
+        );
+    }
+}
+
+#[test]
+fn ac_v2_403_a_live_endpoint_for_the_session_ends_warmth_within_a_second() {
+    let mut lb = LiveBox::new();
+    let owners = lb.rpc.owners();
+    let send = lb
+        .rpc
+        .glen(&["send", "e27c0de", "hi", "--warm", "60s", "--json"])
+        .env("FAKE_OMP_MULTI", "1")
+        .env("FAKE_OMP_OWNERS_DIR", &owners)
+        .output()
+        .unwrap();
+    let one = data(&send)["job"]["id"].as_str().unwrap().to_owned();
+    let home = GlenHome {
+        root: lb.rpc.omp.glen_home.clone(),
+    };
+    let reg = poll(Duration::from_secs(10), || warm::read(&home, A_ID));
+    lb.start_ext(A_ID, "ok", &[]);
+    let appeared = Instant::now();
+    let omp = reg.entry.omp_pid.unwrap();
+    poll(Duration::from_secs(1), || group_gone(omp).then_some(()));
+    assert!(
+        appeared.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        appeared.elapsed()
+    );
+    poll(Duration::from_secs(4), || {
+        (warm::read(&home, A_ID).is_none() && !lock::is_held(&home, A_ID) && gone(reg.entry.pid))
+            .then_some(())
+    });
+    let log = std::fs::read_to_string(lb.rpc.job_dir(&one).join("worker.log")).unwrap();
+    assert!(log.contains("warm: cooling (endpoint)"), "{log}");
+}
+
+#[test]
+fn ac_v2_403_failed_aborted_and_forked_jobs_never_stay_warm() {
+    for scenario in ["error", "aborted", "fork"] {
+        let b = WarmBox::with(&[("FAKE_OMP_SCENARIO", scenario)]);
+        let out = b.run(&["send", "e27c0de", "hi", "--warm", "5s", "--json"]);
+        let v = json(&out);
+        let id = v["data"]["job"]["id"]
+            .as_str()
+            .or_else(|| v["error"]["details"]["job"]["id"].as_str())
+            .unwrap()
+            .to_owned();
+        b.wait_worker_gone(&id);
+        assert!(b.registry().is_none() && !b.held(), "{scenario}");
+        assert!(!b.log(&id).contains("warm:"), "{scenario}: {}", b.log(&id));
+    }
+}
+
+#[test]
+fn ac_v2_403_a_stray_control_for_the_last_job_is_answered_job_ended() {
+    let b = WarmBox::new();
+    let one = job_id(&b.send(&["--warm", "30s"]));
+    b.wait_registry();
+    let dir = b.job_dir(&one).join("control");
+    write_control(&dir, "1.json", br#"{"v":1,"op":"list_models"}"#);
+    let done = poll(Duration::from_secs(3), || {
+        std::fs::read(dir.join("1.done.json"))
+            .ok()
+            .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap())
+    });
+    assert_eq!(done["error"]["code"], "job_ended", "{done}");
+    assert!(b.registry().is_some(), "still warm");
+    release_all(&b);
+}
+
+#[test]
+fn ac_v2_404_a_job_with_another_key_cools_the_worker_and_runs_cold() {
+    let copy = {
+        let b = WarmBox::new();
+        let p = b.omp.tmp.path().join("fake_omp_copy");
+        std::fs::copy(&b.fake, &p).unwrap();
+        (b, p)
+    };
+    let (b, copied) = copy;
+    for (name, extra, vars) in [
+        ("thinking", vec!["--thinking", "high"], vec![]),
+        (
+            "env",
+            vec![],
+            vec![("PI_CONFIG_FILES", "/other/config.yml")],
+        ),
+        (
+            "binary",
+            vec![],
+            vec![("GLEN_OMP_BIN", copied.to_str().unwrap())],
+        ),
+    ] {
+        let starts = b.starts();
+        b.send(&["--warm", "30s"]);
+        let reg = b.wait_registry();
+        let mut args = vec!["send", "e27c0de", "cold", "--json"];
+        args.extend(&extra);
+        let mut c = b.cmd(&args);
+        c.envs(vars.iter().copied());
+        let two = data(&c.output().unwrap());
+        assert_eq!(two["job"]["status"], "completed", "{name}");
+        assert_eq!(two["job"]["omp_reused"], false, "{name}");
+        assert_eq!(b.starts(), starts + 2, "{name}: job 2 started its own omp");
+        assert!(
+            b.log(&reg.entry.job_id)
+                .contains("warm: cooling (mismatch)"),
+            "{name}"
+        );
+        if name == "env" {
+            let last = b
+                .fake_log()
+                .into_iter()
+                .rfind(|v| v["event"] == "start")
+                .unwrap();
+            assert_eq!(last["env"]["PI_CONFIG_FILES"], "/other/config.yml");
+        }
+        b.wait_worker_gone(&job_id(&two));
+        assert!(b.registry().is_none(), "{name}");
+    }
+}
