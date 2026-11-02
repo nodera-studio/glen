@@ -25,7 +25,7 @@
 //!   §A18–§A23): repo_contracts, v2_w0.
 //! - v0.2 W1 omp compatibility (AC-v2-101…AC-v2-106; §A10–§A12, §A19): v2_compat.
 //! - v0.2 W2 push (AC-v2-201…AC-v2-206; §A7, §A11, §A20): v2_push.
-//! - v0.2 W3 ACP spike (AC-v2-301…AC-v2-304; §A23): planned.
+//! - v0.2 W3 ACP spike (AC-v2-301…AC-v2-304; §A2, §A23): v2_acp.
 //! - v0.2 W4 warm worker (AC-v2-401…AC-v2-407; §A21): planned.
 //! - v0.2 W5 MCP layer (AC-v2-501…AC-v2-506; §A22): planned.
 //! - v0.2 W6 tech debt and audits (AC-v2-601…AC-v2-604): planned.
@@ -89,6 +89,8 @@ mod show;
 mod state;
 #[path = "conformance/tail.rs"]
 mod tail;
+#[path = "conformance/v2_acp.rs"]
+mod v2_acp;
 #[path = "conformance/v2_compat.rs"]
 mod v2_compat;
 #[path = "conformance/v2_push.rs"]
