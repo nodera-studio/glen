@@ -826,7 +826,8 @@ in the project. When `--session` matches only sessions outside the project, the 
 
 `--wait` (v0.2) blocks until at least one message is unread, checking every 250 ms like `-f`, for at most
 `--timeout` (default 90s, at most 24h; `--timeout` requires `--wait`). `--wait` conflicts with `-f` and `--all`;
-`--session`, `--cwd` and `--peek` apply as above. Messages already unread return at once.
+`--session`, `--cwd` and `--peek` apply as above. Messages already unread return at once. `--peek` marks nothing
+read, so `--peek --wait` returns the existing unread messages at once on every call: a one-shot read, not a receiver.
 
 - **A message arrives**: the normal document above, exit 0, marked read after output unless `--peek`.
 - **The bound passes** (`inbox.wait`), exit 10: `{total:0,marked_read:false,skipped_lines,messages:[],next,

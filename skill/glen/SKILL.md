@@ -81,6 +81,7 @@ Never poll the inbox in a loop or re-run `glen wait` on a timer: start one recei
   Run `glen inbox --peek` once at the start of each turn for TUI messages and late replies. <!-- glen:if inbox -->
 - Late and TUI replies (no job to wait on): `glen inbox --wait` waits up to 90 s (`--timeout DUR`, at most 24 h): <!-- glen:if inbox -->
   exit 0 with unread messages, exit 10 with none. Replies seen through `glen wait` stay unread there; skip ids you have. <!-- glen:if inbox -->
+  `glen inbox --wait` with `--peek` returns existing unread messages at once on every call: a one-shot read, not a receiver. <!-- glen:if inbox -->
 
 ## Shell timeouts and sandboxes
 - `glen send` and `glen wait` default to 90 s; give them a shell timeout of at least 100 s.
