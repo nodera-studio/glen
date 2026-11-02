@@ -333,6 +333,128 @@ fn ac_v2_406_controls_cool_an_idle_warm_session_then_run_as_today() {
     }
 }
 
+/// `pred` once it holds, or `None` once `child` exited without it.
+fn until_or_exit<T>(child: &mut std::process::Child, pred: impl Fn() -> Option<T>) -> Option<T> {
+    poll(Duration::from_secs(10), || match pred() {
+        Some(v) => Some(Some(v)),
+        None => child.try_wait().unwrap().map(|_| None),
+    })
+}
+
+#[test]
+fn ac_v2_406_models_asks_the_job_a_cooling_warm_worker_adopted() {
+    use glen::jobs::{Deliver, Job, JobId, JobStore, Route, State};
+    let b = WarmBox::new();
+    let home = b.home();
+    // This test process plays an idle warm worker: it holds the session, marked `warm`.
+    let me = liveness::current().unwrap();
+    let held = lock::try_acquire(&home, A_ID).unwrap().unwrap();
+    let warm_holder = lock::Holder {
+        v: 1,
+        kind: lock::HolderKind::Warm,
+        job_id: Some(JobId::new().as_str().into()),
+        pid: me.pid,
+        start: Some(me.start.clone()),
+    };
+    lock::mark(&held, &warm_holder).unwrap();
+    let mut models = b
+        .cmd(&["models", "e27c0de", "--timeout", "10s", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let ident = warm::ident(me.pid, Some(&me.start));
+    let asked = until_or_exit(&mut models, || {
+        warm::release_requested(&home, A_ID, &ident).then_some(())
+    });
+    assert!(
+        asked.is_some(),
+        "models never asked the warm worker to cool"
+    );
+    // Before it cools, the worker adopts a queued job, the way a claim does: the job's status
+    // names this worker first, then the session's holder says `job`.
+    let id = JobId::new();
+    let store = JobStore::new(home.clone());
+    let now = jiff::Timestamp::now().to_string();
+    store
+        .create(&Job {
+            v: 1,
+            id: id.as_str().into(),
+            handle: id.handle(),
+            created_at: now.clone(),
+            route: Route::Rpc,
+            session_id: Some(A_ID.into()),
+            session_file: Some(b.omp.session('A')),
+            session_handle: Some("e27c0de".into()),
+            deliver_as: Deliver::Auto,
+            text: "adopted".into(),
+            cwd: b.omp.alpha(),
+            omp_bin: Some(b.fake.clone()),
+            live_socket: None,
+            live_pid: None,
+            profile_flag: None,
+            thinking_flag: None,
+            owners_dir: b.owners(),
+            job_timeout_ms: 30_000,
+            deadline_at: now,
+            warm_ms: Some(30_000),
+            env_digest: None,
+        })
+        .unwrap();
+    let mut status = store.read_status(&id).unwrap();
+    status.status = State::Accepted;
+    status.worker_pid = Some(me.pid);
+    status.worker_start = Some(me.start.clone());
+    status.omp_reused = true;
+    store.write_status(&id, &status).unwrap();
+    lock::mark(
+        &held,
+        &lock::Holder {
+            kind: lock::HolderKind::Job,
+            job_id: Some(id.as_str().into()),
+            ..warm_holder
+        },
+    )
+    .unwrap();
+    // The adopted job answers the control from its inbox, as its worker would.
+    let control = b.job_dir(id.as_str()).join("control");
+    let request = until_or_exit(&mut models, || {
+        std::fs::read_dir(&control).ok()?.flatten().find_map(|e| {
+            let name = e.file_name().into_string().ok()?;
+            (!name.starts_with('.') && name.ends_with(".json") && !name.ends_with(".done.json"))
+                .then(|| e.path())
+        })
+    });
+    if let Some(request) = request {
+        let body: Value = serde_json::from_slice(&std::fs::read(&request).unwrap()).unwrap();
+        assert_eq!(body["op"], "list_models", "{body}");
+        let answer = serde_json::json!({"v":1,"ok":true,"data":{
+            "session_id":A_ID,
+            "current":{"provider":"fake","id":"adopted"},
+            "thinking_level":"high",
+            "models":[{"provider":"fake","id":"adopted","name":"Adopted","reasoning":true,
+                "thinking_levels":["off","high"],"context_window":1000,"max_tokens":100}],
+        }});
+        write_control(
+            &control,
+            &request
+                .with_extension("done.json")
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            answer.to_string(),
+        );
+    }
+    let doc = data(&models.wait_with_output().unwrap());
+    assert_eq!(doc["route"], "job", "{doc}");
+    assert_eq!(doc["current_source"], "session", "{doc}");
+    assert_eq!(doc["current"]["id"], "adopted", "{doc}");
+    assert_eq!(doc["thinking_level"], "high", "{doc}");
+    assert_eq!(doc["total"], 1, "{doc}");
+    assert_eq!(b.starts(), 0, "no omp of its own: the job answered");
+    drop(held);
+}
+
 #[test]
 fn ac_v2_405_a_stopped_worker_is_stale_and_release_force_kills_it() {
     let b = WarmBox::with(&[("GLEN_WARM_STALE_MS", "500")]);

@@ -543,7 +543,9 @@ pub(crate) fn route_models(
             _ => (),
         }
         crate::sandbox::refuse_rpc(env, "models")?;
-        if lock::is_held(&home, id) {
+        // A cooled warm worker's holder may now be an adopted or successor job: ask again, so
+        // an active job answers from its inbox rather than the profile list and the disk.
+        while lock::is_held(&home, id) {
             match owner(&store, id, deadline, &stop) {
                 Owner::Job(job) => {
                     return Ok((
@@ -553,9 +555,10 @@ pub(crate) fn route_models(
                     ));
                 }
                 Owner::Warm(holder) => {
-                    cool_for_control(env, "models", &home, opened, &holder, deadline, &stop)?
+                    cool_for_control(env, "models", &home, opened, &holder, deadline, &stop)?;
+                    stopped(deadline, &stop, opened)?;
                 }
-                _ => (),
+                _ => break,
             }
         }
         let probe = lease::probe(&paths.session_owners_dir, id);

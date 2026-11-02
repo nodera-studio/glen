@@ -228,7 +228,8 @@ fn force(home: &GlenHome, t: &Indexed) -> (&'static str, bool) {
 /// SIGKILL the omp group and the worker, but only when every recorded process is proven by pid
 /// and start token (binding J11): an `Unknown` worker or omp is never signalled, and a failed
 /// signal or a worker still alive after `bound` falls to `release_timeout` with the registry kept.
-/// `forced` only once the worker is proven dead and omp's group gone.
+/// `forced` only once the worker is proven dead and the recorded omp group is gone, whether or
+/// not its leader was alive to be signalled.
 fn force_with(
     home: &GlenHome,
     e: &warm::Entry,
@@ -244,18 +245,21 @@ fn force_with(
         Liveness::Unknown => return ("timeout", false),
         Liveness::Alive => (),
     }
-    // A dead omp needs no signal (and its pid may be reused); an unproven one blocks the kill.
-    let omp = match (e.omp_pid, identity.omp) {
-        (Some(pid), Some(Liveness::Alive)) => Some(pid),
+    // Only a proven omp leader's group is signalled: once the leader is gone its pid may be
+    // reused, so its group cannot be proven omp's. An unproven leader blocks the kill. The
+    // recorded group must be gone either way, since omp's descendants can outlive their leader.
+    let (signalled, recorded) = match (e.omp_pid, identity.omp) {
         (_, Some(Liveness::Unknown)) => return ("timeout", false),
-        _ => None,
+        (Some(pid), Some(Liveness::Alive)) => (Some(pid), Some(pid)),
+        (pid, _) => (None, pid),
     };
-    if omp.is_some_and(|pid| kill(Kill::Group(pid)).is_err()) || kill(Kill::Process(e.pid)).is_err()
+    if signalled.is_some_and(|pid| kill(Kill::Group(pid)).is_err())
+        || kill(Kill::Process(e.pid)).is_err()
     {
         return ("timeout", false);
     }
     let end = Instant::now() + bound;
-    while !(warm::kill_identity(e).worker == Liveness::Dead && omp.is_none_or(group_gone)) {
+    while !(warm::kill_identity(e).worker == Liveness::Dead && recorded.is_none_or(group_gone)) {
         if Instant::now() >= end {
             return ("timeout", false);
         }
@@ -541,6 +545,72 @@ mod tests {
         assert_eq!(force_with(&h, &e, &signal, FORCE_BOUND), ("forced", true));
         assert!(warm::read(&h, A).is_none());
         assert!(!child.wait().unwrap().success(), "killed");
+    }
+    /// Kills the group on drop, so a failed assertion leaves no `sleep` behind.
+    struct Group(u32);
+    impl Drop for Group {
+        fn drop(&mut self) {
+            let _ = rpc::kill_group(self.0, rustix::process::Signal::KILL);
+        }
+    }
+    #[test]
+    fn force_is_never_forced_while_a_dead_omp_leaders_group_survives() {
+        use std::os::unix::process::CommandExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        // omp's group leader exits at once; a descendant stays in the group.
+        let mut leader = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & exit 0"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let group = Group(leader.id());
+        leader.wait().unwrap();
+        assert!(!group_gone(group.0), "the descendant keeps the group");
+        let (mut worker, mut e) = sleeper();
+        e.omp_pid = Some(group.0);
+        e.omp_start = Some("the-exited-leader".into());
+        assert_eq!(warm::kill_identity(&e).omp, Some(Liveness::Dead));
+        warm::publish(&h, &e).unwrap();
+        let sent = std::cell::Cell::new(vec![]);
+        let recorded = |k: Kill| -> std::io::Result<()> {
+            let mut all = sent.take();
+            all.push(k);
+            sent.set(all);
+            signal(k)
+        };
+        assert_eq!(
+            force_with(&h, &e, &recorded, Duration::from_millis(300)),
+            ("timeout", false)
+        );
+        assert_eq!(
+            sent.take(),
+            [Kill::Process(e.pid)],
+            "a group whose leader is gone is never signalled"
+        );
+        assert!(
+            !worker.wait().unwrap().success(),
+            "the proven worker is killed"
+        );
+        assert!(!group_gone(group.0), "the survivor is left alone");
+        assert_eq!(warm::read(&h, A).unwrap().entry, e, "the registry is kept");
+        // Once that group is gone, a proven worker with the same omp record is forced.
+        rpc::kill_group(group.0, rustix::process::Signal::KILL).unwrap();
+        let end = Instant::now() + Duration::from_secs(10);
+        while !group_gone(group.0) {
+            assert!(Instant::now() < end, "the killed group outlived 10 s");
+            std::thread::sleep(POLL);
+        }
+        let (mut worker, mut e) = sleeper();
+        e.omp_pid = Some(group.0);
+        e.omp_start = Some("the-exited-leader".into());
+        warm::publish(&h, &e).unwrap();
+        assert_eq!(force_with(&h, &e, &signal, FORCE_BOUND), ("forced", true));
+        assert!(warm::read(&h, A).is_none());
+        assert!(!worker.wait().unwrap().success(), "killed");
     }
     #[test]
     fn an_at_new_job_handle_finds_its_worker_after_a_follow_up_was_adopted() {
