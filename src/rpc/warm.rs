@@ -264,13 +264,97 @@ pub fn path(home: &GlenHome, session_id: &str) -> PathBuf {
 pub fn release_path(home: &GlenHome, session_id: &str) -> PathBuf {
     dir(home).join(format!("{}.release", lock_key(session_id)))
 }
-/// Atomic 0600 write in the 0700 `run/warm` directory.
+/// `run/warm/<lock_key>.lock`, the session's metadata lock file.
+fn meta_path(home: &GlenHome, session_id: &str) -> PathBuf {
+    dir(home).join(format!("{}.lock", lock_key(session_id)))
+}
+/// The longest a caller waits for the metadata lock: every holder keeps it for one read, compare
+/// and write or unlink, so only a stopped holder outlasts this.
+const META_BOUND: Duration = Duration::from_secs(1);
+/// The session's metadata lock (design §A21): a flock independent of the session lock, taken by
+/// every publication and removal of the registry and the release request and held only for that
+/// one step, never across a wait. A conditional removal therefore unlinks exactly the file it
+/// compared: no publish or other removal can land in between.
+struct MetaLock {
+    fd: std::os::fd::OwnedFd,
+    path: PathBuf,
+    /// The registry and the release request it guards.
+    guards: [PathBuf; 2],
+}
+/// The lock file lives only while a file it guards does: the holder that leaves neither unlinks
+/// it before it unlocks, and [`meta_lock`] retries a lock taken on an unlinked file. Unlocks
+/// explicitly, as `jobs::lock::SessionLock` does: a child forked on another thread shares the
+/// description until its exec.
+impl Drop for MetaLock {
+    fn drop(&mut self) {
+        let gone = |p: &PathBuf| matches!(fs::symlink_metadata(p), Err(e) if e.kind() == io::ErrorKind::NotFound);
+        if self.guards.iter().all(gone) {
+            let _ = fs::remove_file(&self.path);
+        }
+        let _ = rustix::fs::flock(&self.fd, rustix::fs::FlockOperation::Unlock);
+    }
+}
+/// Takes the metadata lock, waiting at most [`META_BOUND`]. `None` when `run/warm` does not
+/// exist: there is nothing to remove, and a publish fails on its own write.
+fn meta_lock(home: &GlenHome, session_id: &str) -> io::Result<Option<MetaLock>> {
+    use rustix::{
+        fs::{FlockOperation, Mode, OFlags, flock, fstat, lstat, open},
+        io::Errno,
+    };
+    let file = meta_path(home, session_id);
+    let context = |what: &str, e: Errno| {
+        io::Error::new(
+            io::Error::from(e).kind(),
+            format!("cannot {what} {}: {e}", file.display()),
+        )
+    };
+    let end = Instant::now() + META_BOUND;
+    loop {
+        let fd = match open(
+            &file,
+            OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o600),
+        ) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(None),
+            Err(e) => return Err(context("open", e)),
+        };
+        match flock(&fd, FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => {
+                // The holder before this one may have unlinked the file this fd locks.
+                let linked = match (fstat(&fd), lstat(&file)) {
+                    (Ok(held), Ok(now)) => (held.st_dev, held.st_ino) == (now.st_dev, now.st_ino),
+                    _ => false,
+                };
+                if linked {
+                    return Ok(Some(MetaLock {
+                        fd,
+                        path: file.clone(),
+                        guards: [path(home, session_id), release_path(home, session_id)],
+                    }));
+                }
+                let _ = flock(&fd, FlockOperation::Unlock);
+            }
+            Err(Errno::WOULDBLOCK) => std::thread::sleep(Duration::from_millis(1)),
+            Err(e) => return Err(context("lock", e)),
+        }
+        if Instant::now() >= end {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("cannot lock {}: held for over 1s", file.display()),
+            ));
+        }
+    }
+}
+/// Atomic 0600 write in the 0700 `run/warm` directory, under the metadata lock.
 pub fn publish(home: &GlenHome, entry: &Entry) -> io::Result<()> {
     home.ensure_dir("run/warm")?;
+    let _meta = meta_lock(home, &entry.session_id)?;
     write_private_atomic(&path(home, &entry.session_id), &serde_json::to_vec(entry)?)
 }
 /// The heartbeat: moves the registry's mtime without rewriting it. A missing file or a
-/// symlink (never followed) is ignored.
+/// symlink (never followed) is ignored. It takes no metadata lock: it never creates the file, so
+/// at worst it moves the mtime of a registry a removal just unlinked.
 pub fn touch(home: &GlenHome, session_id: &str) {
     use rustix::fs::{Mode, OFlags, open};
     let Ok(fd) = open(
@@ -291,41 +375,24 @@ fn remove_file(path: &Path) -> io::Result<()> {
         _ => Ok(()),
     }
 }
-/// Removes the registry; a missing one is fine.
+/// Removes the registry under the metadata lock; a missing one is fine.
 pub fn remove(home: &GlenHome, session_id: &str) -> io::Result<()> {
+    let Some(_meta) = meta_lock(home, session_id)? else {
+        return Ok(());
+    };
     remove_file(&path(home, session_id))
 }
 /// Removes the registry only while it still names the worker `ident` (see [`ident`]); true when
-/// it did. It needs no session lock: a successor's registry, even one published as this runs,
-/// is never removed (see [`remove_while`]).
+/// it did. It needs no session lock: the read, the compare and the unlink all run under the
+/// metadata lock, so a successor's registry is never removed.
 pub fn remove_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
+    let Some(_meta) = meta_lock(home, session_id)? else {
+        return Ok(false);
+    };
     if read(home, session_id).is_none_or(|i| i.entry.ident() != ident) {
         return Ok(false);
     }
-    remove_while(&path(home, session_id), |bytes| {
-        parse(bytes, session_id).is_some_and(|e| e.ident() == ident)
-    })
-}
-/// Removes `path` only while its bytes pass `names`; true when it did. The file is moved aside
-/// first, so the check reads exactly the file that is removed. One a concurrent writer put there
-/// meanwhile is put back, unless an even newer one already took the path (as
-/// `live::registry::remove_if_unchanged`).
-fn remove_while(path: &Path, names: impl FnOnce(&[u8]) -> bool) -> io::Result<bool> {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let aside = path.with_file_name(format!(".{name}.{}.stale", uuid::Uuid::now_v7()));
-    match fs::rename(path, &aside) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        moved => moved?,
-    }
-    if read_regular(&aside).is_some_and(|(bytes, _)| names(&bytes)) {
-        fs::remove_file(&aside)?;
-        return Ok(true);
-    }
-    match fs::hard_link(&aside, path) {
-        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
-        _ => fs::remove_file(&aside)?,
-    }
-    Ok(false)
+    remove_file(&path(home, session_id)).map(|()| true)
 }
 fn read_regular(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
     let meta = fs::symlink_metadata(path).ok()?;
@@ -345,7 +412,7 @@ fn parse(bytes: &[u8], session_id: &str) -> Option<Entry> {
         .filter(|e| e.v == 1 && e.pid > 0 && e.session_id == session_id)
 }
 /// Every readable registry, plus the count of files that are not (torn, foreign, a symlink).
-/// Release requests and atomic-write temporaries are not registries.
+/// Release requests, metadata lock files and atomic-write temporaries are not registries.
 pub fn index(home: &GlenHome) -> (Vec<Indexed>, usize) {
     let mut entries = vec![];
     let mut unreadable = 0;
@@ -368,9 +435,16 @@ pub fn index(home: &GlenHome) -> (Vec<Indexed>, usize) {
     entries.sort_by(|a, b| a.entry.session_id.cmp(&b.entry.session_id));
     (entries, unreadable)
 }
-/// Asks the worker named by `ident` (see [`ident`]) to cool. Rewriting refreshes the request.
+/// Asks the worker named by `ident` (see [`ident`]) to cool, under the metadata lock. Rewriting
+/// refreshes the request. A lock still busy after [`META_BOUND`] has a stopped holder (such as a
+/// worker SIGSTOPped as it published): the request is not written, and the caller's own wait, or
+/// `glen release --force`, decides as for a worker that never answers.
 pub fn request_release(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<()> {
     home.ensure_dir("run/warm")?;
+    let _meta = match meta_lock(home, session_id) {
+        Err(e) if e.kind() == io::ErrorKind::TimedOut => return Ok(()),
+        held => held?,
+    };
     write_private_atomic(&release_path(home, session_id), ident.as_bytes())
 }
 /// True only for a request addressed to this worker's own identity: a request meant for an
@@ -378,18 +452,24 @@ pub fn request_release(home: &GlenHome, session_id: &str, ident: &str) -> io::Re
 pub fn release_requested(home: &GlenHome, session_id: &str, me: &str) -> bool {
     read_regular(&release_path(home, session_id)).is_some_and(|(bytes, _)| bytes == me.as_bytes())
 }
+/// Removes the release request under the metadata lock; a missing one is fine.
 pub fn clear_release(home: &GlenHome, session_id: &str) -> io::Result<()> {
+    let Some(_meta) = meta_lock(home, session_id)? else {
+        return Ok(());
+    };
     remove_file(&release_path(home, session_id))
 }
-/// Removes the release request only while it is addressed to `ident`; true when it did. A request
-/// another `glen release` writes meanwhile is never removed (see [`remove_while`]).
+/// Removes the release request only while it is addressed to `ident`; true when it did. The read,
+/// the compare and the unlink run under the metadata lock, so another `glen release`'s request is
+/// never removed.
 pub fn clear_release_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
+    let Some(_meta) = meta_lock(home, session_id)? else {
+        return Ok(false);
+    };
     if !release_requested(home, session_id, ident) {
         return Ok(false);
     }
-    remove_while(&release_path(home, session_id), |bytes| {
-        bytes == ident.as_bytes()
-    })
+    remove_file(&release_path(home, session_id)).map(|()| true)
 }
 /// What `glen release --force` may signal: only a process whose pid and start token are proven
 /// unchanged (`Alive`). `Unknown` never signals.
@@ -1013,8 +1093,9 @@ fn guarded(mut w: Worker, body: impl FnOnce(&mut Worker) -> Result<(), Failure>)
     (w, panicked)
 }
 /// The one teardown (design §A21): close omp (bounded by [`TEARDOWN_BOUND`]), remove the
-/// registry and any release request, then free the lock. The registry goes before the lock, so
-/// a reader never sees a free lock with a live registry.
+/// registry and any release request (each under the metadata lock, so a cleanup's removal never
+/// interleaves with them), then free the session lock. The registry goes before the lock, so a
+/// reader never sees a free lock with a live registry.
 pub(crate) fn teardown(
     home: &GlenHome,
     session_id: &str,
@@ -1256,6 +1337,8 @@ mod registry_tests {
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path(&h, ID)), 0o600);
         assert_eq!(mode(&h.root.join("run/warm")), 0o700);
+        // The metadata lock file the publish created is not a registry either.
+        assert_eq!(mode(&meta_path(&h, ID)), 0o600);
         // A release request and a torn or foreign file are not registries.
         request_release(&h, ID, &e.ident()).unwrap();
         assert_eq!(mode(&release_path(&h, ID)), 0o600);
@@ -1411,40 +1494,185 @@ mod registry_tests {
         assert!(clear_release_if(&h, ID, &successor.ident()).unwrap());
         assert!(read(&h, ID).is_none() && !release_path(&h, ID).exists());
     }
+    /// The names in `run/warm`, sorted.
+    fn files(h: &GlenHome) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir(h))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+    /// How long a test holds the metadata lock to prove that another party waits for it: well
+    /// under [`META_BOUND`], so the waiter never gives up.
+    const HELD: Duration = Duration::from_millis(100);
     #[test]
-    fn removal_puts_back_a_file_written_during_the_check() {
-        use std::os::unix::fs::MetadataExt;
+    fn overlapping_removers_wait_their_turn_and_the_newest_files_survive() {
         let t = tempfile::tempdir().unwrap();
         let h = home(&t);
-        let p = path(&h, ID);
-        let successor = me(EntryState::Idle);
-        publish(&h, &successor).unwrap();
-        let stamp = |p: &Path| {
-            let m = fs::metadata(p).unwrap();
-            (m.ino(), m.modified().unwrap())
-        };
-        let before = stamp(&p);
-        // The file moved aside is not the one checked (a successor published in between): it is
-        // put back as it was.
-        assert!(!remove_while(&p, |_| false).unwrap());
-        assert_eq!(read(&h, ID).unwrap().entry, successor);
-        assert_eq!(stamp(&p), before);
-        // An even newer publish while the moved file is checked keeps the path.
-        let mut newer = successor.clone();
-        newer.state = EntryState::Busy;
-        let republish = |_: &[u8]| {
-            publish(&h, &newer).unwrap();
-            false
-        };
-        assert!(!remove_while(&p, republish).unwrap());
-        assert_eq!(read(&h, ID).unwrap().entry, newer);
-        assert!(remove_while(&p, |b| parse(b, ID).is_some_and(|e| e == newer)).unwrap());
-        assert!(!remove_while(&p, |_| true).unwrap(), "nothing to remove");
+        let key = lock_key(ID);
+        // The old worker `old`'s files, which two overlapping `glen release` cleanups remove.
+        let old = entry(1, Some("old".into()), EntryState::Idle);
+        let newest = me(EntryState::Idle);
+        publish(&h, &old).unwrap();
+        request_release(&h, ID, &old.ident()).unwrap();
+        // The test publishes both files under the metadata lock, as a successor does; both
+        // cleanups start while it holds the lock.
+        let meta = meta_lock(&h, ID).unwrap().unwrap();
+        std::thread::scope(|s| {
+            let removers: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        (
+                            remove_if(&h, ID, &old.ident()).unwrap(),
+                            clear_release_if(&h, ID, &old.ident()).unwrap(),
+                        )
+                    })
+                })
+                .collect();
+            std::thread::sleep(HELD);
+            assert_eq!(
+                read(&h, ID).unwrap().entry,
+                old,
+                "no removal lands while another holder has the lock"
+            );
+            assert!(release_requested(&h, ID, &old.ident()));
+            write_private_atomic(&path(&h, ID), &serde_json::to_vec(&newest).unwrap()).unwrap();
+            write_private_atomic(&release_path(&h, ID), newest.ident().as_bytes()).unwrap();
+            drop(meta);
+            for r in removers {
+                assert_eq!(r.join().unwrap(), (false, false), "only `old`'s files go");
+            }
+        });
+        assert_eq!(read(&h, ID).unwrap().entry, newest);
+        assert!(release_requested(&h, ID, &newest.ident()));
         assert_eq!(
-            fs::read_dir(dir(&h)).unwrap().count(),
-            0,
+            files(&h),
+            [
+                format!("{key}.json"),
+                format!("{key}.lock"),
+                format!("{key}.release")
+            ],
             "no copy left aside"
         );
+    }
+    #[test]
+    fn teardown_between_a_cleanups_compare_and_unlink_resurrects_nothing() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let worker = me(EntryState::Idle);
+        let session = crate::jobs::lock::try_acquire(&h, ID).unwrap().unwrap();
+        publish(&h, &worker).unwrap();
+        request_release(&h, ID, &worker.ident()).unwrap();
+        // A `glen release` cleanup for `worker` holds the metadata lock: it has read the registry
+        // and compared its identity, and has not yet unlinked it. The worker tears down meanwhile.
+        let cleanup = meta_lock(&h, ID).unwrap().unwrap();
+        assert!(read(&h, ID).is_some_and(|i| i.entry.ident() == worker.ident()));
+        std::thread::scope(|s| {
+            let down = s.spawn(|| {
+                teardown(
+                    &h,
+                    ID,
+                    Reason::Release,
+                    || None,
+                    move || drop(session),
+                    &|_: &str| (),
+                )
+            });
+            std::thread::sleep(HELD);
+            assert!(
+                crate::jobs::lock::is_held(&h, ID),
+                "teardown's removal waits for the cleanup, so the session lock stays held"
+            );
+            // The cleanup's unlink, then its unlock.
+            remove_file(&path(&h, ID)).unwrap();
+            drop(cleanup);
+            down.join().unwrap();
+        });
+        assert!(!crate::jobs::lock::is_held(&h, ID));
+        assert!(files(&h).is_empty(), "{:?}", files(&h));
+        // A late cleanup for the same worker finds nothing and puts nothing back.
+        assert!(!remove_if(&h, ID, &worker.ident()).unwrap());
+        assert!(!clear_release_if(&h, ID, &worker.ident()).unwrap());
+        assert!(files(&h).is_empty(), "{:?}", files(&h));
+        // Nor does it touch the next worker's registry.
+        let next = entry(1, Some("next".into()), EntryState::Idle);
+        publish(&h, &next).unwrap();
+        assert!(!remove_if(&h, ID, &worker.ident()).unwrap());
+        assert_eq!(read(&h, ID).unwrap().entry, next);
+    }
+    #[test]
+    fn a_mismatched_entry_is_removed_while_its_session_lock_is_held() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        // A live process holds the session lock, but the registry names a start token that is not
+        // its own: cleanup removes it without the session lock, which stays with its holder.
+        let _session = crate::jobs::lock::try_acquire(&h, ID).unwrap().unwrap();
+        let mut reused = me(EntryState::Idle);
+        reused.start = Some("reused".into());
+        publish(&h, &reused).unwrap();
+        request_release(&h, ID, &reused.ident()).unwrap();
+        assert!(remove_if(&h, ID, &reused.ident()).unwrap());
+        assert!(clear_release_if(&h, ID, &reused.ident()).unwrap());
+        assert!(crate::jobs::lock::is_held(&h, ID));
+        assert!(files(&h).is_empty(), "{:?}", files(&h));
+    }
+    #[test]
+    fn the_lock_file_lives_only_while_a_file_it_guards_does() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let e = me(EntryState::Idle);
+        publish(&h, &e).unwrap();
+        request_release(&h, ID, &e.ident()).unwrap();
+        remove(&h, ID).unwrap();
+        assert!(
+            meta_path(&h, ID).exists(),
+            "the release request still needs it"
+        );
+        clear_release(&h, ID).unwrap();
+        assert!(files(&h).is_empty(), "{:?}", files(&h));
+        // A waiter that locks the file its holder unlinked holds nothing: the next acquire locks
+        // the file now at the path, which is the one every later caller contends for.
+        let held = meta_lock(&h, ID).unwrap().unwrap();
+        let stale = fs::File::open(meta_path(&h, ID)).unwrap();
+        drop(held);
+        assert!(!meta_path(&h, ID).exists());
+        stale.try_lock().unwrap();
+        let now = meta_lock(&h, ID).unwrap().unwrap();
+        assert!(meta_path(&h, ID).exists());
+        assert!(
+            fs::File::open(meta_path(&h, ID))
+                .unwrap()
+                .try_lock()
+                .is_err(),
+            "the linked file is the one held"
+        );
+        drop(now);
+    }
+    #[test]
+    fn a_stopped_holder_bounds_every_wait_and_a_release_request_is_not_written() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let e = me(EntryState::Idle);
+        publish(&h, &e).unwrap();
+        // A holder that never lets go, as a worker stopped inside its publish.
+        let stopped = meta_lock(&h, ID).unwrap().unwrap();
+        let started = Instant::now();
+        request_release(&h, ID, &e.ident()).unwrap();
+        assert!(started.elapsed() >= META_BOUND, "{:?}", started.elapsed());
+        assert!(
+            !release_path(&h, ID).exists(),
+            "not written without the lock"
+        );
+        let err = remove_if(&h, ID, &e.ident()).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut, "{err}");
+        assert_eq!(
+            read(&h, ID).unwrap().entry,
+            e,
+            "nothing removed without the lock"
+        );
+        drop(stopped);
+        assert!(remove_if(&h, ID, &e.ident()).unwrap());
     }
     #[test]
     fn kill_identity_requires_proof() {
