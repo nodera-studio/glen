@@ -65,9 +65,12 @@ bash tests/acceptance/self-test.sh
 The self-test uses hand-made recordings and a fake executable only. It checks a passing b
 recording, then missing NONCE_R, an unpaired start and guard_refused (all fail by name); a b3
 permission denial after skill load fails AC-420. It also checks wrapper target guards and that
-gitleaks detects a generated fake Anthropic-shaped token. For mode p it checks one `woke`, two
-`no_wake` (no delivery; a foreground glen output carrying the nonce), a `foreground_only` and a
-`no_wait` recording (both fail `AC-206-bg-wait-started`), inbox polling (three calls, or one
+gitleaks detects a generated fake Anthropic-shaped token. For mode p it checks two `woke` (the
+task's completion as stream-json's `task_notification` event and as `<task-notification>` XML),
+eight `no_wake` (no notification; a blocking `TaskOutput` with and without a later notification; a
+`BashOutput` before it; another task's notification; a stopped and a killed task; a foreground glen
+output carrying the nonce), a `foreground_only` and a `no_wait` recording (both fail
+`AC-206-bg-wait-started`), inbox polling (three calls, or one
 without `--wait`/`--peek`, fails `AC-206-no-inbox-polling`), a woken report without the nonce, a
 run without a `result` event and a second send; and that the wrapper passes only the whitelisted
 manifest `env` names (`LD_PRELOAD` is ignored), accepts P, refuses a foreign handle and a foreign
@@ -190,10 +193,14 @@ to P); `AC-206-bg-wait-started` (a Bash tool_use with `run_in_background: true` 
 with `--for reply`); `AC-206-no-inbox-polling` (at most two `inbox` calls, each with `--wait` or
 `--peek`); `AC-206-evidence` (a `result` event exists); `AC-206-nonce` (a woken run's report
 quotes `NONCE_P`). The `AC-206-evidence` string carries the outcome: `wake=<class>
-launch_event=<i> delivered_event=<i> result_event=<i> foreground_glen_output_had_nonce=<bool>`
-(indices into `p.jsonl`). Classes: `woke` (a background reply wait was launched, a later event
-other than its own `tool_result` carries `NONCE_P` before `result`, and no foreground glen output
-carried it), `no_wake` (launched, but no such event), `foreground_only` (a reply wait without
+launch_event=<i> task=<id> delivered_event=<i> result_event=<i> foreground_glen_output_had_nonce=<bool>
+fetched_before_delivery=<bool>` (indices into `p.jsonl`; `task` is the background task id from the
+launch result). Classes: `woke` (a background reply wait was launched, and its task's own completion
+notification, a `system` `task_notification` event or a user `<task-notification>` with status
+`completed` or `failed`, arrives before `result`; no foreground glen output carried `NONCE_P`, and no
+tool result carried it before that notification, so a blocking `TaskOutput`, a `BashOutput` or a
+`Read` of the output file is not a wake), `no_wake` (launched, but no such notification),
+`foreground_only` (a reply wait without
 `run_in_background`) and `no_wait` (none). The class decides the skill's `claude -p` wording
 (plan Step 13); `no_wake` passes the checks but is not push. Read every tool call of `p.jsonl`
 as for b/b3. Teardown keeps gitleaks and the owner-skills comparison and skips the owner-session

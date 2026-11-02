@@ -37,6 +37,24 @@ def has_nonce($n): $n != null and (tostring | contains($n));
 def bash_uses($events):
   [$events | to_entries[] | .key as $i | .value | .. | objects | select(.type? == "tool_use" and .name? == "Bash") |
    {i:$i, id, bg:(.input.run_in_background? == true), cmd:(.input.command? | if type == "string" then . else "" end)}];
+# The task id Claude Code gives a run_in_background Bash call, from its launch result.
+def task_id($events; $launch):
+  [$events[] | select(any(.. | objects; .type? == "tool_result" and .tool_use_id? == $launch.id)) |
+   (.tool_use_result? | objects | .backgroundTaskId? | strings),
+   (.. | objects | select(.type? == "tool_result" and .tool_use_id? == $launch.id) |
+    [.content | .. | strings] | join("\n") | capture("ID: (?<t>[A-Za-z0-9_-]+)").t)] | first;
+# A completion notification for that task (or its launching tool_use): stream-json's system
+# task_notification event, or the <task-notification> XML Claude Code queues as a user message.
+# A stopped or killed task did not complete, so its notification is no wake.
+def notifies($task; $tool):
+  if .type? == "system" then
+    .subtype? == "task_notification" and (.status? | IN("completed", "failed")) and
+    ((.task_id? != null and .task_id? == $task) or (.tool_use_id? != null and .tool_use_id? == $tool))
+  elif .type? == "user" then
+    any(.. | strings | split("<task-notification>")[1:][] | split("</task-notification>")[0];
+      test("<status>(completed|failed)</status>") and
+      (($task != null and contains("<task-id>\($task)</task-id>")) or contains("<tool-use-id>\($tool)</tool-use-id>")))
+  else false end;
 def base_checks($all;$starts;$ends):
   [check("paired_calls"; (all($starts[]; . as $s | any($ends[]; .id==$s.id and .argv==$s.argv))) and (all($ends[]; . as $e | any($starts[]; .id==$e.id and .argv==$e.argv))) and ([$starts[].id]|unique|length)==($starts|length) and ([$ends[].id]|unique|length)==($ends|length); "unpaired start means killed call"),
    check("guard_refused"; all($all[];.t!="guard_refused"); "zero guard refusals"),
@@ -70,15 +88,19 @@ $m[0] as $manifest | $calls as $all |
   bash_uses($discovered) as $bash |
   ([$bash[] | select(.bg and (.cmd|reply_wait))] | first) as $launch |
   ([$discovered | to_entries[] | select(.value.type? == "result") | .key] | first) as $result_at |
+  (if $launch == null then null else task_id($discovered; $launch) end) as $task |
+  # Delivery is the launched task's own completion notification, never a tool result.
   (if $launch == null then null else
-     [$discovered | to_entries[] | select(.key > $launch.i and (.value.type? == "user" or .value.type? == "system")) |
-      select([.value | .. | objects | select(.type? == "tool_result" and .tool_use_id? == $launch.id)] | length == 0) |
-      select(.value | has_nonce($n)) | .key] | first
+     [$discovered | to_entries[] | select(.key > $launch.i and (.value | notifies($task; $launch.id))) | .key] | first
    end) as $delivered_at |
   ([$bash[] | select((.bg|not) and (.cmd|runs_glen)) | .id as $id |
     $discovered[] | .. | objects | select(.type? == "tool_result" and .tool_use_id? == $id) | has_nonce($n)] | any) as $foreground_carried |
+  # A foreground retrieval (TaskOutput or BashOutput blocking on the task, a Read of its output
+  # file) that returned the nonce before the notification carried the reply, not the wake.
+  ([$discovered | to_entries[] | select(.key < ($delivered_at // infinite)) | .value | .. | objects |
+    select(.type? == "tool_result" and .tool_use_id? != $launch.id) | has_nonce($n)] | any) as $fetched_first |
   (if $launch != null then
-     (if $delivered_at != null and ($result_at == null or $delivered_at < $result_at) and ($foreground_carried|not) then "woke" else "no_wake" end)
+     (if $delivered_at != null and ($result_at == null or $delivered_at < $result_at) and ($foreground_carried|not) and ($fetched_first|not) then "woke" else "no_wake" end)
    elif any($bash[]; (.bg|not) and (.cmd|reply_wait)) then "foreground_only"
    else "no_wait" end) as $wake |
   [$content[]|select(cmd=="inbox")] as $inbox |
@@ -87,7 +109,7 @@ $m[0] as $manifest | $calls as $all |
   [check("AC-206-send"; ($p|length)==1 and ($delivery_attempts|length)==1; "exactly one counted send, to P"),
    check("AC-206-bg-wait-started"; $launch != null; "a Bash tool_use with run_in_background runs glen wait --for reply"),
    check("AC-206-no-inbox-polling"; ($inbox|length)<=2 and all($inbox[]; any(.argv[]; . == "--wait" or . == "--peek")); "at most two inbox calls, each with --wait or --peek"),
-   check("AC-206-evidence"; $result_at != null; "wake=\($wake) launch_event=\($launch.i) delivered_event=\($delivered_at) result_event=\($result_at) foreground_glen_output_had_nonce=\($foreground_carried)"),
+   check("AC-206-evidence"; $result_at != null; "wake=\($wake) launch_event=\($launch.i) task=\($task) delivered_event=\($delivered_at) result_event=\($result_at) foreground_glen_output_had_nonce=\($foreground_carried) fetched_before_delivery=\($fetched_first)"),
    check("AC-206-nonce"; $wake != "woke" or ($report|has_nonce($n)); "report quotes NONCE_P when woken")]
  else
  base_checks($all;$starts;$ends) +

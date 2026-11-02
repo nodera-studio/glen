@@ -295,14 +295,30 @@ p_calls() { # extra argv arrays (JSON) appended after the send and the reply wai
       {t:"start",id:($i|tostring),argv:$v.a,ts:($i*10)},
       {t:"end",id:($i|tostring),argv:$v.a,exit:$v.exit,ms:20,stdout:$v.out}' > "$Q/calls.ndjson"
 }
-p_events() { # $1: the reply wait's run_in_background, $2: whether its completion is delivered
-    jq -cn --argjson bg "$1" --argjson delivered "$2" '
+p_events() { # $1: the reply wait's run_in_background; $2: its task b1's completion notification:
+    # none, system (stream-json's task_notification event) or xml (the <task-notification> user
+    # message), after which the run reads the output file; $3: a foreground retrieval of b1's
+    # output before that notification: none, TaskOutput or BashOutput.
+    jq -cn --argjson bg "$1" --arg note "${2:-none}" --arg fetch "${3:-none}" '
+      "{\"data\":{\"woke\":\"reply\",\"replies\":[{\"text\":\"reply: P-nonce\"}]}}" as $out |
+      "Background command \"glen wait j1234567 --for reply\" failed with exit code 10" as $summary |
       {type:"system",subtype:"init"},
       {type:"assistant",message:{content:[{type:"tool_use",id:"send",name:"Bash",input:{command:"glen send e27c0de \"Call your reply tool with exactly P-nonce\" --no-wait"}}]}},
       {type:"user",message:{content:[{type:"tool_result",tool_use_id:"send",content:"{\"v\":1,\"ok\":true,\"data\":{\"status\":\"running\"}}"}]}},
       {type:"assistant",message:{content:[{type:"tool_use",id:"wait",name:"Bash",input:({command:"glen wait j1234567 --for reply"} + if $bg then {run_in_background:true} else {} end)}]}},
-      {type:"user",message:{content:[{type:"tool_result",tool_use_id:"wait",content:(if $bg then "Command running in background with ID: b1" else "{\"data\":{\"woke\":\"reply\",\"replies\":[{\"text\":\"reply: P-nonce\"}]}}" end)}]}},
-      (if $bg and $delivered then {type:"user",message:{content:[{type:"text",text:"Background command b1 completed: reply: P-nonce"}]}} else empty end),
+      {type:"user",message:{content:[{type:"tool_result",tool_use_id:"wait",content:(if $bg then "Command running in background with ID: b1. Output is being written to: /tmp/tasks/b1.output" else $out end)}]},
+       tool_use_result:(if $bg then {stdout:"",stderr:"",interrupted:false,backgroundTaskId:"b1"} else {stdout:$out,stderr:"",interrupted:false} end)},
+      (if $fetch == "none" then empty else
+        {type:"assistant",message:{content:[{type:"tool_use",id:"fetch",name:$fetch,input:(if $fetch == "TaskOutput" then {task_id:"b1",block:true,timeout:600000} else {bash_id:"b1"} end)}]}},
+        {type:"user",message:{content:[{type:"tool_result",tool_use_id:"fetch",content:"<retrieval_status>success</retrieval_status>\n<task_id>b1</task_id>\n<status>failed</status>\n<exit_code>10</exit_code>\n<output>\($out)</output>"}]}} end),
+      (if ($bg|not) or $note == "none" then empty else
+        (if $note == "system" then
+          {type:"system",subtype:"task_notification",task_id:"b1",tool_use_id:"wait",status:"failed",output_file:"/tmp/tasks/b1.output",summary:$summary}
+        else
+          {type:"user",message:{role:"user",content:[{type:"text",text:"<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>wait</tool-use-id>\n<output-file>/tmp/tasks/b1.output</output-file>\n<status>failed</status>\n<summary>\($summary)</summary>\n</task-notification>"}]}}
+        end),
+        {type:"assistant",message:{content:[{type:"tool_use",id:"read",name:"Read",input:{file_path:"/tmp/tasks/b1.output"}}]}},
+        {type:"user",message:{content:[{type:"tool_result",tool_use_id:"read",content:$out}]}} end),
       {type:"assistant",message:{content:[{type:"text",text:"done"}]}},
       {type:"result",result:"reply: P-nonce"}' > "$Q/p.jsonl"
 }
@@ -314,13 +330,27 @@ p_verdict() { # $1: expected wake class, $2: the checks expected to fail (JSON a
       { echo "mode p: expected wake=$1 failing=$2" >&2; jq . "$Q/verdict.json" >&2; exit 1; }
 }
 printf 'reply: P-nonce\n' > "$Q/report.md"
-p_calls; p_events true true; p_verdict woke '[]'
-p_events true false; p_verdict no_wake '[]'
-p_events false true; p_verdict foreground_only '["AC-206-bg-wait-started"]'
+p_calls; p_events true system; p_verdict woke '[]'
+p_events true xml; p_verdict woke '[]'
+p_events true none; p_verdict no_wake '[]'
+# Only b1's own completion notification is a wake: output a foreground retrieval returned first
+# (TaskOutput blocking on b1, or BashOutput), another task's notification and a stopped or killed
+# b1 are no wake.
+p_events true none TaskOutput; p_verdict no_wake '[]'
+p_events true xml TaskOutput; p_verdict no_wake '[]'
+p_events true system BashOutput; p_verdict no_wake '[]'
+p_events true system
+jq -c 'if .subtype?=="task_notification" then .task_id="b9" | .tool_use_id="other" else . end' "$Q/p.jsonl" > "$Q/p-other.jsonl"
+mv "$Q/p-other.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+p_events true system; jq -c 'if .subtype?=="task_notification" then .status="stopped" else . end' "$Q/p.jsonl" > "$Q/p-stop.jsonl"
+mv "$Q/p-stop.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+p_events true xml; jq -c 'walk(if type=="string" then sub("<status>failed</status>";"<status>killed</status>") else . end)' "$Q/p.jsonl" > "$Q/p-kill.jsonl"
+mv "$Q/p-kill.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+p_events false; p_verdict foreground_only '["AC-206-bg-wait-started"]'
 jq -c 'select(.message.content[0].tool_use_id? != "wait" and .message.content[0].id? != "wait")' "$Q/p.jsonl" > "$Q/p-none.jsonl"
 mv "$Q/p-none.jsonl" "$Q/p.jsonl"; p_verdict no_wait '["AC-206-bg-wait-started"]'
 # A woken run must quote the nonce; three inbox calls, or one without --wait/--peek, is polling.
-p_events true true; printf 'no nonce here\n' > "$Q/report.md"; p_verdict woke '["AC-206-nonce"]'
+p_events true system; printf 'no nonce here\n' > "$Q/report.md"; p_verdict woke '["AC-206-nonce"]'
 printf 'reply: P-nonce\n' > "$Q/report.md"
 p_calls '[["inbox","--peek"],["inbox","--wait"],["inbox","--peek"]]'; p_verdict woke '["AC-206-no-inbox-polling"]'
 p_calls '[["inbox"]]'; p_verdict woke '["AC-206-no-inbox-polling"]'
@@ -329,9 +359,9 @@ p_calls '[["inbox","--wait","--timeout","90s"],["inbox","--peek"]]'; p_verdict w
 jq -c 'if .type=="user" and .message.content[0].tool_use_id?=="send" then .message.content[0].content="reply: P-nonce" else . end' "$Q/p.jsonl" > "$Q/p-fg.jsonl"
 mv "$Q/p-fg.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
 # A run that never ended has no result event; a second send is not exactly one.
-p_events true true; jq -c 'select(.type!="result")' "$Q/p.jsonl" > "$Q/p-open.jsonl"; mv "$Q/p-open.jsonl" "$Q/p.jsonl"
+p_events true system; jq -c 'select(.type!="result")' "$Q/p.jsonl" > "$Q/p-open.jsonl"; mv "$Q/p-open.jsonl" "$Q/p.jsonl"
 p_verdict woke '["AC-206-evidence"]'
-p_events true true
+p_events true system
 jq -c 'select(.t!="end" or .argv[0]!="send"), (select(.t=="end" and .argv[0]=="send") | ., (.id="again" | .)), (select(.t=="start" and .argv[0]=="send") | .id="again")' "$Q/calls.ndjson" > "$Q/calls-two.ndjson"
 mv "$Q/calls-two.ndjson" "$Q/calls.ndjson"; p_verdict woke '["AC-206-send"]'
 p_calls
