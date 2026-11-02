@@ -147,7 +147,7 @@ setup_m() {
 }
 setup() {
     local mode=$1
-    [[ $mode =~ ^(a|b|b2|b3|c1|c2|p|m)$ ]] || die 'mode must be a, b, b2, b3, c1, c2, p or m'
+    [[ $mode =~ ^(a|b|b2|b3|c1|c2|m|p)$ ]] || die 'mode must be a, b, b2, b3, c1, c2, p or m'
     if [[ $mode == p ]]; then setup_p; return; fi
     if [[ $mode == m ]]; then setup_m; return; fi
     for tool in jq perl screen git shasum; do need "$tool"; done
@@ -241,7 +241,7 @@ setup() {
 }
 check_mode() {
     local mode=$1 S=$2
-    [[ $mode =~ ^(a|b|b2|b3|c1|c2|p|m)$ ]] || die 'unknown check mode'
+    [[ $mode =~ ^(a|b|b2|b3|c1|c2|m|p)$ ]] || die 'unknown check mode'
     [[ -f $S/manifest.json ]] || die 'missing manifest'
     if [[ ! -f $S/calls.ndjson ]]; then
         # Reuse the mode's check IDs, but fail every check when setup left no recording.

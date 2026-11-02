@@ -183,7 +183,7 @@ fn real_omp_legs_run_under_the_glen_harness_profile() {
 fn mcp_mode_runs_no_omp_and_its_launcher_closes_the_environment() {
     let acc = include_str!("acceptance/acc.sh");
     assert_eq!(
-        acc.matches("[[ $mode =~ ^(a|b|b2|b3|c1|c2|p|m)$ ]]")
+        acc.matches("[[ $mode =~ ^(a|b|b2|b3|c1|c2|m|p)$ ]]")
             .count(),
         2,
         "mode m must be in setup's and check's mode regex"
