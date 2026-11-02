@@ -20,6 +20,11 @@ use std::{
     time::{Duration, Instant},
 };
 pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenError> {
+    // Before stdin and any state: a bad GLEN_WARM must never leave a job behind.
+    let warm = rpc::warm::resolve_warm(args.warm, env)?.map(|duration| rpc::warm::Setting {
+        duration,
+        explicit: args.warm.is_some(),
+    });
     paths::resolve(env, cli.global.profile.as_deref())?;
     let scope = args
         .cwd
@@ -75,6 +80,7 @@ pub fn run(cli: &Cli, args: &SendArgs, env: &Env, ctx: &OutputCtx) -> Result<Out
         text,
         args.deliver(),
         args.thinking.as_deref(),
+        warm,
     )?;
     let flag = wait::install_interrupt()?;
     let spinner = Spinner::start(
@@ -135,6 +141,7 @@ pub(crate) fn send_cwd(
     Ok(cwd)
 }
 /// Submit an already-read message. No stdin, signal handlers, or terminal output.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn submit(
     cli: &Cli,
     env: &Env,
@@ -143,6 +150,7 @@ pub(crate) fn submit(
     text: String,
     deliver: DeliverAs,
     thinking: Option<&str>,
+    warm: Option<rpc::warm::Setting>,
 ) -> Result<Submitted, GlenError> {
     let paths = paths::resolve(env, cli.global.profile.as_deref())?;
     if text.trim().is_empty() {
@@ -243,18 +251,19 @@ pub(crate) fn submit(
         .checked_add(jiff::SignedDuration::from_millis(timeout.as_millis() as i64))
         .map_err(|e| GlenError::new(ErrorCode::Internal, e.to_string()))?;
     let id = JobId::new();
+    let route = if live.is_some() {
+        Route::Live
+    } else if opened.is_some() {
+        Route::Rpc
+    } else {
+        Route::New
+    };
     let job = Job {
         v: 1,
         id: id.as_str().into(),
         handle: id.handle(),
         created_at: now.to_string(),
-        route: if live.is_some() {
-            Route::Live
-        } else if opened.is_some() {
-            Route::Rpc
-        } else {
-            Route::New
-        },
+        route,
         session_id: opened.as_ref().map(|o| o.session.header.id.clone()),
         session_file: opened
             .as_ref()
@@ -280,6 +289,10 @@ pub(crate) fn submit(
         owners_dir: paths.session_owners_dir,
         job_timeout_ms: timeout.as_millis() as u64,
         deadline_at: deadline.to_string(),
+        warm_ms: warm
+            .filter(|_| route != Route::Live)
+            .map(|w| w.duration.as_millis().min(u128::from(u64::MAX)) as u64),
+        env_digest: (route != Route::Live).then(|| rpc::warm::env_digest(env)),
     };
     let store = JobStore::new(home.clone());
     store.create_for_send(&job, env)?;
@@ -301,6 +314,12 @@ pub(crate) fn submit(
             message: format!(
                 "--thinking has no effect on the live route (the session is already running); {advice}"
             ),
+        });
+    }
+    if route == Route::Live && warm.is_some_and(|w| w.explicit) {
+        route_warnings.push(Warning {
+            code: "ignored_flag".into(),
+            message: "--warm has no effect on the live route; live sessions never stay warm".into(),
         });
     }
     route_warnings.extend(warning);
@@ -534,8 +553,17 @@ mod submit_tests {
         );
         let cli = Cli::try_parse_from(["glen", "send", "@new", "-"]).unwrap();
         let cwd = send_cwd(None, None, &env).unwrap();
-        let mut submitted =
-            submit(&cli, &env, None, cwd, "-".into(), DeliverAs::FollowUp, None).unwrap();
+        let mut submitted = submit(
+            &cli,
+            &env,
+            None,
+            cwd,
+            "-".into(),
+            DeliverAs::FollowUp,
+            None,
+            None,
+        )
+        .unwrap();
         // The worker child is this unit-test binary, not a live omp process.
         if submitted.child.try_wait().unwrap().is_none() {
             submitted.child.kill().unwrap();
@@ -544,6 +572,9 @@ mod submit_tests {
         let stored = submitted.store.read_job(&submitted.id).unwrap();
         assert_eq!(stored.text, "-");
         assert_eq!(stored.deliver_as, crate::jobs::Deliver::FollowUp);
+        // Cold by default; the digest is recorded on every RPC and @new job.
+        assert_eq!(stored.warm_ms, None);
+        assert_eq!(stored.env_digest, Some(rpc::warm::env_digest(&env)));
     }
     #[test]
     fn submit_rejects_empty_and_oversize_before_creating_home() {
@@ -563,6 +594,7 @@ mod submit_tests {
                 tree.path().into(),
                 text,
                 DeliverAs::Auto,
+                None,
                 None,
             )
             .err()

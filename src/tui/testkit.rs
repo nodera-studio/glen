@@ -158,6 +158,8 @@ fn job(session: &str) -> Job {
         owners_dir: "/fixtures/owners".into(),
         job_timeout_ms: 90_000,
         deadline_at: "2026-10-30T12:01:13Z".into(),
+        warm_ms: None,
+        env_digest: None,
     }
 }
 fn jobs(app: &mut App, kind: SceneKind) {

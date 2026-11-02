@@ -43,6 +43,10 @@ impl Env {
         env.cwd = cwd.to_path_buf();
         env
     }
+    /// Every variable of the snapshot, sorted by name.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.vars.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+    }
     pub fn get(&self, k: &str) -> Option<&str> {
         self.vars.get(k).map(String::as_str)
     }

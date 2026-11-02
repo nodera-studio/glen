@@ -225,6 +225,7 @@ fn owner(store: &JobStore, session_id: &str, deadline: Instant, stop: &AtomicBoo
         {
             match holder.kind {
                 lock::HolderKind::Control => return Owner::Control,
+                lock::HolderKind::Warm => (),
                 lock::HolderKind::Job => {
                     finishing = holder
                         .job_id

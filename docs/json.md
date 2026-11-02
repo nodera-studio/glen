@@ -64,9 +64,11 @@ model_change `model`; thinking_level `level`. Consumers dispatch by kind rather 
 Unknown omp records are skipped by the rendered reader and preserved by raw output.
 
 Job views share `id,handle,status,route,deliver_as,delivered_as,session_id,session_handle,actual_session_id,
-created_at,updated_at,elapsed_ms,task_state`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
+created_at,updated_at,elapsed_ms,task_state,omp_reused`. Routes are `rpc|new|live`. `deliver_as` is the requested mode,
 `auto|steer|follow_up`; `delivered_as` is how omp took it, `prompt|steer|follow_up`, or null until then.
 Replies carry `text,final` and context/sequence metadata; read their field names from the examples below.
+`omp_reused` (v0.2) is true only for a job that ran on an omp process a warm worker kept from an earlier job
+(design §A21); every other job, including every live-route job, reads false.
 
 `task_state` (v0.2) names the job's state in A2A's task-state vocabulary; glen borrows the names only.
 `status` stays authoritative and keeps its exit mapping. The value is derived from `status` and `error.code`
@@ -464,6 +466,7 @@ passes no `--thinking` when the persisted value has none.
       "elapsed_ms": 614,
       "handle": "j6977273",
       "id": "01a18bcc-6970-7685-8f03-0ecc16977273",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -511,6 +514,7 @@ passes no `--thinking` when the persisted value has none.
       "elapsed_ms": 133,
       "handle": "j3f52ae7",
       "id": "01a18bcc-6e57-7495-aa65-cf0d73f52ae7",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -551,6 +555,7 @@ passes no `--thinking` when the persisted value has none.
       "elapsed_ms": 197,
       "handle": "j1ddc744",
       "id": "01a18bcc-6c2f-733f-98ed-59c791ddc744",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -632,6 +637,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "elapsed_ms": 841,
       "handle": "j3f52ae7",
       "id": "01a18bcc-6e57-7495-aa65-cf0d73f52ae7",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -679,6 +685,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "elapsed_ms": 2045,
       "handle": "jc6ccc17",
       "id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -737,6 +744,7 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
       "elapsed_ms": 2387,
       "handle": "jc6ccc17",
       "id": "01a19ad3-974d-7651-a617-9d365c6ccc17",
+      "omp_reused": false,
       "route": "rpc",
       "session_handle": "e27c0de",
       "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
@@ -778,6 +786,7 @@ warning per job, including jobs the filter then drops.
       "id": "01a18bcc-6d3e-75f2-b9cf-6ffc7656f7d4",
       "handle": "j656f7d4",
       "status": "completed",
+      "omp_reused": false,
       "route": "rpc",
       "deliver_as": "auto",
       "delivered_as": "prompt",
@@ -1212,6 +1221,7 @@ and the absolute scope directory. File paths bypass project filtering and remain
         "elapsed_ms": 135,
         "handle": "j656f7d4",
         "id": "01a18bcc-6d3e-75f2-b9cf-6ffc7656f7d4",
+        "omp_reused": false,
         "route": "rpc",
         "session_handle": "e27c0de",
         "session_id": "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",

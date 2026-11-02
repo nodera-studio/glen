@@ -16,6 +16,8 @@ use std::{
 pub enum HolderKind {
     Job,
     Control,
+    /// An idle warm worker (v0.2 W4): it keeps omp and the lock between jobs.
+    Warm,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Holder {
@@ -60,6 +62,10 @@ pub fn holder(home: &GlenHome, id: &str) -> Option<Holder> {
     }
     let h: Holder = serde_json::from_slice(&bytes).ok()?;
     (h.v == 1 && h.pid > 0).then_some(h)
+}
+/// The recorded holder's kind, for refusal wording only (not proof of ownership).
+pub fn holder_kind(home: &GlenHome, id: &str) -> Option<HolderKind> {
+    holder(home, id).map(|h| h.kind)
 }
 pub fn lock_key(id: &str) -> String {
     lease::lease_name(id)
@@ -388,6 +394,7 @@ mod holder_tests {
         for (kind, job_id) in [
             (HolderKind::Job, Some("job".into())),
             (HolderKind::Control, None),
+            (HolderKind::Warm, Some("job".into())),
         ] {
             let h = Holder {
                 v: 1,
@@ -397,6 +404,7 @@ mod holder_tests {
                 start: Some(identity.start.clone()),
             };
             mark(&lock, &h).unwrap();
+            assert_eq!(holder_kind(&home, "s"), Some(kind));
             assert_eq!(holder(&home, "s"), Some(h));
             assert!(is_held(&home, "s"));
             assert!(try_acquire(&home, "s").unwrap().is_none());

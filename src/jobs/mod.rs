@@ -91,6 +91,12 @@ pub struct Job {
     pub owners_dir: PathBuf,
     pub job_timeout_ms: u64,
     pub deadline_at: String,
+    /// How long the worker stays warm after this job (v0.2 W4, `--warm`); RPC and `@new` only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warm_ms: Option<u64>,
+    /// `rpc::warm::env_digest` of the send's environment; every RPC and `@new` job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_digest: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -164,6 +170,9 @@ pub struct Status {
     pub error: Option<JobError>,
     #[serde(default)]
     pub warnings: Vec<Warning>,
+    /// The job ran on an omp a warm worker kept from an earlier job (v0.2 W4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub omp_reused: bool,
 }
 impl Status {
     /// The job's state in A2A's task-state vocabulary (design §A7), derived at view time and
@@ -596,6 +605,8 @@ pub(crate) mod tests {
             owners_dir: "/fixture/owners".into(),
             job_timeout_ms: 30000,
             deadline_at: jiff::Timestamp::now().to_string(),
+            warm_ms: None,
+            env_digest: None,
         }
     }
     pub fn store(root: &Path) -> JobStore {
@@ -628,6 +639,9 @@ pub(crate) mod tests {
         let job: Job = serde_json::from_value(encoded).unwrap();
         assert_eq!(job.profile_flag, None);
         assert_eq!(job.thinking_flag, None);
+        // Nor do jobs written before v0.2 W4 carry the warm fields.
+        assert_eq!(job.warm_ms, None);
+        assert_eq!(job.env_digest, None);
     }
     #[test]
     fn ids_and_handles() {
@@ -678,6 +692,17 @@ pub(crate) mod tests {
     #[test]
     fn schemas_roundtrip_and_lenient_status() {
         roundtrip(&job());
+        let warm = Job {
+            warm_ms: Some(2000),
+            env_digest: Some("0123456789abcdef".into()),
+            ..job()
+        };
+        roundtrip(&warm);
+        let encoded = serde_json::to_value(&warm).unwrap();
+        assert_eq!(encoded["warm_ms"], 2000);
+        assert_eq!(encoded["env_digest"], "0123456789abcdef");
+        let cold = serde_json::to_value(job()).unwrap();
+        assert!(cold.get("warm_ms").is_none() && cold.get("env_digest").is_none());
         for route in [Route::New, Route::Rpc, Route::Live] {
             roundtrip(&route);
         }
@@ -729,13 +754,23 @@ pub(crate) mod tests {
                     code: "test".into(),
                     message: "warning".into(),
                 }],
+                omp_reused: true,
             };
             roundtrip(&s);
+            assert_eq!(serde_json::to_value(&s).unwrap()["omp_reused"], true);
         }
         let s:Status=serde_json::from_value(json!({"v":1,"status":"queued","updated_at":"2026-10-30T00:00:00Z","future":{"anything":1}})).unwrap();
         assert!(s.worker_pid.is_none());
         assert!(s.rpc_protocol.is_none());
         assert!(s.warnings.is_empty());
+        assert!(!s.omp_reused);
+        // Omitted when false, so a cold job's status.json is unchanged.
+        assert!(
+            serde_json::to_value(&s)
+                .unwrap()
+                .get("omp_reused")
+                .is_none()
+        );
         let reply = Reply {
             v: 1,
             id: JobId::new().as_str().into(),

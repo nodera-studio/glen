@@ -521,7 +521,17 @@ fn submit(
     if ctx.stopped() {
         return Err(cancelled());
     }
-    send::submit(&ctx.cli, &ctx.env, Some(&opened), cwd, text, mode, None)
+    // `watch` sends never go warm (design §A21).
+    send::submit(
+        &ctx.cli,
+        &ctx.env,
+        Some(&opened),
+        cwd,
+        text,
+        mode,
+        None,
+        None,
+    )
 }
 fn reap(tasks: &mut Vec<JoinHandle<()>>) -> Result<(), GlenError> {
     let mut index = 0;

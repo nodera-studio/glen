@@ -110,6 +110,12 @@ pub enum Command {
   glen inbox --wait --timeout 2m"
     )]
     Inbox(InboxArgs),
+    #[command(
+        hide = true,
+        about = "End warm workers (glen send --warm)",
+        after_help = "Examples:\n  glen release e27c0de\n  glen release --all\n  glen release e27c0de --force"
+    )]
+    Release(ReleaseArgs),
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
     Worker(WorkerArgs),
     #[command(
@@ -249,6 +255,14 @@ pub struct SendArgs {
         value_parser = parse_thinking_level
     )]
     pub thinking: Option<String>,
+    #[arg(
+        long,
+        value_name = "DUR",
+        value_parser = crate::rpc::warm::parse_warm,
+        hide = true,
+        help = "keep omp alive for DUR after this job so the next send to the session skips startup (at most 10m; 0 = off)"
+    )]
+    pub warm: Option<Duration>,
 }
 /// omp 18.14.0's full thinking-level list (coding-agent/src/cli/flag-tables.ts).
 /// A bad value is a usage error (exit 2), not a dispatch-time omp failure.
@@ -374,6 +388,24 @@ pub struct InboxArgs {
         value_parser = parse_duration,
         help = "maximum --wait (at most 24h)"
     )]
+    pub timeout: Duration,
+}
+#[derive(Debug, Args)]
+pub struct ReleaseArgs {
+    #[arg(
+        required_unless_present = "all",
+        conflicts_with = "all",
+        help = "session handle, session id or job handle of a warm worker"
+    )]
+    pub target: Option<String>,
+    #[arg(long, help = "end every warm worker")]
+    pub all: bool,
+    #[arg(
+        long,
+        help = "kill a worker that does not release in time (after a pid and start-time check)"
+    )]
+    pub force: bool,
+    #[arg(long,value_name="DUR",default_value="10s",value_parser=parse_control_timeout,help="how long to wait for each worker to release (default 10s)")]
     pub timeout: Duration,
 }
 #[derive(Debug, Args)]
@@ -518,6 +550,7 @@ impl Command {
             Self::Thinking(_) => "thinking",
             Self::Compact(_) => "compact",
             Self::Inbox(_) => "inbox",
+            Self::Release(_) => "release",
             Self::Worker(_) => "__worker",
             Self::Acp(_) => "__acp",
             Self::Watch(_) => "watch",
@@ -583,12 +616,34 @@ pub fn parse_since(s: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(seconds))
 }
 pub fn public_command() -> clap::Command {
-    let full = Cli::command();
+    // 'static, so a rebuilt subcommand can keep its name (clap's `Str` takes only `&'static str`).
+    static FULL: std::sync::OnceLock<clap::Command> = std::sync::OnceLock::new();
+    let full: &'static clap::Command = FULL.get_or_init(Cli::command);
     clap::Command::new("glen")
         .version(env!("CARGO_PKG_VERSION"))
         .about("See and talk to omp sessions")
         .args(full.get_arguments().cloned())
-        .subcommands(full.get_subcommands().filter(|s| !s.is_hide_set()).cloned())
+        .subcommands(
+            full.get_subcommands()
+                .filter(|s| !s.is_hide_set())
+                .map(without_hidden_args),
+        )
+}
+/// clap_complete completes hidden arguments, so the public surface (completions, the skill and
+/// docs checks) drops them from each visible subcommand.
+fn without_hidden_args(s: &'static clap::Command) -> clap::Command {
+    if !s.get_arguments().any(|a| a.is_hide_set()) {
+        return s.clone();
+    }
+    let mut c = clap::Command::new(s.get_name())
+        .args(s.get_arguments().filter(|a| !a.is_hide_set()).cloned());
+    if let Some(about) = s.get_about() {
+        c = c.about(about.clone());
+    }
+    if let Some(after) = s.get_after_help() {
+        c = c.after_help(after.clone());
+    }
+    c
 }
 #[cfg(test)]
 mod tests {
@@ -787,6 +842,96 @@ mod acp_tests {
                 .find_subcommand("__acp")
                 .is_some_and(|c| c.is_hide_set())
         );
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
+        Cli::try_parse_from(std::iter::once("glen").chain(args.iter().copied()))
+    }
+    #[test]
+    fn send_warm_parses_with_a_ten_minute_cap() {
+        for (raw, ms) in [("2s", 2000), ("0", 0), ("10m", 600_000), ("5", 5000)] {
+            let Command::Send(a) = parse(&["send", "x", "hi", "--warm", raw]).unwrap().command
+            else {
+                panic!("not send")
+            };
+            assert_eq!(a.warm, Some(Duration::from_millis(ms)), "{raw}");
+        }
+        let Command::Send(a) = parse(&["send", "x", "hi"]).unwrap().command else {
+            panic!("not send")
+        };
+        assert_eq!(a.warm, None);
+        for bad in ["11m", "abc", "10m1ms", ""] {
+            let e = parse(&["send", "x", "hi", "--warm", bad]).unwrap_err();
+            assert_eq!(e.exit_code(), 2, "{bad}");
+        }
+    }
+    #[test]
+    fn release_takes_a_target_or_all() {
+        let release = |args: &[&str]| match parse(args).unwrap().command {
+            Command::Release(a) => a,
+            other => panic!("not release: {}", other.name()),
+        };
+        let a = release(&["release", "e27c0de"]);
+        assert_eq!(a.target.as_deref(), Some("e27c0de"));
+        assert!(!a.all && !a.force);
+        assert_eq!(a.timeout, Duration::from_secs(10));
+        let a = release(&["release", "--all"]);
+        assert!(a.all && a.target.is_none());
+        let a = release(&["release", "e27c0de", "--force", "--timeout", "5s"]);
+        assert!(a.force);
+        assert_eq!(a.timeout, Duration::from_secs(5));
+        for bad in [
+            vec!["release"],
+            vec!["release", "x", "--all"],
+            vec!["release", "x", "--timeout", "0"],
+            vec!["release", "x", "--timeout", "25h"],
+        ] {
+            assert!(parse(&bad).is_err(), "{bad:?}");
+        }
+        assert_eq!(
+            parse(&["release", "--all"]).unwrap().command.name(),
+            "release"
+        );
+    }
+    #[test]
+    fn warm_surface_is_hidden_until_the_flip() {
+        let public = public_command();
+        assert!(public.get_subcommands().all(|c| c.get_name() != "release"));
+        let send = public.find_subcommand("send").unwrap();
+        assert!(send.get_arguments().all(|a| a.get_id() != "warm"));
+        assert_eq!(
+            send.get_after_help().map(|h| h.to_string()),
+            Cli::command()
+                .find_subcommand("send")
+                .and_then(|s| s.get_after_help())
+                .map(|h| h.to_string())
+        );
+        let full = Cli::command();
+        assert!(
+            full.find_subcommand("release")
+                .is_some_and(|c| c.is_hide_set())
+        );
+        assert!(
+            full.find_subcommand("send")
+                .unwrap()
+                .get_arguments()
+                .any(|a| a.get_id() == "warm" && a.is_hide_set())
+        );
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let mut buf = Vec::new();
+            clap_complete::generate(shell, &mut public_command(), "glen", &mut buf);
+            let script = String::from_utf8(buf).unwrap();
+            assert!(!script.contains("warm"), "{shell}");
+            assert!(!script.contains("release"), "{shell}");
+        }
     }
 }
 

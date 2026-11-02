@@ -1,5 +1,6 @@
 pub mod control;
 pub mod reply;
+pub mod warm;
 pub mod worker;
 use crate::{
     env::Env,
