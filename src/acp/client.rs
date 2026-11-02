@@ -93,6 +93,9 @@ pub struct PromptOutcome {
     pub stop_reason: Option<String>,
     pub usage: Option<Value>,
     pub cancel: Option<CancelState>,
+    /// A malformed frame in the trailing drain: the response came, yet the turn fails as on a
+    /// malformed frame before it.
+    pub malformed: Option<String>,
 }
 
 /// The writer thread's report: how many frames it has written and flushed, and whether a write
@@ -292,10 +295,22 @@ impl Client {
         stop: &AtomicBool,
         deadline: Instant,
     ) -> Result<Value, CallError> {
+        let end = (Instant::now() + timeout).min(deadline);
+        self.call_until(method, params, end, stop, deadline)
+    }
+    /// [`Client::call`] bounded by `end` alone; `cutoff` is only where the policy stops answering
+    /// permission requests (see [`Client::pump`]).
+    fn call_until(
+        &mut self,
+        method: &str,
+        params: Value,
+        end: Instant,
+        stop: &AtomicBool,
+        cutoff: Instant,
+    ) -> Result<Value, CallError> {
         if stop.load(Ordering::SeqCst) {
             return Err(CallError::Interrupted);
         }
-        let end = (Instant::now() + timeout).min(deadline);
         if end <= Instant::now() {
             return Err(CallError::Timeout);
         }
@@ -308,7 +323,7 @@ impl Client {
             if left.is_zero() {
                 return Err(CallError::Timeout);
             }
-            match self.pump(TICK.min(left), stop, deadline) {
+            match self.pump(TICK.min(left), stop, cutoff) {
                 Pump::Response { id: got, result } if got == id => {
                     return result.map_err(CallError::Rpc);
                 }
@@ -384,6 +399,7 @@ impl Client {
                     stop_reason: None,
                     usage: None,
                     cancel: self.cancel.clone(),
+                    malformed: None,
                 });
             }
             let result = match self.pump(TICK.min(left), stop, deadline) {
@@ -392,7 +408,7 @@ impl Client {
                 Pump::Closed => Err(CallError::Exited),
                 Pump::Malformed(reason) => Err(CallError::Malformed(reason)),
             };
-            let outcome = result.and_then(|result| {
+            let outcome = result.map(|result| {
                 let stop_reason = result
                     .get("stopReason")
                     .and_then(Value::as_str)
@@ -400,12 +416,12 @@ impl Client {
                 if let Some(cancel) = &mut self.cancel {
                     cancel.confirmed = stop_reason.as_deref() == Some("cancelled");
                 }
-                self.drain(stop, deadline)?;
-                Ok(PromptOutcome {
+                PromptOutcome {
                     stop_reason,
                     usage: result.get("usage").filter(|u| u.is_object()).cloned(),
                     cancel: None,
-                })
+                    malformed: self.drain(stop, deadline),
+                }
             });
             // The answer to a cancel can overtake the writer thread's report that it wrote it.
             self.settle_cancel(TICK);
@@ -423,29 +439,36 @@ impl Client {
         }
     }
     /// The trailing drain: an update that overtook the prompt response is still applied, for
-    /// at most one tick. A malformed frame in it fails the turn like one before the response.
-    fn drain(&mut self, stop: &AtomicBool, deadline: Instant) -> Result<(), CallError> {
+    /// at most one tick. Returns the reason of a malformed frame in it, which fails the turn like
+    /// one before the response.
+    fn drain(&mut self, stop: &AtomicBool, deadline: Instant) -> Option<String> {
         let end = Instant::now() + TICK;
         loop {
             let left = end.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Ok(());
+                return None;
             }
             match self.pump(left, stop, deadline) {
                 Pump::Handled | Pump::Response { .. } => (),
-                Pump::Idle | Pump::Closed => return Ok(()),
-                Pump::Malformed(reason) => return Err(CallError::Malformed(reason)),
+                Pump::Idle | Pump::Closed => return None,
+                Pump::Malformed(reason) => return Some(reason),
             }
         }
     }
-    /// Best-effort `session/close`, bounded by [`CLOSE_TIMEOUT`].
-    pub fn close_session(&mut self, session_id: &str, stop: &AtomicBool) -> Result<(), CallError> {
-        self.call(
+    /// Best-effort `session/close`, bounded by [`CLOSE_TIMEOUT`] even past the job `deadline`; a
+    /// permission request after that deadline is still answered `cancelled`.
+    pub fn close_session(
+        &mut self,
+        session_id: &str,
+        stop: &AtomicBool,
+        deadline: Instant,
+    ) -> Result<(), CallError> {
+        self.call_until(
             "session/close",
             json!({"sessionId":session_id}),
-            CLOSE_TIMEOUT,
-            stop,
             Instant::now() + CLOSE_TIMEOUT,
+            stop,
+            deadline,
         )
         .map(drop)
     }
@@ -1240,10 +1263,14 @@ mod tests {
         peer.send(chunk("s1", "answer", "m1"));
         peer.send(response(json!(1), json!({"stopReason":"end_turn"})));
         peer.raw(b"not json\n");
-        match client.prompt("s1", "hi", &AtomicBool::new(false), far(), WAIT) {
-            Err(CallError::Malformed(reason)) => assert!(reason.contains("JSON"), "{reason}"),
-            other => panic!("{other:?}"),
-        }
+        // The response's stop reason is kept beside the failure.
+        let outcome = client
+            .prompt("s1", "hi", &AtomicBool::new(false), far(), WAIT)
+            .unwrap();
+        let reason = outcome.malformed.unwrap();
+        assert!(reason.contains("JSON"), "{reason}");
+        assert_eq!(outcome.stop_reason.as_deref(), Some("end_turn"));
+        assert_eq!(outcome.cancel, None);
     }
     #[test]
     fn updates_during_session_close_do_not_change_the_turn() {
@@ -1276,7 +1303,7 @@ mod tests {
         });
         let stop = AtomicBool::new(false);
         client.prompt("s1", "hi", &stop, far(), WAIT).unwrap();
-        client.close_session("s1", &stop).unwrap();
+        client.close_session("s1", &stop, far()).unwrap();
         let (answered, _out) = agent.join().unwrap();
         assert_eq!(answered["id"], "r1");
         assert_eq!(answered["error"]["code"], -32601);

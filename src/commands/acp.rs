@@ -414,12 +414,12 @@ fn converse(
         turn.deadline,
         acp::cancel_grace(turn.env),
     );
-    let answered = matches!(&outcome, Ok(o) if o.cancel.is_none());
+    let answered = matches!(&outcome, Ok(o) if o.cancel.is_none() && o.malformed.is_none());
     let ending = prompt_ending(outcome, client.cancel().cloned());
     if answered
         && can_close
         && !turn.stop.load(Ordering::SeqCst)
-        && let Err(e) = client.close_session(&id, turn.stop)
+        && let Err(e) = client.close_session(&id, turn.stop, turn.deadline)
     {
         facts.warnings.push(Warning {
             code: "acp_close_failed".into(),
@@ -504,9 +504,43 @@ fn deadline_error(stop_reason: Option<&str>, cancel: &CancelState) -> GlenError 
     .with_detail("stop_reason", stop_reason)
     .with_detail("task_state", stop_reason.map_or("failed", acp::task_state))
 }
+/// A malformed frame in the turn, before or after its response: exit 7 `acp_malformed` even
+/// after a glen cancel, which stays in the details with omp's stop reason when one came.
+fn malformed_error(
+    reason: &str,
+    stop_reason: Option<String>,
+    cancel: Option<&CancelState>,
+) -> GlenError {
+    let mut error = acp::error(
+        Stage::Session,
+        Reason::AcpMalformed,
+        format!("omp acp sent a malformed frame during session/prompt: {reason}"),
+    )
+    .with_detail("task_state", "failed");
+    if let Some(stop_reason) = stop_reason {
+        error = error.with_detail("stop_reason", stop_reason);
+    }
+    if let Some(cancel) = cancel {
+        error = error.with_detail("cancel", cancel.json());
+    }
+    error
+}
 /// The §A23 exit mapping of a prompt: only `end_turn` with no glen cancel is a success.
 fn prompt_ending(result: Result<PromptOutcome, CallError>, cancel: Option<CancelState>) -> Ending {
     match (result, cancel) {
+        // A bad frame wins over the cancel branches below, which would mask it.
+        (
+            Ok(PromptOutcome {
+                malformed: Some(reason),
+                stop_reason,
+                cancel,
+                ..
+            }),
+            _,
+        ) => Ending::Failed(malformed_error(&reason, stop_reason, cancel.as_ref())),
+        (Err(CallError::Malformed(reason)), cancel) => {
+            Ending::Failed(malformed_error(&reason, None, cancel.as_ref()))
+        }
         (Ok(outcome), _) => match outcome.cancel {
             Some(c) if c.reason == CancelReason::Interrupt => Ending::Interrupted {
                 stop_reason: outcome.stop_reason,
@@ -637,6 +671,7 @@ mod tests {
             stop_reason: stop.map(str::to_owned),
             usage: Some(json!({"totalTokens":3})),
             cancel,
+            malformed: None,
         }
     }
     fn failed(ending: Ending) -> GlenError {
@@ -694,11 +729,7 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let c = interrupt(false);
-        for result in [
-            Ok(outcome(None, Some(c.clone()))),
-            Err(CallError::Exited),
-            Err(CallError::Malformed("x".into())),
-        ] {
+        for result in [Ok(outcome(None, Some(c.clone()))), Err(CallError::Exited)] {
             match prompt_ending(result, Some(c.clone())) {
                 Ending::Interrupted {
                     stop_reason: None,
@@ -720,6 +751,32 @@ mod tests {
             let e = failed(prompt_ending(result, Some(deadline.clone())));
             assert_eq!((e.code.exit_code(), reason(&e)), (7, "acp_timeout"));
             assert_eq!(e.details.unwrap()["cancel"]["reason"], "deadline");
+        }
+        // A malformed frame is never masked by a cancel: exit 7 `acp_malformed`, with the cancel
+        // and (after a response) its stop reason kept.
+        for c in [interrupt(false), deadline.clone()] {
+            let e = failed(prompt_ending(
+                Err(CallError::Malformed("x".into())),
+                Some(c.clone()),
+            ));
+            assert_eq!((e.code.exit_code(), reason(&e)), (7, "acp_malformed"));
+            let details = e.details.unwrap();
+            assert_eq!(details["cancel"], c.json());
+            assert_eq!(details["task_state"], "failed");
+            assert!(details.get("stop_reason").is_none(), "{details}");
+            let confirmed = CancelState {
+                confirmed: true,
+                ..c
+            };
+            let after = PromptOutcome {
+                malformed: Some("x".into()),
+                ..outcome(Some("cancelled"), Some(confirmed.clone()))
+            };
+            let e = failed(prompt_ending(Ok(after), Some(confirmed.clone())));
+            assert_eq!((e.code.exit_code(), reason(&e)), (7, "acp_malformed"));
+            let details = e.details.unwrap();
+            assert_eq!(details["cancel"], confirmed.json());
+            assert_eq!(details["stop_reason"], "cancelled");
         }
     }
     #[test]
@@ -963,22 +1020,34 @@ mod tests {
         vars: &[(&str, &str)],
         stop: &AtomicBool,
     ) -> (Ending, Facts, Option<SessionLock>) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        converse_until(answer, existing, vars, stop, deadline, AcpPermission::Deny)
+    }
+    /// [`converse_on`] with the job deadline and the permission policy given.
+    fn converse_until(
+        answer: impl Fn(&Value) -> Vec<String> + Send + 'static,
+        existing: Option<&str>,
+        vars: &[(&str, &str)],
+        stop: &AtomicBool,
+        deadline: Instant,
+        permission: AcpPermission,
+    ) -> (Ending, Facts, Option<SessionLock>) {
         let tree = tempfile::tempdir().unwrap();
         let env = Env::for_test(Some(tree.path()), tree.path(), vars);
         let home = GlenHome {
             root: tree.path().join("glen"),
         };
-        let args = args(AcpPermission::Deny);
+        let args = args(permission);
         let turn = Turn {
             env: &env,
             home: &home,
             args: &args,
             cwd: tree.path().to_str().unwrap(),
             existing,
-            deadline: Instant::now() + Duration::from_secs(30),
+            deadline,
             stop,
         };
-        let mut client = scripted(answer, AcpPermission::Deny);
+        let mut client = scripted(answer, permission);
         let mut facts = Facts {
             agent: Value::Null,
             session: Value::Null,
@@ -1064,6 +1133,96 @@ mod tests {
         }
         let methods: Vec<_> = methods.iter().collect();
         assert_eq!(methods, [json!("initialize"), json!("session/new")]);
+    }
+    #[test]
+    fn a_permission_request_during_close_after_the_job_deadline_is_answered_cancelled() {
+        fn ask(id: &str) -> String {
+            json!({"jsonrpc":"2.0","id":id,"method":"session/request_permission","params":{"sessionId":"s-new","toolCall":{"toolCallId":"t1","title":"rm x","kind":"execute","status":"pending"},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"}]}}).to_string()
+        }
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (answered, answers) = std::sync::mpsc::channel();
+        let close = std::sync::Mutex::new(Value::Null);
+        // The turn ends well before the deadline, so close starts before it too.
+        let script = move |frame: &Value| match (frame["method"].as_str(), frame["id"].as_str()) {
+            (Some("session/close"), _) => {
+                *close.lock().unwrap() = frame["id"].clone();
+                vec![ask("before")]
+            }
+            (None, Some("before")) => {
+                answered.send(frame["result"].clone()).unwrap();
+                // Past the job deadline, still inside close's own 2 s bound.
+                thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(100),
+                );
+                vec![ask("after")]
+            }
+            (None, Some("after")) => {
+                answered.send(frame["result"].clone()).unwrap();
+                let id = close.lock().unwrap().clone();
+                vec![ok(&json!({ "id": id }), json!({}))]
+            }
+            _ => turn_script(frame),
+        };
+        let stop = AtomicBool::new(false);
+        let (ending, facts, _) =
+            converse_until(script, None, &[], &stop, deadline, AcpPermission::Allow);
+        assert!(matches!(ending, Ending::Completed { .. }), "{ending:?}");
+        assert!(
+            facts.warnings.iter().all(|w| w.code != "acp_close_failed"),
+            "{:?}",
+            facts.warnings
+        );
+        assert_eq!(
+            answers.try_iter().collect::<Vec<_>>(),
+            [
+                json!({"outcome":{"outcome":"selected","optionId":"allow_once"}}),
+                json!({"outcome":{"outcome":"cancelled"}})
+            ]
+        );
+    }
+    #[test]
+    fn a_malformed_trailing_frame_after_a_cancel_is_still_acp_malformed() {
+        for cause in ["interrupt", "deadline"] {
+            let interrupt = cause == "interrupt";
+            let stop = std::sync::Arc::new(AtomicBool::new(false));
+            let flag = std::sync::Arc::clone(&stop);
+            let prompt = std::sync::Mutex::new(Value::Null);
+            let script = move |frame: &Value| match frame["method"].as_str() {
+                Some("session/prompt") => {
+                    *prompt.lock().unwrap() = frame["id"].clone();
+                    if interrupt {
+                        // The signal lands during the turn; otherwise the deadline passes.
+                        flag.store(true, Ordering::SeqCst);
+                    }
+                    vec![json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-new","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"partial"},"messageId":"m1"}}}).to_string()]
+                }
+                Some("session/cancel") => {
+                    let id = prompt.lock().unwrap().clone();
+                    vec![
+                        ok(&json!({ "id": id }), json!({"stopReason":"cancelled"})),
+                        "noise".into(),
+                    ]
+                }
+                _ => turn_script(frame),
+            };
+            let deadline = Instant::now() + Duration::from_secs(if interrupt { 30 } else { 1 });
+            let (ending, _, _) =
+                converse_until(script, None, &[], &stop, deadline, AcpPermission::Deny);
+            let e = failed(ending);
+            assert_eq!(
+                (e.code.exit_code(), reason(&e)),
+                (7, "acp_malformed"),
+                "{cause}: {e:?}"
+            );
+            let details = e.details.unwrap();
+            assert_eq!(
+                details["cancel"],
+                json!({"sent":true,"confirmed":true,"reason":cause}),
+                "{cause}"
+            );
+            assert_eq!(details["stop_reason"], "cancelled", "{cause}");
+            assert_eq!(details["task_state"], "failed", "{cause}");
+        }
     }
     #[test]
     fn the_failure_table_through_a_scripted_client() {
