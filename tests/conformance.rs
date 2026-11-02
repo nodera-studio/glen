@@ -91,6 +91,8 @@ mod state;
 mod tail;
 #[path = "conformance/v2_compat.rs"]
 mod v2_compat;
+#[path = "conformance/v2_push.rs"]
+mod v2_push;
 #[path = "conformance/v2_w0.rs"]
 mod v2_w0;
 #[path = "conformance/w10.rs"]
