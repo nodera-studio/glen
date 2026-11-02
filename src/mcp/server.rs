@@ -1,9 +1,9 @@
 //! The JSON-RPC loop (design §A22): framing, the handshake, `tools/list`, `ping`, the error
 //! table, and the shutdown on stdin EOF or a signal.
 use super::{
-    Line, MAX_LINE, SUPPORTED_VERSIONS, TICK, Writer,
+    CALL_TICK, Line, MAX_IN_FLIGHT, MAX_LINE, SHUTDOWN_JOIN, SUPPORTED_VERSIONS, TICK, Writer,
     catalog::{Catalog, Tool},
-    dispatch::{self, Launcher},
+    dispatch::{self, Launcher, Registry, Watch},
     read_line,
 };
 use serde_json::{Map, Value, json};
@@ -16,6 +16,7 @@ use std::{
         mpsc::{self, RecvTimeoutError},
     },
     thread,
+    time::Instant,
 };
 
 /// Why the server stopped: stdin EOF (or a gone client), or the signal number that stopped it.
@@ -51,6 +52,7 @@ struct Server {
     initialized: bool,
     tools: Vec<Value>,
     calls: Vec<thread::JoinHandle<()>>,
+    registry: Arc<Registry>,
 }
 
 /// Serves MCP on `input` and `output` until stdin EOF, a gone client or a signal recorded in
@@ -97,6 +99,7 @@ where
                 Ok(Line::Eof) | Err(RecvTimeoutError::Disconnected) => break Exit::Eof,
                 Err(RecvTimeoutError::Timeout) => {}
             }
+            server.calls.retain(|h| !h.is_finished());
         }
     };
     server.shutdown();
@@ -112,6 +115,7 @@ impl Server {
             initialized: false,
             tools,
             calls: vec![],
+            registry: Arc::default(),
         }
     }
     fn result(&self, id: Value, result: Value) {
@@ -226,7 +230,13 @@ impl Server {
         self.result(id, result);
         self.initialized = true;
     }
-    fn notification(&mut self, _method: &str, _params: Option<&Value>) {}
+    fn notification(&mut self, method: &str, params: Option<&Value>) {
+        if method == "notifications/cancelled"
+            && let Some(key) = params.and_then(|p| p.get("requestId")).and_then(id_key)
+        {
+            self.registry.cancel(&key);
+        }
+    }
     fn tool(&self, params: &Map<String, Value>) -> Result<&Tool, String> {
         let name = params
             .get("name")
@@ -240,6 +250,14 @@ impl Server {
             .ok_or_else(|| format!("unknown tool: {name}"))
     }
     fn call(&mut self, id: Value, params: &Map<String, Value>) {
+        let key = id_key(&id).unwrap_or_default();
+        if self.registry.is_in_flight(&key) {
+            return self.error(
+                id,
+                INVALID_REQUEST,
+                "a tools/call with this id is already in flight".into(),
+            );
+        }
         let tool = match self.tool(params) {
             Ok(t) => t.clone(),
             Err(e) => return self.error(id, INVALID_PARAMS, e),
@@ -249,27 +267,56 @@ impl Server {
             Ok(supplied) => dispatch::argv(&tool, &supplied, self.config.profile.as_deref()),
             Err(e) => return self.result(id, dispatch::argument_failure(&tool.name, &e)),
         };
-        let (config, writer, answer) = (self.config.clone(), self.writer.clone(), id.clone());
+        if self.registry.insert(&key).is_err() {
+            let message =
+                format!("{MAX_IN_FLIGHT} tool calls are already running; retry when one finishes");
+            return self.result(id, dispatch::exec_failure(&tool.name, &message, b""));
+        }
+        let (config, writer, registry) = (
+            self.config.clone(),
+            self.writer.clone(),
+            self.registry.clone(),
+        );
+        let (name, answer, call_key) = (tool.name.clone(), id.clone(), key.clone());
         let spawned = thread::Builder::new()
             .name("glen-mcp-call".into())
             .spawn(move || {
-                let run = dispatch::run_child(&config.launcher, &argv, &[]);
-                let result = dispatch::result(&tool, run);
-                writer.send(&json!({"jsonrpc":"2.0","id":answer,"result":result}));
+                let watch = Watch::Call(&registry, &call_key);
+                let result = dispatch::result(
+                    &tool,
+                    dispatch::run_child(&config.launcher, &argv, &[], watch),
+                );
+                // Exactly one response per request, and none for a cancelled one.
+                if registry.finish(&call_key) {
+                    writer.send(&json!({"jsonrpc":"2.0","id":answer,"result":result}));
+                }
             });
         match spawned {
             Ok(handle) => self.calls.push(handle),
-            Err(e) => self.result(
-                id,
-                dispatch::exec_failure(
-                    params["name"].as_str().unwrap_or_default(),
-                    &format!("cannot start a call thread: {e}"),
-                    b"",
-                ),
-            ),
+            Err(e) => {
+                self.registry.finish(&key);
+                let message = format!("cannot start a call thread: {e}");
+                self.result(id, dispatch::exec_failure(&name, &message, b""));
+            }
         }
     }
-    fn shutdown(&mut self) {}
+    /// Cancels every call in parallel and waits up to `SHUTDOWN_JOIN` for their threads.
+    fn shutdown(&mut self) {
+        self.registry.cancel_all();
+        let deadline = Instant::now() + SHUTDOWN_JOIN;
+        while self.calls.iter().any(|h| !h.is_finished()) && Instant::now() < deadline {
+            thread::sleep(CALL_TICK);
+        }
+    }
+}
+
+/// The registry key of a request id: `1` and `"1"` are different requests.
+fn id_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(s) => Some(format!("s:{s}")),
+        Value::Number(n) if n.is_i64() || n.is_u64() => Some(format!("n:{n}")),
+        _ => None,
+    }
 }
 
 /// A catalog tool as `tools/list` shows it: no `exec` sidecar.
@@ -518,5 +565,241 @@ pub(crate) mod tests {
             signal,
         );
         assert_eq!(exit, Exit::Signal(15));
+    }
+
+    /// A server on a pipe that stays open, for calls that are still running.
+    pub(crate) struct Live {
+        input: Option<std::io::PipeWriter>,
+        pub(crate) out: Shared,
+        handle: Option<thread::JoinHandle<Exit>>,
+        pub(crate) signal: Arc<AtomicUsize>,
+    }
+    impl Live {
+        pub(crate) fn start(config: Config) -> Self {
+            let (reader, input) = std::io::pipe().unwrap();
+            let (out, signal) = (Shared::default(), Arc::new(AtomicUsize::new(0)));
+            let handle = {
+                let (out, signal) = (out.clone(), signal.clone());
+                thread::spawn(move || run(std::io::BufReader::new(reader), out, config, signal))
+            };
+            let mut live = Self {
+                input: Some(input),
+                out,
+                handle: Some(handle),
+                signal,
+            };
+            live.send(INIT);
+            live.wait(|m| m["id"] == 0);
+            live
+        }
+        pub(crate) fn send(&mut self, line: &str) {
+            writeln!(self.input.as_mut().unwrap(), "{line}").unwrap();
+        }
+        pub(crate) fn call(&mut self, id: Value, name: &str, arguments: Value) {
+            let call = json!({"jsonrpc":"2.0","id":id,"method":"tools/call",
+                "params":{"name":name,"arguments":arguments}});
+            self.send(&call.to_string());
+        }
+        pub(crate) fn cancel(&mut self, id: Value) {
+            let n = json!({"jsonrpc":"2.0","method":"notifications/cancelled",
+                "params":{"requestId":id,"reason":"test"}});
+            self.send(&n.to_string());
+        }
+        pub(crate) fn wait(&self, mut pred: impl FnMut(&Value) -> bool) -> Value {
+            let start = Instant::now();
+            loop {
+                if let Some(m) = self.out.lines().into_iter().find(|m| pred(m)) {
+                    return m;
+                }
+                assert!(
+                    start.elapsed() < std::time::Duration::from_secs(10),
+                    "{:?}",
+                    self.out.lines()
+                );
+                thread::sleep(std::time::Duration::from_millis(5));
+            }
+        }
+        pub(crate) fn answers(&self, id: &Value) -> usize {
+            self.out.lines().iter().filter(|m| &m["id"] == id).count()
+        }
+        /// Closes stdin and returns the exit and how long the shutdown took.
+        pub(crate) fn close(mut self) -> (Exit, std::time::Duration) {
+            let start = Instant::now();
+            self.input = None;
+            let exit = self.handle.take().unwrap().join().unwrap();
+            (exit, start.elapsed())
+        }
+        pub(crate) fn join(mut self) -> (Exit, std::time::Duration) {
+            let start = Instant::now();
+            let exit = self.handle.take().unwrap().join().unwrap();
+            (exit, start.elapsed())
+        }
+    }
+
+    /// `jobs` holds (SIGINT ends it), `doctor` holds and ignores SIGINT, `show` answers at once
+    /// and `ls` floods stdout. Every started child appends its pid to `pids`.
+    fn script(pids: &std::path::Path) -> String {
+        let p = pids.display();
+        format!(
+            r#"echo $$ >> '{p}'
+case "$2" in
+  jobs) exec sleep 30;;
+  doctor) trap '' INT; exec sleep 30;;
+  show) printf '{{"v":1,"ok":true,"data":{{"n":"%s"}}}}\n' "$4";;
+  ls) exec yes;;
+esac"#
+        )
+    }
+    fn pids(path: &std::path::Path) -> Vec<u32> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().parse().unwrap())
+            .collect()
+    }
+    fn wait_pids(path: &std::path::Path, n: usize) -> Vec<u32> {
+        let start = Instant::now();
+        loop {
+            let p = pids(path);
+            if p.len() >= n {
+                return p;
+            }
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "{p:?}"
+            );
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+    fn gone(pid: u32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+    }
+    fn live(dir: &tempfile::TempDir) -> (Live, std::path::PathBuf) {
+        let pids = dir.path().join("pids");
+        (Live::start(config(false, &script(&pids))), pids)
+    }
+
+    #[test]
+    fn a_cancelled_call_is_never_answered_and_its_child_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, pidfile) = live(&dir);
+        s.call(json!(1), "glen_jobs", json!({}));
+        let pid = wait_pids(&pidfile, 1)[0];
+        // ping is answered inline while the call runs.
+        let start = Instant::now();
+        s.send(r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#);
+        s.wait(|m| m["id"] == "p");
+        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        // A second call with an id in flight is refused; `"1"` is another request.
+        s.call(json!(1), "glen_show", json!({"session":"x"}));
+        assert_eq!(s.wait(|m| m["id"] == 1)["error"]["code"], INVALID_REQUEST);
+        s.cancel(json!("1"));
+        s.cancel(json!(99));
+        thread::sleep(std::time::Duration::from_millis(100));
+        assert!(!gone(pid), "a cancel naming another id stops nothing");
+        let start = Instant::now();
+        s.cancel(json!(1));
+        while !gone(pid) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        thread::sleep(std::time::Duration::from_millis(500));
+        assert_eq!(s.answers(&json!(1)), 1, "only the -32600 for the duplicate");
+        s.call(json!(2), "glen_show", json!({"session":"x"}));
+        let r = s.wait(|m| m["id"] == 2);
+        assert_eq!(r["result"]["isError"], false);
+        assert_eq!(s.close().0, Exit::Eof);
+    }
+
+    #[test]
+    fn a_cancel_racing_the_response_writes_at_most_one_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, _) = live(&dir);
+        for i in 0..40 {
+            s.call(json!(i), "glen_show", json!({"session":i.to_string()}));
+            s.cancel(json!(i));
+        }
+        s.send(r#"{"jsonrpc":"2.0","id":"end","method":"ping"}"#);
+        s.wait(|m| m["id"] == "end");
+        thread::sleep(std::time::Duration::from_millis(300));
+        for i in 0..40 {
+            assert!(s.answers(&json!(i)) <= 1, "{i}");
+        }
+        assert_eq!(s.close().0, Exit::Eof);
+    }
+
+    #[test]
+    fn the_seventeenth_call_is_refused_and_shutdown_stops_every_child() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, pidfile) = live(&dir);
+        for i in 0..super::MAX_IN_FLIGHT {
+            s.call(
+                json!(i),
+                if i % 2 == 0 {
+                    "glen_jobs"
+                } else {
+                    "glen_doctor"
+                },
+                json!({}),
+            );
+        }
+        let children = wait_pids(&pidfile, super::MAX_IN_FLIGHT);
+        s.call(json!("17th"), "glen_jobs", json!({}));
+        let r = s.wait(|m| m["id"] == "17th");
+        let text = r["result"]["content"][0]["text"].as_str().unwrap();
+        let envelope: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(envelope["error"]["details"]["reason"], "mcp_exec");
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("16 tool calls")
+        );
+        assert_eq!(
+            pids(&pidfile).len(),
+            super::MAX_IN_FLIGHT,
+            "the 17th started nothing"
+        );
+        let (exit, took) = s.close();
+        assert_eq!(exit, Exit::Eof);
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert!(children.iter().all(|p| gone(*p)), "{children:?}");
+    }
+
+    #[test]
+    fn a_signal_shuts_down_with_calls_in_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, pidfile) = live(&dir);
+        s.call(json!(1), "glen_doctor", json!({}));
+        s.call(json!(2), "glen_jobs", json!({}));
+        let children = wait_pids(&pidfile, 2);
+        s.signal.store(15, Ordering::SeqCst);
+        let (exit, took) = s.join();
+        assert_eq!(exit, Exit::Signal(15));
+        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert!(children.iter().all(|p| gone(*p)));
+    }
+
+    #[test]
+    fn a_stdout_flood_gets_one_exec_failure_and_the_next_call_is_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, pidfile) = live(&dir);
+        s.call(json!(1), "glen_ls", json!({}));
+        let r = s.wait(|m| m["id"] == 1);
+        let envelope: Value =
+            serde_json::from_str(r["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(envelope["error"]["details"]["reason"], "mcp_exec");
+        assert!(gone(pids(&pidfile)[0]));
+        s.call(json!(2), "glen_show", json!({"session":"after"}));
+        let r = s.wait(|m| m["id"] == 2);
+        assert!(
+            r["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("after")
+        );
+        assert_eq!(s.answers(&json!(1)), 1);
+        assert_eq!(s.close().0, Exit::Eof);
     }
 }

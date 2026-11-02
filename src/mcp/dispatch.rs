@@ -2,7 +2,7 @@
 //! (design §A22). The child is glen itself (no shell), so a result's text is the CLI's own
 //! envelope; only a call glen could not run to an envelope gets a synthesized one.
 use super::{
-    CALL_TICK, MAX_OUTPUT,
+    CALL_TICK, CANCEL_GRACE, MAX_IN_FLIGHT, MAX_OUTPUT,
     catalog::{ArgKind, ArgSpec, Tool},
 };
 use crate::{
@@ -11,6 +11,7 @@ use crate::{
 };
 use serde_json::{Map, Value, json};
 use std::{
+    collections::HashMap,
     ffi::OsString,
     io::{self, Read},
     os::unix::process::ExitStatusExt,
@@ -169,6 +170,138 @@ pub(crate) enum Run {
     },
     NotStarted(io::Error),
     Lost(io::Error),
+    /// Cancelled: never started, or signalled and reaped. A cancelled call is never answered.
+    Cancelled,
+}
+
+/// The in-flight `tools/call` registry (design §A22 "Cancellation"). Every transition happens
+/// under its one lock, which is never held across a stdout write, a spawn or a wait; the call
+/// thread reaps its child only under the lock, so no signal ever reaches a reaped pid.
+#[derive(Default)]
+pub(crate) struct Registry(Mutex<HashMap<String, CallState>>);
+#[derive(Default)]
+struct CallState {
+    cancelled: bool,
+    child_pid: Option<u32>,
+    sigint_at: Option<Instant>,
+    killed: bool,
+}
+/// Why a call could not be registered.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Refused {
+    /// That request id is already in flight.
+    Duplicate,
+    /// `MAX_IN_FLIGHT` calls are running.
+    Full,
+}
+fn sigint(pid: u32) -> bool {
+    i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+        .is_some_and(|pid| rustix::process::kill_process(pid, rustix::process::Signal::INT).is_ok())
+}
+impl Registry {
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CallState>> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    pub(crate) fn insert(&self, key: &str) -> Result<(), Refused> {
+        let mut calls = self.lock();
+        if calls.contains_key(key) {
+            return Err(Refused::Duplicate);
+        }
+        if calls.len() >= MAX_IN_FLIGHT {
+            return Err(Refused::Full);
+        }
+        calls.insert(key.to_owned(), CallState::default());
+        Ok(())
+    }
+    /// (1) A call cancelled before its child exists never starts one.
+    fn may_start(&self, key: &str) -> bool {
+        self.lock().get(key).is_some_and(|s| !s.cancelled)
+    }
+    /// (2) Records the child; a cancel that came in meanwhile gets its SIGINT now. Returns
+    /// whether a signal was sent.
+    pub(crate) fn started(&self, key: &str, pid: u32) -> bool {
+        let mut calls = self.lock();
+        let Some(s) = calls.get_mut(key) else {
+            return false;
+        };
+        s.child_pid = Some(pid);
+        if s.cancelled && s.sigint_at.is_none() {
+            s.sigint_at = Some(Instant::now());
+            return sigint(pid);
+        }
+        false
+    }
+    /// (3) `notifications/cancelled`: marks the call and SIGINTs its child when it has one.
+    /// Ignored for an id that is not in flight. Returns whether a signal was sent.
+    pub(crate) fn cancel(&self, key: &str) -> bool {
+        let mut calls = self.lock();
+        let Some(s) = calls.get_mut(key) else {
+            return false;
+        };
+        s.cancelled = true;
+        match (s.child_pid, s.sigint_at) {
+            (Some(pid), None) => {
+                s.sigint_at = Some(Instant::now());
+                sigint(pid)
+            }
+            _ => false,
+        }
+    }
+    /// Shutdown: cancels every call at once.
+    pub(crate) fn cancel_all(&self) {
+        let keys: Vec<String> = self.lock().keys().cloned().collect();
+        for key in keys {
+            self.cancel(&key);
+        }
+    }
+    /// (4) and (5): one poll of the call's child. SIGKILL once `CANCEL_GRACE` has passed since
+    /// the SIGINT; the exit is observed and the pid cleared in one critical section.
+    fn poll(&self, key: &str, child: &mut Child) -> io::Result<Option<ExitStatus>> {
+        let mut calls = self.lock();
+        let status = match child.try_wait() {
+            Ok(status) => status,
+            Err(e) => {
+                // The caller kills and reaps it outside the lock: no signal may target it now.
+                if let Some(s) = calls.get_mut(key) {
+                    s.child_pid = None;
+                }
+                return Err(e);
+            }
+        };
+        if let Some(s) = calls.get_mut(key) {
+            if status.is_some() {
+                s.child_pid = None;
+            } else if s.cancelled
+                && !s.killed
+                && s.sigint_at.is_some_and(|t| t.elapsed() >= CANCEL_GRACE)
+            {
+                // Best effort: an error means the child is already gone.
+                let _ = child.kill();
+                s.killed = true;
+            }
+        }
+        Ok(status)
+    }
+    fn cancelled(&self, key: &str) -> bool {
+        self.lock().get(key).is_some_and(|s| s.cancelled)
+    }
+    /// (6) Ends the call: `true` when its response may be written (it was not cancelled).
+    /// Removing the entry makes a later cancel for that id a no-op.
+    pub(crate) fn finish(&self, key: &str) -> bool {
+        self.lock().remove(key).is_some_and(|s| !s.cancelled)
+    }
+    pub(crate) fn is_in_flight(&self, key: &str) -> bool {
+        self.lock().contains_key(key)
+    }
+}
+
+/// Who may stop a child.
+#[derive(Clone, Copy)]
+pub(crate) enum Watch<'a> {
+    /// A `tools/call`: its registry entry decides.
+    Call(&'a Registry, &'a str),
 }
 
 #[derive(Default)]
@@ -235,21 +368,34 @@ fn spawn(launcher: &Launcher, argv: &[OsString], env: &[(&str, &str)]) -> io::Re
 }
 
 /// Runs one child to its end: stdin `/dev/null`, stdout and stderr captured, `env` added to the
-/// inherited environment, cwd inherited.
-pub(crate) fn run_child(launcher: &Launcher, argv: &[OsString], env: &[(&str, &str)]) -> Run {
-    match spawn(launcher, argv, env) {
-        Ok(child) => supervise(child),
-        Err(e) => Run::NotStarted(e),
+/// inherited environment (that child only), cwd inherited.
+pub(crate) fn run_child(
+    launcher: &Launcher,
+    argv: &[OsString],
+    env: &[(&str, &str)],
+    watch: Watch,
+) -> Run {
+    let Watch::Call(registry, key) = watch;
+    if !registry.may_start(key) {
+        return Run::Cancelled;
     }
+    let child = match spawn(launcher, argv, env) {
+        Ok(child) => child,
+        Err(e) => return Run::NotStarted(e),
+    };
+    registry.started(key, child.id());
+    supervise(child, watch)
 }
 
-/// Polls a started child until it exits, killing it when its stdout overflows.
-pub(crate) fn supervise(mut child: Child) -> Run {
+/// Polls a started child every `CALL_TICK` until it exits: cancellation escalates to SIGKILL
+/// after `CANCEL_GRACE`, and a stdout flood past `MAX_OUTPUT` is killed at once.
+pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
+    let Watch::Call(registry, key) = watch;
     let out = capture(child.stdout.take(), MAX_OUTPUT, false);
     let err = capture(child.stderr.take(), STDERR_TAIL, true);
     let mut killed = false;
     let status = loop {
-        match child.try_wait() {
+        match registry.poll(key, &mut child) {
             Ok(Some(status)) => break status,
             Ok(None) => {}
             Err(e) => {
@@ -266,6 +412,10 @@ pub(crate) fn supervise(mut child: Child) -> Run {
         }
         thread::sleep(CALL_TICK);
     };
+    // A cancelled call is not answered, so its pipe readers are not waited for.
+    if registry.cancelled(key) {
+        return Run::Cancelled;
+    }
     let deadline = Instant::now() + READER_JOIN;
     while !(out.done.load(Ordering::SeqCst) && err.done.load(Ordering::SeqCst))
         && Instant::now() < deadline
@@ -307,6 +457,7 @@ pub(crate) fn result(tool: &Tool, run: Run) -> Value {
         }
         Run::NotStarted(e) => return exec_failure(name, &format!("cannot start glen: {e}"), b""),
         Run::Lost(e) => return exec_failure(name, &format!("cannot wait for glen: {e}"), b""),
+        Run::Cancelled => return exec_failure(name, "the call was cancelled", b""),
     };
     if let Some(signal) = status.signal() {
         return exec_failure(
@@ -552,7 +703,7 @@ pub(crate) mod tests {
 
     fn mapped(script: &str) -> Value {
         let t = tool("glen_jobs");
-        result(&t, run_child(&sh(script), &[], &[]))
+        result(&t, run_free(&sh(script), &[], &[]))
     }
     fn envelope(result: &Value) -> Value {
         serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap()
@@ -602,7 +753,7 @@ pub(crate) mod tests {
             program: "/nonexistent/glen".into(),
             prefix_args: vec![],
         };
-        let e = envelope(&result(&tool("glen_jobs"), run_child(&missing, &[], &[])));
+        let e = envelope(&result(&tool("glen_jobs"), run_free(&missing, &[], &[])));
         assert!(
             e["error"]["message"]
                 .as_str()
@@ -617,7 +768,7 @@ pub(crate) mod tests {
         assert_eq!(envelope(&r)["x"], "1");
     }
     fn mapped_env(script: &str, env: &[(&str, &str)]) -> Value {
-        result(&tool("glen_jobs"), run_child(&sh(script), &[], env))
+        result(&tool("glen_jobs"), run_free(&sh(script), &[], env))
     }
 
     #[test]
@@ -639,7 +790,7 @@ pub(crate) mod tests {
         let big = OsString::from("x".repeat(2 * 1024 * 1024));
         let e = envelope(&result(
             &tool("glen_send"),
-            run_child(&sh("true"), &[big], &[]),
+            run_free(&sh("true"), &[big], &[]),
         ));
         assert_eq!(e["error"]["details"]["reason"], "mcp_exec");
         let message = e["error"]["message"].as_str().unwrap();
@@ -655,8 +806,148 @@ pub(crate) mod tests {
         t.output_schema = Some(json!({"type":"object"}));
         let r = result(
             &t,
-            run_child(&sh(r#"printf '{"v":1,"ok":true,"data":{}}\n'"#), &[], &[]),
+            run_free(&sh(r#"printf '{"v":1,"ok":true,"data":{}}\n'"#), &[], &[]),
         );
         assert_eq!(r["structuredContent"], json!({"v":1,"ok":true,"data":{}}));
+    }
+
+    /// A run under a throwaway registry entry that nobody cancels.
+    pub(crate) fn run_free(launcher: &Launcher, argv: &[OsString], env: &[(&str, &str)]) -> Run {
+        let registry = Registry::default();
+        registry.insert("free").unwrap();
+        run_child(launcher, argv, env, Watch::Call(&registry, "free"))
+    }
+    fn gone(pid: u32) -> bool {
+        let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
+        rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+    }
+    fn wait_file(path: &std::path::Path) -> String {
+        let start = Instant::now();
+        loop {
+            if let Ok(s) = std::fs::read_to_string(path)
+                && s.ends_with('\n')
+            {
+                return s;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "{}",
+                path.display()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_cancel_before_spawn_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("started");
+        let registry = Registry::default();
+        registry.insert("k").unwrap();
+        assert!(!registry.cancel("k"), "no child yet, so no signal");
+        let script = format!("touch '{}'", marker.display());
+        let run = run_child(&sh(&script), &[], &[], Watch::Call(&registry, "k"));
+        assert!(matches!(run, Run::Cancelled), "{run:?}");
+        assert!(!marker.exists());
+        assert!(!registry.finish("k"), "a cancelled call is not answered");
+    }
+
+    /// Cancels a running child (`trap` decides whether it ignores SIGINT) and returns how long it
+    /// took from the cancel to the reaped child.
+    fn cancel_running(ignore_sigint: bool) -> Duration {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pid");
+        let trap = if ignore_sigint { "trap '' INT; " } else { "" };
+        let script = format!("{trap}echo $$ > '{}'; exec sleep 30", pidfile.display());
+        let registry = Arc::new(Registry::default());
+        registry.insert("k").unwrap();
+        let thread = {
+            let registry = registry.clone();
+            thread::spawn(move || run_child(&sh(&script), &[], &[], Watch::Call(&registry, "k")))
+        };
+        let pid: u32 = wait_file(&pidfile).trim().parse().unwrap();
+        let start = Instant::now();
+        // Whether the pid is stored yet or not, the SIGINT goes out now (by this cancel or by
+        // the call thread right after its pid store).
+        registry.cancel("k");
+        assert!(!registry.cancel("k"), "a second cancel sends nothing");
+        let run = thread.join().unwrap();
+        let took = start.elapsed();
+        assert!(matches!(run, Run::Cancelled), "{run:?}");
+        assert!(gone(pid));
+        assert!(!registry.finish("k"));
+        took
+    }
+
+    #[test]
+    fn a_cancelled_child_is_gone_within_a_second() {
+        let took = cancel_running(false);
+        assert!(took < Duration::from_secs(1), "{took:?}");
+        let took = cancel_running(true);
+        assert!(
+            took >= CANCEL_GRACE && took < Duration::from_secs(1),
+            "{took:?}"
+        );
+    }
+
+    #[test]
+    fn a_cancel_between_spawn_and_the_pid_store_still_escalates() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let script = format!("trap '' INT; echo > '{}'; exec sleep 30", ready.display());
+        let registry = Registry::default();
+        registry.insert("k").unwrap();
+        let child = spawn(&sh(&script), &[], &[]).unwrap();
+        let pid = child.id();
+        wait_file(&ready);
+        let start = Instant::now();
+        assert!(!registry.cancel("k"), "the pid is not stored yet");
+        assert!(
+            registry.started("k", pid),
+            "the call thread sends the SIGINT itself"
+        );
+        let run = supervise(child, Watch::Call(&registry, "k"));
+        let took = start.elapsed();
+        assert!(matches!(run, Run::Cancelled), "{run:?}");
+        assert!(
+            took >= CANCEL_GRACE && took < Duration::from_secs(1),
+            "{took:?}"
+        );
+        assert!(gone(pid));
+    }
+
+    #[test]
+    fn a_cancel_after_the_exit_was_observed_sends_no_signal() {
+        let registry = Registry::default();
+        registry.insert("k").unwrap();
+        let mut child = spawn(&sh("exit 0"), &[], &[]).unwrap();
+        assert!(!registry.started("k", child.id()));
+        let start = Instant::now();
+        while registry.poll("k", &mut child).unwrap().is_none() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            thread::sleep(CALL_TICK);
+        }
+        assert!(!registry.cancel("k"), "a reaped pid is never signalled");
+        assert!(!registry.finish("k"), "the cancel still drops the response");
+        assert!(!registry.cancel("k"), "a finished call is ignored");
+    }
+
+    #[test]
+    fn the_registry_refuses_duplicates_and_a_seventeenth_call() {
+        let registry = Registry::default();
+        for i in 0..MAX_IN_FLIGHT {
+            registry.insert(&format!("n:{i}")).unwrap();
+        }
+        assert_eq!(registry.insert("n:0"), Err(Refused::Duplicate));
+        assert_eq!(registry.insert("n:99"), Err(Refused::Full));
+        assert!(registry.finish("n:0"));
+        assert_eq!(registry.insert("n:99"), Ok(()));
+        assert_eq!(registry.insert("n:100"), Err(Refused::Full));
+        registry.cancel_all();
+        assert!(
+            (0..MAX_IN_FLIGHT)
+                .skip(1)
+                .all(|i| !registry.finish(&format!("n:{i}")))
+        );
     }
 }
