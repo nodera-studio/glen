@@ -502,6 +502,95 @@ fn ac_v2_302_an_ignored_cancel_ends_after_the_grace() {
     assert_groups_gone(&b);
 }
 
+/// `wait_with_output`, plus the child's own peak resident set in bytes (from `wait4`, so no
+/// other child of this test process, such as the `cargo build` of the fake, is counted).
+fn wait_with_peak_rss(mut child: Child) -> (Output, u64) {
+    use std::{io::Read, os::unix::process::ExitStatusExt};
+    let drain = |mut pipe: Box<dyn Read + Send>| {
+        std::thread::spawn(move || {
+            let mut bytes = vec![];
+            pipe.read_to_end(&mut bytes).unwrap();
+            bytes
+        })
+    };
+    let stdout = drain(Box::new(child.stdout.take().unwrap()));
+    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+    let mut status = 0;
+    // SAFETY: `rusage` is plain data; `wait4` only writes into `status` and `usage`.
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    let pid = libc::pid_t::try_from(child.id()).unwrap();
+    assert_eq!(unsafe { libc::wait4(pid, &mut status, 0, &mut usage) }, pid);
+    let peak = u64::try_from(usage.ru_maxrss).unwrap();
+    let output = Output {
+        status: std::process::ExitStatus::from_raw(status),
+        stdout: stdout.join().unwrap(),
+        stderr: stderr.join().unwrap(),
+    };
+    (
+        output,
+        if cfg!(target_os = "macos") {
+            peak
+        } else {
+            peak * 1024
+        },
+    )
+}
+
+#[test]
+fn ac_v2_302_a_flooding_agent_stays_bounded_and_is_torn_down() {
+    let b = RpcBox::new();
+    let child = spawn(
+        &b,
+        &["@new", "flood", "--permission", "allow"],
+        &[
+            ("FAKE_OMP_ACP", "flood"),
+            ("GLEN_ACP_CANCEL_GRACE_MS", "300"),
+        ],
+    );
+    wait_first_chunk(&b);
+    std::thread::sleep(Duration::from_millis(1500));
+    signal(&child, Signal::INT);
+    let started = Instant::now();
+    let (out, peak) = wait_with_peak_rss(child);
+    // 100 ms tick + 300 ms grace + 100 ms exit grace, then TERM: well inside the J1 bound.
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    // A large document spills to a file; the stub names it.
+    let stub = envelope(&out, 130);
+    let v: Value = match stub["spilled"]["path"].as_str() {
+        Some(path) => serde_json::from_slice(&fs::read(path).unwrap()).unwrap(),
+        None => stub,
+    };
+    assert_eq!(v["ok"], true);
+    let d = &v["data"];
+    assert_eq!(d["task_state"], "canceled");
+    assert_eq!(d["cancel"]["confirmed"], false);
+    let kinds = d["updates"]["kinds"].as_object().unwrap();
+    assert!(kinds.len() <= 32 + 1, "{} kinds", kinds.len());
+    assert!(kinds.keys().all(|k| k.len() <= 64));
+    assert!(kinds["other"].as_u64().unwrap() > 0);
+    let events = d["events"].as_array().unwrap();
+    assert!(
+        !events.is_empty() && events.len() <= 100,
+        "{}",
+        events.len()
+    );
+    for event in events {
+        for key in ["tool_call_id", "title", "kind"] {
+            let text = event[key].as_str().unwrap();
+            assert!(text.len() <= 4096 + '…'.len_utf8(), "{key}: {}", text.len());
+            assert!(text.ends_with('…'), "{key}");
+        }
+    }
+    // Hundreds of MiB went past glen; it kept only bounded state.
+    eprintln!("flood: glen peak RSS {} KiB", peak >> 10);
+    assert!(peak < 64 << 20, "glen peak RSS {} MiB", peak >> 20);
+    assert_groups_gone(&b);
+}
+
 #[test]
 fn ac_v2_302_sigint_before_the_prompt_sends_no_cancel() {
     let b = RpcBox::new();

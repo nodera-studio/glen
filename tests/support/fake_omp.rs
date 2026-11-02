@@ -939,6 +939,33 @@ impl AcpPeer {
                 )?;
                 end("end_turn")?;
             }
+            "flood" => {
+                // A runaway agent: distinct, long update kinds and permission requests with huge
+                // strings, as fast as stdout takes them, until SIGTERM or a closed pipe. It never
+                // ends the turn and never logs the frames.
+                let pad = "k".repeat(4 * 1024);
+                let huge = "t".repeat(256 * 1024);
+                let mut stdout = io::stdout().lock();
+                for i in 0u64.. {
+                    if self.terminated.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let frame = if i % 16 == 0 {
+                        json!({"jsonrpc":"2.0","id":format!("flood-{i}"),"method":"session/request_permission","params":{"sessionId":session,"toolCall":{"toolCallId":huge,"title":huge,"kind":huge,"status":"pending"},"options":[{"optionId":"allow_once","name":"Allow once","kind":"allow_once"}]}})
+                    } else {
+                        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":{"sessionUpdate":format!("flood_{i}_{pad}")}}})
+                    };
+                    let written = serde_json::to_writer(&mut stdout, &frame)
+                        .map_err(io::Error::from)
+                        .and_then(|()| stdout.write_all(b"\n"));
+                    if written.is_err() {
+                        break;
+                    }
+                }
+                drop(stdout);
+                log(json!({"event":"exit","reason":"flood ended"}))?;
+                return Ok(Some(0));
+            }
             "stop" => {
                 let stop = knob("FAKE_OMP_ACP_STOP").unwrap_or_else(|| "refusal".into());
                 chunk("agent_message_chunk", "lo ", "m1")?;

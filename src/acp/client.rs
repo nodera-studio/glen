@@ -1,16 +1,18 @@
 //! The synchronous ACP transport for `glen __acp` (design §A23): NDJSON JSON-RPC 2.0 over a child's
-//! stdio. A reader thread turns stdout lines into [`Frame`]s and a writer thread owns stdin, so a
-//! blocked pipe never stalls the 100 ms tick or the cancel decision. Generic over `Read` and
-//! `Write`: [`Client::from_io`] is the test seam.
-use super::{Answer, CLOSE_TIMEOUT, MAX_EVENTS, MAX_FRAME_BYTES, TICK, Updates};
+//! stdio. A reader thread turns stdout lines into [`Frame`]s (at most [`MAX_QUEUED_FRAMES`] ahead
+//! of the client) and a writer thread owns stdin and reports what it has written, so a blocked
+//! pipe never stalls the 100 ms tick or the cancel decision. Generic over `Read` and `Write`:
+//! [`Client::from_io`] is the test seam.
+use super::{Answer, CLOSE_TIMEOUT, MAX_EVENTS, MAX_FRAME_BYTES, MAX_QUEUED_FRAMES, TICK, Updates};
 use crate::{cli::AcpPermission, ctl::ephemeral::Process, error::Warning};
 use serde_json::{Value, json};
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     process::Command,
     sync::{
+        Arc, Condvar, Mutex, PoisonError,
         atomic::{AtomicBool, Ordering},
-        mpsc::{self, Receiver, RecvTimeoutError, Sender},
+        mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender},
     },
     time::{Duration, Instant},
 };
@@ -71,8 +73,9 @@ impl CancelReason {
         }
     }
 }
-/// `sent`: the `session/cancel` notification was queued; `confirmed`: omp answered the prompt
-/// with `stopReason:"cancelled"` within the grace (it accepted the cancel; cleanup may continue).
+/// `sent`: the writer thread wrote and flushed the `session/cancel` notification to omp's stdin
+/// (queued behind a stalled write is not sent); `confirmed`: omp answered the prompt with
+/// `stopReason:"cancelled"` within the grace (it accepted the cancel; cleanup may continue).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CancelState {
     pub sent: bool,
@@ -92,9 +95,47 @@ pub struct PromptOutcome {
     pub cancel: Option<CancelState>,
 }
 
+/// The writer thread's report: how many frames it has written and flushed, and whether a write
+/// failed (nothing after it is written).
+#[derive(Default)]
+struct Written {
+    progress: Mutex<Progress>,
+    changed: Condvar,
+}
+#[derive(Default)]
+struct Progress {
+    frames: u64,
+    failed: bool,
+}
+impl Written {
+    fn record(&self, ok: bool) {
+        let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        if ok {
+            progress.frames += 1;
+        } else {
+            progress.failed = true;
+        }
+        self.changed.notify_all();
+    }
+    /// True once the `frame`th queued frame (from 1) is written; waits at most `wait` for a write
+    /// still in flight.
+    fn reached(&self, frame: u64, wait: Duration) -> bool {
+        let progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        let (progress, _) = self
+            .changed
+            .wait_timeout_while(progress, wait, |p| p.frames < frame && !p.failed)
+            .unwrap_or_else(PoisonError::into_inner);
+        progress.frames >= frame
+    }
+}
+
 pub struct Client {
     writer: Option<Sender<Vec<u8>>>,
-    frames: Receiver<Frame>,
+    written: Arc<Written>,
+    /// Frames handed to the writer thread so far.
+    queued: u64,
+    /// `None` once [`Client::shutdown`] handed the reader to a draining thread.
+    frames: Option<Receiver<Frame>>,
     process: Option<Process>,
     next_id: u64,
     policy: AcpPermission,
@@ -102,6 +143,8 @@ pub struct Client {
     events: Vec<Value>,
     events_dropped: u64,
     cancel: Option<CancelState>,
+    /// The queue position of the `session/cancel` notification, once queued.
+    cancel_frame: Option<u64>,
 }
 impl Client {
     /// Spawns `command` (see [`super::command`]) in its own process group.
@@ -115,14 +158,18 @@ impl Client {
         process: Option<Process>,
         policy: AcpPermission,
     ) -> Self {
-        let (frame_tx, frames) = mpsc::channel();
+        let (frame_tx, frames) = mpsc::sync_channel(MAX_QUEUED_FRAMES);
         // Never joined: a grandchild holding stdout open must not block glen's exit.
         std::thread::spawn(move || read_frames(read, frame_tx));
+        let written = Arc::new(Written::default());
+        let report = Arc::clone(&written);
         let (writer, lines) = mpsc::channel();
-        std::thread::spawn(move || write_frames(write, lines));
+        std::thread::spawn(move || write_frames(write, lines, &report));
         Self {
             writer: Some(writer),
-            frames,
+            written,
+            queued: 0,
+            frames: Some(frames),
             process,
             next_id: 1,
             policy,
@@ -130,6 +177,7 @@ impl Client {
             events: vec![],
             events_dropped: 0,
             cancel: None,
+            cancel_frame: None,
         }
     }
     pub fn pid(&self) -> Option<u32> {
@@ -145,7 +193,7 @@ impl Client {
         self.cancel.as_ref()
     }
     /// Queues one frame for the writer thread; false once the writer has gone.
-    fn send(&self, frame: &Value) -> bool {
+    fn send(&mut self, frame: &Value) -> bool {
         let Some(writer) = &self.writer else {
             return false;
         };
@@ -153,7 +201,9 @@ impl Client {
             return false;
         };
         bytes.push(b'\n');
-        writer.send(bytes).is_ok()
+        let queued = writer.send(bytes).is_ok();
+        self.queued += u64::from(queued);
+        queued
     }
     /// Writes a request and returns its id (integers from 1).
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value, CallError> {
@@ -173,7 +223,10 @@ impl Client {
     /// `method` is a response, returned to the caller unmatched. `stop` and `deadline` are read
     /// when a request is answered: once either is reached, a cancel is due.
     pub fn pump(&mut self, wait: Duration, stop: &AtomicBool, deadline: Instant) -> Pump {
-        let value = match self.frames.recv_timeout(wait) {
+        let Some(frames) = &self.frames else {
+            return Pump::Closed;
+        };
+        let value = match frames.recv_timeout(wait) {
             Ok(Frame::Json(value)) => value,
             Ok(Frame::Malformed(reason)) => return Pump::Malformed(reason),
             Ok(Frame::Eof) | Err(RecvTimeoutError::Disconnected) => return Pump::Closed,
@@ -313,9 +366,10 @@ impl Client {
                     None
                 };
                 if let Some(reason) = reason {
-                    let sent = self.notify("session/cancel", json!({"sessionId":session_id}));
+                    let queued = self.notify("session/cancel", json!({"sessionId":session_id}));
+                    self.cancel_frame = queued.then_some(self.queued);
                     self.cancel = Some(CancelState {
-                        sent,
+                        sent: false,
                         confirmed: false,
                         reason,
                     });
@@ -324,6 +378,8 @@ impl Client {
             }
             let left = grace_end.unwrap_or(deadline).saturating_duration_since(now);
             if grace_end.is_some() && left.is_zero() {
+                // The grace is over: a cancel still stuck behind a stalled write is not waited for.
+                self.settle_cancel(Duration::ZERO);
                 return Ok(PromptOutcome {
                     stop_reason: None,
                     usage: None,
@@ -351,10 +407,19 @@ impl Client {
                     cancel: None,
                 })
             });
+            // The answer to a cancel can overtake the writer thread's report that it wrote it.
+            self.settle_cancel(TICK);
             return outcome.map(|outcome| PromptOutcome {
                 cancel: self.cancel.clone(),
                 ..outcome
             });
+        }
+    }
+    /// `sent` becomes true only once the writer thread has written the cancel; waits at most
+    /// `wait` for a write in flight.
+    fn settle_cancel(&mut self, wait: Duration) {
+        if let (Some(cancel), Some(frame)) = (&mut self.cancel, self.cancel_frame) {
+            cancel.sent = self.written.reached(frame, wait);
         }
     }
     /// The trailing drain: an update that overtook the prompt response is still applied, for
@@ -385,9 +450,15 @@ impl Client {
         .map(drop)
     }
     /// Closes stdin (once the writer has drained) and stops the process group within `grace`
-    /// plus the TERM and KILL escalation (`Process::finish`). Idempotent.
+    /// plus the TERM and KILL escalation (`Process::finish`). It never waits on the writer: a
+    /// stalled write ends when the group is gone. Idempotent.
     pub fn shutdown(&mut self, grace: Duration) -> Vec<Warning> {
         self.writer.take();
+        // Keep reading omp's stdout (and dropping it) so a chatty omp never blocks on the full
+        // pipe while it exits; the thread ends with the reader, at stdout EOF.
+        if let Some(frames) = self.frames.take() {
+            std::thread::spawn(move || frames.into_iter().for_each(drop));
+        }
         self.process
             .take()
             .map(|mut process| process.finish(grace))
@@ -399,15 +470,18 @@ impl Drop for Client {
         drop(self.shutdown(Duration::ZERO));
     }
 }
-fn write_frames(mut write: impl Write, lines: Receiver<Vec<u8>>) {
+fn write_frames(mut write: impl Write, lines: Receiver<Vec<u8>>, written: &Written) {
     for line in lines {
-        if write.write_all(&line).and_then(|()| write.flush()).is_err() {
+        let ok = write.write_all(&line).and_then(|()| write.flush()).is_ok();
+        written.record(ok);
+        if !ok {
             return;
         }
     }
     // Dropping `write` here is stdin EOF.
 }
-fn read_frames(read: impl Read, frames: Sender<Frame>) {
+/// Blocks on a full queue: backpressure lands on this thread (and on omp) only.
+fn read_frames(read: impl Read, frames: SyncSender<Frame>) {
     let mut reader = BufReader::with_capacity(64 * 1024, read);
     loop {
         let frame = match read_line(&mut reader, MAX_FRAME_BYTES) {
@@ -475,7 +549,7 @@ mod tests {
     use super::*;
     use std::{
         io::{PipeReader, PipeWriter},
-        sync::Arc,
+        sync::{Arc, atomic::AtomicUsize},
         thread,
     };
     const WAIT: Duration = Duration::from_secs(5);
@@ -645,7 +719,8 @@ mod tests {
         );
         assert_eq!(exact.len(), MAX_FRAME_BYTES);
         for (line, ok) in [(exact.clone(), true), (format!("{exact} "), false)] {
-            let (tx, rx) = mpsc::channel();
+            // Room for the frame and the EOF after it, so the reader never blocks here.
+            let (tx, rx) = mpsc::sync_channel(MAX_QUEUED_FRAMES);
             let mut bytes = line.into_bytes();
             bytes.push(b'\n');
             read_frames(io::Cursor::new(bytes), tx);
@@ -1038,6 +1113,125 @@ mod tests {
         peer.send(permission(json!(3), &ALL));
         assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
         assert_eq!(peer.next()["result"]["outcome"]["optionId"], "allow_once");
+    }
+    #[test]
+    fn the_inbound_queue_is_bounded_and_shutdown_keeps_draining() {
+        const FRAMES: usize = 4096;
+        let (mut client, peer) = pair(AcpPermission::Deny);
+        let Peer { inbox: _inbox, out } = peer;
+        let line = format!("{}\n", chunk("s1", &"x".repeat(16 * 1024), "m1"));
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&accepted);
+        let flood = thread::spawn(move || {
+            let mut out = out;
+            for _ in 0..FRAMES {
+                if out.write_all(line.as_bytes()).is_err() {
+                    return;
+                }
+                count.fetch_add(1, Ordering::SeqCst);
+            }
+        });
+        // Nothing pumps: the reader fills its queue and blocks, and the agent blocks behind it
+        // on the full pipe (64 MiB would otherwise sit in memory).
+        thread::sleep(Duration::from_millis(500));
+        let stalled = accepted.load(Ordering::SeqCst);
+        assert!(
+            stalled < 64,
+            "{stalled} of {FRAMES} frames were taken in without a pump"
+        );
+        for _ in 0..16 {
+            assert!(matches!(pump(&mut client, WAIT), Pump::Handled));
+        }
+        // Teardown waits for nobody, and the reader keeps draining so a chatty agent is never
+        // left blocked on its stdout while it exits.
+        let started = Instant::now();
+        assert!(client.shutdown(Duration::ZERO).is_empty());
+        assert!(started.elapsed() < Duration::from_millis(100));
+        let end = Instant::now() + WAIT;
+        while !flood.is_finished() && Instant::now() < end {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            flood.is_finished(),
+            "the agent stayed blocked after shutdown"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), FRAMES);
+    }
+    #[test]
+    fn a_cancel_stuck_behind_a_stalled_write_is_not_sent() {
+        let (client_read, _agent_write) = std::io::pipe().unwrap();
+        // Nobody reads the agent's end: the 4 MiB prompt fills the pipe and the cancel queues
+        // behind it.
+        let (_agent_read, client_write): (PipeReader, PipeWriter) = std::io::pipe().unwrap();
+        let mut client = Client::from_io(client_read, client_write, None, AcpPermission::Deny);
+        let big = "x".repeat(4 * 1024 * 1024);
+        let started = Instant::now();
+        let soon = Instant::now() + Duration::from_millis(200);
+        let outcome = client
+            .prompt(
+                "s1",
+                &big,
+                &AtomicBool::new(false),
+                soon,
+                Duration::from_millis(200),
+            )
+            .unwrap();
+        let unsent = Some(CancelState {
+            sent: false,
+            confirmed: false,
+            reason: CancelReason::Deadline,
+        });
+        assert_eq!(outcome.cancel, unsent);
+        assert_eq!(client.cancel(), unsent.as_ref());
+        // The stalled write delays neither the grace nor the teardown.
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let started = Instant::now();
+        drop(client.shutdown(Duration::ZERO));
+        assert!(started.elapsed() < Duration::from_millis(100));
+    }
+    #[test]
+    fn a_cancel_is_sent_once_its_bytes_reach_the_agent() {
+        let (client_read, _agent_write) = std::io::pipe().unwrap();
+        let (agent_read, client_write) = std::io::pipe().unwrap();
+        let mut client = Client::from_io(client_read, client_write, None, AcpPermission::Deny);
+        // The agent reads only after the deadline: the cancel first queues behind the prompt.
+        let agent = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(400));
+            BufReader::new(agent_read)
+                .lines()
+                .take(2)
+                .map(|line| {
+                    serde_json::from_str::<Value>(&line.unwrap()).unwrap()["method"].clone()
+                })
+                .collect::<Vec<_>>()
+        });
+        let big = "x".repeat(4 * 1024 * 1024);
+        let soon = Instant::now() + Duration::from_millis(200);
+        let outcome = client
+            .prompt(
+                "s1",
+                &big,
+                &AtomicBool::new(false),
+                soon,
+                Duration::from_secs(1),
+            )
+            .unwrap();
+        assert_eq!(
+            agent.join().unwrap(),
+            [json!("session/prompt"), json!("session/cancel")]
+        );
+        assert_eq!(
+            outcome.cancel,
+            Some(CancelState {
+                sent: true,
+                confirmed: false,
+                reason: CancelReason::Deadline
+            })
+        );
     }
     #[test]
     fn a_malformed_frame_in_the_trailing_drain_fails_the_turn() {

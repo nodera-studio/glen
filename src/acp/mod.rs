@@ -29,6 +29,17 @@ pub const STOP_GRACE: Duration = Duration::from_millis(100);
 pub const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_TEXT_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_EVENTS: usize = 100;
+/// Parsed frames the reader thread queues ahead of the client before it blocks (and omp with it,
+/// on its full stdout pipe).
+pub const MAX_QUEUED_FRAMES: usize = 4;
+/// An event string (`tool_call_id`, `title`, `kind`, `option_id`) longer than this is cut to it
+/// and ends in "…".
+pub const MAX_EVENT_TEXT_BYTES: usize = 4 * 1024;
+/// `updates.kinds` names at most this many kinds, each at most [`MAX_KIND_BYTES`] long; every
+/// other update is counted under `"other"`.
+pub const MAX_KINDS: usize = 32;
+pub const MAX_KIND_BYTES: usize = 64;
+const OTHER_KIND: &str = "other";
 
 /// A debug-build-only millisecond override; release builds and out-of-range values ignore it.
 fn debug_ms(env: &Env, key: &str, min: u64, max: u64) -> Option<Duration> {
@@ -127,7 +138,15 @@ impl Updates {
             Phase::During => (),
         }
         self.during_turn += 1;
-        *self.kinds.entry(kind.to_owned()).or_default() += 1;
+        let named = self.kinds.len() - usize::from(self.kinds.contains_key(OTHER_KIND));
+        let key = if kind.len() <= MAX_KIND_BYTES
+            && (named < MAX_KINDS || self.kinds.contains_key(kind))
+        {
+            kind
+        } else {
+            OTHER_KIND
+        };
+        *self.kinds.entry(key.to_owned()).or_default() += 1;
         match kind {
             "agent_message_chunk" if update["content"]["type"] == "text" => {
                 if let Some(text) = update["content"]["text"].as_str() {
@@ -231,12 +250,23 @@ pub fn answer(policy: AcpPermission, options: &[Value]) -> Answer {
             kind: want,
         })
 }
-/// The `data.events` entry for one answered permission request.
+/// `text`, or its first [`MAX_EVENT_TEXT_BYTES`] (cut at a char boundary) followed by "…".
+fn clip(text: &str) -> String {
+    if text.len() <= MAX_EVENT_TEXT_BYTES {
+        return text.to_owned();
+    }
+    let mut end = MAX_EVENT_TEXT_BYTES;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+/// The `data.events` entry for one answered permission request; its strings are clipped.
 pub fn input_required_event(params: &Value, policy: AcpPermission, answer: &Answer) -> Value {
     let tool = &params["toolCall"];
-    let text = |key: &str| tool.get(key).and_then(Value::as_str).map(str::to_owned);
+    let text = |key: &str| tool.get(key).and_then(Value::as_str).map(clip);
     let option_id = match answer {
-        Answer::Selected { option_id, .. } => Some(option_id.as_str()),
+        Answer::Selected { option_id, .. } => Some(clip(option_id)),
         Answer::Cancelled => None,
     };
     json!({"event":"task_state","task_state":"input_required","tool_call_id":text("toolCallId"),"title":text("title"),"kind":text("kind"),"policy":policy.as_str(),"answer":answer.as_str(),"option_id":option_id})
@@ -602,6 +632,54 @@ mod tests {
             input_required_event(&json!({}), AcpPermission::Deny, &Answer::Cancelled),
             json!({"event":"task_state","task_state":"input_required","tool_call_id":null,"title":null,"kind":null,"policy":"deny","answer":"cancelled","option_id":null})
         );
+    }
+    #[test]
+    fn event_strings_are_cut_at_a_char_boundary_with_an_ellipsis() {
+        let huge = "é".repeat(1024 * 1024);
+        let fits = "a".repeat(MAX_EVENT_TEXT_BYTES);
+        let params = json!({"toolCall":{"toolCallId":huge,"title":fits,"kind":huge},"options":[{"optionId":huge,"kind":"allow_once"}]});
+        let a = answer(AcpPermission::Allow, params["options"].as_array().unwrap());
+        let event = input_required_event(&params, AcpPermission::Allow, &a);
+        assert_eq!(
+            event["title"],
+            fits.as_str(),
+            "a string at the cap is kept whole"
+        );
+        for key in ["tool_call_id", "kind", "option_id"] {
+            let text = event[key].as_str().unwrap();
+            // "é" is 2 bytes: the cut lands on the boundary at or just below the cap.
+            assert_eq!(text.len(), MAX_EVENT_TEXT_BYTES + '…'.len_utf8(), "{key}");
+            assert!(text.ends_with("é…"), "{key}");
+        }
+        // The answer on the wire keeps the exact option id.
+        assert_eq!(a.result()["outcome"]["optionId"], huge.as_str());
+    }
+    #[test]
+    fn kinds_are_capped_in_number_and_length() {
+        let mut u = Updates::default();
+        u.for_session("s1");
+        u.begin_turn();
+        u.apply(&kind(&"k".repeat(MAX_KIND_BYTES + 1)));
+        u.apply(&kind(&"k".repeat(MAX_KIND_BYTES)));
+        for i in 0..(MAX_KINDS + 10) {
+            u.apply(&kind(&format!("kind_{i}")));
+        }
+        u.apply(&kind("kind_0"));
+        u.apply(&chunk("still text", Some("m1")));
+        assert_eq!(u.kinds.len(), MAX_KINDS + 1, "{:?}", u.kinds.keys());
+        assert!(u.kinds.keys().all(|k| k.len() <= MAX_KIND_BYTES));
+        assert_eq!(u.kinds["k".repeat(MAX_KIND_BYTES).as_str()], 1);
+        assert_eq!(u.kinds["kind_0"], 2);
+        // The over-long kind, the 11 new kinds past the cap, and the chunk's kind.
+        assert_eq!(u.kinds["other"], 1 + 11 + 1);
+        assert_eq!(u.during_turn, 1 + 1 + MAX_KINDS as u64 + 10 + 1 + 1);
+        assert_eq!(u.assistant_text(), Some("still text"));
+        // After the turn nothing counts, not even as replay.
+        let during = u.during_turn;
+        u.end_turn();
+        u.apply(&chunk("late", Some("m2")));
+        assert_eq!(u.assistant_text(), Some("still text"));
+        assert_eq!((u.during_turn, u.replayed), (during, 0));
     }
     #[test]
     fn stop_reasons_map_to_task_states() {
