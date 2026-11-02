@@ -274,13 +274,10 @@ fn group_gone(pid: u32) -> bool {
     })
 }
 
-/// Removes `e`'s registry and release request while they still name `e`, under the session lock:
-/// only the lock's holder publishes a registry, so no successor can write one in between. A
-/// held lock belongs to a live process that owns the session's files; they are left to it.
+/// Removes `e`'s registry and release request, each only while it still names `e`: a successor's
+/// files survive, even ones written as this runs. No session lock is taken, so a registry whose
+/// identity is not that of the process holding the lock is removed too.
 fn cleanup(home: &GlenHome, e: &warm::Entry) {
-    let Ok(Some(_lock)) = lock::try_acquire(home, &e.session_id) else {
-        return;
-    };
     let _ = warm::remove_if(home, &e.session_id, &e.ident());
     let _ = warm::clear_release_if(home, &e.session_id, &e.ident());
 }
@@ -459,6 +456,33 @@ mod tests {
             assert!(old.try_wait().unwrap().is_none(), "never signalled");
             old.kill().unwrap();
             old.wait().unwrap();
+        }
+    }
+    #[test]
+    fn a_mismatched_entry_is_cleaned_while_a_live_process_holds_the_lock() {
+        for force in [false, true] {
+            let t = tempfile::tempdir().unwrap();
+            let h = home(&t);
+            let env = Env::for_test(None, t.path(), &[]);
+            // This process holds the session lock as its warm worker, but the registry names a
+            // start token that is not its own.
+            let (_held, mut e) = successor(&h);
+            e.start = Some("reused".into());
+            warm::publish(&h, &e).unwrap();
+            warm::request_release(&h, A, &e.ident()).unwrap();
+            let snapshot = warm::read(&h, A).unwrap();
+            let got = release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(force, Duration::from_millis(100)),
+                warm::STALE,
+            )
+            .unwrap();
+            assert_eq!(got, ("cleaned", true), "force {force}");
+            assert!(warm::read(&h, A).is_none(), "force {force}");
+            assert!(!warm::release_path(&h, A).exists(), "force {force}");
+            assert!(lock::is_held(&h, A), "the lock stays with its holder");
         }
     }
     #[test]

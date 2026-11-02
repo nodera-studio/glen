@@ -296,13 +296,36 @@ pub fn remove(home: &GlenHome, session_id: &str) -> io::Result<()> {
     remove_file(&path(home, session_id))
 }
 /// Removes the registry only while it still names the worker `ident` (see [`ident`]); true when
-/// it did. Only the session lock's holder publishes a registry, so a caller that holds the lock
-/// can never remove a successor's (`glen release`).
+/// it did. It needs no session lock: a successor's registry, even one published as this runs,
+/// is never removed (see [`remove_while`]).
 pub fn remove_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
     if read(home, session_id).is_none_or(|i| i.entry.ident() != ident) {
         return Ok(false);
     }
-    remove(home, session_id).map(|()| true)
+    remove_while(&path(home, session_id), |bytes| {
+        parse(bytes, session_id).is_some_and(|e| e.ident() == ident)
+    })
+}
+/// Removes `path` only while its bytes pass `names`; true when it did. The file is moved aside
+/// first, so the check reads exactly the file that is removed. One a concurrent writer put there
+/// meanwhile is put back, unless an even newer one already took the path (as
+/// `live::registry::remove_if_unchanged`).
+fn remove_while(path: &Path, names: impl FnOnce(&[u8]) -> bool) -> io::Result<bool> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let aside = path.with_file_name(format!(".{name}.{}.stale", uuid::Uuid::now_v7()));
+    match fs::rename(path, &aside) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        moved => moved?,
+    }
+    if read_regular(&aside).is_some_and(|(bytes, _)| names(&bytes)) {
+        fs::remove_file(&aside)?;
+        return Ok(true);
+    }
+    match fs::hard_link(&aside, path) {
+        Err(e) if e.kind() != io::ErrorKind::AlreadyExists => return Err(e),
+        _ => fs::remove_file(&aside)?,
+    }
+    Ok(false)
 }
 fn read_regular(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
     let meta = fs::symlink_metadata(path).ok()?;
@@ -314,9 +337,12 @@ fn read_regular(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
 }
 pub fn read(home: &GlenHome, session_id: &str) -> Option<Indexed> {
     let (bytes, mtime) = read_regular(&path(home, session_id))?;
-    let entry: Entry = serde_json::from_slice(&bytes).ok()?;
-    (entry.v == 1 && entry.pid > 0 && entry.session_id == session_id)
-        .then_some(Indexed { entry, mtime })
+    parse(&bytes, session_id).map(|entry| Indexed { entry, mtime })
+}
+fn parse(bytes: &[u8], session_id: &str) -> Option<Entry> {
+    serde_json::from_slice::<Entry>(bytes)
+        .ok()
+        .filter(|e| e.v == 1 && e.pid > 0 && e.session_id == session_id)
 }
 /// Every readable registry, plus the count of files that are not (torn, foreign, a symlink).
 /// Release requests and atomic-write temporaries are not registries.
@@ -355,12 +381,15 @@ pub fn release_requested(home: &GlenHome, session_id: &str, me: &str) -> bool {
 pub fn clear_release(home: &GlenHome, session_id: &str) -> io::Result<()> {
     remove_file(&release_path(home, session_id))
 }
-/// Removes the release request only while it is addressed to `ident`; true when it did.
+/// Removes the release request only while it is addressed to `ident`; true when it did. A request
+/// another `glen release` writes meanwhile is never removed (see [`remove_while`]).
 pub fn clear_release_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<bool> {
     if !release_requested(home, session_id, ident) {
         return Ok(false);
     }
-    clear_release(home, session_id).map(|()| true)
+    remove_while(&release_path(home, session_id), |bytes| {
+        bytes == ident.as_bytes()
+    })
 }
 /// What `glen release --force` may signal: only a process whose pid and start token are proven
 /// unchanged (`Alive`). `Unknown` never signals.
@@ -1381,6 +1410,41 @@ mod registry_tests {
         assert!(remove_if(&h, ID, &successor.ident()).unwrap());
         assert!(clear_release_if(&h, ID, &successor.ident()).unwrap());
         assert!(read(&h, ID).is_none() && !release_path(&h, ID).exists());
+    }
+    #[test]
+    fn removal_puts_back_a_file_written_during_the_check() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let p = path(&h, ID);
+        let successor = me(EntryState::Idle);
+        publish(&h, &successor).unwrap();
+        let stamp = |p: &Path| {
+            let m = fs::metadata(p).unwrap();
+            (m.ino(), m.modified().unwrap())
+        };
+        let before = stamp(&p);
+        // The file moved aside is not the one checked (a successor published in between): it is
+        // put back as it was.
+        assert!(!remove_while(&p, |_| false).unwrap());
+        assert_eq!(read(&h, ID).unwrap().entry, successor);
+        assert_eq!(stamp(&p), before);
+        // An even newer publish while the moved file is checked keeps the path.
+        let mut newer = successor.clone();
+        newer.state = EntryState::Busy;
+        let republish = |_: &[u8]| {
+            publish(&h, &newer).unwrap();
+            false
+        };
+        assert!(!remove_while(&p, republish).unwrap());
+        assert_eq!(read(&h, ID).unwrap().entry, newer);
+        assert!(remove_while(&p, |b| parse(b, ID).is_some_and(|e| e == newer)).unwrap());
+        assert!(!remove_while(&p, |_| true).unwrap(), "nothing to remove");
+        assert_eq!(
+            fs::read_dir(dir(&h)).unwrap().count(),
+            0,
+            "no copy left aside"
+        );
     }
     #[test]
     fn kill_identity_requires_proof() {
