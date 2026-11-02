@@ -126,7 +126,7 @@ fn classify(path: &Path, version: &str, home: &Path) -> io::Result<(State, Optio
     if home.to_str().is_some() && bytes == render(version, home).as_bytes() {
         return Ok((State::Current, installed));
     }
-    let state = match crate::skill::compare_versions(fields[0], version) {
+    let state = match crate::version::compare_versions(fields[0], version) {
         Ordering::Less => State::Outdated(fields[0].into()),
         Ordering::Greater => State::Newer(fields[0].into()),
         Ordering::Equal => {

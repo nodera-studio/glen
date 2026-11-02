@@ -1,0 +1,12 @@
+# Loopback stub provider for the omp surface contract (tests/omp_surface.rs) and the nightly
+# omp-latest workflow. It lets a real omp reach `ready` without a credential or a network
+# provider: 127.0.0.1:9 is the discard port, and the surface set never sends a prompt.
+# Copied to <scratch HOME>/.omp/agent/models.yml; never into a real omp home.
+providers:
+  glen-surface:
+    baseUrl: http://127.0.0.1:9/v1
+    auth: none
+    api: openai-completions
+    models:
+      - id: surface-null
+        name: surface-null

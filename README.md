@@ -10,7 +10,8 @@ envelope for agents.
 
 ## Install
 
-macOS and Linux. glen is tested against omp 18.14.0; `glen doctor` warns on any other version.
+macOS and Linux. glen supports omp 18.14.0 to 18.14.0 (tested against 18.14.0, declared in
+`src/omp/compat.json`); `glen doctor` warns when your omp is outside that range.
 
 ### Script
 
@@ -64,6 +65,7 @@ The install script is not affected.
 
 ```sh
 glen doctor                          # omp, its version and the paths glen uses
+glen doctor --probe                  # also start omp briefly (no session) and check its RPC
 glen ls                              # sessions in this project
 glen ls --all --live                 # live sessions in every project
 glen show e27c0de                    # a session's transcript

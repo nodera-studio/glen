@@ -15,7 +15,7 @@ fn ac007_no_color_wins_over_clicolor_force() {
             sb.glen(["doctor", "--human", "--color", "auto"]).fake_omp(),
             sb.glen(["doctor", "--human"])
                 .fake_omp()
-                .env("FAKE_OMP_VERSION", "18.0.9"),
+                .env("FAKE_OMP_VERSION", "18.99.0"),
             sb.glen(["doctor", "--human"]),
             sb.glen(["ls", "--human"]),
             sb.glen(["--human", "bogus"]),
@@ -128,7 +128,7 @@ fn ac009_json_output_never_contains_ansi() {
         sb.glen(["doctor", "--color", "always"]).fake_omp(),
         sb.glen(["doctor", "--json", "--color", "always"])
             .fake_omp()
-            .env("FAKE_OMP_VERSION", "18.0.9"),
+            .env("FAKE_OMP_VERSION", "18.99.0"),
         sb.glen(["doctor", "--json", "--color", "always"]),
         sb.glen(["ls", "--json", "--color", "always"]),
         sb.glen(["--json", "--color", "always", "bogus"]),
@@ -198,7 +198,7 @@ fn a10_warning_token_paints_the_untested_version() {
     let out = sb
         .glen(["doctor", "--human", "--color", "always"])
         .fake_omp()
-        .env("FAKE_OMP_VERSION", "18.0.9")
+        .env("FAKE_OMP_VERSION", "18.99.0")
         .env("COLORTERM", "truecolor")
         .run();
     out.assert_exit(0);

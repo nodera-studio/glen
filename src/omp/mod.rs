@@ -1,7 +1,10 @@
 pub mod bin;
 pub mod paths;
-pub const TESTED_OMP_VERSION: &str = "18.14.0";
+/// The omp version glen is tested against, from `compat.json` (`tested`).
+pub static TESTED_OMP_VERSION: std::sync::LazyLock<&'static str> =
+    std::sync::LazyLock::new(|| compat::get().tested.as_str());
 pub mod bucket;
+pub mod compat;
 pub mod continuation;
 pub mod handle;
 pub mod items;

@@ -45,9 +45,10 @@ pub const VISIBLE: [&str; 18] = [
 pub const HIDDEN: [&str; 0] = [];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
-pub const DOCTOR_CHECKS: [&str; 12] = [
+pub const DOCTOR_CHECKS: [&str; 13] = [
     "omp_binary",
     "omp_version",
+    "omp_capabilities",
     "profile",
     "agent_dir",
     "sessions_dir",

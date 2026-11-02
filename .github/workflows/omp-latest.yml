@@ -1,0 +1,144 @@
+name: omp-latest
+
+# Nightly: run glen's omp surface contract against the latest omp release (AC-v2-106).
+# Non-blocking: it is not a required check, and the release preflight reads only the `ci`
+# workflow. Every omp command runs under `env -i` with a scratch HOME from `mktemp -d`, so no
+# runner secret or token reaches omp; no step references a secret. A real omp needs a
+# selectable model to send `ready`, so the scratch HOME gets the loopback stub provider
+# (tests/fixtures/omp-surface/models.yml): no credential, no network provider, no prompt.
+on:
+  schedule:
+    - cron: '41 4 * * *'
+  workflow_dispatch:
+  pull_request:
+    paths: ['.github/workflows/omp-latest.yml']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: omp-latest-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The toolchain comes from rust-toolchain.toml (W8 DEBT-7).
+      - id: toolchain
+        shell: bash
+        run: echo "channel=$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      # The official installer with its documented --binary flag (the prebuilt binary, never a
+      # bun install), into a scratch HOME. The binary is discovered rather than assumed.
+      - id: omp
+        name: Install the latest omp
+        shell: bash
+        run: |
+          scratch="$(mktemp -d)"
+          env -i HOME="$scratch" PATH="$PATH" sh -c 'curl -fsSL https://omp.sh/install | sh -s -- --binary'
+          bin="$(PATH="$scratch/.local/bin:$scratch/.omp/bin:$scratch/.bun/bin:$PATH" command -v omp || true)"
+          if [ -z "$bin" ]; then
+            bin="$(find "$scratch" \( -type f -o -type l \) -name omp -print -quit)"
+          fi
+          if [ -z "$bin" ] || [ ! -x "$bin" ]; then
+            echo "::error title=omp not found::the installer left no executable omp under $scratch or on PATH"
+            exit 1
+          fi
+          line="$(cd "$scratch" && env -i HOME="$scratch" PATH=/usr/bin:/bin "$bin" --version | sed -n 1p)"
+          version="${line#omp/}"
+          version="${version#v}"
+          version="${version%%+*}"
+          mkdir -p "$scratch/.omp/agent"
+          cp tests/fixtures/omp-surface/models.yml "$scratch/.omp/agent/models.yml"
+          {
+            echo "bin=$bin"
+            echo "home=$scratch"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+      # The test spawns omp itself, with its own scratch HOME and the stub provider.
+      - id: surface
+        if: ${{ !cancelled() && steps.omp.outcome == 'success' }}
+        shell: bash
+        env:
+          GLEN_OMP_SURFACE_BIN: ${{ steps.omp.outputs.bin }}
+        run: cargo test --locked --test omp_surface -- --nocapture
+      # Only the manifest's files, at the installed version's tag.
+      - id: facts
+        if: ${{ !cancelled() && steps.omp.outcome == 'success' }}
+        shell: bash
+        env:
+          OMP_VERSION: ${{ steps.omp.outputs.version }}
+        run: |
+          tree="$(mktemp -d)"
+          jq -r '.facts[].file' tests/fixtures/omp-surface/facts.json | sort -u | while IFS= read -r file; do
+            mkdir -p "$tree/$(dirname "$file")"
+            curl -fsSL --retry 3 "https://raw.githubusercontent.com/can1357/oh-my-pi/v$OMP_VERSION/$file" -o "$tree/$file"
+          done
+          GLEN_OMP_SOURCE="$tree" cargo test --locked --test omp_source_facts -- --nocapture
+      # glen's own doctor judges the version, so the shell never compares versions. It runs from
+      # the scratch directory, so omp (started with glen's cwd) finds no project config.
+      - id: doctor
+        if: ${{ !cancelled() && steps.omp.outcome == 'success' }}
+        shell: bash
+        env:
+          OMP_BIN: ${{ steps.omp.outputs.bin }}
+          OMP_HOME: ${{ steps.omp.outputs.home }}
+        run: |
+          cargo build --locked
+          (cd "$OMP_HOME" && env -i HOME="$OMP_HOME" PATH=/usr/bin:/bin GLEN_HOME="$OMP_HOME/glen" GLEN_OMP_BIN="$OMP_BIN" "$GITHUB_WORKSPACE/target/debug/glen" doctor --probe --json > "$GITHUB_WORKSPACE/doctor.json")
+      # Names the omp version, each outcome, a bump candidate and what the run does not cover.
+      # Nothing gates on this workflow.
+      - name: Step summary
+        if: always()
+        shell: bash
+        env:
+          OMP_VERSION: ${{ steps.omp.outputs.version }}
+          OUTCOME_OMP: ${{ steps.omp.outcome }}
+          OUTCOME_SURFACE: ${{ steps.surface.outcome }}
+          OUTCOME_FACTS: ${{ steps.facts.outcome }}
+          OUTCOME_DOCTOR: ${{ steps.doctor.outcome }}
+          DOCTOR_JSON: doctor.json
+        run: |
+          max_tested="$(sed -n 's/.*"max_tested": *"\([^"]*\)".*/\1/p' src/omp/compat.json)"
+          failed=""
+          for step in "install:$OUTCOME_OMP" "surface:$OUTCOME_SURFACE" "facts:$OUTCOME_FACTS" "doctor:$OUTCOME_DOCTOR"; do
+            outcome="${step#*:}"
+            if [ "$outcome" != success ]; then
+              failed="$failed ${step%%:*} (${outcome:-not run})"
+            fi
+          done
+          {
+            echo "## omp-latest ($GITHUB_EVENT_NAME)"
+            echo
+            if [ -z "$OMP_VERSION" ]; then
+              echo "omp not installed"
+            else
+              echo "omp version: $OMP_VERSION"
+            fi
+            echo
+            echo "- install: ${OUTCOME_OMP:-not run}"
+            echo "- surface: ${OUTCOME_SURFACE:-not run}"
+            echo "- facts: ${OUTCOME_FACTS:-not run}"
+            echo "- doctor: ${OUTCOME_DOCTOR:-not run}"
+            echo
+            if [ -n "$failed" ]; then
+              echo "FAILED:$failed"
+            elif jq -e '.data.checks[]? | select(.name == "omp_version" and .detail == "untested")' "${DOCTOR_JSON:-doctor.json}" >/dev/null 2>&1; then
+              echo "bump candidate: omp $OMP_VERSION passed every check and is newer than max_tested $max_tested"
+            else
+              echo "in range, no bump needed"
+            fi
+            echo
+            echo "Not covered: model turns, and lease and storage behaviour under a real turn."
+          } >> "$GITHUB_STEP_SUMMARY"

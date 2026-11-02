@@ -422,7 +422,13 @@ pub fn parse_control_timeout(raw: &str) -> Result<Duration, String> {
     }
 }
 #[derive(Debug, Args)]
-pub struct DoctorArgs {}
+pub struct DoctorArgs {
+    #[arg(
+        long,
+        help = "start omp briefly (no session, no prompt) and check its RPC capabilities"
+    )]
+    pub probe: bool,
+}
 #[derive(Debug, Args)]
 pub struct CompletionsArgs {
     #[arg(help = "shell to generate completions for")]

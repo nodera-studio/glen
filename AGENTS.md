@@ -26,8 +26,10 @@ Design and the omp surfaces it builds on: [`docs/design.md`](docs/design.md).
 
 ## omp facts that matter
 
-- Target version: **omp 18.14.0** (`omp --version`). The source is at
-  `../metis/references/oh-my-pi` (a reference clone, MIT; read it, never edit or push it).
+- Supported omp range: `src/omp/compat.json` (`min`, `max_tested`, `tested`; at v0.2 W1 all
+  **18.14.0**, `omp --version`), and the `omp-rpc` git tag pin in `Cargo.toml` matches `tested`.
+  The source is at `../metis/references/oh-my-pi` (a reference clone, MIT; read it, never edit
+  or push it).
   When omp updates, re-check the surfaces in `docs/design.md` against the new source before
   relying on them: omp ships several releases a week and its RPC/session code moves fast.
 - omp home: `~/.omp` (`PI_CONFIG_DIR`), agent dir `~/.omp/agent` (`PI_CODING_AGENT_DIR`,
@@ -51,6 +53,9 @@ cargo fmt --all                                     # format
 node --experimental-strip-types --test extension/glen/test/*.test.ts  # extension tests (also cargo test)
 shellcheck -s sh install.sh scripts/package-release.sh scripts/flake-check.sh  # lint shell scripts
 gh workflow run release.yml --ref main              # release workflow dry run: builds, publishes nothing
+GLEN_OMP_SURFACE_BIN="$(command -v omp)" cargo test --locked --test omp_surface -- --nocapture  # surface contract on real omp (own scratch HOME)
+GLEN_OMP_SOURCE=../metis/references/oh-my-pi cargo test --locked --test omp_source_facts  # omp source facts
+gh workflow run omp-latest.yml --ref main           # nightly surface contract against the latest omp
 ```
 
 Site:

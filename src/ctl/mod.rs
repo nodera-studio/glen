@@ -2,6 +2,7 @@
 pub mod ephemeral;
 pub mod exec;
 pub mod inbox;
+pub mod probe;
 pub mod route;
 use crate::{
     error::{ErrorCode, GlenError},

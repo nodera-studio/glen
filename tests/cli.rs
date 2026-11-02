@@ -124,7 +124,7 @@ fn doctor_success() {
 fn untested_version() {
     let o = glen(
         &["doctor"],
-        &[("GLEN_OMP_BIN", &fake()), ("FAKE_OMP_VERSION", "18.0.9")],
+        &[("GLEN_OMP_BIN", &fake()), ("FAKE_OMP_VERSION", "18.99.0")],
     );
     assert!(o.status.success());
     assert!(
@@ -137,7 +137,7 @@ fn untested_version() {
     let v = json(&o);
     let check = &v["data"]["checks"][1];
     assert_eq!(check["status"], "warn");
-    assert_eq!(check["value"], "18.0.9");
+    assert_eq!(check["value"], "18.99.0");
     assert_eq!(check["detail"], "untested");
 }
 #[test]
@@ -164,14 +164,8 @@ fn doctor_unavailable() {
         );
         assert!(o.stderr.is_empty());
     }
-    for version in ["bad", "18.14", "18.14.0\u{1b}[31m"] {
-        let o = glen(
-            &["doctor"],
-            &[("GLEN_OMP_BIN", &fake()), ("FAKE_OMP_VERSION", version)],
-        );
-        assert_eq!(o.status.code(), Some(5));
-        assert_eq!(json(&o)["error"]["code"], "omp_unavailable");
-    }
+    // Since v0.2 W1 (AC-v2-102) an unparseable `omp --version` is a warning, not exit 5:
+    // tests/omp_compat.rs covers it.
 }
 #[test]
 fn fixture_paths() {
@@ -801,7 +795,7 @@ fn doctor_json_explains_glen_home_permissions() {
     );
     assert!(o.status.success());
     let v = json(&o);
-    let check = &v["data"]["checks"][5];
+    let check = &v["data"]["checks"][6];
     assert_eq!(check["status"], "warn");
     assert_eq!(check["value"], t.path().to_str().unwrap());
     assert_eq!(check["detail"], "group/other permission bits are set");

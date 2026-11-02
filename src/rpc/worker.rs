@@ -426,6 +426,7 @@ impl Worker {
         } = started;
         self.omp_queued = baseline.queued_message_count > 0;
         self.status.omp_pid = client.pid();
+        self.status.rpc_protocol = Some(client.protocol_version());
         self.status.warnings.extend(warnings);
         self.save()?;
         // Drain at the source before adding a forwarder, so buffered startup frames cannot lag into the run.
@@ -495,8 +496,9 @@ impl Worker {
                     ready_deadline,
                     &startup_ready,
                     &startup_abandon,
+                    &tx,
                 );
-                if let Err(undelivered) = tx.send(result) {
+                if let Err(undelivered) = tx.send(Startup::Done(Box::new(result))) {
                     // A late Started owns its Client; dropping it tears omp down.
                     drop(undelivered);
                 }
@@ -509,14 +511,23 @@ impl Worker {
                     break finished.map(|()| None);
                 }
                 match rx.recv_timeout(rpc::TICK) {
-                    Ok(result) => {
+                    Ok(Startup::Peer { pid, protocol }) => {
+                        // Saved before host-tool registration, so a startup failure keeps them.
+                        self.status.omp_pid = pid;
+                        self.status.rpc_protocol = Some(protocol);
+                        if let Err(failure) = self.save() {
+                            abandon.store(true, Ordering::SeqCst);
+                            break Err(failure);
+                        }
+                    }
+                    Ok(Startup::Done(result)) => {
                         if let Err(failure) = self.check_start_stop(ready_deadline, &ready) {
                             abandon.store(true, Ordering::SeqCst);
                             let finished = self.finish_failure(failure);
                             drop(result);
                             break finished.map(|()| None);
                         }
-                        break result.map(Some);
+                        break (*result).map(Some);
                     }
                     Err(mpsc::RecvTimeoutError::Timeout) => (),
                     Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -1063,6 +1074,11 @@ fn route_probe(
     f.details = e.details.map(|d| *d);
     Err(f)
 }
+/// What the startup thread sends: the negotiated peer as soon as omp is up, then the result.
+enum Startup {
+    Peer { pid: Option<u32>, protocol: u32 },
+    Done(Box<Result<Started, Failure>>),
+}
 struct Started {
     client: Client,
     events: Receiver<Event>,
@@ -1077,6 +1093,7 @@ impl Started {
         ready_deadline: Instant,
         ready: &AtomicBool,
         abandon: &AtomicBool,
+        peer: &mpsc::Sender<Startup>,
     ) -> Result<Self, Failure> {
         let check = || {
             if abandon.load(Ordering::SeqCst) {
@@ -1113,6 +1130,11 @@ impl Started {
             Failure::new(code, format!("cannot start omp: {e} (see worker.log)"))
         })?;
         ready.store(true, Ordering::SeqCst);
+        // The receiver lives until this thread is joined, so the send cannot fail.
+        let _ = peer.send(Startup::Peer {
+            pid: client.pid(),
+            protocol: client.protocol_version(),
+        });
         let (reply_tx, replies) = mpsc::channel();
         let tools = client.set_custom_tools(vec![reply::glen_reply_tool(reply_tx)]);
         check()?;

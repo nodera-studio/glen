@@ -186,49 +186,6 @@ pub(crate) const GUARD: install_guard::Spec = install_guard::Spec {
     file_mode: 0o644,
     dir_mode: 0o755,
 };
-/// A pre-release identifier; a number sorts below a word.
-#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Identifier<'a> {
-    Number(u64),
-    Word(&'a str),
-}
-/// The precedence key of `major.minor.patch[-pre.release][+build]`: the numeric core, then
-/// whether it is a release (above its pre-releases), then the pre-release identifiers. Build
-/// metadata is ignored.
-fn semver(v: &str) -> Option<([u64; 3], bool, Vec<Identifier<'_>>)> {
-    let v = v.split_once('+').map_or(v, |(v, _)| v);
-    let (core, pre) = v.split_once('-').map_or((v, None), |(c, p)| (c, Some(p)));
-    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let mut parts = core.split('.');
-    let mut number = || parts.next().filter(|s| digits(s))?.parse::<u64>().ok();
-    let core = [number()?, number()?, number()?];
-    if parts.next().is_some() {
-        return None;
-    }
-    let mut identifiers = Vec::new();
-    for id in pre.map(|p| p.split('.')).into_iter().flatten() {
-        if id.is_empty() {
-            return None;
-        }
-        identifiers.push(match id.parse() {
-            Ok(n) if digits(id) => Identifier::Number(n),
-            _ => Identifier::Word(id),
-        });
-    }
-    Some((core, pre.is_none(), identifiers))
-}
-/// Semver precedence (W8 DEBT-5): numeric `major.minor.patch`, a release above its
-/// pre-releases, pre-release identifiers compared numerically when both are numbers and as
-/// ASCII otherwise. A version that does not parse sorts below every valid one; two such
-/// versions compare equal.
-pub fn compare_versions(a: &str, b: &str) -> Ordering {
-    match (semver(a), semver(b)) {
-        (Some(a), Some(b)) => a.cmp(&b),
-        (None, Some(_)) => Ordering::Less,
-        (Some(_), None) => Ordering::Greater,
-        (None, None) => Ordering::Equal,
-    }
-}
 fn marker(line: &str) -> Option<(&str, &str, &str)> {
     let s = line
         .strip_prefix("<!-- glen-skill version=")?
@@ -332,15 +289,19 @@ pub fn inspect_scoped(
         .find_map(marker)
         .map(|m| m.0)
         .unwrap_or(env!("CARGO_PKG_VERSION"));
-    Ok(match compare_versions(version, current_version) {
-        Ordering::Greater => inspection(
-            State::Newer,
-            v,
-            format!("written by a newer glen {version}"),
-        ),
-        Ordering::Less => inspection(State::Outdated, v, format!("installed {version}")),
-        Ordering::Equal => inspection(State::Outdated, v, format!("another build of {version}")),
-    })
+    Ok(
+        match crate::version::compare_versions(version, current_version) {
+            Ordering::Greater => inspection(
+                State::Newer,
+                v,
+                format!("written by a newer glen {version}"),
+            ),
+            Ordering::Less => inspection(State::Outdated, v, format!("installed {version}")),
+            Ordering::Equal => {
+                inspection(State::Outdated, v, format!("another build of {version}"))
+            }
+        },
+    )
 }
 pub fn user_target(env: &Env, agent: Agent) -> Result<PathBuf, GlenError> {
     let home = env
@@ -480,25 +441,6 @@ mod tests {
                 inspect(&path, Agent::Claude, &current).unwrap().state,
                 state
             );
-        }
-        for (a, b, expected) in [
-            ("0.0.9", "0.1.0", Ordering::Less),
-            ("0.1.10", "0.1.9", Ordering::Greater),
-            ("dev", "0.1.0", Ordering::Less),
-            // W8 DEBT-5: pre-releases.
-            ("0.1.0", "0.2.0-rc.1", Ordering::Less),
-            ("0.2.0-rc.1", "0.1.1", Ordering::Greater),
-            ("0.2.0-rc.10", "0.2.0-rc.9", Ordering::Greater),
-            ("0.2.0-rc.1", "0.2.0", Ordering::Less),
-            ("0.2.0-rc.1", "0.2.0-rc.1.1", Ordering::Less),
-            ("0.2.0-1", "0.2.0-alpha", Ordering::Less),
-            ("0.2.0-alpha", "0.2.0-beta", Ordering::Less),
-            ("0.2.0+build.1", "0.2.0", Ordering::Equal),
-            ("0.2.0-", "0.1.0", Ordering::Less),
-            ("0.2", "0.1.0", Ordering::Less),
-            ("dev", "nightly", Ordering::Equal),
-        ] {
-            assert_eq!(compare_versions(a, b), expected);
         }
     }
     #[cfg(unix)]

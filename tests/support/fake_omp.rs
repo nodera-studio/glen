@@ -87,8 +87,31 @@ fn main() -> std::process::ExitCode {
 }
 fn run() -> io::Result<u8> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    let version = knob("FAKE_OMP_VERSION")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "18.14.0".into());
     if args == ["--version"] {
-        println!("omp/18.14.0");
+        println!("omp/{version}");
+        return Ok(0);
+    }
+    if args == ["--help"] {
+        // The flags glen passes, in omp's `--flag=<value>` help style.
+        println!(
+            "omp v{version}
+
+USAGE
+  $ omp [MESSAGES...] [FLAGS]
+
+FLAGS
+  --mode=<value>           Output mode: text (default), json, rpc, or rpc-ui
+  --no-ui                  With --mode rpc or rpc-ui: run extensions headless
+  --no-session             Don't save session (ephemeral)
+  -r, --resume=<value>     Resume a session (by ID prefix, path, or picker if omitted)
+  --profile=<value>        Use an isolated profile for auth, sessions, settings, and caches
+  --thinking=<value>       Set thinking level
+  -e, --extension=<value>  Load an extension file (can be used multiple times)
+  --no-extensions          Disable extension discovery (explicit -e paths still work)"
+        );
         return Ok(0);
     }
     if args.first().map(String::as_str) == Some("hold-lease") && args.len() == 2 {
@@ -253,6 +276,9 @@ fn run() -> io::Result<u8> {
             Ok(line) => {
                 let f: Value = serde_json::from_str(&line)?;
                 log(json!({"event":"in","frame":f}))?;
+                if knob("FAKE_OMP_STALL").is_some_and(|t| f["type"] == t) {
+                    continue;
+                }
                 match f["type"].as_str().unwrap_or("") {
                     "negotiate_protocol" => response(&f, json!({"protocolVersion":2}))?,
                     "set_host_tools" if scenario == "reject_tools" => reject(
