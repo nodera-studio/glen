@@ -3222,7 +3222,7 @@ fn ac411_install_skill_help_shows_the_four_examples() {
 // ---------------------------------------------------------------------------------------------
 
 /// Every contract example ID in docs/json.md that this suite runs.
-const CONTRACT_IDS: [&str; 35] = [
+const CONTRACT_IDS: [&str; 36] = [
     "ls",
     "show",
     "show.raw",
@@ -3239,6 +3239,7 @@ const CONTRACT_IDS: [&str; 35] = [
     "completions",
     "install-skill",
     "inbox",
+    "inbox.wait",
     "inbox.follow",
     "install-extension",
     "models",
@@ -3569,6 +3570,20 @@ fn ac412_contract_inbox_and_inbox_follow() {
     let mut st = bx.follow(&["inbox", "-f", "--peek", "--json"]);
     st.expect_event("message", reader::T);
     assert_stream_contract("inbox.follow", st);
+    // v0.2 W2: `inbox --wait` reaching its bound (exit 10) with nothing unread for that session.
+    let out = bx
+        .glen([
+            "inbox",
+            "--wait",
+            "--timeout",
+            "300ms",
+            "--session",
+            "ffff",
+            "--json",
+        ])
+        .run();
+    out.assert_exit(10).assert_stderr_empty();
+    assert_contract("inbox.wait", &out.json());
 }
 
 #[test]

@@ -240,6 +240,7 @@ impl Peer {
                 return self.write(&mut s,json!({"v":1,"id":id,"event":"error","error":{"code":"session_switched","message":"switched"}}));
             }
         }
+        hold("FAKE_EXT_RUN_RELEASE");
         let texts = if self.scenario == "progress" {
             vec![("working".into(), false), (format!("reply: {text}"), true)]
         } else {
@@ -271,6 +272,7 @@ impl Peer {
             f.write_all(&line)?;
             self.write(&mut s, json!({"v":1,"id":id,"event":"reply","reply":reply}))?;
         }
+        hold("FAKE_EXT_RESULT_RELEASE");
         if self.scenario == "crash" {
             std::process::exit(0)
         }
@@ -424,6 +426,17 @@ fn accept_next(listener: Arc<UnixListener>, peer: Peer, started: Option<mpsc::Se
             }
         }
     });
+}
+/// Holds a send until the file named by `knob` exists, at most 30 s, so a test can observe a live
+/// job between its events (`FAKE_EXT_RUN_RELEASE`, `FAKE_EXT_RESULT_RELEASE`). Unset, no hold.
+fn hold(knob: &str) {
+    let Some(path) = std::env::var_os(knob).map(PathBuf::from) else {
+        return;
+    };
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !path.exists() && std::time::Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 fn moved(id: &str) -> String {
     let mut s = id.to_owned();

@@ -824,6 +824,20 @@ in the project. When `--session` matches only sessions outside the project, the 
 | `skipped_lines` | malformed inbox lines skipped |
 | `messages` | reply records plus session_handle and job_handle (null without a job) |
 
+`--wait` (v0.2) blocks until at least one message is unread, checking every 250 ms like `-f`, for at most
+`--timeout` (default 90s, at most 24h; `--timeout` requires `--wait`). `--wait` conflicts with `-f` and `--all`;
+`--session`, `--cwd` and `--peek` apply as above. Messages already unread return at once.
+
+- **A message arrives**: the normal document above, exit 0, marked read after output unless `--peek`.
+- **The bound passes** (`inbox.wait`), exit 10: `{total:0,marked_read:false,skipped_lines,messages:[],next,
+  interrupted:false}`. Nothing is marked read. `next` is `glen inbox --wait --timeout <T>` with the caller's
+  `--session`, `--cwd` and `--peek` repeated, each value one shell word.
+- **SIGINT**, exit 130: the same document with `interrupted:true`. A second SIGINT exits at once.
+
+`--wait` covers what `wait --for reply` cannot: replies that arrive after their job ended, and messages from the
+omp TUI with no job. With `--cwd`, a reply from a session glen has not yet placed in the project can take up to
+3 s to wake the call (glen rescans the session catalog at most every 3 s); known sessions wake within one check.
+
 <!-- contract: inbox -->
 ```json
 {
@@ -846,6 +860,22 @@ in the project. When `--session` matches only sessions outside the project, the 
     ],
     "skipped_lines": 0,
     "total": 1
+  },
+  "ok": true,
+  "v": 1
+}
+```
+
+<!-- contract: inbox.wait -->
+```json
+{
+  "data": {
+    "interrupted": false,
+    "marked_read": false,
+    "messages": [],
+    "next": "glen inbox --wait --timeout 300ms --session ffff",
+    "skipped_lines": 0,
+    "total": 0
   },
   "ok": true,
   "v": 1

@@ -334,6 +334,14 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     let out = b.glen(&["inbox", "--peek"], &b.alpha());
     assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
     all.insert("inbox".into(), vec![json(&out)]);
+    // v0.2 W2: `inbox --wait` reaching its bound with nothing unread for the session.
+    let out = b.glen(
+        &["inbox", "--wait", "--timeout", "300ms", "--session", "ffff"],
+        &b.alpha(),
+    );
+    assert_eq!(out.status.code(), Some(10), "{out:?}");
+    assert!(out.stderr.is_empty(), "{out:?}");
+    all.insert("inbox.wait".into(), vec![json(&out)]);
     let out = b
         .command(&["show", "e27c0de"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "200")
