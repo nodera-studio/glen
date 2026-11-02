@@ -395,6 +395,24 @@ impl JobStore {
         })?;
         Ok(file)
     }
+    /// Read, decide and write under the status lock: `f` edits the on-disk status and returns
+    /// whether to write it. Returns the status (as written, or as read when `f` refused) and
+    /// whether it was written.
+    pub fn update_status_if(
+        &self,
+        id: &JobId,
+        f: impl FnOnce(&mut Status) -> bool,
+    ) -> Result<(Status, bool), GlenError> {
+        let _lock = self.status_lock(id)?;
+        let mut s = self.read_status(id)?;
+        let before = s.clone();
+        if f(&mut s) {
+            self.write_status_locked(id, &s)?;
+            Ok((s, true))
+        } else {
+            Ok((before, false))
+        }
+    }
     pub(crate) fn write_status_locked(&self, id: &JobId, s: &Status) -> Result<(), GlenError> {
         write_json(&self.dir(id).join("status.json"), s)
     }
@@ -835,6 +853,34 @@ pub(crate) mod tests {
         // Derived only: never written into status.json.
         let encoded = serde_json::to_value(with(State::Accepted, None, false)).unwrap();
         assert!(encoded.get("task_state").is_none(), "{encoded}");
+    }
+    #[test]
+    fn update_status_if_writes_only_when_asked() {
+        let t = tempfile::tempdir().unwrap();
+        let store = store(t.path());
+        let j = job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let path = store.dir(&id).join("status.json");
+        let before = fs::read(&path).unwrap();
+        let (s, wrote) = store
+            .update_status_if(&id, |s| {
+                s.status = State::Failed;
+                false
+            })
+            .unwrap();
+        assert!(!wrote);
+        assert_eq!(s.status, State::Queued, "a refused edit is not returned");
+        assert_eq!(fs::read(&path).unwrap(), before, "nothing written");
+        let (s, wrote) = store
+            .update_status_if(&id, |s| {
+                s.omp_reused = true;
+                true
+            })
+            .unwrap();
+        assert!(wrote && s.omp_reused);
+        assert!(store.read_status(&id).unwrap().omp_reused);
+        assert!(store.update_status_if(&JobId::new(), |_| true).is_err());
     }
     #[test]
     fn private_creation_and_existing_directory_refused() {

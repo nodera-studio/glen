@@ -65,6 +65,15 @@ impl Failure {
             ..Self::new("cancelled", "the glen job was cancelled")
         }
     }
+    /// Not a job outcome: a warm worker claimed the job, so this worker exits 0 and writes nothing.
+    pub(crate) fn stolen() -> Self {
+        Self::new(STOLEN, "a warm worker claimed the job")
+    }
+}
+pub(crate) const STOLEN: &str = "stolen";
+/// The on-disk status names another worker: a warm worker claimed the job (design §A21).
+fn claimed_by_other(s: &Status) -> bool {
+    s.worker_pid.is_some_and(|p| p != std::process::id())
 }
 impl From<GlenError> for Failure {
     fn from(e: GlenError) -> Self {
@@ -123,30 +132,50 @@ pub fn main(arg: &str) -> ExitCode {
         }
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.run()));
-    match result {
-        Ok(Ok(())) => ExitCode::SUCCESS,
-        Ok(Err(e)) => {
-            w.log("failed", &e.to_string());
-            match w.finish_failure(e) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("cannot persist worker failure: {e}");
-                    ExitCode::FAILURE
-                }
-            }
+    conclude(&mut w, result)
+}
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<String>()
+        .map(String::as_str)
+        .or_else(|| payload.downcast_ref::<&str>().copied())
+        .unwrap_or("unknown panic")
+}
+/// The worker's exit. A stolen job ends silently with 0; a job already terminal (a warm worker
+/// whose idle phase failed) is never rewritten; anything else is persisted as the job's failure.
+fn conclude(w: &mut Worker, result: std::thread::Result<Result<(), Failure>>) -> ExitCode {
+    let (failure, panicked) = match result {
+        Ok(Ok(())) => return ExitCode::SUCCESS,
+        Ok(Err(e)) if e.code == STOLEN => {
+            w.log("claim", "claimed by another worker, exiting");
+            return ExitCode::SUCCESS;
         }
-        Err(payload) => {
-            let message = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            if let Err(e) = w.finish_failure(Failure::new(
+        Ok(Err(e)) => (e, false),
+        Err(payload) => (
+            Failure::new(
                 "internal",
-                format!("worker panicked: {message}"),
-            )) {
-                eprintln!("cannot persist worker panic: {e}");
-            }
+                format!("worker panicked: {}", panic_message(payload.as_ref())),
+            ),
+            true,
+        ),
+    };
+    if w.status.status.is_terminal() {
+        w.log(
+            "failed",
+            &format!("failed after terminal status: {failure}"),
+        );
+        return ExitCode::FAILURE;
+    }
+    w.log("failed", &failure.to_string());
+    match w.finish_failure(failure) {
+        Ok(()) if panicked => ExitCode::FAILURE,
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.code == STOLEN => {
+            w.log("claim", "claimed by another worker, exiting");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("cannot persist worker failure: {e}");
             ExitCode::FAILURE
         }
     }
@@ -159,10 +188,34 @@ impl Worker {
             self.job.handle
         );
     }
+    /// Every status write of a worker: refused (`Failure::stolen`) once the on-disk status names
+    /// another worker, so a blocked worker can never clobber a job a warm worker claimed.
     pub(crate) fn save(&mut self) -> Result<(), Failure> {
         self.status.updated_at = jiff::Timestamp::now().to_string();
-        self.store.write_status(&self.id, &self.status)?;
-        Ok(())
+        if self.write_if_mine(&self.status)? {
+            Ok(())
+        } else {
+            Err(Failure::stolen())
+        }
+    }
+    fn write_if_mine(&self, status: &Status) -> Result<bool, GlenError> {
+        let _lock = self.store.status_lock(&self.id)?;
+        // An unreadable status is still overwritten, as before W4: only a proven claim refuses.
+        if self
+            .store
+            .read_status(&self.id)
+            .is_ok_and(|disk| claimed_by_other(&disk))
+        {
+            return Ok(false);
+        }
+        self.store.write_status_locked(&self.id, status)?;
+        Ok(true)
+    }
+    /// A warm worker claimed this job while this worker waited for the session lock.
+    fn stolen(&self) -> bool {
+        self.store
+            .read_status(&self.id)
+            .is_ok_and(|s| claimed_by_other(&s))
     }
     fn controls(&self) -> (bool, Vec<control::Request>) {
         let mut abort = false;
@@ -364,15 +417,22 @@ impl Worker {
                 .to_owned();
             self.log("lock", "waiting for glen session lock");
             let home = self.store.home.clone();
-            let acquired =
-                lock::acquire(&home, &id, self.deadline, &|| self.stop_requested(), || {
+            // A claim is checked before any stop: a stolen job's control requests are the
+            // claimant's to answer.
+            let acquired = lock::acquire(
+                &home,
+                &id,
+                self.deadline,
+                &|| self.stolen() || self.stop_requested(),
+                || {
                     let mut status = self.status.clone();
                     status.waiting_for_lock = true;
                     status.waited_ms = Some(1);
-                    self.store
-                        .write_status(&self.id, &status)
+                    self.write_if_mine(&status)
+                        .map(drop)
                         .map_err(std::io::Error::other)
-                })?;
+                },
+            )?;
             match acquired {
                 lock::Acquired::Locked { lock, waited } => {
                     self.mark_holder(&lock);
@@ -390,6 +450,7 @@ impl Worker {
                         "waited for another glen job on this session until the job deadline",
                     ));
                 }
+                lock::Acquired::Cancelled if self.stolen() => return Err(Failure::stolen()),
                 lock::Acquired::Cancelled => return Err(Failure::cancelled()),
             }
             self.log("continuation", "re-following after lock");
@@ -2086,6 +2147,86 @@ mod control_tests {
         w.control_in_flight = None;
         w.respond_pending();
         assert_eq!(done(&inflight)["error"]["code"], crate::ops::JOB_ENDED);
+    }
+    fn claim_on_disk(w: &Worker, pid: u32) -> Vec<u8> {
+        let mut s = w.store.read_status(&w.id).unwrap();
+        s.worker_pid = Some(pid);
+        s.worker_start = Some("warm".into());
+        s.omp_reused = true;
+        w.store.write_status(&w.id, &s).unwrap();
+        std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap()
+    }
+    fn panic(message: &'static str) -> std::thread::Result<Result<(), Failure>> {
+        Err(Box::new(message))
+    }
+    #[test]
+    fn a_stolen_job_is_never_written_by_its_blocked_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        w.save().unwrap();
+        let before = claim_on_disk(&w, 1);
+        let status = || std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap();
+        // The deadline passing during the lock wait (`Acquired::TimedOut`) and any other failure.
+        let mut cold = worker(temp.path());
+        cold.store = w.store.clone();
+        cold.id = w.id.clone();
+        for failure in [
+            Failure::new("timeout", "waited until the job deadline"),
+            Failure::cancelled(),
+            Failure::new("io", "forced"),
+        ] {
+            assert_eq!(cold.finish_failure(failure).unwrap_err().code, STOLEN);
+            assert_eq!(status(), before);
+        }
+        assert_eq!(cold.save().unwrap_err().code, STOLEN);
+        cold.status.status = State::Queued;
+        for result in [
+            Ok(Err(Failure::new("timeout", "deadline"))),
+            Ok(Err(Failure::stolen())),
+            panic("boom"),
+        ] {
+            assert_eq!(conclude(&mut cold, result), ExitCode::SUCCESS);
+            cold.status.status = State::Queued;
+            assert_eq!(status(), before);
+        }
+        assert!(cold.stolen());
+    }
+    #[test]
+    fn an_adopted_jobs_own_worker_still_writes() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        claim_on_disk(&w, std::process::id());
+        assert!(!w.stolen());
+        w.finish_failure(Failure::new("io", "own failure")).unwrap();
+        let disk = w.store.read_status(&w.id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(disk.error.unwrap().message, "own failure");
+    }
+    #[test]
+    fn a_failure_after_terminal_status_never_rewrites_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut w = worker(temp.path());
+        w.status.status = State::Completed;
+        w.save().unwrap();
+        let before = std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap();
+        for result in [Ok(Err(Failure::new("io", "idle phase"))), panic("idle")] {
+            assert_eq!(conclude(&mut w, result), ExitCode::FAILURE);
+            assert_eq!(
+                std::fs::read(w.store.dir(&w.id).join("status.json")).unwrap(),
+                before
+            );
+        }
+        // Not terminal: a panic is persisted as the job's failure, as before W4.
+        let mut w = worker(temp.path());
+        assert_eq!(conclude(&mut w, panic("boom")), ExitCode::FAILURE);
+        let disk = w.store.read_status(&w.id).unwrap();
+        assert_eq!(disk.status, State::Failed);
+        assert_eq!(disk.error.unwrap().message, "worker panicked: boom");
+        let mut w = worker(temp.path());
+        assert_eq!(
+            conclude(&mut w, Ok(Err(Failure::new("io", "x")))),
+            ExitCode::SUCCESS
+        );
     }
     #[test]
     fn holder_is_published_on_the_held_inode() {
