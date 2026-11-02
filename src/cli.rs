@@ -113,6 +113,12 @@ pub enum Command {
     #[command(name = "__worker", hide = true, about = "Internal: run one glen job")]
     Worker(WorkerArgs),
     #[command(
+        name = "__acp",
+        hide = true,
+        about = "Internal spike: send one message to omp over ACP v1 (unsupported, not a contract)"
+    )]
+    Acp(AcpArgs),
+    #[command(
         about = "Watch sessions live: transcripts, replies and a prompt (full screen)",
         after_help = "Examples:\n  glen watch\n  glen watch e27c0de\n  glen watch --all"
     )]
@@ -273,6 +279,34 @@ impl SendArgs {
 #[derive(Debug, Args)]
 pub struct WorkerArgs {
     pub job: String,
+}
+/// How the hidden `__acp` spike answers omp's permission requests (v0.2 W3, design §A23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum AcpPermission {
+    Allow,
+    Deny,
+}
+impl AcpPermission {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Deny => "deny",
+        }
+    }
+}
+#[derive(Debug, Args)]
+pub struct AcpArgs {
+    #[arg(help = "session handle, id, @latest, or @new")]
+    pub session: String,
+    #[arg(help = "message text (use -- before a message that starts with -)")]
+    pub message: String,
+    #[arg(
+        long,
+        value_enum,
+        default_value = "deny",
+        help = "answer permission requests: allow picks allow_once, deny picks reject_once"
+    )]
+    pub permission: AcpPermission,
 }
 /// What `glen wait --for` returns on besides the end of the job (v0.2 W2, design §A20).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -485,6 +519,7 @@ impl Command {
             Self::Compact(_) => "compact",
             Self::Inbox(_) => "inbox",
             Self::Worker(_) => "__worker",
+            Self::Acp(_) => "__acp",
             Self::Watch(_) => "watch",
             Self::InstallExtension(_) => "install-extension",
             Self::InstallSkill(_) => "install-skill",
@@ -703,6 +738,55 @@ mod push_tests {
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod acp_tests {
+    use super::*;
+    fn acp(args: &[&str]) -> Result<AcpArgs, clap::Error> {
+        let cli = Cli::try_parse_from(std::iter::once("glen").chain(args.iter().copied()))?;
+        match cli.command {
+            Command::Acp(a) => Ok(a),
+            other => panic!("not __acp: {}", other.name()),
+        }
+    }
+    #[test]
+    fn acp_parses_hidden_with_a_deny_default() {
+        let a = acp(&["__acp", "x", "y"]).unwrap();
+        assert_eq!((a.session.as_str(), a.message.as_str()), ("x", "y"));
+        assert_eq!(a.permission, AcpPermission::Deny);
+        for (flag, want) in [
+            ("allow", AcpPermission::Allow),
+            ("deny", AcpPermission::Deny),
+        ] {
+            let a = acp(&["__acp", "@new", "hi", "--permission", flag]).unwrap();
+            assert_eq!(a.permission, want);
+            assert_eq!(a.permission.as_str(), flag);
+        }
+        for bad in [
+            vec!["__acp", "x", "y", "--permission", "bogus"],
+            vec!["__acp", "x", "y", "--permission", "allow_always"],
+            vec!["__acp", "x"],
+        ] {
+            assert!(
+                Cli::try_parse_from(std::iter::once("glen").chain(bad.iter().copied())).is_err(),
+                "{bad:?}"
+            );
+        }
+        let parsed = Cli::try_parse_from(["glen", "__acp", "x", "y"]).unwrap();
+        assert_eq!(parsed.command.name(), "__acp");
+        assert!(matches!(parsed.command.output_kind(), OutputKind::Document));
+        assert!(
+            !public_command()
+                .get_subcommands()
+                .any(|c| c.get_name() == "__acp")
+        );
+        assert!(
+            Cli::command()
+                .find_subcommand("__acp")
+                .is_some_and(|c| c.is_hide_set())
+        );
     }
 }
 

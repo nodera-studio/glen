@@ -41,8 +41,11 @@ pub const VISIBLE: [&str; 18] = [
     "completions",
     "help",
 ];
-/// Unimplemented public commands still hidden; the internal worker is checked separately.
-pub const HIDDEN: [&str; 0] = [];
+/// Hidden from help, completions, the skill and docs/json.md; still answers --help. The
+/// internal worker is checked separately.
+pub const HIDDEN: [&str; 1] = ["__acp"];
+/// Declared but unfinished: hidden, exit 8 `not_implemented`.
+pub const NOT_IMPLEMENTED: [&str; 0] = [];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
 pub const DOCTOR_CHECKS: [&str; 13] = [

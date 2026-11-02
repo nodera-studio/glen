@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod completions;
 pub mod ctl;
 pub mod doctor;
@@ -35,6 +36,7 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
             ErrorCode::Internal,
             "__worker is dispatched before commands",
         )),
+        Command::Acp(a) => acp::run(cli, a, env, ctx),
         Command::Tail(a) => tail::run(cli, a, env, ctx),
         Command::Show(a) => show::run(cli, a, env, ctx),
         Command::Ls(a) => ls::run(cli, a, env, ctx),
