@@ -123,6 +123,9 @@ FLAGS
         }
         return Ok(0);
     }
+    if args.first().map(String::as_str) == Some("acp") {
+        return run_acp(&args, &version);
+    }
     let mut resume = None;
     let mut no_session = false;
     let mut mode = false;
@@ -634,6 +637,363 @@ FLAGS
     drop(lease);
     log(json!({"event":"exit","reason":"stdin eof"}))?;
     Ok(0)
+}
+/// `fake_omp acp [--profile NAME]`: an ACP v1 agent shaped like omp 18.14.0 (design §A15 lists
+/// the scenarios and knobs). It never writes a session file.
+fn run_acp(args: &[String], version: &str) -> io::Result<u8> {
+    let accepted = match &args[1..] {
+        [] => true,
+        [flag, _] => flag == "--profile",
+        _ => false,
+    };
+    if !accepted {
+        return Ok(64);
+    }
+    let scenario = knob("FAKE_OMP_ACP").unwrap_or_else(|| "ok".into());
+    let terminated = Arc::new(AtomicBool::new(false));
+    signal_hook::flag::register(signal_hook::consts::SIGTERM, terminated.clone())?;
+    log(
+        json!({"event":"start","pid":std::process::id(),"pgid":rustix::process::getpgrp().as_raw_nonzero().get(),"argv":args,"cwd":std::env::current_dir()?,"env":{"GLEN_MANAGED":knob("GLEN_MANAGED"),"OMP_PROFILE":knob("OMP_PROFILE"),"PI_PROFILE":knob("PI_PROFILE")}}),
+    )?;
+    if let Some(message) = knob("FAKE_OMP_STARTUP_STDERR") {
+        let mut stderr = io::stderr().lock();
+        stderr.write_all(message.as_bytes())?;
+        stderr.flush()?;
+    }
+    if scenario == "startup_exit" {
+        return Ok(1);
+    }
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let peer = AcpPeer {
+        rx,
+        terminated,
+        scenario,
+    };
+    while let Some(frame) = peer.recv() {
+        let Some(method) = frame["method"].as_str() else {
+            continue;
+        };
+        let Some(id) = frame.get("id").cloned() else {
+            // Notifications, including session/cancel while idle, are ignored.
+            continue;
+        };
+        let params = &frame["params"];
+        match method {
+            "initialize" => match peer.scenario.as_str() {
+                "init_hang" => (),
+                "init_error" => acp_error(
+                    &id,
+                    -32603,
+                    "Internal error",
+                    json!({"details":"fake initialize failure"}),
+                )?,
+                scenario => {
+                    let mut result = json!({"protocolVersion":1,"agentInfo":{"name":"omp","title":"omp","version":version},"authMethods":[{"id":"agent","name":"Use existing local credentials","description":"fake"}],"agentCapabilities":{"loadSession":true,"mcpCapabilities":{"http":true,"sse":true},"promptCapabilities":{"embeddedContext":true,"image":true},"sessionCapabilities":{"list":{},"fork":{},"resume":{},"close":{}}},"_meta":{"steering":{"supported":true}}});
+                    match scenario {
+                        "proto2" => result["protocolVersion"] = json!(2),
+                        "proto_missing" => {
+                            if let Some(o) = result.as_object_mut() {
+                                o.remove("protocolVersion");
+                            }
+                        }
+                        "no_load" => {
+                            result["agentCapabilities"]["loadSession"] = json!(false);
+                            if let Some(o) = result["agentCapabilities"].as_object_mut() {
+                                o.remove("sessionCapabilities");
+                            }
+                        }
+                        _ => (),
+                    }
+                    acp_result(&id, result)?;
+                    if scenario == "noise" {
+                        let mut stdout = io::stdout().lock();
+                        stdout.write_all(b"this is not json\n")?;
+                        stdout.flush()?;
+                        log(json!({"event":"out","raw":"this is not json"}))?;
+                    }
+                }
+            },
+            "session/new" => {
+                if !relative_cwd(&id, params)? {
+                    let session = knob("FAKE_OMP_ACP_SESSION").unwrap_or_else(|| {
+                        format!("01a1ffff-0000-7000-8000-{:012x}", std::process::id())
+                    });
+                    acp_result(
+                        &id,
+                        json!({"sessionId":session,"modes":modes(),"configOptions":[]}),
+                    )?;
+                }
+            }
+            "session/load" => {
+                let session = params["sessionId"].as_str().unwrap_or("").to_owned();
+                if peer.scenario == "rpc_error_load" {
+                    acp_error(
+                        &id,
+                        -32603,
+                        "Internal error",
+                        json!({"details":format!("ACP session not found: {session}")}),
+                    )?;
+                } else if !relative_cwd(&id, params)? {
+                    let pairs = knob("FAKE_OMP_ACP_REPLAY")
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or(2);
+                    for n in 1..=pairs {
+                        update(
+                            &session,
+                            json!({"sessionUpdate":"user_message_chunk","content":{"type":"text","text":"REPLAYED QUESTION"},"messageId":format!("replay-{n}-user")}),
+                        )?;
+                        update(
+                            &session,
+                            json!({"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"REPLAYED ANSWER"},"messageId":format!("replay-{n}")}),
+                        )?;
+                    }
+                    acp_result(&id, json!({"modes":modes(),"configOptions":[]}))?;
+                    // omp's bootstrap updates follow on a timer; they are never message text.
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(100));
+                        let sent = update(&session, json!({"sessionUpdate":"available_commands_update","availableCommands":[{"name":"compact","description":"Compact the context"}]}))
+                            .and_then(|()| update(&session, json!({"sessionUpdate":"session_info_update","title":"fake session"})));
+                        if let Err(e) = sent {
+                            eprintln!("fake acp bootstrap: {e}");
+                        }
+                    });
+                }
+            }
+            "session/prompt" => {
+                if let Some(code) = peer.prompt(&id, params)? {
+                    return Ok(code);
+                }
+            }
+            "session/close" => acp_result(&id, json!({}))?,
+            _ => acp_error(
+                &id,
+                -32601,
+                &format!("Method not found: {method}"),
+                Value::Null,
+            )?,
+        }
+    }
+    log(json!({"event":"exit","reason":"stdin eof"}))?;
+    Ok(0)
+}
+struct AcpPeer {
+    rx: mpsc::Receiver<String>,
+    terminated: Arc<AtomicBool>,
+    scenario: String,
+}
+impl AcpPeer {
+    /// The next inbound frame (logged), or `None` at stdin EOF or SIGTERM.
+    fn recv(&self) -> Option<Value> {
+        loop {
+            if self.terminated.load(Ordering::SeqCst) {
+                return None;
+            }
+            match self.rx.recv_timeout(Duration::from_millis(10)) {
+                Ok(line) => {
+                    let frame: Value =
+                        serde_json::from_str(&line).unwrap_or_else(|_| json!({"unparsed":line}));
+                    if let Err(e) = log(json!({"event":"in","frame":frame})) {
+                        eprintln!("fake acp log: {e}");
+                    }
+                    return Some(frame);
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => (),
+                Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            }
+        }
+    }
+    /// The first inbound frame matching `want`; other frames are logged and dropped.
+    fn wait_for(&self, want: impl Fn(&Value) -> bool) -> Option<Value> {
+        loop {
+            let frame = self.recv()?;
+            if want(&frame) {
+                return Some(frame);
+            }
+        }
+    }
+    /// Runs one prompt turn; `Some(code)` when the process should exit with it.
+    fn prompt(&self, id: &Value, params: &Value) -> io::Result<Option<u8>> {
+        let session = params["sessionId"].as_str().unwrap_or("").to_owned();
+        let text = match params["prompt"].as_array().map(Vec::as_slice) {
+            Some([block]) if block["type"] == "text" && block["text"].is_string() => {
+                block["text"].as_str().unwrap_or("").to_owned()
+            }
+            _ => {
+                acp_error(
+                    id,
+                    -32602,
+                    "Invalid params",
+                    json!({"details":"prompt must be one text block"}),
+                )?;
+                return Ok(None);
+            }
+        };
+        if self.scenario == "rpc_error_prompt" {
+            acp_error(
+                id,
+                -32603,
+                "Internal error",
+                json!({"details":format!("ACP session not found: {session}")}),
+            )?;
+            return Ok(None);
+        }
+        let chunk = |kind: &str, text: &str, message: &str| {
+            update(
+                &session,
+                json!({"sessionUpdate":kind,"content":{"type":"text","text":text},"messageId":message}),
+            )
+        };
+        chunk("agent_thought_chunk", "thinking about it", "m1")?;
+        chunk("agent_message_chunk", "Hel", "m1")?;
+        let end = |stop: &str| {
+            acp_result(
+                id,
+                json!({"stopReason":stop,"usage":{"totalTokens":3,"inputTokens":1,"outputTokens":2}}),
+            )
+        };
+        match self.scenario.as_str() {
+            "crash" => {
+                log(json!({"event":"exit","reason":"crash"}))?;
+                return Ok(Some(1));
+            }
+            "cancel" => {
+                if self.wait_for(|f| f["method"] == "session/cancel").is_none() {
+                    return Ok(Some(0));
+                }
+                end("cancelled")?;
+            }
+            "cancel_ignored" | "hang" => {
+                while self.recv().is_some() {}
+                log(json!({"event":"exit","reason":"stdin eof or SIGTERM"}))?;
+                return Ok(Some(0));
+            }
+            "permission" => {
+                update(
+                    &session,
+                    json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"Delete e2-target.txt","kind":"execute","status":"pending","rawInput":{"command":"rm e2-target.txt"}}),
+                )?;
+                let kinds: &[&str] = match knob("FAKE_OMP_ACP_OPTIONS").as_deref() {
+                    Some("reject_only") => &["reject_once", "reject_always"],
+                    Some("allow_only") => &["allow_once", "allow_always"],
+                    _ => &["allow_once", "allow_always", "reject_once", "reject_always"],
+                };
+                let names = |k: &str| match k {
+                    "allow_once" => "Allow once",
+                    "allow_always" => "Always allow",
+                    "reject_once" => "Reject",
+                    _ => "Always reject",
+                };
+                let options: Vec<_> = kinds
+                    .iter()
+                    .map(|k| json!({"optionId":k,"name":names(k),"kind":k}))
+                    .collect();
+                out(
+                    json!({"jsonrpc":"2.0","id":100,"method":"session/request_permission","params":{"sessionId":session,"toolCall":{"toolCallId":"t1","title":"Delete e2-target.txt","kind":"execute","status":"pending","rawInput":{"command":"rm e2-target.txt"}},"options":options}}),
+                )?;
+                let Some(answer) = self.wait_for(|f| f["id"] == 100 && f.get("method").is_none())
+                else {
+                    return Ok(Some(0));
+                };
+                log(json!({"event":"permission","response":answer}))?;
+                let outcome = &answer["result"]["outcome"];
+                let chosen = if outcome["outcome"] == "selected" {
+                    outcome["optionId"].as_str().unwrap_or("?").to_owned()
+                } else {
+                    "cancelled".to_owned()
+                };
+                let status = if matches!(chosen.as_str(), "allow_once" | "allow_always") {
+                    "completed"
+                } else {
+                    "failed"
+                };
+                update(
+                    &session,
+                    json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":status}),
+                )?;
+                chunk("agent_message_chunk", &format!("permission:{chosen}"), "m2")?;
+                end("end_turn")?;
+            }
+            "agent_request" => {
+                out(
+                    json!({"jsonrpc":"2.0","id":101,"method":"fs/read_text_file","params":{"sessionId":session,"path":"/etc/hosts"}}),
+                )?;
+                let Some(answer) = self.wait_for(|f| f["id"] == 101 && f.get("method").is_none())
+                else {
+                    return Ok(Some(0));
+                };
+                let code = answer["error"]["code"]
+                    .as_i64()
+                    .map_or("none".to_owned(), |c| c.to_string());
+                chunk(
+                    "agent_message_chunk",
+                    &format!("agent-request:{code}"),
+                    "m2",
+                )?;
+                end("end_turn")?;
+            }
+            "stop" => {
+                let stop = knob("FAKE_OMP_ACP_STOP").unwrap_or_else(|| "refusal".into());
+                chunk("agent_message_chunk", "lo ", "m1")?;
+                chunk("agent_message_chunk", &format!("stopped: {stop}"), "m2")?;
+                end(&stop)?;
+            }
+            _ => {
+                chunk("agent_message_chunk", "lo ", "m1")?;
+                update(
+                    &session,
+                    json!({"sessionUpdate":"tool_call","toolCallId":"t1","title":"Read file","kind":"read","status":"pending"}),
+                )?;
+                update(
+                    &session,
+                    json!({"sessionUpdate":"tool_call_update","toolCallId":"t1","status":"completed"}),
+                )?;
+                chunk("agent_message_chunk", "reply: ", "m2")?;
+                chunk("agent_message_chunk", &text, "m2")?;
+                end("end_turn")?;
+            }
+        }
+        Ok(None)
+    }
+}
+fn acp_result(id: &Value, result: Value) -> io::Result<()> {
+    out(json!({"jsonrpc":"2.0","id":id,"result":result}))
+}
+fn acp_error(id: &Value, code: i64, message: &str, data: Value) -> io::Result<()> {
+    let mut error = json!({"code":code,"message":message});
+    if !data.is_null() {
+        error["data"] = data;
+    }
+    out(json!({"jsonrpc":"2.0","id":id,"error":error}))
+}
+fn update(session: &str, update: Value) -> io::Result<()> {
+    out(
+        json!({"jsonrpc":"2.0","method":"session/update","params":{"sessionId":session,"update":update}}),
+    )
+}
+fn modes() -> Value {
+    json!({"currentModeId":"default","availableModes":[{"id":"default","name":"Default"}]})
+}
+/// omp rejects a relative `cwd` with -32603 (`acp-agent.ts:2067`); true when it did so here.
+fn relative_cwd(id: &Value, params: &Value) -> io::Result<bool> {
+    let cwd = params["cwd"].as_str().unwrap_or("");
+    if Path::new(cwd).is_absolute() {
+        return Ok(false);
+    }
+    acp_error(
+        id,
+        -32603,
+        "Internal error",
+        json!({"details":format!("cwd must be an absolute path: {cwd:?}")}),
+    )?;
+    Ok(true)
 }
 fn emit_call(i: usize, args: &Value) -> io::Result<()> {
     out(
