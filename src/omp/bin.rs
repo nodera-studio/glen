@@ -78,6 +78,9 @@ fn terminate(child: &mut Child) -> Result<(), String> {
 fn retryable_spawn_error(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::ExecutableFileBusy
 }
+/// Runs `omp --version` and returns its first stdout line, trimmed and unparsed (it may be
+/// empty); `version::parse_omp_line` judges it. Only a run failure is an error: a spawn
+/// error, a timeout, a non-zero exit or non-UTF-8 output.
 pub fn omp_version(
     bin: &Path,
     timeout: Duration,
@@ -174,17 +177,7 @@ pub fn omp_version(
     err.join()
         .map_err(|_| "cannot read omp stderr".to_string())?;
     let text = std::str::from_utf8(&bytes).map_err(|_| "omp version is not UTF-8".to_string())?;
-    let line = text.lines().next().unwrap_or("").trim();
-    let version = line.strip_prefix("omp/").unwrap_or(line).trim();
-    let parts = version.split('.').collect::<Vec<_>>();
-    if parts.len() != 3
-        || !parts
-            .iter()
-            .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
-    {
-        return Err("cannot parse omp --version".into());
-    }
-    Ok(version.to_string())
+    Ok(text.lines().next().unwrap_or("").trim().to_string())
 }
 #[cfg(test)]
 mod tests {
@@ -280,16 +273,18 @@ mod tests {
     #[test]
     fn versions_and_failures() {
         let t = tempfile::tempdir().unwrap();
+        // The raw first line, trimmed: doctor parses it (`version::parse_omp_line`). Only a
+        // run failure is an error.
         for (name, body, want) in [
-            ("prefix", "echo 'omp/18.14.0'", Some("18.14.0")),
+            ("prefix", "echo 'omp/18.14.0'", Some("omp/18.14.0")),
             (
                 "plain",
                 "echo ' 18.0.9 '\necho 'ignored second line'",
                 Some("18.0.9"),
             ),
             ("failed", "exit 1", None),
-            ("garbage", "echo invalid", None),
-            ("empty", "exit 0", None),
+            ("garbage", "echo invalid", Some("invalid")),
+            ("empty", "exit 0", Some("")),
         ] {
             let bin = script(t.path(), name, body);
             let result = omp_version(&bin, Duration::from_secs(10), None);

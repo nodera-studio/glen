@@ -33,7 +33,7 @@ A second SIGINT terminates immediately and may prevent a terminal line.
 | 2 | false | `usage`, `invalid_env` | arguments or environment need correction |
 | 3 | false | `not_found` | session or job not found |
 | 4 | false | `ambiguous` | use a candidate handle |
-| 5 | false | `omp_unavailable` | omp missing, broken or timed out |
+| 5 | false | `omp_unavailable` | omp missing, broken or timed out, or `doctor --probe` proved a required capability missing |
 | 6 | false | `no_route` | refusal: live owner, unknown lease, or sandbox |
 | 7 | false | `job_failed`, `control_failed` | failed, aborted or lost job, or failed control operation |
 | 8 | false | `not_implemented` | hidden unfinished command |
@@ -731,7 +731,7 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 | Field | Meaning |
 |---|---|
 | `glen` | version, home, home_exists |
-| `omp` | bin, version, tested_version |
+| `omp` | bin, version, tested_version, supported:{min,max_tested}, capabilities |
 | `paths` | resolved omp paths and their sources |
 | `extension` | path, state, version, current of the installed omp extension |
 | `checks` | ordered {name,status,value,detail}, status ok/warn/fail/info |
@@ -763,6 +763,11 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
     },
     "omp": {
       "bin": "/work/glen/tests/fixtures/bin/fake-omp",
+      "capabilities": null,
+      "supported": {
+        "max_tested": "18.14.0",
+        "min": "18.14.0"
+      },
       "tested_version": "18.14.0",
       "version": "18.14.0"
     },
@@ -799,8 +804,32 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 }
 ```
 
-Check order: omp_binary, omp_version, profile, agent_dir, sessions_dir, glen_home, extension,
-live_endpoints, omp_env_files, skill_claude, skill_codex, sandbox. `extension.state` is
+`omp.version` is the normalized `omp --version` text (no `omp/` or `v` prefix; pre-release and
+build metadata kept), or null when it cannot be parsed or omp cannot run. `omp.supported` is the
+declared range from `src/omp/compat.json`. `omp.capabilities` is null unless `--probe` ran; then
+it is `{protocol, host_tools, event_filter}`: `protocol` is the negotiated RPC protocol (1 or 2,
+null when unknown), and each capability is `ok`, `missing` or `unknown`. Example of a probed
+object (not a contract block):
+
+```json
+{
+  "event_filter": "ok",
+  "host_tools": "ok",
+  "protocol": 2
+}
+```
+
+Check order: omp_binary, omp_version, omp_capabilities, profile, agent_dir, sessions_dir,
+glen_home, extension, live_endpoints, omp_env_files, skill_claude, skill_codex, sandbox.
+`omp_version` is `ok` inside the supported range, `warn` with detail `untested` above
+`max_tested` or `unsupported` below `min`, and `warn` with value `unprobed` when the output cannot
+be parsed; it is `fail` only when `omp --version` cannot run. `omp_capabilities` is `info`
+`not probed` without `--probe`, `info` `skipped` when the binary is missing or `--version` failed,
+and otherwise `protocol=<p> host_tools=<c> event_filter=<c>` (p is 1, 2 or unknown; c is ok,
+missing or unknown): `fail` when `host_tools` is `missing` (exit 5 `omp_unavailable`), `ok` when
+all three are known and ok, `warn` otherwise (an omp that exits before `ready`, for example with
+no usable model, is `warn`).
+`extension.state` is
 current/not_installed/outdated/newer/different_home/modified/foreign; `live_endpoints` reports live and stale counts.
 The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
 
@@ -1096,6 +1125,11 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
         },
         "omp": {
           "bin": null,
+          "capabilities": null,
+          "supported": {
+            "max_tested": "18.14.0",
+            "min": "18.14.0"
+          },
           "tested_version": "18.14.0",
           "version": null
         },
@@ -1153,7 +1187,8 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
 
 | Code | Commands | Meaning |
 |---|---|---|
-| `omp_version_untested` | doctor | version differs from tested version |
+| `omp_version_untested` | doctor | version is newer than the newest tested version, or cannot be parsed |
+| `omp_version_unsupported` | doctor | version is older than the supported minimum |
 | `invalid_env` | any document, send | invalid output limit or job timeout uses fallback |
 | `settle_timeout` | send, wait | persistence settlement timed out |
 | `settle_cancelled` | send, wait | settlement cancelled during worker shutdown |

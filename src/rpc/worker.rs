@@ -426,6 +426,7 @@ impl Worker {
         } = started;
         self.omp_queued = baseline.queued_message_count > 0;
         self.status.omp_pid = client.pid();
+        self.status.rpc_protocol = Some(client.protocol_version());
         self.status.warnings.extend(warnings);
         self.save()?;
         // Drain at the source before adding a forwarder, so buffered startup frames cannot lag into the run.

@@ -143,6 +143,9 @@ pub struct Status {
     pub worker_start: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub omp_pid: Option<u32>,
+    /// The RPC protocol the worker negotiated with omp (1 or 2); RPC-route jobs only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rpc_protocol: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,6 +678,7 @@ pub(crate) mod tests {
                 worker_pid: Some(1),
                 worker_start: Some("start".into()),
                 omp_pid: Some(2),
+                rpc_protocol: Some(2),
                 request_id: Some("r".into()),
                 actual_session_id: Some("actual".into()),
                 actual_session_file: Some("/actual.jsonl".into()),
@@ -692,6 +696,7 @@ pub(crate) mod tests {
         }
         let s:Status=serde_json::from_value(json!({"v":1,"status":"queued","updated_at":"2026-10-30T00:00:00Z","future":{"anything":1}})).unwrap();
         assert!(s.worker_pid.is_none());
+        assert!(s.rpc_protocol.is_none());
         assert!(s.warnings.is_empty());
         let reply = Reply {
             v: 1,

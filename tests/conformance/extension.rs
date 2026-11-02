@@ -715,7 +715,7 @@ fn ac304_doctor_lists_the_w3_checks_in_order_and_installing_keeps_it_ok() {
         .map(|c| c["name"].as_str().unwrap().to_owned())
         .collect();
     assert_eq!(names, DOCTOR_CHECKS, "§A10 doctor checks");
-    assert_eq!(json!(names[6..8]), json!(["extension", "live_endpoints"]));
+    assert_eq!(json!(names[7..9]), json!(["extension", "live_endpoints"]));
 }
 
 // ---------------------------------------------------------------------------------------------

@@ -98,7 +98,7 @@ fn ac015_untested_omp_version_warns_but_succeeds() {
     let out = sb
         .glen(["doctor"])
         .fake_omp()
-        .env("FAKE_OMP_VERSION", "18.0.9")
+        .env("FAKE_OMP_VERSION", "18.99.0")
         .run();
     let env = out.ok_envelope();
     out.assert_stderr_empty();
@@ -109,7 +109,7 @@ fn ac015_untested_omp_version_warns_but_succeeds() {
         .filter_map(|w| w["code"].as_str())
         .collect();
     assert!(codes.contains(&"omp_version_untested"), "{}", out.ctx());
-    assert_eq!(env["data"]["omp"]["version"], Value::from("18.0.9"));
+    assert_eq!(env["data"]["omp"]["version"], Value::from("18.99.0"));
     assert_eq!(
         env["data"]["omp"]["tested_version"],
         Value::from(TESTED_OMP)
@@ -119,7 +119,7 @@ fn ac015_untested_omp_version_warns_but_succeeds() {
     let human = sb
         .glen(["doctor", "--human"])
         .fake_omp()
-        .env("FAKE_OMP_VERSION", "18.0.9")
+        .env("FAKE_OMP_VERSION", "18.99.0")
         .run();
     human.assert_exit(0);
     assert!(human.err().contains("warning"), "{}", human.ctx());
@@ -164,15 +164,12 @@ fn ac016_missing_omp_binary_is_omp_unavailable() {
 }
 
 #[test]
-fn ac016_failing_or_unparseable_omp_version_is_omp_unavailable() {
+fn ac016_failing_omp_version_is_omp_unavailable() {
     let sb = Sandbox::new();
     let tools = sb.dir("tools");
     let scripts = [
         write_script(&tools, "exit-1", "exit 1"),
         write_script(&tools, "fails-after-print", "echo omp/18.14.0\nexit 3"),
-        write_script(&tools, "garbage", "echo garbage"),
-        write_script(&tools, "two-part", "echo omp/18.14"),
-        write_script(&tools, "silent", "echo omp/18.14.0 >&2"),
     ];
     for script in scripts {
         let out = sb.glen(["doctor"]).env("GLEN_OMP_BIN", &script).run();
@@ -196,6 +193,35 @@ fn ac016_failing_or_unparseable_omp_version_is_omp_unavailable() {
             out.ctx()
         );
         assert_eq!(report["omp"]["version"], Value::Null, "{}", out.ctx());
+    }
+}
+
+/// v0.2 W1 (AC-v2-102) supersedes AC-016 for output that runs but cannot be parsed: it is the
+/// warning `omp_version_untested` with the row value "unprobed", not exit 5 (§A11, §A12).
+/// A `--version` that cannot run stays `omp_unavailable` (above).
+#[test]
+fn ac016_unparseable_omp_version_is_a_warning_since_v0_2_w1() {
+    let sb = Sandbox::new();
+    let tools = sb.dir("tools");
+    let scripts = [
+        write_script(&tools, "garbage", "echo garbage"),
+        write_script(&tools, "two-part", "echo omp/18.14"),
+        write_script(&tools, "silent", "echo omp/18.14.0 >&2"),
+    ];
+    for script in scripts {
+        let out = sb.glen(["doctor"]).env("GLEN_OMP_BIN", &script).run();
+        let env = out.ok_envelope();
+        assert_eq!(env["data"]["omp"]["version"], Value::Null, "{}", out.ctx());
+        let row = check(&env["data"], "omp_version");
+        assert_eq!(row["status"], "warn", "{}", out.ctx());
+        assert_eq!(row["value"], "unprobed", "{}", out.ctx());
+        let codes: Vec<&str> = env["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("warnings array expected\n{}", out.ctx()))
+            .iter()
+            .filter_map(|w| w["code"].as_str())
+            .collect();
+        assert!(codes.contains(&"omp_version_untested"), "{}", out.ctx());
     }
 }
 

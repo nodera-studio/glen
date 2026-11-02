@@ -4,6 +4,15 @@ All notable changes to glen are listed here, newest first.
 
 ## Unreleased
 
+### Added
+
+- `glen doctor --probe` starts omp briefly, with no session and no prompt, and checks its RPC capabilities: the negotiated protocol, host tools and the event filter. They appear in a new `omp_capabilities` row and in `data.omp.capabilities`. Only a missing host-tool capability fails doctor; an omp that cannot start (for example with no model selected) is a warning. RPC jobs also record the negotiated protocol as `rpc_protocol` in their `status.json`.
+- The nightly `omp-latest` workflow runs glen's omp surface contract and source facts against the latest omp release, with a scratch home and no credentials, and reports a bump candidate. It never gates a pull request or a release.
+
+### Changed
+
+- `glen doctor` judges omp against a supported range declared in `src/omp/compat.json` and reports it in `data.omp.supported`. A version older than the minimum warns with the new code `omp_version_unsupported`; one newer than the newest tested version still warns `omp_version_untested`. `omp --version` output that cannot be parsed is now a warning (`omp_version_untested`, row value `unprobed`), not exit 5; an `omp --version` that fails or times out is still exit 5 `omp_unavailable`.
+
 ### Documentation
 
 - `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). The CLI is unchanged.

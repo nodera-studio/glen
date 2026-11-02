@@ -30,13 +30,13 @@ use std::{
 };
 // Glen owns the child before the blocking RPC handshake starts. A startup error or
 // cancellation drops this guard before the session lock can leave spawn's scope.
-struct Process {
-    child: Child,
-    stderr: Option<std::thread::JoinHandle<io::Result<Vec<Warning>>>>,
-    reaped: bool,
+pub(super) struct Process {
+    pub(super) child: Child,
+    pub(super) stderr: Option<std::thread::JoinHandle<io::Result<Vec<Warning>>>>,
+    pub(super) reaped: bool,
 }
 impl Process {
-    fn stop(&mut self, grace: Duration) -> io::Result<()> {
+    pub(super) fn stop(&mut self, grace: Duration) -> io::Result<()> {
         if self.reaped {
             return Ok(());
         }
@@ -83,7 +83,7 @@ impl Process {
         }
         Err(io::Error::other("omp process group survived SIGKILL"))
     }
-    fn finish(&mut self, grace: Duration) -> Vec<Warning> {
+    pub(super) fn finish(&mut self, grace: Duration) -> Vec<Warning> {
         let mut warnings = vec![];
         if let Err(error) = self.stop(grace) {
             warnings.push(Warning {
@@ -119,7 +119,7 @@ impl Drop for Process {
         drop(self.finish(Duration::ZERO));
     }
 }
-fn drain_stderr(mut stderr: impl Read) -> io::Result<Vec<Warning>> {
+pub(super) fn drain_stderr(mut stderr: impl Read) -> io::Result<Vec<Warning>> {
     // Keep memory bounded even for a noisy child or an unterminated line, but
     // continue draining after the capture budget so the child cannot block.
     const MAX_LINES: usize = 16;

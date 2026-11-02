@@ -26,6 +26,9 @@ E has exactly two deliberately malformed lines: literal `not json at all` and th
 The empty dotfile `.2026-10-01T09-00-00-000Z_01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de.jsonl.lock.os` is an append-gate sibling.
 `bin/fake-omp` (0755) answers --version, supports FAKE_OMP_VERSION, and rejects other arguments with exit 64.
 
+`omp-surface/` (v0.2 W1) holds `models.yml`, the loopback stub provider (`baseUrl: http://127.0.0.1:9/v1`, `auth: none`, one model `surface-null`) that lets a real omp reach `ready` in a scratch HOME without a credential or a network provider, and `facts.json`, the omp source facts `tests/omp_source_facts.rs` checks. `tests/omp_surface.rs` and the nightly `omp-latest` workflow copy `models.yml` into their own scratch HOME only.
+The Rust `fake_omp` example (`tests/support/fake_omp.rs`) answers `--version` with `omp/<FAKE_OMP_VERSION>` (default 18.14.0) and `--help` with the flags glen passes; `FAKE_OMP_STALL=<frame type>` leaves that RPC command unanswered.
+
 Run `cargo test --locked --test fixtures_sanity` to check the slots, headers, copied entries,
 active branch, malformed lines, message shapes, handles and artifact layout.
 
