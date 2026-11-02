@@ -258,7 +258,7 @@ fn pre_options(argv: &[OsString]) -> (bool, bool, ColorWhen, OutputKind) {
             }
             value if !value.starts_with('-') && !command_seen => {
                 command_seen = true;
-                if value == "completions" {
+                if value == "completions" || value == "mcp" {
                     kind = OutputKind::Raw;
                 }
             }
@@ -526,6 +526,7 @@ mod tests {
             (vec!["glen", "--jsonx"], true, Mode::Human),
             (vec!["glen", "--json=1"], true, Mode::Human),
             (vec!["glen", "completions", "bad"], false, Mode::Raw),
+            (vec!["glen", "mcp", "--bogus"], false, Mode::Raw),
             (
                 vec!["glen", "--profile", "work", "completions"],
                 false,

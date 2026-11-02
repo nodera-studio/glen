@@ -6,6 +6,7 @@ pub mod env;
 pub mod error;
 pub mod glen_home;
 pub mod jobs;
+pub mod mcp;
 pub mod omp;
 pub mod output;
 pub mod render;
@@ -50,6 +51,9 @@ pub fn run() -> ExitCode {
         && a.follow
     {
         return commands::inbox::follow(&cli, a, &env, &ctx);
+    }
+    if let cli::Command::Mcp(a) = &cli.command {
+        return commands::mcp::run(&cli, a, &env, &ctx);
     }
     if matches!(cli.command, cli::Command::Watch(_)) {
         return commands::watch::run(cli, &env, &ctx, &term);

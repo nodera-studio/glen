@@ -129,6 +129,12 @@ pub enum Command {
     )]
     Watch(WatchArgs),
     #[command(
+        hide = true,
+        about = "Serve glen's commands to an MCP host over stdio",
+        after_help = "Examples:\n  claude mcp add glen -- glen mcp\n  codex mcp add glen -- glen mcp"
+    )]
+    Mcp(McpArgs),
+    #[command(
         about = "Install the bundled omp extension (live sessions, glen_reply)",
         after_help = "Examples:
   glen install-extension
@@ -416,6 +422,16 @@ pub struct WatchArgs {
     pub cwd: Option<PathBuf>,
 }
 #[derive(Debug, Args)]
+pub struct McpArgs {
+    /// Hidden for good (v0.2 W5, design §A22): protocol-tested only, the owner checks it live.
+    #[arg(
+        long,
+        hide = true,
+        help = "push new omp replies as notifications/claude/channel (unsupported)"
+    )]
+    pub channel: bool,
+}
+#[derive(Debug, Args)]
 pub struct InstallExtensionArgs {
     #[arg(long, help = "show what would change")]
     pub dry_run: bool,
@@ -552,6 +568,7 @@ impl Command {
             Self::Worker(_) => "__worker",
             Self::Acp(_) => "__acp",
             Self::Watch(_) => "watch",
+            Self::Mcp(_) => "mcp",
             Self::InstallExtension(_) => "install-extension",
             Self::InstallSkill(_) => "install-skill",
             Self::Doctor(_) => "doctor",
@@ -559,7 +576,8 @@ impl Command {
         }
     }
     pub fn output_kind(&self) -> OutputKind {
-        if matches!(self, Self::Completions(_)) {
+        // `mcp`'s stdout carries MCP JSON-RPC only, so its refusals go to stderr as text (J10).
+        if matches!(self, Self::Completions(_) | Self::Mcp(_)) {
             OutputKind::Raw
         } else {
             OutputKind::Document
@@ -933,6 +951,54 @@ mod warm_tests {
             assert!(script.contains("warm"), "{shell}");
             assert!(script.contains("release"), "{shell}");
         }
+    }
+}
+
+#[cfg(test)]
+mod mcp_tests {
+    use super::*;
+    fn mcp(args: &[&str]) -> McpArgs {
+        let cli = Cli::try_parse_from(std::iter::once("glen").chain(args.iter().copied())).unwrap();
+        assert_eq!(cli.command.name(), "mcp");
+        assert!(matches!(cli.command.output_kind(), OutputKind::Raw));
+        match cli.command {
+            Command::Mcp(a) => a,
+            other => panic!("not mcp: {}", other.name()),
+        }
+    }
+    #[test]
+    fn mcp_and_its_channel_flag_parse() {
+        assert!(!mcp(&["mcp"]).channel);
+        assert!(mcp(&["mcp", "--channel"]).channel);
+        assert!(mcp(&["--profile", "p", "mcp"]).channel.eq(&false));
+        assert!(Cli::try_parse_from(["glen", "mcp", "extra"]).is_err());
+    }
+    #[test]
+    fn channel_stays_hidden_and_mcp_has_a_help_page() {
+        let public = public_command();
+        let mcp = public.find_subcommand("mcp");
+        assert!(
+            mcp.is_none_or(|c| !c.get_arguments().any(|a| a.get_id() == "channel")),
+            "the public surface never carries --channel"
+        );
+        let mut full = Cli::command();
+        let sub = full.find_subcommand_mut("mcp").expect("mcp is declared");
+        assert!(
+            sub.get_arguments()
+                .any(|a| a.get_id() == "channel" && a.is_hide_set())
+        );
+        let help = sub.render_help().to_string();
+        assert!(help.contains("Usage:"), "{help}");
+        assert!(!help.contains("channel"), "{help}");
+    }
+    #[test]
+    fn mcp_is_hidden_until_the_flip() {
+        assert!(public_command().find_subcommand("mcp").is_none());
+        assert!(
+            Cli::command()
+                .find_subcommand("mcp")
+                .is_some_and(|c| c.is_hide_set())
+        );
     }
 }
 
