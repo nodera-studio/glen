@@ -134,7 +134,7 @@ jobs:
             echo
             if [ -n "$failed" ]; then
               echo "FAILED:$failed"
-            elif grep -q '"code":"omp_version_untested"' "${DOCTOR_JSON:-doctor.json}" 2>/dev/null; then
+            elif jq -e '.data.checks[]? | select(.name == "omp_version" and .detail == "untested")' "${DOCTOR_JSON:-doctor.json}" >/dev/null 2>&1; then
               echo "bump candidate: omp $OMP_VERSION passed every check and is newer than max_tested $max_tested"
             else
               echo "in range, no bump needed"
