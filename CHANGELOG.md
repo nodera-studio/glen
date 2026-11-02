@@ -22,7 +22,7 @@ All notable changes to glen are listed here, newest first.
 ### Documentation
 
 - `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). The CLI is unchanged.
-- §A20 describes push to the calling agent as shipped in v0.2 W2: the two receivers, the unseen-reply rule, why `wait` leaves the inbox marker alone, the two exit-10 documents and the per-caller delivery table. Whether a background wait wakes a headless `claude -p` run is still being recorded.
+- §A20 describes push to the calling agent as shipped in v0.2 W2: the two receivers, the unseen-reply rule, why `wait` leaves the inbox marker alone, the two exit-10 documents and the per-caller delivery table. A background wait also wakes a headless `claude -p` run: verified on Claude Code 2.1.316 in stream-json mode, where the completion notification resumed the run after its first result. The skill's allowed-tools may not apply to that resumed turn under `--permission-mode dontAsk`.
 
 ## v0.1.1 — 2026-11-01
 

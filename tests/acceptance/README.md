@@ -193,15 +193,23 @@ to P); `AC-206-bg-wait-started` (a Bash tool_use with `run_in_background: true` 
 with `--for reply`); `AC-206-no-inbox-polling` (at most two `inbox` calls, each with `--wait` or
 `--peek`); `AC-206-evidence` (a `result` event exists); `AC-206-nonce` (a woken run's report
 quotes `NONCE_P`). The `AC-206-evidence` string carries the outcome: `wake=<class>
-launch_event=<i> task=<id> delivered_event=<i> result_event=<i> foreground_glen_output_had_nonce=<bool>
-fetched_before_delivery=<bool>` (indices into `p.jsonl`; `task` is the background task id from the
-launch result). Classes: `woke` (a background reply wait was launched, and its task's own completion
-notification, a `system` `task_notification` event or a user `<task-notification>` with status
-`completed` or `failed`, arrives before `result`; no foreground glen output carried `NONCE_P`, and no
-tool result carried it before that notification, so a blocking `TaskOutput`, a `BashOutput` or a
-`Read` of the output file is not a wake), `no_wake` (launched, but no such notification),
-`foreground_only` (a reply wait without
-`run_in_background`) and `no_wait` (none). The class decides the skill's `claude -p` wording
+launch_event=<i> task=<id> delivered_event=<i> resumed_event=<i> first_result_event=<i>
+result_event=<i> foreground_glen_output_had_nonce=<bool> fetched_before_delivery=<bool>` (0-based
+indices into `p.jsonl`, so line = index + 1; `task` is the background task id from the launch
+result; `resumed_event` is the first assistant text or tool_use after the notification;
+`first_result_event` and `result_event` are the first and the last `result`). Classes: `woke` (a
+background reply wait was launched, its task's own completion notification, a `system`
+`task_notification` event or a user `<task-notification>` with status `completed` or `failed` (a
+`glen wait` that exits 10 is `failed`), arrives, and an assistant text or tool_use follows it; no
+foreground glen output carried `NONCE_P`, no tool result carried it before that notification, and
+nothing retrieved the task's output before it, so a `TaskOutput` or `BashOutput` naming the task or
+a `Read` of its output file is not a wake), `no_wake` (launched, but no such notification, only
+another task's, a stopped or killed task, a retrieval first, or no assistant activity after the
+notification), `foreground_only` (a reply wait without
+`run_in_background`) and `no_wait` (none). A `result` before the notification does not rule out
+`woke`: Claude Code 2.1.316 keeps a `claude -p` process with a running background task alive past
+its first `result`, then resumes the run on the notification with a new `init`, and a second
+`result` ends it (recorded 2026-11-02). The class decides the skill's `claude -p` wording
 (plan Step 13); `no_wake` passes the checks but is not push. Read every tool call of `p.jsonl`
 as for b/b3. Teardown keeps gitleaks and the owner-skills comparison and skips the owner-session
 snapshot (mode p touches only scratch sessions).

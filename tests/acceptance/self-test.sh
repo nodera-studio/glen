@@ -298,8 +298,11 @@ p_calls() { # extra argv arrays (JSON) appended after the send and the reply wai
 p_events() { # $1: the reply wait's run_in_background; $2: its task b1's completion notification:
     # none, system (stream-json's task_notification event) or xml (the <task-notification> user
     # message), after which the run reads the output file; $3: a foreground retrieval of b1's
-    # output before that notification: none, TaskOutput or BashOutput.
-    jq -cn --argjson bg "$1" --arg note "${2:-none}" --arg fetch "${3:-none}" '
+    # output before that notification: none, TaskOutput, BashOutput or Read; $4: live (the
+    # notification arrives inside the turn) or resumed (the shape Claude Code 2.1.316 recorded: the
+    # turn ends with a first result, then task_updated, the notification, a new init and the
+    # resumed turn, which ends with the final result).
+    jq -cn --argjson bg "$1" --arg note "${2:-none}" --arg fetch "${3:-none}" --arg shape "${4:-live}" '
       "{\"data\":{\"woke\":\"reply\",\"replies\":[{\"text\":\"reply: P-nonce\"}]}}" as $out |
       "Background command \"glen wait j1234567 --for reply\" failed with exit code 10" as $summary |
       {type:"system",subtype:"init"},
@@ -309,14 +312,20 @@ p_events() { # $1: the reply wait's run_in_background; $2: its task b1's complet
       {type:"user",message:{content:[{type:"tool_result",tool_use_id:"wait",content:(if $bg then "Command running in background with ID: b1. Output is being written to: /tmp/tasks/b1.output" else $out end)}]},
        tool_use_result:(if $bg then {stdout:"",stderr:"",interrupted:false,backgroundTaskId:"b1"} else {stdout:$out,stderr:"",interrupted:false} end)},
       (if $fetch == "none" then empty else
-        {type:"assistant",message:{content:[{type:"tool_use",id:"fetch",name:$fetch,input:(if $fetch == "TaskOutput" then {task_id:"b1",block:true,timeout:600000} else {bash_id:"b1"} end)}]}},
+        {type:"assistant",message:{content:[{type:"tool_use",id:"fetch",name:$fetch,input:(if $fetch == "TaskOutput" then {task_id:"b1",block:true,timeout:600000} elif $fetch == "BashOutput" then {bash_id:"b1"} else {file_path:"/tmp/tasks/b1.output"} end)}]}},
         {type:"user",message:{content:[{type:"tool_result",tool_use_id:"fetch",content:"<retrieval_status>success</retrieval_status>\n<task_id>b1</task_id>\n<status>failed</status>\n<exit_code>10</exit_code>\n<output>\($out)</output>"}]}} end),
+      (if $shape == "resumed" then
+        {type:"assistant",message:{content:[{type:"text",text:"Waiting for the reply."}]}},
+        {type:"result",result:"Waiting for the reply."},
+        (if $bg and $note != "none" then {type:"system",subtype:"task_updated",task_id:"b1",patch:{status:"failed"}} else empty end)
+       else empty end),
       (if ($bg|not) or $note == "none" then empty else
         (if $note == "system" then
           {type:"system",subtype:"task_notification",task_id:"b1",tool_use_id:"wait",status:"failed",output_file:"/tmp/tasks/b1.output",summary:$summary}
         else
           {type:"user",message:{role:"user",content:[{type:"text",text:"<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>wait</tool-use-id>\n<output-file>/tmp/tasks/b1.output</output-file>\n<status>failed</status>\n<summary>\($summary)</summary>\n</task-notification>"}]}}
         end),
+        (if $shape == "resumed" then {type:"system",subtype:"init"} else empty end),
         {type:"assistant",message:{content:[{type:"tool_use",id:"read",name:"Read",input:{file_path:"/tmp/tasks/b1.output"}}]}},
         {type:"user",message:{content:[{type:"tool_result",tool_use_id:"read",content:$out}]}} end),
       {type:"assistant",message:{content:[{type:"text",text:"done"}]}},
@@ -346,6 +355,37 @@ p_events true system; jq -c 'if .subtype?=="task_notification" then .status="sto
 mv "$Q/p-stop.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
 p_events true xml; jq -c 'walk(if type=="string" then sub("<status>failed</status>";"<status>killed</status>") else . end)' "$Q/p.jsonl" > "$Q/p-kill.jsonl"
 mv "$Q/p-kill.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+# The recorded shape: a first result ends the turn, the process stays alive, and b1's notification
+# resumes the run (an assistant tool_use after it). A result before the notification is no bar.
+p_events true system none resumed; p_verdict woke '[]'
+jq -e '.checks[] | select(.id=="AC-206-evidence").evidence |
+  capture("delivered_event=(?<d>[0-9]+) resumed_event=(?<r>[0-9]+) first_result_event=(?<f>[0-9]+) result_event=(?<l>[0-9]+)") |
+  map_values(tonumber) | .f < .d and .d < .r and .r < .l' "$Q/verdict.json" >/dev/null ||
+  { echo 'mode p: resumed evidence fields out of order' >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+p_events true xml none resumed; p_verdict woke '[]'
+# No resumed activity is no wake: the run ends at the notification, or only an init and the
+# final result follow it.
+p_events true system none resumed
+jq -sc '(map(.subtype? == "task_notification") | index(true)) as $k | .[:$k+1][]' "$Q/p.jsonl" > "$Q/p-end.jsonl"
+mv "$Q/p-end.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+for shape in live resumed; do
+    p_events true system none "$shape"
+    jq -sc '(map(.subtype? == "task_notification") | index(true)) as $k | to_entries[] |
+      select(.key <= $k or (.value.type | IN("assistant", "user") | not)) | .value' "$Q/p.jsonl" > "$Q/p-idle.jsonl"
+    mv "$Q/p-idle.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+done
+# A foreground retrieval of b1 before its notification is no wake even when the output it got
+# lacks the nonce (the fake's first reply is `progress`); another task's notification neither.
+for fetch in TaskOutput BashOutput Read; do
+    p_events true system "$fetch" resumed
+    jq -c 'walk(if type=="string" then gsub("reply: P-nonce"; "progress") else . end)' "$Q/p.jsonl" > "$Q/p-progress.jsonl"
+    mv "$Q/p-progress.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
+    jq -e '.checks|any(.id=="AC-206-evidence" and (.evidence|contains("fetched_before_delivery=true")))' "$Q/verdict.json" >/dev/null ||
+      { echo "mode p: $fetch before the notification was not a retrieval" >&2; exit 1; }
+done
+p_events true system none resumed
+jq -c 'if .subtype?=="task_notification" then .task_id="b9" | .tool_use_id="other" else . end' "$Q/p.jsonl" > "$Q/p-other.jsonl"
+mv "$Q/p-other.jsonl" "$Q/p.jsonl"; p_verdict no_wake '[]'
 p_events false; p_verdict foreground_only '["AC-206-bg-wait-started"]'
 jq -c 'select(.message.content[0].tool_use_id? != "wait" and .message.content[0].id? != "wait")' "$Q/p.jsonl" > "$Q/p-none.jsonl"
 mv "$Q/p-none.jsonl" "$Q/p.jsonl"; p_verdict no_wait '["AC-206-bg-wait-started"]'

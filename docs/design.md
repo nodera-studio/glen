@@ -636,7 +636,7 @@ Owner: **v0.2 W2** (ADR `0773c35d`, plan `.claude/plans/v020-wave-2-push.md`). o
 | Caller | Delivery | Push |
 |---|---|---|
 | Claude Code, interactive | `glen send <h> "…" --no-wait`, then `glen wait <job> --for reply` as a background Bash task (`run_in_background`); its completion wakes the session | yes |
-| Claude Code, `claude -p` | the same background wait, within the run; acceptance mode `p` (`tests/acceptance`) records whether its completion wakes the run, and the skill uses a foreground wait if it does not | yes (evidence pending) |
+| Claude Code, `claude -p` | the same background wait, within the run; acceptance mode `p` (`tests/acceptance`) records whether its completion wakes the run, and the skill uses a foreground wait if it does not | yes (verified 2026-11-02 on Claude Code 2.1.316, stream-json: the completion notification resumed the run; the skill's allowed-tools may not apply to the resumed turn under dontAsk) |
 | Claude Code subagent | a foreground wait (`--timeout 90s`, under Bash's 2-minute limit), or return the job handle and the last reply id to the parent | no |
 | Codex CLI | a blocking wait: `glen wait <job> --for reply --timeout 25s` through the `exec_command` yield and re-poll, plus `glen inbox --peek` at the start of each turn | Codex: no push |
 | Other MCP clients | tool results from `glen mcp` calls (§A22): pull | no |
