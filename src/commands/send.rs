@@ -178,7 +178,15 @@ pub(crate) fn submit(
         match crate::live::route::find(&home, &o.session.header.id, crate::live::HELLO_SEND) {
             crate::live::route::Endpoint::Live { reg, hello } => {
                 if lock::is_held(&home, &o.session.header.id) {
-                    return Err(crate::live::route::rpc_job_running(&o.handle, "send"));
+                    return Err(
+                        if lock::holder_kind(&home, &o.session.header.id)
+                            == Some(lock::HolderKind::Warm)
+                        {
+                            crate::live::route::rpc_warm_held(&o.handle, "send")
+                        } else {
+                            crate::live::route::rpc_job_running(&o.handle, "send")
+                        },
+                    );
                 }
                 route_warnings.extend(crate::live::route::extension_version_warning(&hello));
                 live = Some(reg);

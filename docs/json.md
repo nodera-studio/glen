@@ -53,6 +53,8 @@ JSON's own escapes, glen writes U+007F–U+009F, U+061C, U+200E–U+200F, U+202A
 
 Session objects have `handle,id,path,bucket,cwd,title,first_message,created_at,updated_at,age_ms,size_bytes,model,
 last_turn,state,state_source,state_detail,continuation_of,parent_session`. State is `idle|live|busy|unknown`.
+A disk row of a session a warm worker holds (v0.2, design §A21) has `state_detail`
+`warm worker, idle, <N>s left`, `warm worker, busy` or `warm worker, no heartbeat for <N>s`.
 Handles are unique catalog suffixes, normally 7 hex characters. Nullable model and continuation fields stay null.
 
 Transcript items share `kind,id,timestamp`. Kind-specific fields are: user `text,images`; assistant
@@ -994,7 +996,7 @@ object (not a contract block):
 ```
 
 Check order: omp_binary, omp_version, omp_capabilities, profile, agent_dir, sessions_dir,
-glen_home, extension, live_endpoints, omp_env_files, skill_claude, skill_codex, sandbox.
+glen_home, extension, live_endpoints, warm_workers, omp_env_files, skill_claude, skill_codex, sandbox.
 `omp_version` is `ok` inside the supported range, `warn` with detail `untested` above
 `max_tested` or `unsupported` below `min`, and `warn` with value `unprobed` when the output cannot
 be parsed; it is `fail` only when `omp --version` cannot run. `omp_capabilities` is `info`
@@ -1005,6 +1007,8 @@ all three are known and ok, `warn` otherwise (an omp that exits before `ready`, 
 no usable model, is `warn`).
 `extension.state` is
 current/not_installed/outdated/newer/different_home/modified/foreign; `live_endpoints` reports live and stale counts.
+`warm_workers` (v0.2) reports `<w> warm, <s> stale, <d> dead` warm-worker registries: `info`, or `warn`
+naming the session and the fix when a heartbeat is stale or a registry unreadable.
 The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
 
 ## `glen completions`

@@ -206,6 +206,8 @@ fn open_error(error: OpenError, opened: Option<&Opened>) -> GlenError {
 enum Owner {
     Job(JobId),
     Control,
+    /// An idle warm worker (v0.2 W4) holds the lock: it cools on request, or keeps omp for abort.
+    Warm(lock::Holder),
     Finishing,
     Unknown,
     Free,
@@ -225,6 +227,16 @@ fn owner(store: &JobStore, session_id: &str, deadline: Instant, stop: &AtomicBoo
         {
             match holder.kind {
                 lock::HolderKind::Control => return Owner::Control,
+                // Idle only when no active job names the holder: right after a claim the
+                // holder already says `job`, so this is the flip's microsecond window.
+                lock::HolderKind::Warm
+                    if !store
+                        .active_for_session(session_id)
+                        .iter()
+                        .any(|(_, _, status)| status.worker_pid == Some(holder.pid)) =>
+                {
+                    return Owner::Warm(holder);
+                }
                 lock::HolderKind::Warm => (),
                 lock::HolderKind::Job => {
                     finishing = holder
@@ -329,7 +341,13 @@ pub(crate) fn route(
                         "set_thinking_level" => "thinking",
                         other => other,
                     };
-                    return Err(live::route::rpc_job_running(&opened.handle, command));
+                    return Err(
+                        if lock::holder_kind(&home, id) == Some(lock::HolderKind::Warm) {
+                            live::route::rpc_warm_held(&opened.handle, command)
+                        } else {
+                            live::route::rpc_job_running(&opened.handle, command)
+                        },
+                    );
                 }
                 if !hello.ops.iter().any(|op| op == op_name) {
                     let ctx = super::ErrCtx {
@@ -373,6 +391,20 @@ pub(crate) fn route(
             match holder {
                 Owner::Job(job) => return Ok((job_target(store, job, id, deadline, stop), vec![])),
                 Owner::Free => continue,
+                // Nothing runs on an idle warm session; it stays warm (design §A21).
+                Owner::Warm(_) if op_name == "abort" => return Ok((Target::Idle, vec![])),
+                Owner::Warm(holder) => {
+                    cool_for_control(
+                        env,
+                        cli.command.name(),
+                        &home,
+                        opened,
+                        &holder,
+                        deadline,
+                        &stop,
+                    )?;
+                    continue;
+                }
                 Owner::Finishing if op_name == "abort" => {
                     return Err(super::to_glen_error(
                         OpError::new(ops::BUSY, "a glen job is finishing; retry"),
@@ -511,14 +543,20 @@ pub(crate) fn route_models(
             _ => (),
         }
         crate::sandbox::refuse_rpc(env, "models")?;
-        if lock::is_held(&home, id)
-            && let Owner::Job(job) = owner(&store, id, deadline, &stop)
-        {
-            return Ok((
-                job_target(store, job, id, deadline, stop),
-                warnings,
-                ModelsSource::Session,
-            ));
+        if lock::is_held(&home, id) {
+            match owner(&store, id, deadline, &stop) {
+                Owner::Job(job) => {
+                    return Ok((
+                        job_target(store, job, id, deadline, stop),
+                        warnings,
+                        ModelsSource::Session,
+                    ));
+                }
+                Owner::Warm(holder) => {
+                    cool_for_control(env, "models", &home, opened, &holder, deadline, &stop)?
+                }
+                _ => (),
+            }
         }
         let probe = lease::probe(&paths.session_owners_dir, id);
         // A hidden lease (Linux under a Codex marker) is unknown whatever it probes as.
@@ -551,6 +589,32 @@ pub(crate) fn route_models(
         Some(o) => ModelsSource::Disk(o.session.selection()),
     };
     Ok((Target::Rpc(client), warnings, source))
+}
+/// Asks the idle warm worker named by `holder` to cool, then waits until the session lock is
+/// free (bounded by the command's deadline). The caller then routes as if it had never been warm.
+fn cool_for_control(
+    env: &Env,
+    command: &str,
+    home: &glen_home::GlenHome,
+    opened: &Opened,
+    holder: &lock::Holder,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Result<(), GlenError> {
+    let id = &opened.session.header.id;
+    crate::rpc::warm::request_release(
+        home,
+        id,
+        &crate::rpc::warm::ident(holder.pid, holder.start.as_deref()),
+    )
+    .map_err(|e| crate::sandbox::map_home_write(env, command, e))?;
+    while lock::is_held(home, id) {
+        stopped(deadline, stop, opened)?;
+        std::thread::sleep(
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now())),
+        );
+    }
+    Ok(())
 }
 pub fn not_persisted() -> Warning {
     Warning {
@@ -608,6 +672,27 @@ mod tests {
         assert!(matches!(
             owner(&store, session_id, Instant::now(), &stop),
             Owner::Finishing
+        ));
+        // An idle warm holder (v0.2 W4): `Warm`, unless an active job already names its pid.
+        holder.kind = lock::HolderKind::Warm;
+        lock::mark(&lock, &holder).unwrap();
+        assert!(
+            matches!(owner(&store, session_id, Instant::now(), &stop), Owner::Warm(h) if h == holder)
+        );
+        status.status = jobs::State::Queued;
+        status.omp_reused = true;
+        store.write_status(&id, &status).unwrap();
+        assert!(
+            matches!(owner(&store, session_id, Instant::now(), &stop), Owner::Job(found) if found == id),
+            "a claimed job is the owner, never Target::Idle"
+        );
+        status.status = jobs::State::Completed;
+        store.write_status(&id, &status).unwrap();
+        holder.start = Some("reused".into());
+        lock::mark(&lock, &holder).unwrap();
+        assert!(matches!(
+            owner(&store, session_id, Instant::now(), &stop),
+            Owner::Unknown
         ));
         drop(lock);
         // Parallel tests may fork while the lock is held; allow their inherited
