@@ -156,16 +156,23 @@ impl Writer {
     /// Queues one message from a call or the notifier: while more than `OUTPUT_QUEUE` bytes
     /// wait unread, it waits for the host to catch up (until shutdown begins).
     pub(crate) fn send(&self, message: &Value) {
-        self.push(message, true);
+        self.push(message, true, || ());
+    }
+    /// `send`, running `queued` once the wait is over, under the queue lock, before the host
+    /// can read the line (a call frees its slot there).
+    pub(crate) fn send_then(&self, message: &Value, queued: impl FnOnce()) {
+        self.push(message, true, queued);
     }
     /// Queues one message from the main loop, never waiting.
     pub(crate) fn post(&self, message: &Value) {
-        self.push(message, false);
+        self.push(message, false, || ());
     }
-    fn push(&self, message: &Value, wait: bool) {
-        let Ok(mut line) = serde_json::to_vec(message) else {
-            return;
-        };
+    fn push(&self, message: &Value, wait: bool, queued: impl FnOnce()) {
+        // A `Value` always serializes; should it not, nothing is queued.
+        let mut line = serde_json::to_vec(message).unwrap_or_default();
+        if line.is_empty() {
+            return queued();
+        }
         line.push(b'\n');
         let mut queue = self.0.lock();
         while wait
@@ -176,6 +183,7 @@ impl Writer {
         {
             queue = self.0.wait(queue);
         }
+        queued();
         if queue.gone {
             return;
         }
@@ -332,6 +340,20 @@ mod tests {
         assert!(writer.gone());
         writer.post(&serde_json::json!({}));
         assert!(writer.gone());
+    }
+
+    #[test]
+    fn send_then_runs_before_the_host_can_read_the_line() {
+        let out = test_support::Shared::default();
+        let writer = Writer::new(out.clone());
+        let mut ran = false;
+        writer.send_then(&serde_json::json!({"id":1}), || {
+            assert!(out.lines().is_empty(), "the line was readable first");
+            ran = true;
+        });
+        assert!(ran);
+        writer.finish(Instant::now() + Duration::from_secs(10));
+        assert_eq!(out.lines(), [serde_json::json!({"id":1})]);
     }
 
     #[test]

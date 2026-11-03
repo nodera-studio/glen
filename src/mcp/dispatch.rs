@@ -187,6 +187,9 @@ struct Calls {
 #[derive(Default)]
 struct CallState {
     cancelled: bool,
+    /// Its response is being queued: a cancel comes too late, and the slot is held until
+    /// `release`, so a host that stops reading cannot pile up more than `MAX_IN_FLIGHT` answers.
+    responded: bool,
     child_pid: Option<u32>,
     sigint_at: Option<Instant>,
     killed: bool,
@@ -258,7 +261,7 @@ impl Registry {
     pub(crate) fn cancel(&self, key: &str) -> bool {
         let mut calls = self.lock();
         let closing = calls.closing;
-        let Some(s) = calls.map.get_mut(key) else {
+        let Some(s) = calls.map.get_mut(key).filter(|s| !s.responded) else {
             return false;
         };
         s.cancelled = true;
@@ -269,7 +272,7 @@ impl Registry {
     pub(crate) fn shutdown(&self) {
         let mut calls = self.lock();
         calls.closing = true;
-        for s in calls.map.values_mut() {
+        for s in calls.map.values_mut().filter(|s| !s.responded) {
             s.cancelled = true;
             s.stop(true);
         }
@@ -307,10 +310,26 @@ impl Registry {
     fn cancelled(&self, key: &str) -> bool {
         self.lock().map.get(key).is_some_and(|s| s.cancelled)
     }
-    /// (6) Ends the call: `true` when its response may be written (it was not cancelled).
-    /// Removing the entry makes a later cancel for that id a no-op.
+    /// (6) Decides the call's response: `true` when it may be written (it was not cancelled);
+    /// from then on a cancel for that id is a no-op. A cancelled call's entry goes at once, an
+    /// answered one's at `release`.
     pub(crate) fn finish(&self, key: &str) -> bool {
-        self.lock().map.remove(key).is_some_and(|s| !s.cancelled)
+        let mut calls = self.lock();
+        match calls.map.get_mut(key) {
+            Some(s) if !s.cancelled => {
+                s.responded = true;
+                true
+            }
+            Some(_) => {
+                calls.map.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+    /// Frees the call's slot once its response is queued (or it has none).
+    pub(crate) fn release(&self, key: &str) {
+        self.lock().map.remove(key);
     }
     pub(crate) fn is_in_flight(&self, key: &str) -> bool {
         self.lock().map.contains_key(key)
@@ -1052,6 +1071,16 @@ pub(crate) mod tests {
         assert_eq!(registry.insert("n:0"), Err(Refused::Duplicate));
         assert_eq!(registry.insert("n:99"), Err(Refused::Full));
         assert!(registry.finish("n:0"));
+        assert!(
+            !registry.cancel("n:0"),
+            "a cancel after the response is decided is ignored"
+        );
+        assert_eq!(
+            registry.insert("n:99"),
+            Err(Refused::Full),
+            "an answer not yet queued holds its slot"
+        );
+        registry.release("n:0");
         assert_eq!(registry.insert("n:99"), Ok(()));
         assert_eq!(registry.insert("n:100"), Err(Refused::Full));
         registry.shutdown();

@@ -333,16 +333,21 @@ impl Server {
                 // Exactly one response per request, and none for a cancelled one: a cancel
                 // before the exit leaves no run, one after it makes `finish` refuse.
                 let result = run.map(|run| dispatch::result(&tool, run));
-                if registry.finish(&call_key)
-                    && let Some(result) = result
-                {
-                    writer.send(&json!({"jsonrpc":"2.0","id":answer,"result":result}));
+                let answer_it = registry.finish(&call_key);
+                match result {
+                    // The slot is held until the answer is queued, so at most `MAX_IN_FLIGHT`
+                    // calls wait on a host that stopped reading.
+                    Some(result) if answer_it => writer.send_then(
+                        &json!({"jsonrpc":"2.0","id":answer,"result":result}),
+                        || registry.release(&call_key),
+                    ),
+                    _ => registry.release(&call_key),
                 }
             });
         match spawned {
             Ok(handle) => self.calls.push(handle),
             Err(e) => {
-                self.registry.finish(&key);
+                self.registry.release(&key);
                 let message = format!("cannot start a call thread: {e}");
                 self.result(id, dispatch::exec_failure(&name, &message, b""));
             }
