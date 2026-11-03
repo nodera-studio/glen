@@ -290,3 +290,63 @@ mod tests {
         assert_eq!(unknown.hint, Some(lease_held_hint(&paths)));
     }
 }
+
+#[cfg(all(test, unix))]
+mod s04_tests {
+    use super::*;
+    use crate::jobs::liveness::force_pids_hidden_for_test;
+    /// A registry whose pid is gone from this process's view, with its owned socket bound by a
+    /// listener that never answers (so a hello times out instead of proving anything).
+    fn planted(t: &tempfile::TempDir) -> (GlenHome, Registry, std::os::unix::net::UnixListener) {
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        let dir = home.ensure_dir("run/live").unwrap();
+        let pid = crate::jobs::liveness::tests_dead_pid();
+        let socket = dir.join(format!("{pid}.sock"));
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let reg = Registry {
+            v: 1,
+            pid,
+            session_id: "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de".into(),
+            session_file: None,
+            socket,
+            ext_version: None,
+            omp_version: None,
+            protocol: Some(1),
+            mode: Some("tui".into()),
+            started_at: None,
+            cwd: None,
+            title: None,
+        };
+        std::fs::write(
+            registry::path(&home, &reg.session_id),
+            serde_json::to_vec(&reg).unwrap(),
+        )
+        .unwrap();
+        (home, reg, listener)
+    }
+    /// S-04: under a Codex marker on Linux (forced here) a TUI in the host's pid namespace looks
+    /// gone; its registry and socket must survive `find`. Without the marker they are cleaned.
+    #[test]
+    fn a_gone_pid_never_removes_a_registry_or_socket_where_pids_may_be_hidden() {
+        for hidden in [true, false] {
+            let t = tempfile::tempdir().unwrap();
+            let (home, reg, _listener) = planted(&t);
+            force_pids_hidden_for_test(Some(hidden));
+            let found = find(&home, &reg.session_id, Duration::from_millis(200));
+            force_pids_hidden_for_test(None);
+            let kept = registry::path(&home, &reg.session_id).exists();
+            assert_eq!(kept, hidden, "hidden {hidden}: {found:?}");
+            assert_eq!(reg.socket.exists(), hidden, "hidden {hidden}");
+            if hidden {
+                assert!(
+                    matches!(found, Endpoint::Unhealthy { .. }),
+                    "an unanswered hello proves nothing: {found:?}"
+                );
+            } else {
+                assert!(matches!(found, Endpoint::Stale(_)), "{found:?}");
+            }
+        }
+    }
+}

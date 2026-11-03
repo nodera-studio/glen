@@ -25,38 +25,87 @@ pub fn run(
 ) -> Result<Outcome, GlenError> {
     // Trusted before anything is read or signalled; creates nothing.
     let home = glen_home::resolve_trusted(env, &["run/warm", "run/locks", "jobs"])?;
-    let (entries, _) = warm::index(&home);
+    let index = warm::index(&home);
     let targets = match &args.target {
-        None => entries,
-        Some(target) => vec![select(&home, entries, target)?],
+        None => index.entries,
+        Some(target) => vec![select(&home, index.entries, target)?],
     };
     let stale = warm::stale_bound(env);
     let mut rows = vec![];
     let mut timed_out = false;
+    // Tech-debt F3: one worker's I/O error never drops the rows of the others.
+    let mut failed = None;
     for target in &targets {
         // The state as found, before this command changed it.
         let state = target
             .entry
             .class(target.mtime, SystemTime::now(), stale)
             .as_str(&target.entry);
-        let (outcome, ok) = release_one(env, &home, target, args, stale)?;
-        timed_out |= !ok;
+        let outcome = match release_one(env, &home, target, args, stale) {
+            Ok((outcome, ok)) => {
+                timed_out |= !ok;
+                outcome
+            }
+            Err(e) => {
+                failed.get_or_insert(e);
+                "failed"
+            }
+        };
         rows.push((target, state, outcome));
     }
     let workers: Vec<Value> = rows
         .iter()
         .map(|(t, state, outcome)| row(t, state, outcome))
         .collect();
+    let done = rows
+        .iter()
+        .filter(|(_, _, o)| !matches!(*o, "failed" | "timeout"))
+        .count();
+    if let Some(mut e) = failed {
+        e.message = format!(
+            "{} ({done} of {} warm workers released)",
+            e.message,
+            rows.len()
+        );
+        return Err(e.with_detail("workers", workers));
+    }
     if timed_out {
+        let target = args.target.as_deref().unwrap_or("--all");
+        // Tech-debt F5: after `--force` the kill itself could not be proven or finished.
+        let hint = if args.force {
+            "a process glen cannot prove unchanged is never signalled; check it with `glen doctor`, then retry".to_owned()
+        } else {
+            format!("wait and retry, or kill it with `glen release {target} --force`")
+        };
         return Err(GlenError::new(
             ErrorCode::ControlFailed,
             "a warm worker did not release in time",
         )
-        .with_hint(format!(
-            "wait and retry, or kill it with `glen release {} --force`",
-            args.target.as_deref().unwrap_or("--all")
-        ))
+        .with_hint(hint)
         .with_details(json!({"reason":"release_timeout","workers":workers})));
+    }
+    // Tech-debt F4: a registry glen cannot read may still name a running worker, so `--all`
+    // never reports success (or "no warm workers") past one.
+    if args.target.is_none() && !index.unreadable.is_empty() {
+        let paths: Vec<String> = index
+            .unreadable
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        return Err(GlenError::new(
+            ErrorCode::Io,
+            format!(
+                "{} warm worker registr{} unreadable: {} ({done} of {} warm workers released)",
+                paths.len(),
+                if paths.len() == 1 { "y is" } else { "ies are" },
+                text::single_line(&paths.join(", ")),
+                rows.len()
+            ),
+        )
+        .with_hint(
+            "inspect the file; a worker it names may still run (`glen doctor` lists warm workers)",
+        )
+        .with_details(json!({"workers":workers,"unreadable":paths})));
     }
     let human = if rows.is_empty() {
         ctx.painter.paint(Token::Muted, "no warm workers")
@@ -252,10 +301,28 @@ fn force_with(
         (Some(pid), Some(Liveness::Alive)) => (Some(pid), Some(pid)),
         (pid, _) => (None, pid),
     };
-    if signalled.is_some_and(|pid| kill(Kill::Group(pid)).is_err())
-        || kill(Kill::Process(e.pid)).is_err()
-    {
-        return Ok(("timeout", false));
+    // S-09: each identity is proven again right before its own signal, so a process that ended
+    // since the first check (its pid now free for reuse) is never signalled. A leader gone by
+    // then is skipped (its group must still be gone below); a worker gone by then needs no kill.
+    if let Some(pid) = signalled {
+        match warm::kill_identity(e).omp {
+            Some(Liveness::Alive) => {
+                if kill(Kill::Group(pid)).is_err() {
+                    return Ok(("timeout", false));
+                }
+            }
+            Some(Liveness::Dead) => (),
+            _ => return Ok(("timeout", false)),
+        }
+    }
+    match warm::kill_identity(e).worker {
+        Liveness::Alive => {
+            if kill(Kill::Process(e.pid)).is_err() {
+                return Ok(("timeout", false));
+            }
+        }
+        Liveness::Dead => (),
+        Liveness::Unknown => return Ok(("timeout", false)),
     }
     let end = Instant::now() + bound;
     while !(warm::kill_identity(e).worker == Liveness::Dead && recorded.is_none_or(group_gone)) {
@@ -324,7 +391,7 @@ mod tests {
         for s in [A, B] {
             warm::publish(&h, &entry(s, std::process::id(), None)).unwrap();
         }
-        let entries = || warm::index(&h).0;
+        let entries = || warm::index(&h).entries;
         assert_eq!(select(&h, entries(), A).unwrap().entry.session_id, A);
         assert_eq!(
             select(&h, entries(), &A.to_uppercase())
@@ -369,7 +436,7 @@ mod tests {
         let env = Env::for_test(None, t.path(), &[]);
         // This test process stands in for a worker whose start token no longer matches.
         warm::publish(&h, &entry(A, std::process::id(), Some("reused".into()))).unwrap();
-        let (entries, _) = warm::index(&h);
+        let entries = warm::index(&h).entries;
         let (outcome, ok) = release_one(&env, &h, &entries[0], &args, warm::STALE).unwrap();
         assert_eq!((outcome, ok), ("cleaned", true));
         assert!(warm::read(&h, A).is_none());
@@ -747,6 +814,104 @@ mod tests {
         );
         assert!(warm::read(&h, B).is_none());
     }
+    /// S-09: every identity is proven again right before its own signal. Here signalling omp's
+    /// group also ends the worker (as a worker exits once its omp dies), so by its own turn the
+    /// worker is a zombie whose re-proof says dead: it is never signalled, and the release is
+    /// still `forced` once both are gone.
+    #[test]
+    fn s09_a_worker_that_ended_after_the_first_proof_is_never_signalled() {
+        use std::os::unix::process::CommandExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let omp = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let omp_pid = omp.id();
+        let _cleanup = Group(omp_pid);
+        let crate::jobs::liveness::Probe::Running(omp_start) =
+            crate::jobs::liveness::start_token(omp_pid)
+        else {
+            panic!("no start token for omp")
+        };
+        let (mut worker, mut e) = sleeper();
+        e.omp_pid = Some(omp_pid);
+        e.omp_start = Some(omp_start);
+        warm::publish(&h, &e).unwrap();
+        let worker_pid = worker.id();
+        let omp = std::cell::RefCell::new(omp);
+        let sent = std::cell::RefCell::new(vec![]);
+        let kill = |k: Kill| -> std::io::Result<()> {
+            sent.borrow_mut().push(k);
+            signal(k)?;
+            if k == Kill::Group(omp_pid) {
+                omp.borrow_mut().wait()?;
+                let pid = rpc::signal_pid(worker_pid).unwrap();
+                rustix::process::kill_process(pid, rustix::process::Signal::KILL)?;
+                let end = Instant::now() + Duration::from_secs(5);
+                while !matches!(
+                    crate::jobs::liveness::start_token(worker_pid),
+                    crate::jobs::liveness::Probe::Gone
+                ) {
+                    assert!(Instant::now() < end, "the worker outlived SIGKILL");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            Ok(())
+        };
+        assert_eq!(
+            force_with(&h, &e, &kill, FORCE_BOUND).unwrap(),
+            ("forced", true)
+        );
+        assert_eq!(*sent.borrow(), [Kill::Group(omp_pid)], "no second signal");
+        assert!(warm::read(&h, A).is_none());
+        assert!(!worker.wait().unwrap().success());
+    }
+    /// S-04: under a Codex marker on Linux (forced here) a worker whose pid is gone from this
+    /// process's view may be alive in the host's pid namespace: its registry is never cleaned
+    /// and it is never signalled. Without the marker the same entry is cleaned.
+    #[test]
+    fn s04_a_gone_worker_is_never_cleaned_where_pids_may_be_hidden() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let env = Env::for_test(None, t.path(), &[]);
+        let dead = entry(
+            A,
+            crate::jobs::liveness::tests_dead_pid(),
+            Some("linux:1".into()),
+        );
+        warm::publish(&h, &dead).unwrap();
+        let snapshot = warm::read(&h, A).unwrap();
+        crate::jobs::liveness::force_pids_hidden_for_test(Some(true));
+        assert_ne!(
+            snapshot
+                .entry
+                .class(snapshot.mtime, SystemTime::now(), warm::STALE),
+            Class::Dead
+        );
+        for force in [false, true] {
+            let got = release_one(
+                &env,
+                &h,
+                &snapshot,
+                &args(force, Duration::from_millis(100)),
+                warm::STALE,
+            );
+            assert_eq!(got.unwrap(), ("timeout", false), "force {force}");
+            assert_eq!(warm::read(&h, A).unwrap().entry, dead, "force {force}");
+        }
+        crate::jobs::liveness::force_pids_hidden_for_test(None);
+        let got = release_one(
+            &env,
+            &h,
+            &snapshot,
+            &args(false, Duration::from_millis(100)),
+            warm::STALE,
+        );
+        assert_eq!(got.unwrap(), ("cleaned", true));
+        assert!(warm::read(&h, A).is_none());
+    }
     #[test]
     fn an_at_new_job_handle_finds_its_worker_after_a_follow_up_was_adopted() {
         let t = tempfile::tempdir().unwrap();
@@ -768,7 +933,7 @@ mod tests {
         e.job_id = JobId::new().as_str().into();
         warm::publish(&h, &e).unwrap();
         warm::publish(&h, &entry(B, std::process::id(), None)).unwrap();
-        let found = select(&h, warm::index(&h).0, &id.handle()).unwrap();
+        let found = select(&h, warm::index(&h).entries, &id.handle()).unwrap();
         assert_eq!(found.entry.session_id, A);
     }
 }

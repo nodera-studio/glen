@@ -67,8 +67,11 @@ pub fn holder(home: &GlenHome, id: &str) -> Option<Holder> {
 pub fn holder_kind(home: &GlenHome, id: &str) -> Option<HolderKind> {
     holder(home, id).map(|h| h.kind)
 }
+/// A plain id is its own key; any other id is `h-` and its hash. A plain id that itself starts
+/// with `h-` is hashed too (S-28), so it can never name another id's files.
 pub fn lock_key(id: &str) -> String {
     lease::lease_name(id)
+        .filter(|plain| !plain.starts_with("h-"))
         .map(str::to_owned)
         .unwrap_or_else(|| format!("h-{:016x}", xxhash_rust::xxh64::xxh64(id.as_bytes(), 0)))
 }
@@ -219,6 +222,26 @@ mod tests {
             std::fs::metadata(&lock.path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+    /// S-28: the audit's collision. `a.b` hashes to `h-0091b6393ae8ed56`; the plain id spelled
+    /// that way once mapped to the same lock, registry and inbox name.
+    #[test]
+    fn an_h_prefixed_plain_id_never_shares_a_hashed_key() {
+        let hashed = lock_key("a.b");
+        assert_eq!(hashed, "h-0091b6393ae8ed56");
+        assert_ne!(lock_key(&hashed), hashed);
+        assert!(lock_key(&hashed).starts_with("h-"));
+        assert_eq!(lock_key("h-"), lock_key("h-"), "stable");
+        // Other plain ids, `h` without the dash included, stay their own key.
+        for plain in [
+            "abc",
+            "h",
+            "hx-1",
+            "H-1",
+            "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",
+        ] {
+            assert_eq!(lock_key(plain), plain);
+        }
     }
     #[test]
     fn exclusive_timeout_cancel_and_release() {

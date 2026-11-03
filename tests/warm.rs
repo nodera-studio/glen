@@ -31,8 +31,7 @@ impl std::ops::Deref for WarmBox {
 }
 impl Drop for WarmBox {
     fn drop(&mut self) {
-        let (entries, _) = warm::index(&self.home());
-        for e in entries {
+        for e in warm::index(&self.home()).entries {
             for pid in [Some(e.entry.pid), e.entry.omp_pid].into_iter().flatten() {
                 if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
                     let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
@@ -95,7 +94,7 @@ impl WarmBox {
     }
     /// The box's one warm registry, whatever its session.
     fn registry(&self) -> Option<warm::Indexed> {
-        warm::index(&self.home()).0.into_iter().next()
+        warm::index(&self.home()).entries.into_iter().next()
     }
     fn wait_registry(&self) -> warm::Indexed {
         poll(Duration::from_secs(10), || {
@@ -514,6 +513,176 @@ fn ac_v2_405_a_mismatched_registry_is_cleaned_and_never_signalled() {
     );
     sleeper.kill().unwrap();
     sleeper.wait().unwrap();
+}
+
+/// A stale idle registry for session A naming `pid` with its real start token, as a forger
+/// reads both from `ps`.
+fn forged_entry(pid: u32) -> warm::Entry {
+    let Probe::Running(start) = liveness::start_token(pid) else {
+        panic!("no start token for {pid}")
+    };
+    warm::Entry {
+        v: 1,
+        pid,
+        start: Some(start),
+        session_id: A_ID.into(),
+        session_handle: None,
+        job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+        omp_pid: None,
+        omp_start: None,
+        warm_ms: 1000,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        state: warm::EntryState::Idle,
+        started_at: "2020-01-01T00:00:00Z".into(),
+    }
+}
+fn age(path: &std::path::Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+        .unwrap();
+}
+
+/// S-09, the audit's reproduction: a registry forged under a name that is not its session's
+/// key (`forged.json`), naming a live process by its real pid and start token, is never a
+/// release target. `release --all --force` signals nothing and deletes nothing; doctor names
+/// the file in a warning.
+#[test]
+fn s09_a_misnamed_registry_is_never_signalled_or_removed() {
+    let b = WarmBox::new();
+    let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let dir = b.home().ensure_dir("run/warm").unwrap();
+    let forged = dir.join("forged.json");
+    std::fs::write(
+        &forged,
+        serde_json::to_vec(&forged_entry(sleeper.id())).unwrap(),
+    )
+    .unwrap();
+    age(&forged);
+    let out = data(&b.run(&["release", "--all", "--force", "--json"]));
+    assert_eq!(out["total"], 0, "{out}");
+    assert!(sleeper.try_wait().unwrap().is_none(), "never signalled");
+    assert!(forged.exists(), "never deleted");
+    let doctor = data(&b.run(&["doctor", "--json"]));
+    let row = check(&doctor, "warm_workers");
+    assert_eq!(row["status"], "warn", "{row}");
+    assert_eq!(row["value"], "0 warm, 0 stale, 0 dead");
+    let detail = row["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("forged.json") && detail.contains("ignored"),
+        "{detail}"
+    );
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+}
+
+/// Tech-debt F4: a torn registry may still name a running worker, so `release --all` releases
+/// the readable ones and then fails (exit 1, `io`) naming the torn file; it never says "no warm
+/// workers" with exit 0, and it removes nothing it cannot read.
+#[test]
+fn f4_release_all_never_succeeds_past_an_unreadable_registry() {
+    let b = WarmBox::new();
+    let dir = b.home().ensure_dir("run/warm").unwrap();
+    let torn = dir.join("01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de.json");
+    std::fs::write(&torn, b"{\"v\":1,\"pid\":").unwrap();
+    // A dead registry next to it is still cleaned and reported (never this test process: the
+    // box's drop kills every pid left in a registry).
+    let mut stand_in = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut dead = forged_entry(stand_in.id());
+    dead.start = Some("reused".into());
+    warm::publish(&b.home(), &dead).unwrap();
+    let out = b.run(&["release", "--all", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let e = &json(&out)["error"];
+    assert_eq!(e["code"], "io", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("unreadable"), "{e}");
+    assert_eq!(e["details"]["unreadable"][0], torn.to_str().unwrap());
+    assert_eq!(e["details"]["workers"][0]["outcome"], "cleaned", "{e}");
+    assert!(torn.exists());
+    assert!(b.registry().is_none());
+    let human = b.run(&["release", "--all", "--human"]);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    assert!(!String::from_utf8_lossy(&human.stdout).contains("no warm workers"));
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
+}
+
+/// Tech-debt F3: one worker's I/O error never drops the other rows. The first worker (by
+/// session id) cannot be cleaned (its metadata lock path is a directory); the second still is,
+/// and the error carries both rows.
+#[test]
+fn f3_release_all_keeps_every_row_past_one_workers_io_error() {
+    let b = WarmBox::new();
+    // Never this test process: the box's drop kills every pid left in a registry.
+    let mut stand_in = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let first = "01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de";
+    for id in [first, A_ID] {
+        let mut dead = forged_entry(stand_in.id());
+        dead.session_id = id.into();
+        dead.start = Some("reused".into());
+        warm::publish(&b.home(), &dead).unwrap();
+    }
+    let lock = b.home().root.join("run/warm").join(format!("{first}.lock"));
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    let out = b.run(&["release", "--all", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let e = &json(&out)["error"];
+    assert_eq!(e["code"], "io", "{e}");
+    let message = e["message"].as_str().unwrap();
+    assert!(
+        message.contains(".lock") && message.ends_with("(1 of 2 warm workers released)"),
+        "{message}"
+    );
+    let rows = e["details"]["workers"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{e}");
+    assert_eq!(
+        (&rows[0]["session"]["id"], &rows[0]["outcome"]),
+        (&Value::from(first), &Value::from("failed"))
+    );
+    assert_eq!(
+        (&rows[1]["session"]["id"], &rows[1]["outcome"]),
+        (&Value::from(A_ID), &Value::from("cleaned"))
+    );
+    assert!(warm::read(&b.home(), A_ID).is_none());
+    assert!(warm::read(&b.home(), first).is_some());
+    assert!(stand_in.try_wait().unwrap().is_none(), "never signalled");
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
+}
+
+/// Tech-debt F5: when `--force` itself could not prove the process, the hint never suggests
+/// `--force` again; without it, it does.
+#[test]
+fn f5_the_release_timeout_hint_names_force_only_without_it() {
+    let b = WarmBox::new();
+    // A live process with no start token: unprovable, so never signalled.
+    let mut stand_in = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut unproven = forged_entry(stand_in.id());
+    unproven.start = None;
+    warm::publish(&b.home(), &unproven).unwrap();
+    for (force, names_force) in [(true, false), (false, true)] {
+        let mut args = vec!["release", "e27c0de", "--timeout", "100ms", "--json"];
+        if force {
+            args.push("--force");
+        }
+        let out = b.run(&args);
+        assert_eq!(out.status.code(), Some(7), "{out:?}");
+        let e = &json(&out)["error"];
+        assert_eq!(e["details"]["reason"], "release_timeout");
+        let hint = e["hint"].as_str().unwrap();
+        assert_eq!(
+            hint.contains("--force"),
+            names_force,
+            "force {force}: {hint}"
+        );
+    }
+    assert_eq!(warm::read(&b.home(), A_ID).unwrap().entry, unproven);
+    assert!(stand_in.try_wait().unwrap().is_none(), "never signalled");
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
 }
 
 /// A flock on session A's metadata lock file from this process, as a holder stopped inside its
