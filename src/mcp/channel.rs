@@ -22,7 +22,9 @@ use std::{
 const POLL_BOUND: Duration = Duration::from_secs(10);
 const TRUNCATED: &str = "… [truncated; glen inbox --peek has the full text]";
 
-/// Reply ids already accounted for: the baseline and every emitted reply, oldest evicted first.
+/// Reply ids already accounted for: the baseline and every emitted reply. Past `SEEN_CAP` the
+/// oldest are forgotten, but never one the last poll still listed (forgetting it would replay
+/// it on the next poll).
 #[derive(Debug, Default)]
 pub(crate) struct Seen {
     ids: HashSet<String>,
@@ -31,28 +33,43 @@ pub(crate) struct Seen {
     baselined: bool,
 }
 impl Seen {
-    /// Records `id`; true when it was new.
-    fn insert(&mut self, id: &str) -> bool {
-        if !self.ids.insert(id.to_owned()) {
-            return false;
-        }
-        self.order.push_back(id.to_owned());
-        while self.order.len() > SEEN_CAP {
-            if let Some(old) = self.order.pop_front() {
-                self.ids.remove(&old);
-            }
-        }
-        true
-    }
     /// Takes one successful poll: the first is the baseline (nothing to emit), later ones
     /// return the replies not seen before, in file order.
     fn take<'m>(&mut self, messages: &'m [Value]) -> Vec<&'m Value> {
         let first = !self.baselined;
         self.baselined = true;
-        messages
-            .iter()
-            .filter(|m| m["id"].as_str().is_some_and(|id| self.insert(id)) && !first)
-            .collect()
+        let (mut new, mut listed) = (vec![], HashSet::new());
+        for message in messages {
+            let Some(id) = message["id"].as_str() else {
+                continue;
+            };
+            listed.insert(id);
+            if self.ids.insert(id.to_owned()) {
+                self.order.push_back(id.to_owned());
+                new.push(message);
+            }
+        }
+        self.forget(&listed);
+        if first { vec![] } else { new }
+    }
+    /// Forgets the oldest ids beyond `SEEN_CAP` that `listed` does not hold.
+    fn forget(&mut self, listed: &HashSet<&str>) {
+        let mut excess = self.order.len().saturating_sub(SEEN_CAP);
+        let mut kept = vec![];
+        while excess > 0 {
+            let Some(id) = self.order.pop_front() else {
+                break;
+            };
+            if listed.contains(id.as_str()) {
+                kept.push(id);
+            } else {
+                self.ids.remove(&id);
+                excess -= 1;
+            }
+        }
+        for id in kept.into_iter().rev() {
+            self.order.push_front(id);
+        }
     }
 }
 
@@ -103,8 +120,8 @@ impl Poller {
     }
 }
 
-/// The next poll waits at least `CHANNEL_POLL` and four times the last poll's wall time, so a
-/// slow poll never costs more than a fifth of a core.
+/// After a poll ends, the next waits at least `CHANNEL_POLL` and four times that poll's wall
+/// time, so a slow poll never costs more than a fifth of a core.
 fn next_wait(period: Duration, took: Duration) -> Duration {
     period.max(took.saturating_mul(4))
 }
@@ -121,16 +138,34 @@ pub(crate) fn spawn(
         .spawn(move || run(&poller, seen, &writer, &stop, CHANNEL_POLL))
 }
 
-fn run(poller: &Poller, mut seen: Seen, writer: &Writer, stop: &AtomicBool, period: Duration) {
+fn run(poller: &Poller, seen: Seen, writer: &Writer, stop: &AtomicBool, period: Duration) {
     let stopped = || stop.load(Ordering::SeqCst);
-    while !stopped() {
+    schedule(
+        || poller.poll(POLL_BOUND, &stopped),
+        seen,
+        writer,
+        stop,
+        period,
+    );
+}
+
+/// The poll loop: one `poll`, its new replies emitted, then the throttled wait.
+fn schedule(
+    mut poll: impl FnMut() -> Option<Vec<Value>>,
+    mut seen: Seen,
+    writer: &Writer,
+    stop: &AtomicBool,
+    period: Duration,
+) {
+    while !stop.load(Ordering::SeqCst) {
         let started = Instant::now();
-        if let Some(messages) = poller.poll(POLL_BOUND, &stopped) {
+        if let Some(messages) = poll() {
             for message in seen.take(&messages) {
                 writer.send(&notification(message));
             }
         }
-        let wake = started + next_wait(period, started.elapsed());
+        let took = started.elapsed();
+        let wake = Instant::now() + next_wait(period, took);
         while !stop.load(Ordering::SeqCst) && Instant::now() < wake {
             thread::sleep(TICK.min(period));
         }
@@ -272,13 +307,77 @@ mod tests {
         let new: Vec<_> = seen.take(&second).iter().map(|m| m["id"].clone()).collect();
         assert_eq!(new, [json!("c"), json!("d")]);
         assert!(seen.take(&second).is_empty());
+        // Ids no longer listed are forgotten past the cap, oldest first.
         let mut seen = Seen::default();
-        for i in 0..SEEN_CAP + 5 {
-            assert!(seen.insert(&i.to_string()));
-        }
+        let many: Vec<Value> = (0..SEEN_CAP + 5)
+            .map(|i| reply(&i.to_string(), ""))
+            .collect();
+        assert!(seen.take(&many).is_empty());
+        assert_eq!(seen.ids.len(), SEEN_CAP + 5, "every listed id is kept");
+        assert!(seen.take(&[]).is_empty());
         assert_eq!(seen.ids.len(), SEEN_CAP);
-        assert!(seen.insert("0"), "the oldest id was evicted");
-        assert!(!seen.insert(&(SEEN_CAP + 4).to_string()));
+        let again: Vec<_> = seen
+            .take(&[reply("0", ""), reply(&(SEEN_CAP + 4).to_string(), "")])
+            .iter()
+            .map(|m| m["id"].clone())
+            .collect();
+        assert_eq!(again, [json!("0")], "only the oldest id was forgotten");
+    }
+
+    #[test]
+    fn more_unread_replies_than_the_cap_are_never_replayed() {
+        let listed: Vec<Value> = (0..=SEEN_CAP)
+            .map(|i| reply(&format!("r{i}"), ""))
+            .collect();
+        let mut seen = Seen::default();
+        assert!(seen.take(&listed).is_empty(), "the baseline is silent");
+        for _ in 0..3 {
+            assert!(seen.take(&listed).is_empty(), "a listed reply is replayed");
+        }
+        let mut more = listed.clone();
+        more.push(reply("new", ""));
+        let new: Vec<_> = seen.take(&more).iter().map(|m| m["id"].clone()).collect();
+        assert_eq!(new, [json!("new")]);
+        assert!(seen.take(&more).is_empty());
+        // After an empty baseline, more new replies than the cap are each emitted once, ever.
+        let mut seen = Seen {
+            baselined: true,
+            ..Seen::default()
+        };
+        assert_eq!(seen.take(&listed).len(), SEEN_CAP + 1, "each once");
+        assert!(seen.take(&listed).is_empty());
+    }
+
+    #[test]
+    fn the_next_poll_waits_four_times_the_last_poll_after_it_ends() {
+        let (writer, stop) = (Writer::new(Shared::default()), AtomicBool::new(false));
+        let spans: std::sync::Mutex<Vec<(Instant, Instant)>> = Default::default();
+        let poll = || {
+            let start = Instant::now();
+            thread::sleep(Duration::from_millis(150));
+            let mut spans = spans.lock().unwrap();
+            spans.push((start, Instant::now()));
+            if spans.len() == 3 {
+                stop.store(true, Ordering::SeqCst);
+            }
+            None
+        };
+        schedule(
+            poll,
+            Seen::default(),
+            &writer,
+            &stop,
+            Duration::from_millis(20),
+        );
+        let spans = spans.into_inner().unwrap();
+        for pair in spans.windows(2) {
+            let ((start, end), (next, _)) = (pair[0], pair[1]);
+            let (took, waited) = (end - start, next - end);
+            assert!(
+                waited >= took * 4,
+                "waited {waited:?} after a {took:?} poll"
+            );
+        }
     }
 
     #[test]
