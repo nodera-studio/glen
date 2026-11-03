@@ -576,16 +576,19 @@ const V0_1_1_BINARY_INPUTS: [(&str, &str); 5] = [
     ("Cargo.lock", "d882ba290524a610ef0113d95df79f97cb51849c"),
 ];
 
+/// `git -C <repo> <args>` to its exit; its output is captured in files (`flake::try_output`), not
+/// read from a pipe to end of file.
 fn git(args: &[&str]) -> Option<std::process::Output> {
-    Command::new("git")
-        .arg("-C")
-        .arg(repo_root())
-        .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .output()
-        .ok()
+    crate::flake::try_output(
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_root())
+            .args(args)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE"),
+    )
+    .ok()
 }
 
 #[test]
