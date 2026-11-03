@@ -4,7 +4,7 @@
 use std::{
     fs::File,
     io::{Read, Seek},
-    process::{Command, ExitStatus, Output, Stdio},
+    process::{Child, Command, ExitStatus, Output, Stdio},
     sync::OnceLock,
     time::Duration,
 };
@@ -81,10 +81,96 @@ impl Capture {
 /// `cmd.output()` through a [`Capture`]: it returns once the child has exited, whoever else holds
 /// a copy of its output. Stdin is null, as `output()` makes it.
 pub fn output(cmd: &mut Command) -> Output {
+    try_output(cmd).unwrap()
+}
+
+/// [`output`] that returns a spawn or wait error instead of panicking, as `cmd.output()` does.
+pub fn try_output(cmd: &mut Command) -> std::io::Result<Output> {
     let capture = Capture::new();
     capture.attach(cmd.stdin(Stdio::null()));
-    let status = cmd.status().unwrap();
-    capture.output(status)
+    let status = cmd.status()?;
+    Ok(capture.output(status))
+}
+
+/// A spawned child whose stdout and stderr go to a [`Capture`]; it derefs to its [`Child`].
+/// Stdin is left as the command sets it.
+pub struct Captured {
+    child: Child,
+    capture: Capture,
+}
+
+impl Captured {
+    pub fn spawn(cmd: &mut Command) -> std::io::Result<Self> {
+        let capture = Capture::new();
+        capture.attach(cmd);
+        Ok(Self {
+            child: cmd.spawn()?,
+            capture,
+        })
+    }
+
+    /// `Child::wait_with_output` that returns at the child's exit, not at end of file on a pipe:
+    /// it closes the child's stdin, waits, and reads the capture.
+    pub fn wait_with_output(mut self) -> Output {
+        drop(self.child.stdin.take());
+        let status = self.child.wait().unwrap();
+        self.capture.output(status)
+    }
+
+    /// What the child wrote, once it has exited with `status` (reaped by the caller).
+    pub fn output(&self, status: ExitStatus) -> Output {
+        self.capture.output(status)
+    }
+}
+
+impl std::ops::Deref for Captured {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for Captured {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+/// Lets `settle` pass (a window in which the caller may check that nothing happened), then waits
+/// until process `pid` catches SIGINT, so a SIGINT sent next reaches its handler instead of the
+/// default or inherited disposition. Linux shows the handler in `/proc/<pid>/status` (`SigCgt`).
+/// macOS has no such view, so there the wait is `settle` times [`time_scale`]. A process that has
+/// exited ends the wait (the caller sees its exit).
+#[cfg(target_os = "linux")]
+pub fn await_sigint_handler(pid: u32, settle: Duration) {
+    std::thread::sleep(settle);
+    let deadline = std::time::Instant::now() + scaled(Duration::from_secs(20));
+    loop {
+        let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) else {
+            return;
+        };
+        let field = |name: &str| status.lines().find_map(|l| l.strip_prefix(name));
+        if field("State:").is_some_and(|s| s.trim_start().starts_with('Z')) {
+            return;
+        }
+        let caught = field("SigCgt:")
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & (1u64 << (libc::SIGINT - 1)) != 0);
+        if caught {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "process {pid} never installed a SIGINT handler"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// See the Linux version: macOS cannot show a process's handlers, so this sleeps `settle` scaled.
+#[cfg(target_os = "macos")]
+pub fn await_sigint_handler(_pid: u32, settle: Duration) {
+    std::thread::sleep(scaled(settle));
 }
 
 /// The live direct children of `parent` (zombies left out), read from the kernel: no `/bin/ps`,

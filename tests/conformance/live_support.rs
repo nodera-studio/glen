@@ -31,6 +31,7 @@ use std::time::{Duration, Instant};
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
+use crate::flake::scaled;
 use crate::rpc_support::*;
 use crate::support::*;
 
@@ -178,7 +179,7 @@ impl Ext {
     pub fn stop(&mut self) {
         if let Some(mut c) = self.child.take() {
             self.signal(Signal::TERM);
-            let deadline = Instant::now() + LONG;
+            let deadline = Instant::now() + scaled(LONG);
             while c.try_wait().ok().flatten().is_none() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(20));
             }
@@ -292,7 +293,9 @@ impl LiveBox {
             let _ = BufReader::new(stdout).read_line(&mut line);
             let _ = tx.send(line);
         });
-        let ready = rx.recv_timeout(Duration::from_secs(10)).unwrap_or_default();
+        let ready = rx
+            .recv_timeout(scaled(Duration::from_secs(10)))
+            .unwrap_or_default();
         assert_eq!(ready.trim(), "ready", "fake_ext did not report ready");
         Ext {
             child: Some(child),

@@ -192,8 +192,8 @@ fn ctl(lb: &LiveBox, args: &[&str]) -> Run {
     lb.glen(a).env("FAKE_OMP_SERIAL", "1")
 }
 
-/// `glen <args> --json` started in the background (piped stdout/stderr).
-fn spawn_ctl(lb: &LiveBox, args: &[&str], env: &[(&str, &str)]) -> Child {
+/// `glen <args> --json` started in the background, its stdout and stderr captured in files.
+fn spawn_ctl(lb: &LiveBox, args: &[&str], env: &[(&str, &str)]) -> crate::flake::Captured {
     let mut a: Vec<&str> = args.to_vec();
     a.push("--json");
     let mut cmd = lb.command(&a);
@@ -201,8 +201,7 @@ fn spawn_ctl(lb: &LiveBox, args: &[&str], env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.spawn().expect("spawn glen")
+    crate::flake::Captured::spawn(&mut cmd).expect("spawn glen")
 }
 
 fn has_keys(v: &Value, keys: &[&str], what: &str) {

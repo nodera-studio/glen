@@ -28,21 +28,23 @@ pub fn write_control(dir: &Path, name: &str, body: impl AsRef<[u8]>) {
     drop(file);
     std::fs::rename(staging, dir.join(name)).unwrap();
 }
+/// `glen <args>` in a fresh scratch HOME, to its exit; its output is captured in files
+/// (`flake::output`), never read from a pipe to end of file.
 pub fn glen(args: &[&str], vars: &[(&str, &str)]) -> Output {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let path = tmp.path().join("bin");
     std::fs::create_dir(&home).unwrap();
     std::fs::create_dir(&path).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_glen"))
-        .args(args)
-        .env_clear()
-        .env("HOME", &home)
-        .env("GLEN_HOME", tmp.path().join("glen"))
-        .env("PATH", path)
-        .envs(vars.iter().copied())
-        .output()
-        .unwrap()
+    flake::output(
+        Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("GLEN_HOME", tmp.path().join("glen"))
+            .env("PATH", path)
+            .envs(vars.iter().copied()),
+    )
 }
 pub fn fixture(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -150,8 +152,11 @@ impl OmpBox {
             .current_dir(cwd);
         c
     }
+    /// `glen <args>` from `cwd`, to its exit; its output is captured in files (`flake::output`):
+    /// a pipe read to end of file would also wait for any process that inherited its write end
+    /// from a concurrent spawn.
     pub fn glen(&self, args: &[&str], cwd: &std::path::Path) -> Output {
-        self.command(args, cwd).output().unwrap()
+        flake::output(&mut self.command(args, cwd))
     }
     pub fn clean(&self) {
         assert!(!self.home.join(".omp").exists());
@@ -393,8 +398,10 @@ impl LiveBox {
         .env("FAKE_EXT_LOG", &self.log)
         .env("FAKE_EXT_CWD", self.rpc.omp.alpha())
         .envs(vars.iter().copied())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped());
+        // Its stderr goes to a file, so a failed start is read at its exit, not at end of file.
+        let stderr = flake::Capture::new();
+        stderr.attach_stderr(&mut c);
         if id == A_ID {
             c.arg("--session-file").arg(self.rpc.omp.session('A'));
         }
@@ -408,10 +415,10 @@ impl LiveBox {
                 .map(|_| line);
             let _ = tx.send(result);
         });
-        let ready = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let ready = rx.recv_timeout(scaled(std::time::Duration::from_secs(10)));
         if !matches!(&ready,Ok(Ok(line)) if line=="ready\n") {
             let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
+            let out = stderr.output(child.wait().unwrap());
             panic!(
                 "fake_ext not ready: {ready:?}: {}",
                 String::from_utf8_lossy(&out.stderr)

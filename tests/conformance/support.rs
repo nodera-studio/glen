@@ -16,7 +16,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-use crate::flake::Capture;
+use crate::flake::{Capture, scaled};
 
 pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -272,13 +272,17 @@ impl Run {
         std::thread::spawn(move || {
             let _ = tx.send(child.wait());
         });
-        let output = match rx.recv_timeout(RUN_TIMEOUT) {
+        let output = match rx.recv_timeout(scaled(RUN_TIMEOUT)) {
             Ok(r) => capture.output(r.unwrap_or_else(|e| panic!("wait glen {}: {e}", self.desc))),
             Err(_) => {
                 let _ = Command::new("/bin/kill")
                     .args(["-9", &pid.to_string()])
                     .status();
-                panic!("`glen {}` did not finish within {RUN_TIMEOUT:?}", self.desc);
+                panic!(
+                    "`glen {}` did not finish within {:?}",
+                    self.desc,
+                    scaled(RUN_TIMEOUT)
+                );
             }
         };
         Out {

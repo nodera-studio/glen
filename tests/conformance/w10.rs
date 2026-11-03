@@ -458,8 +458,7 @@ fn ac1006_a_worker_side_held_lease_is_live_owner_in_send_and_wait() {
     let rb = RpcBox::new();
     let lock = rb.hold_glen_lock(A.id);
     let mut cmd = rb.command(&["send", A.handle, "hi", "--wait", "20s", "--json"]);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let child = cmd.spawn().expect("spawn glen send");
+    let child = crate::flake::Captured::spawn(&mut cmd).expect("spawn glen send");
     let id = rb.wait_one_job();
     rb.wait_status(&id, "waiting_for_lock", LONG, |s| {
         s["waiting_for_lock"] == true

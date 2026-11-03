@@ -2202,10 +2202,8 @@ fn ac502_a_terminal_on_stdin_is_a_usage_refusal_on_stderr_never_a_message_on_std
         let slave = pty.open_slave();
         let argv: Vec<OsString> = args.iter().map(OsString::from).collect();
         let mut cmd = rb.command_in(&alpha(&rb), &argv);
-        cmd.stdin(Stdio::from(slave))
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = cmd.spawn().expect("spawn glen mcp on a terminal");
+        cmd.stdin(Stdio::from(slave));
+        let child = crate::flake::Captured::spawn(&mut cmd).expect("spawn glen mcp on a terminal");
         let out = finish(child, &args.join(" "), Duration::from_secs(20));
         assert_eq!(out.code(), exit_for("usage"), "{args:?}\n{}", out.ctx());
         assert!(

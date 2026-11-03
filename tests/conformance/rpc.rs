@@ -703,10 +703,8 @@ fn ac207_a_live_owner_is_refused_before_any_job_or_omp_exists() {
 fn ac207_send_reprobes_the_owner_lease_after_reading_stdin() {
     let rb = RpcBox::new();
     let mut cmd = rb.command(&["send", A.handle, "-", "--json"]);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
+    cmd.stdin(Stdio::piped());
+    let mut child = crate::flake::Captured::spawn(&mut cmd).unwrap();
     let mut stdin = child.stdin.take().unwrap();
     // `send` resolves (and probes) the target before it blocks on stdin; give it time to get
     // there. A slower start only makes this row less discriminating, never wrongly red.

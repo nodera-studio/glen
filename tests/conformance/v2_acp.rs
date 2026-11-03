@@ -25,13 +25,13 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant, SystemTime};
 
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
-use crate::flake::scaled;
+use crate::flake::{Captured, scaled};
 use crate::live_support::*;
 use crate::reader::*;
 use crate::rpc_support::*;
@@ -96,12 +96,10 @@ fn acp(rb: &RpcBox, scenario: &str, session: &str, extra: &[&str]) -> Run {
     acp_with(rb, scenario, session, MSG, extra)
 }
 
-/// A background `glen __acp <session> MSG --json` with piped output.
-fn spawn_acp(rb: &RpcBox, scenario: &str, session: &str, env: &[(&str, &str)]) -> Child {
+/// A background `glen __acp <session> MSG --json`, its stdout and stderr captured in files.
+fn spawn_acp(rb: &RpcBox, scenario: &str, session: &str, env: &[(&str, &str)]) -> Captured {
     let (mut cmd, desc) = glen_acp(rb, scenario, &["__acp", session, MSG, "--json"], env);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.spawn()
-        .unwrap_or_else(|e| panic!("spawn glen {desc}: {e}"))
+    Captured::spawn(&mut cmd).unwrap_or_else(|e| panic!("spawn glen {desc}: {e}"))
 }
 
 /// Frames in direction `dir` (`"in"` = glen → omp, `"out"` = omp → glen) of a fake log.
