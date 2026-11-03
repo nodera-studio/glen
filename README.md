@@ -85,8 +85,8 @@ cannot open it) until the window expires or `glen release` ends it.
 For agents, pass `--json` (or pipe the output): a command prints one v1 JSON envelope (`tail -f`
 streams one JSON object per line), and the exit code says what to do next. 0 means the reply is in `data`, 10 means the job is still running
 (run `glen wait`; with `--for reply`, `data.woke` set to `reply` means new replies arrived), and 11
-means omp moved the session to a new handle. The envelope and every exit
-code are in [docs/design.md](docs/design.md#a10-output-contract).
+means omp moved the session to a new handle. The envelope is in [docs/design.md](docs/design.md#a10-output-contract);
+every exit code is in [docs/design.md](docs/design.md#a11-exit-codes) and [docs/json.md](docs/json.md).
 
 ## Watch sessions (`glen watch`)
 
@@ -174,6 +174,10 @@ and `~/.agents/skills/glen/SKILL.md`. `--project` writes `.claude/skills/glen/SK
 `.agents/skills/glen/SKILL.md` under the current directory, so run it from the repository root.
 Run `glen install-skill` again after upgrading glen. An edited or newer `SKILL.md` is skipped
 unless you pass `--force`; `--dry-run` works as it does for the extension.
+
+Because the skill's `allowed-tools: Bash(glen *)` pre-approves every `glen` command for the turn and glen starts
+omp with no approval flag of its own, a prompt-injected agent that reaches that turn can start an omp agent whose
+tools then run unattended under omp's own default (yolo) approval mode (design.md §A13).
 
 Headless Claude Code needs the skill itself allowed: `claude -p --permission-mode dontAsk` denies
 a skill that is not on the allow list, so pass `--allowedTools "Skill(glen)"`. The skill's own

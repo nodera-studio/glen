@@ -1,5 +1,6 @@
 //! The supported omp range. `compat.json` is the single source: Rust, the nightly
-//! `omp-latest` workflow and the site read it, and `TESTED_OMP_VERSION` derives from it.
+//! `omp-latest` workflow read it (the site reads it from the v0.2.0 release PR on), and
+//! `TESTED_OMP_VERSION` derives from it.
 use crate::version::Version;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -90,7 +91,7 @@ mod tests {
             c.supported(),
             json!({"min":c.min_text,"max_tested":c.max_tested_text})
         );
-        // One key per line, exactly these keys: the nightly and the site read the file.
+        // One key per line, exactly these keys: the nightly (and later the site) read the file.
         let keys: Vec<_> = RAW
             .lines()
             .filter_map(|l| l.trim().strip_prefix('"')?.split('"').next())

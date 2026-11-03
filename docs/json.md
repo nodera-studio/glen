@@ -941,12 +941,22 @@ the worker from being signalled too (`release_timeout`, registry kept). A remova
 bound is `release_timeout` too, with the files kept for a later `glen release`. A
 target that matches no warm worker exits 3 `not_found` with `details:{reason:"not_warm",target}`. A worker that
 did not release in time without `--force` exits 7 `control_failed` with `details:{reason:"release_timeout",workers}`
-and a hint naming `--force`. `--all` with no warm worker is exit 0 with `total:0`. It creates no glen home.
+and a hint naming `--force`; with `--force` already given, the hint instead points at `glen doctor` before retrying,
+since a process glen cannot prove unchanged is never signalled. `--all` with no warm worker is exit 0 with `total:0`.
+It creates no glen home.
+
+`--all` processes every warm worker even when one of them fails: a worker whose release hits an I/O error does not
+stop the others. Every row attempted so far — every finished worker plus the failed one, whose own `outcome` is
+`failed` — is collected into `details.workers`, and the error's message ends with `(k of n warm workers released)`,
+naming how many of the targeted workers finished (released, cooling, forced or cleaned) before the failure. With
+`--all` (not a single `<target>`), an unreadable warm-worker registry file is checked too, after every readable
+worker has still been processed: it exits 1 `io`, with `details.unreadable` (the unreadable paths) alongside
+`details.workers`, rather than silently reporting success or `total:0`.
 
 | Field | Meaning |
 |---|---|
 | `total` | warm workers processed |
-| `workers` | `{session:{id,handle},job,pid,state,outcome}`: `state` idle, busy, stale or dead as found; `outcome` released, cooling, forced or cleaned |
+| `workers` | `{session:{id,handle},job,pid,state,outcome}`: `state` idle, busy, stale or dead as found; `outcome` released, cooling, forced or cleaned on success, or, only inside an error's `details.workers`, timeout (not yet forced) or failed (this run's own I/O error) |
 
 <!-- contract: release -->
 ```json

@@ -19,8 +19,8 @@ The bootstrap filled these values into the agent prompts, commands and skills un
 | Token | glen |
 | --- | --- |
 | `{{PROJECT_NAME}}` | glen |
-| `{{PRIMARY_LANGUAGE}}` | Rust, stable toolchain, edition 2024. The TypeScript omp extension runs under omp’s Bun runtime and is tested under Node. |
-| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; omp-rpc (git tag v18.14.0), uuid (v7 job ids), libc (Unix, process start time); rustix (lease probe and process feature, Unix), xxhash-rust (Linux lease name), jiff (timestamps), unicode-width, signal-hook (tail -f SIGINT, Unix), ratatui 0.30 (crossterm 0.29 through `ratatui::crossterm`), insta (dev). Static Astro 7 with React 19 islands for `site/`. |
+| `{{PRIMARY_LANGUAGE}}` | Rust, edition 2024, toolchain pinned by `rust-toolchain.toml` (currently 1.99.1; `Cargo.toml`’s MSRV is 1.89, checked by CI’s `msrv` job). The TypeScript omp extension runs under omp’s Bun runtime and is tested under Node. |
+| `{{FRAMEWORK}}` | clap 4 (derive) + clap_complete; serde/serde_json; thiserror (the `GlenError` type, used in both the binary and the library, no `anyhow`); anstyle/anstream colour, comfy-table tables, indicatif spinners, terminal_size; dirs; omp-rpc (git tag v18.14.0), uuid (v7 job ids), libc (Unix, process start time); rustix (`fs`, `net`, `process`, `pty` and `termios` features, Unix: the lease probe, process start tokens and the watch pty tests), xxhash-rust (`xxh3` and `xxh64` features: the Linux lease name and the warm-worker env digest), jiff (timestamps), unicode-width, unicode-segmentation (grapheme-aware text truncation), signal-hook (tail -f SIGINT, Unix), ratatui 0.30 (crossterm 0.29 through `ratatui::crossterm`), insta (dev), tempfile (dev). Two cargo examples carry the test fakes: `fake_omp` (the RPC/ACP peer, `tests/support/fake_omp.rs`) and `fake_ext` (the live extension peer, `tests/support/fake_ext.rs`). Static Astro 7 with React 19 islands for `site/`. |
 | `{{PACKAGE_MANAGER}}` | cargo; `Cargo.lock` is committed and CI builds with `--locked`; npm for `site/` (`package-lock.json` committed, CI `npm ci`) |
 | `{{MONOREPO}}` | no Cargo workspace; `site/` is a separate npm project |
 | `{{FRONTEND_DIR}}` | `site/`: static Astro 7 site with React 19 islands and Tailwind v4; Node from `site/.nvmrc` |
@@ -79,7 +79,7 @@ The full agent index is `.claude/agents/README.md`; commands are listed in
 | `/code-review`, `/respond-to-review` | Review the current diff (Claude ‖ Codex, + omp when ready); answer PR review comments |
 | `/review-implementation` | Claude ‖ Codex ‖ omp |
 | `/deep-debug` | Claude ‖ Codex investigator (+ optional omp), then the adversary |
-| `/run-ci` | Run the same checks as `.github/workflows/ci.yml` locally |
+| `/run-ci` | Run `ci.yml`'s rustfmt/clippy/test checks locally; it does not cover `linux-sandbox`, `msrv`, `site-deploy`, `shellcheck`, or the site's budgets/link-check/lhci steps |
 | `/goal` + `/auto-mode` | Carry a multi-wave goal to merged completion on `main` |
 | `/explore`, `/research`, `/brainstorm` | Map code, research a topic with Exa, turn an idea into requirements |
 | `/security-audit`, `/error-audit`, `/docs-audit`, `/tech-debt-audit`, `/codebase-audit` | Periodic whole-repo audits |
