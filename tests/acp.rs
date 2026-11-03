@@ -1,5 +1,11 @@
 //! v0.2 W3 ACP spike (design §A23): the hidden `glen __acp` on the real binary against the
 //! `fake_omp acp` peer (AC-v2-301 to AC-v2-303). Every omp is the fake, with the box's own HOME.
+//!
+//! Every glen's output is captured in files (`flake::output`, `flake::Captured`), never read from a
+//! pipe to end of file, which a process that inherited the pipe from a concurrent spawn could hold
+//! back. Under `scripts/flake-check.sh` the waits and the upper bounds (the AC-v2-302 500 ms
+//! cancel frame among them) are multiplied by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a
+//! plain run); lower bounds are not.
 mod common;
 use common::*;
 use glen::{glen_home::GlenHome, jobs::lock};
@@ -9,7 +15,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    process::{Child, Output, Stdio},
+    process::{Child, Output},
     time::{Duration, Instant, SystemTime},
 };
 
@@ -17,18 +23,13 @@ fn run(b: &RpcBox, args: &[&str], vars: &[(&str, &str)]) -> Output {
     let mut full = vec!["__acp"];
     full.extend_from_slice(args);
     full.push("--json");
-    b.glen(&full).envs(vars.iter().copied()).output().unwrap()
+    flake::output(b.glen(&full).envs(vars.iter().copied()))
 }
-fn spawn(b: &RpcBox, args: &[&str], vars: &[(&str, &str)]) -> Child {
+fn spawn(b: &RpcBox, args: &[&str], vars: &[(&str, &str)]) -> flake::Captured {
     let mut full = vec!["__acp"];
     full.extend_from_slice(args);
     full.push("--json");
-    b.glen(&full)
-        .envs(vars.iter().copied())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap()
+    flake::Captured::spawn(b.glen(&full).envs(vars.iter().copied())).unwrap()
 }
 /// The JSON envelope of an exit; JSON mode never writes stderr.
 fn envelope(out: &Output, code: i32) -> Value {
@@ -64,7 +65,9 @@ fn assert_groups_gone(b: &RpcBox) {
     for start in starts {
         let pgid = start["pgid"].as_i64().unwrap();
         assert_eq!(start["pid"].as_i64(), Some(pgid), "omp leads its own group");
-        poll(Duration::from_secs(3), || group_gone(pgid).then_some(()));
+        poll(flake::scaled(Duration::from_secs(3)), || {
+            group_gone(pgid).then_some(())
+        });
     }
 }
 /// AC-v2-303: no durable job, no inbox; the only glen state is the session lock.
@@ -104,11 +107,14 @@ fn signal(child: &Child, signal: Signal) -> u128 {
     rustix::process::kill_process(Pid::from_raw(child.id() as i32).unwrap(), signal).unwrap();
     at
 }
-/// Waits until the fake has written its first prompt chunk ("Hel").
+/// Waits until the fake has written its first prompt chunk ("Hel"): one logged after the
+/// `session/prompt` frame. `session/load` replays an existing session's history as agent chunks
+/// too, and a signal sent on one of those lands before the prompt, when there is no turn yet.
 fn wait_first_chunk(b: &RpcBox) {
-    poll(Duration::from_secs(10), || {
+    poll(flake::scaled(Duration::from_secs(10)), || {
         b.fake_log()
             .iter()
+            .skip_while(|r| !(r["event"] == "in" && r["frame"]["method"] == "session/prompt"))
             .any(|r| {
                 r["event"] == "out"
                     && r["frame"]["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
@@ -201,12 +207,11 @@ fn ac_v2_302_303_new_session_turn_rebuilds_the_last_message() {
 #[test]
 fn ac_v2_303_an_explicit_profile_reaches_omp_and_drops_the_env_profiles() {
     let b = RpcBox::new();
-    let out = b
-        .glen(&["--profile", "p", "__acp", "@new", "hi", "--json"])
-        .env("OMP_PROFILE", "other")
-        .env("PI_PROFILE", "other")
-        .output()
-        .unwrap();
+    let out = flake::output(
+        b.glen(&["--profile", "p", "__acp", "@new", "hi", "--json"])
+            .env("OMP_PROFILE", "other")
+            .env("PI_PROFILE", "other"),
+    );
     envelope(&out, 0);
     let start = b
         .fake_log()
@@ -335,7 +340,7 @@ fn ac_v2_302_startup_failures_map_to_omp_unavailable() {
         &[("FAKE_OMP_ACP", "init_hang"), ("GLEN_ACP_SETUP_MS", "300")],
     );
     failure(&out, 5, "omp_unavailable", "acp_timeout");
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < flake::scaled(Duration::from_secs(5)));
     assert_groups_gone(&b);
 
     let b = RpcBox::new();
@@ -446,7 +451,7 @@ fn ac_v2_302_sigint_and_sigterm_send_session_cancel() {
         let child = spawn(&b, &["@new", "long job"], &[("FAKE_OMP_ACP", "cancel")]);
         wait_first_chunk(&b);
         let at = signal(&child, sig);
-        let out = child.wait_with_output().unwrap();
+        let out = child.wait_with_output();
         let v = envelope(&out, 130);
         assert_eq!(v["ok"], true, "{sig:?}");
         let d = &v["data"];
@@ -459,9 +464,10 @@ fn ac_v2_302_sigint_and_sigterm_send_session_cancel() {
         let cancels = frames_in(&b, "session/cancel");
         assert_eq!(cancels.len(), 1, "{sig:?}");
         let logged = cancels[0]["at_ms"].as_u64().unwrap() as u128;
+        let bound = flake::scaled(Duration::from_millis(500)).as_millis();
         assert!(
-            logged.saturating_sub(at) < 500,
-            "{sig:?}: {}ms",
+            logged.saturating_sub(at) < bound,
+            "{sig:?}: {}ms (bound {bound}ms)",
             logged - at
         );
         assert_eq!(
@@ -489,8 +495,8 @@ fn ac_v2_302_an_ignored_cancel_ends_after_the_grace() {
     wait_first_chunk(&b);
     signal(&child, Signal::INT);
     let started = Instant::now();
-    let out = child.wait_with_output().unwrap();
-    assert!(started.elapsed() < Duration::from_secs(4));
+    let out = child.wait_with_output();
+    assert!(started.elapsed() < flake::scaled(Duration::from_secs(4)));
     let d = envelope(&out, 130)["data"].clone();
     assert_eq!(d["task_state"], "canceled");
     assert_eq!(
@@ -503,29 +509,17 @@ fn ac_v2_302_an_ignored_cancel_ends_after_the_grace() {
 }
 
 /// `wait_with_output`, plus the child's own peak resident set in bytes (from `wait4`, so no
-/// other child of this test process, such as the `cargo build` of the fake, is counted).
-fn wait_with_peak_rss(mut child: Child) -> (Output, u64) {
-    use std::{io::Read, os::unix::process::ExitStatusExt};
-    let drain = |mut pipe: Box<dyn Read + Send>| {
-        std::thread::spawn(move || {
-            let mut bytes = vec![];
-            pipe.read_to_end(&mut bytes).unwrap();
-            bytes
-        })
-    };
-    let stdout = drain(Box::new(child.stdout.take().unwrap()));
-    let stderr = drain(Box::new(child.stderr.take().unwrap()));
+/// other child of this test process, such as the `cargo build` of the fake, is counted). The
+/// output is read from the capture files once the child has exited.
+fn wait_with_peak_rss(child: flake::Captured) -> (Output, u64) {
+    use std::os::unix::process::ExitStatusExt;
     let mut status = 0;
     // SAFETY: `rusage` is plain data; `wait4` only writes into `status` and `usage`.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     let pid = libc::pid_t::try_from(child.id()).unwrap();
     assert_eq!(unsafe { libc::wait4(pid, &mut status, 0, &mut usage) }, pid);
     let peak = u64::try_from(usage.ru_maxrss).unwrap();
-    let output = Output {
-        status: std::process::ExitStatus::from_raw(status),
-        stdout: stdout.join().unwrap(),
-        stderr: stderr.join().unwrap(),
-    };
+    let output = child.output(std::process::ExitStatus::from_raw(status));
     (
         output,
         if cfg!(target_os = "macos") {
@@ -554,7 +548,7 @@ fn ac_v2_302_a_flooding_agent_stays_bounded_and_is_torn_down() {
     let (out, peak) = wait_with_peak_rss(child);
     // 100 ms tick + 300 ms grace + 100 ms exit grace, then TERM: well inside the J1 bound.
     assert!(
-        started.elapsed() < Duration::from_secs(4),
+        started.elapsed() < flake::scaled(Duration::from_secs(4)),
         "{:?}",
         started.elapsed()
     );
@@ -595,13 +589,13 @@ fn ac_v2_302_a_flooding_agent_stays_bounded_and_is_torn_down() {
 fn ac_v2_302_sigint_before_the_prompt_sends_no_cancel() {
     let b = RpcBox::new();
     let child = spawn(&b, &["@new", "hi"], &[("FAKE_OMP_ACP", "init_hang")]);
-    poll(Duration::from_secs(10), || {
+    poll(flake::scaled(Duration::from_secs(10)), || {
         (!frames_in(&b, "initialize").is_empty()).then_some(())
     });
     signal(&child, Signal::INT);
     let started = Instant::now();
-    let out = child.wait_with_output().unwrap();
-    assert!(started.elapsed() < Duration::from_millis(3500));
+    let out = child.wait_with_output();
+    assert!(started.elapsed() < flake::scaled(Duration::from_millis(3500)));
     let d = envelope(&out, 130)["data"].clone();
     assert_eq!(d["task_state"], "canceled");
     assert_eq!(
@@ -678,7 +672,7 @@ fn ac_v2_302_failures_after_the_handshake_are_job_failed() {
         "job_failed",
         "acp_timeout",
     );
-    assert!(started.elapsed() < Duration::from_secs(8));
+    assert!(started.elapsed() < flake::scaled(Duration::from_secs(8)));
     assert_eq!(
         e["details"]["cancel"],
         json!({"sent":true,"confirmed":false,"reason":"deadline"})
@@ -727,7 +721,7 @@ fn ac_v2_303_the_lock_is_held_until_the_omp_group_is_gone() {
     assert!(lock::try_acquire(&home(&b), A_ID).unwrap().is_none());
     signal(&child, Signal::INT);
     // Observe the lock continuously: the moment it is free, omp's group must be gone.
-    let held = poll(Duration::from_secs(5), || {
+    let held = poll(flake::scaled(Duration::from_secs(5)), || {
         let lock = lock::try_acquire(&home(&b), A_ID).unwrap()?;
         assert!(
             group_gone(pgid),
@@ -736,7 +730,7 @@ fn ac_v2_303_the_lock_is_held_until_the_omp_group_is_gone() {
         Some(lock)
     });
     drop(held);
-    envelope(&child.wait_with_output().unwrap(), 130);
+    envelope(&child.wait_with_output(), 130);
 }
 
 /// AC-v2-303: every refusal exits 6 before omp starts.
