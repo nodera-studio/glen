@@ -662,12 +662,13 @@ fn inbox_wait_usage_errors() {
 fn inbox_wait_with_a_closed_stdout_keeps_messages_unread() {
     let b = OmpBox::new();
     append(&b, A_ID, &record(A_ID, "keep"));
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    // Stderr goes to a file, read at glen's exit; stdin is null, as `output()` makes it.
+    // Stderr goes to a file, read at glen's exit; stdin is null, as `output()` makes it. Stdout
+    // has no reader anywhere (`flake::closed_stdout`): a dropped pipe reader can live on in a
+    // process another thread spawned, and glen's write would then succeed and mark the message.
     let stderr = flake::Capture::new();
     let mut cmd = inbox_wait(&b, &["--timeout", "5s"]);
-    cmd.stdin(Stdio::null()).stdout(Stdio::from(writer));
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::from(flake::closed_stdout()));
     stderr.attach_stderr(&mut cmd);
     let out = stderr.output(cmd.status().unwrap());
     assert_eq!(out.status.code(), Some(0), "{out:?}");
@@ -699,4 +700,13 @@ fn harness_captured_wait_returns_at_exit_while_another_process_holds_the_output(
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stderr, b"done\n");
     assert!(took < flake::scaled(Duration::from_secs(10)), "{took:?}");
+}
+
+/// `flake::closed_stdout`, the closed-stdout case's stdout, has no reader: a write fails with
+/// EPIPE (the test process ignores SIGPIPE, as every Rust program does).
+#[test]
+fn harness_closed_stdout_has_no_reader() {
+    let mut f = flake::closed_stdout();
+    let err = f.write_all(b"x").unwrap_err();
+    assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
 }

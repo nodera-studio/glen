@@ -684,11 +684,10 @@ pub fn display_width(line: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(strip_ansi(line).as_str())
 }
 
-/// A pipe whose read end is already closed: every write gets EPIPE.
+/// A stdout whose writes fail with EPIPE (`flake::closed_stdout`: a FIFO with no reader, which
+/// unlike a dropped pipe reader no concurrently spawned process can hold).
 pub fn closed_stdout() -> Stdio {
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    drop(reader);
-    Stdio::from(writer)
+    Stdio::from(crate::flake::closed_stdout())
 }
 
 // ---------------------------------------------------------------------------------------------

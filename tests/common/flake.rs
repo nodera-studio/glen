@@ -136,6 +136,31 @@ impl std::ops::DerefMut for Captured {
     }
 }
 
+/// A file every write to which fails with EPIPE, for a child's stdout: the write end of a FIFO
+/// whose only reader has closed. A pipe from `std::io::pipe()` with its reader dropped is not
+/// enough on macOS: std sets the pipe's `FD_CLOEXEC` after `pipe()`, so a process another test
+/// thread spawns in between keeps the read end for its life, and the child's writes succeed. Both
+/// FIFO ends are opened with `O_CLOEXEC`, and its path is removed before this returns, so no other
+/// process can hold or open a reader.
+pub fn closed_stdout() -> File {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("stdout");
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+    let made = unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) };
+    assert_eq!(made, 0, "mkfifo: {}", std::io::Error::last_os_error());
+    let reader = File::options()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&path)
+        .unwrap();
+    // A reader exists, so this blocking open returns at once.
+    let writer = File::options().write(true).open(&path).unwrap();
+    drop(reader);
+    writer
+}
+
 /// Lets `settle` pass (a window in which the caller may check that nothing happened), then waits
 /// until process `pid` catches SIGINT, so a SIGINT sent next reaches its handler instead of the
 /// default or inherited disposition. Linux shows the handler in `/proc/<pid>/status` (`SigCgt`).
