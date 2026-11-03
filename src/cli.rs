@@ -129,7 +129,6 @@ pub enum Command {
     )]
     Watch(WatchArgs),
     #[command(
-        hide = true,
         about = "Serve glen's commands to an MCP host over stdio",
         after_help = "Examples:\n  claude mcp add glen -- glen mcp\n  codex mcp add glen -- glen mcp"
     )]
@@ -992,13 +991,33 @@ mod mcp_tests {
         assert!(!help.contains("channel"), "{help}");
     }
     #[test]
-    fn mcp_is_hidden_until_the_flip() {
-        assert!(public_command().find_subcommand("mcp").is_none());
-        assert!(
-            Cli::command()
-                .find_subcommand("mcp")
-                .is_some_and(|c| c.is_hide_set())
+    fn mcp_surface_is_public() {
+        let mut public = public_command();
+        let names: Vec<_> = public.get_subcommands().map(|c| c.get_name()).collect();
+        let at = names
+            .iter()
+            .position(|n| *n == "mcp")
+            .expect("mcp is public");
+        assert_eq!(
+            (names[at - 1], names[at + 1]),
+            ("watch", "install-extension")
         );
+        let mcp = public.find_subcommand_mut("mcp").unwrap();
+        assert!(!mcp.is_hide_set());
+        let help = mcp.render_help().to_string();
+        assert!(help.contains("claude mcp add glen -- glen mcp"), "{help}");
+        assert!(!help.contains("channel"), "{help}");
+        for shell in [
+            clap_complete::Shell::Bash,
+            clap_complete::Shell::Zsh,
+            clap_complete::Shell::Fish,
+        ] {
+            let mut buf = Vec::new();
+            clap_complete::generate(shell, &mut public_command(), "glen", &mut buf);
+            let script = String::from_utf8(buf).unwrap();
+            assert!(script.contains("mcp"), "{shell}");
+            assert!(!script.contains("channel"), "{shell}");
+        }
     }
 }
 

@@ -225,18 +225,18 @@ fn the_catalog_holds_the_fourteen_tools_and_the_skips() {
         .iter()
         .map(|s| (s.command.as_str(), s.reason.as_str()))
         .collect();
-    let mut want = vec![
-        ("stop", "alias"),
-        ("watch", "tty"),
-        ("install-extension", "installer"),
-        ("install-skill", "installer"),
-        ("completions", "shell-setup"),
-        ("help", "help"),
-    ];
-    if skipped.iter().any(|(c, _)| *c == "mcp") {
-        want.insert(2, ("mcp", "server"));
-    }
-    assert_eq!(skipped, want);
+    assert_eq!(
+        skipped,
+        [
+            ("stop", "alias"),
+            ("watch", "tty"),
+            ("mcp", "server"),
+            ("install-extension", "installer"),
+            ("install-skill", "installer"),
+            ("completions", "shell-setup"),
+            ("help", "help"),
+        ]
+    );
     for hidden in ["__acp", "__worker"] {
         assert!(!catalog::TOOLS_JSON.contains(hidden), "{hidden}");
         assert!(

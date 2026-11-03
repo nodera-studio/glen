@@ -124,6 +124,8 @@ Never poll the inbox in a loop or re-run `glen wait` on a timer: start one recei
 - Never work around a refusal: don't start omp on a session yourself or copy it. Two writers fork a session.
 - Don't send into a session someone is using unless asked; on a busy session prefer default follow-up.
 - Setup: `glen doctor`. Update: `glen install-skill`. Completions for people: `glen completions zsh`.
+- MCP hosts can register `glen mcp` and call glen as tools (`glen_ls`, `glen_send`, `glen_wait`, …) with the same envelopes (`isError` is `ok:false`); never run it from Bash. <!-- glen:if mcp -->
+  In a tool call `send` and `wait` still wait up to 90 s: pass a shorter `wait` or `timeout` if the host cuts calls sooner. <!-- glen:if mcp -->
 <!-- glen:if watch -->
 - For people in an interactive terminal: `glen watch <handle>` (exits 2 without a terminal); agents should not run it and use `glen tail <handle> -f` for a transcript and the receivers under Replies without polling for replies.
 <!-- glen:end -->

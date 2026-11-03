@@ -770,3 +770,38 @@ fn w4_warm_bullet_is_guarded_and_valid() {
         assert!(cli::Cli::try_parse_from(args).is_ok(), "{args:?}");
     }
 }
+#[test]
+fn w5_mcp_lines_are_guarded_and_valid() {
+    use clap::Parser;
+    let lines: Vec<_> = skill::parse_template(skill::TEMPLATE)
+        .unwrap()
+        .into_iter()
+        .filter(|s| s.text.contains("glen mcp") || s.text.contains("In a tool call"))
+        .collect();
+    assert_eq!(lines.len(), 2, "one bullet, two physical lines: {lines:?}");
+    for segment in &lines {
+        assert_eq!(segment.guards, ["mcp"], "{segment:?}");
+    }
+    for agent in Agent::ALL {
+        let text = skill::render_current(agent).unwrap();
+        let rules = text
+            .split("\n## Rules\n")
+            .nth(1)
+            .and_then(|s| s.split("\n## ").next())
+            .unwrap();
+        for term in [
+            "`glen mcp`",
+            "`glen_ls`, `glen_send`, `glen_wait`",
+            "`isError` is `ok:false`",
+            "never run it from Bash",
+            "up to 90 s",
+            "a shorter `wait` or `timeout`",
+        ] {
+            assert!(rules.contains(term), "{agent:?}: {term}\n{rules}");
+        }
+        assert!(!text.contains("channel"), "{agent:?}");
+    }
+    // The span parses through the real clap.
+    let cli = cli::Cli::try_parse_from(["glen", "mcp"]).unwrap();
+    assert_eq!(cli.command.name(), "mcp");
+}

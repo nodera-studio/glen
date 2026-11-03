@@ -792,6 +792,10 @@
       "reason": "tty"
     },
     {
+      "command": "mcp",
+      "reason": "server"
+    },
+    {
       "command": "install-extension",
       "reason": "installer"
     },
