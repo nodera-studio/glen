@@ -13,18 +13,24 @@
 //! (`FAKE_OMP_RUN_RELEASE`, `FAKE_OMP_RESULT_RELEASE`, `FAKE_EXT_RUN_RELEASE`,
 //! `FAKE_EXT_RESULT_RELEASE`) so no case races a job's own end. Every `glen` runs with a cleared
 //! environment against a scratch HOME and GLEN_HOME and a fake peer, never a live `~/.omp`.
+//!
+//! Under `scripts/flake-check.sh` the waits and the upper bounds on the product's timing (the
+//! AC-v2-201 and AC-v2-202 one-second wakes, the 2 s SIGINT exits, "at once" bounds) are multiplied
+//! by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); lower bounds and the windows
+//! in which nothing may happen are not.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
+use crate::flake::{Captured, await_sigint_handler, scaled, try_output};
 use crate::live_support::*;
 use crate::reader::*;
 use crate::rpc_support::*;
@@ -37,7 +43,9 @@ const ONE_SECOND: Duration = Duration::from_secs(1);
 // Helpers: a background `glen`, file watchers, `next` commands, durations.
 // ---------------------------------------------------------------------------------------------
 
-/// A running `glen` whose exit instant is recorded by the thread that reaps it.
+/// A running `glen` whose exit instant is recorded by the thread that reaps it. Its output goes to
+/// files (`flake::Captured`): the exit instant is the reap, never a pipe's end of file, which a
+/// process that inherited the pipe from a concurrent spawn could hold back.
 struct Bg {
     pid: u32,
     rx: mpsc::Receiver<(Out, Instant)>,
@@ -48,16 +56,13 @@ struct Bg {
 
 impl Bg {
     fn spawn(mut cmd: Command, desc: &str) -> Bg {
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-        let child = cmd
-            .spawn()
-            .unwrap_or_else(|e| panic!("spawn glen {desc}: {e}"));
+        let child = Captured::spawn(&mut cmd).unwrap_or_else(|e| panic!("spawn glen {desc}: {e}"));
         let pid = child.id();
         let started = Instant::now();
         let desc = format!("glen {desc}");
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let r = child.wait_with_output().expect("wait for glen");
+            let r = child.wait_with_output();
             let at = Instant::now();
             let out = Out {
                 desc,
@@ -129,7 +134,7 @@ impl Drop for Bg {
 fn watch_lines(path: PathBuf, lines: usize) -> mpsc::Receiver<Instant> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + scaled(Duration::from_secs(30));
         while Instant::now() < deadline {
             if let Ok(b) = fs::read(&path)
                 && b.iter().filter(|c| **c == b'\n').count() >= lines
@@ -323,7 +328,7 @@ fn held_rpc_job(rb: &RpcBox) -> HeldJob {
         .env("FAKE_OMP_RESULT_RELEASE", &result)
         .run();
     let id = job_id(&data_of(&out, 10));
-    rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id, "accepted", scaled(LONG), |s| s["status"] == "accepted");
     HeldJob::new(id, run, result)
 }
 
@@ -331,7 +336,7 @@ fn held_rpc_job(rb: &RpcBox) -> HeldJob {
 fn replied_rpc_job(rb: &RpcBox) -> (HeldJob, Vec<Value>) {
     let h = held_rpc_job(rb);
     h.release_run();
-    let replies = poll_until("two replies on disk", LONG, || {
+    let replies = poll_until("two replies on disk", scaled(LONG), || {
         let r = replies_on_disk(rb, &h.id);
         (r.len() >= 2).then_some(r)
     });
@@ -409,14 +414,14 @@ fn ac_v2_201_rpc_a_reply_wakes_wait_for_reply_within_one_second() {
     );
     let landed = watch_lines(rb.job_dir(&h.id).join("replies.ndjson"), 1);
     h.release_run();
-    let (out, exited) = w.join(LONG);
+    let (out, exited) = w.join(scaled(LONG));
     let at = landed
-        .recv_timeout(LONG)
+        .recv_timeout(scaled(LONG))
         .expect("the peer appended a reply to replies.ndjson");
     let lag = exited.saturating_duration_since(at);
     eprintln!("rpc reply wake lag: {lag:?}");
     assert!(
-        lag <= ONE_SECOND,
+        lag <= scaled(ONE_SECOND),
         "the wait returned {lag:?} after the reply landed\n{}",
         out.ctx()
     );
@@ -450,7 +455,7 @@ fn ac_v2_201_rpc_replies_already_present_wake_at_once_and_only_unseen_ones_are_r
     // Without --after nothing is seen: both replies come back at once, not at the bound.
     let out = reply_wait(&rb, &h.handle, &["--timeout", "20s"]);
     assert!(
-        out.elapsed < Duration::from_secs(10),
+        out.elapsed < scaled(Duration::from_secs(10)),
         "replies already present wake the call at once ({:?})",
         out.elapsed
     );
@@ -459,7 +464,11 @@ fn ac_v2_201_rpc_replies_already_present_wake_at_once_and_only_unseen_ones_are_r
 
     // --after skips every reply up to and including the id it names.
     let out = reply_wait(&rb, &h.handle, &["--after", id1, "--timeout", "20s"]);
-    assert!(out.elapsed < Duration::from_secs(10), "{}", out.ctx());
+    assert!(
+        out.elapsed < scaled(Duration::from_secs(10)),
+        "{}",
+        out.ctx()
+    );
     let d = assert_wake(&out, &h, &[r2]);
     assert_wait_next(&d, &h.handle, Some(id2), Some(Duration::from_secs(20)));
 
@@ -483,7 +492,7 @@ fn ac_v2_201_rpc_each_wake_returns_the_next_replies_and_none_twice() {
     let mut seen: Vec<String> = Vec::new();
     let mut after: Option<String> = None;
     h.release_run();
-    let want = poll_until("both replies on disk", LONG, || {
+    let want = poll_until("both replies on disk", scaled(LONG), || {
         let r = replies_on_disk(&rb, &h.id);
         (r.len() >= 2).then(|| reply_ids(&json!(r)))
     });
@@ -518,7 +527,7 @@ fn ac_v2_201_rpc_bound_expiry_has_no_woke_and_a_next_that_keeps_the_caller_flags
     let h = held_rpc_job(&rb);
     let out = reply_wait(&rb, &h.handle, &["--timeout", "500ms"]);
     assert!(
-        out.elapsed >= Duration::from_millis(450) && out.elapsed < Duration::from_secs(10),
+        out.elapsed >= Duration::from_millis(450) && out.elapsed < scaled(Duration::from_secs(10)),
         "the bound is honoured ({:?})",
         out.elapsed
     );
@@ -558,13 +567,13 @@ fn ac_v2_201_rpc_sigint_gives_the_expiry_document_with_interrupted_true_and_exit
     let (h, disk) = replied_rpc_job(&rb);
     let last = disk[1]["id"].as_str().unwrap().to_owned();
     let mut w = spawn_reply_wait(&rb, &h, &["--after", &last]);
-    std::thread::sleep(Duration::from_millis(700));
+    await_sigint_handler(w.pid, Duration::from_millis(700));
     assert!(w.running(), "no unseen reply, so the wait keeps waiting");
     let sent = Instant::now();
     w.signal(Signal::INT);
-    let (out, exited) = w.join(LONG);
+    let (out, exited) = w.join(scaled(LONG));
     assert!(
-        exited.duration_since(sent) < Duration::from_secs(2),
+        exited.duration_since(sent) < scaled(Duration::from_secs(2)),
         "SIGINT ends the wait promptly"
     );
     let d = data_of(&out, 130);
@@ -606,7 +615,7 @@ fn ac_v2_201_rpc_an_after_id_outside_the_jobs_replies_is_usage_unknown_reply() {
             "details.job names the job: {err}"
         );
         assert!(
-            out.elapsed < Duration::from_secs(10),
+            out.elapsed < scaled(Duration::from_secs(10)),
             "an unknown id is refused at once, never waited on ({:?})",
             out.elapsed
         );
@@ -733,7 +742,7 @@ fn ac_v2_201_rpc_completed_first_returns_exit_0_with_only_the_unseen_replies() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(w.running(), "no unseen reply and no end yet");
     h.release_result();
-    let (out, _) = w.join(LONG);
+    let (out, _) = w.join(scaled(LONG));
     let d = data_of(&out, 0);
     for k in COMPLETED_KEYS {
         assert!(d.get(k).is_some(), "completed data lacks `{k}`: {d}");
@@ -793,7 +802,7 @@ fn ac_v2_201_rpc_aborted_first_returns_exit_7_with_the_unseen_replies_in_the_det
     std::thread::sleep(Duration::from_millis(500));
     assert!(w.running());
     signal(worker, Signal::TERM);
-    let (out, _) = w.join(LONG);
+    let (out, _) = w.join(scaled(LONG));
     let err = assert_ended_with(&out, "job_failed", "aborted", "canceled", &[]);
     assert_eq!(err["details"]["error"]["code"], "cancelled", "{err}");
     rb.wait_terminal(&h.id);
@@ -861,7 +870,7 @@ fn ac_v2_201_rpc_lost_first_returns_exit_7_with_the_unseen_replies_in_the_detail
             signal_group(pgid, Signal::KILL);
         }
     }
-    poll_until("the worker to be gone", LONG, || {
+    poll_until("the worker to be gone", scaled(LONG), || {
         (!pid_alive(worker)).then_some(())
     });
     let out = reply_wait(&rb, &h.handle, &["--timeout", "20s"]);
@@ -928,7 +937,7 @@ fn ac_v2_201_rpc_a_reply_racing_the_end_of_the_job_is_never_lost_or_repeated() {
             .env("FAKE_OMP_RUN_RELEASE", &run)
             .run();
         let id = job_id(&data_of(&out, 10));
-        rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+        rb.wait_status(&id, "accepted", scaled(LONG), |s| s["status"] == "accepted");
         let handle = job_handle(&id);
         let args = ["wait", handle.as_str(), "--for", "reply", "--json"];
         let mut w = Bg::spawn(rb.command(&args), "wait --for reply (race)");
@@ -936,7 +945,7 @@ fn ac_v2_201_rpc_a_reply_racing_the_end_of_the_job_is_never_lost_or_repeated() {
         assert!(w.running());
         fs::write(&run, "").unwrap();
         let mut seen: Vec<String> = Vec::new();
-        let (mut out, _) = w.join(LONG);
+        let (mut out, _) = w.join(scaled(LONG));
         for _ in 0..4 {
             let code = out.code();
             let d = out.json()["data"].clone();
@@ -1064,8 +1073,12 @@ fn ac_v2_201_rpc_a_reply_line_is_not_returned_until_its_newline_has_landed() {
     assert!(w.running(), "an unterminated line must not wake the wait");
     append(b"\n");
     let landed = Instant::now();
-    let (out, exited) = w.join(LONG);
-    assert!(exited.duration_since(landed) <= ONE_SECOND, "{}", out.ctx());
+    let (out, exited) = w.join(scaled(LONG));
+    assert!(
+        exited.duration_since(landed) <= scaled(ONE_SECOND),
+        "{}",
+        out.ctx()
+    );
     assert_wake(&out, &h, &[&rec]);
     finish_held(&rb, &h);
 }
@@ -1090,7 +1103,7 @@ fn held_live_job(lb: &LiveBox) -> (Ext, HeldJob, Value) {
     );
     let send = data_of(&lb.send(A.handle, "hi", &["--no-wait"]).run(), 10);
     let id = job_id(&send);
-    lb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&id, "accepted", scaled(LONG), |s| s["status"] == "accepted");
     (ext, HeldJob::new(id, run, result), send)
 }
 
@@ -1103,14 +1116,14 @@ fn ac_v2_201_live_a_reply_wakes_wait_for_reply_within_one_second() {
     assert!(w.running(), "nothing replied yet\n{}", lb.diag());
     let landed = watch_lines(lb.job_dir(&h.id).join("replies.ndjson"), 1);
     h.release_run();
-    let (out, exited) = w.join(LONG);
+    let (out, exited) = w.join(scaled(LONG));
     let at = landed
-        .recv_timeout(LONG)
+        .recv_timeout(scaled(LONG))
         .expect("the live job recorded a reply");
     let lag = exited.saturating_duration_since(at);
     eprintln!("live reply wake lag: {lag:?}");
     assert!(
-        lag <= ONE_SECOND,
+        lag <= scaled(ONE_SECOND),
         "the wait returned {lag:?} after the reply landed\n{}",
         out.ctx()
     );
@@ -1131,7 +1144,7 @@ fn ac_v2_201_live_after_skips_earlier_replies_and_the_end_of_the_job_wins() {
     let lb = LiveBox::new();
     let (_ext, h, _) = held_live_job(&lb);
     h.release_run();
-    let disk = poll_until("two live replies", LONG, || {
+    let disk = poll_until("two live replies", scaled(LONG), || {
         let r = replies_on_disk(&lb, &h.id);
         (r.len() >= 2).then_some(r)
     });
@@ -1149,7 +1162,7 @@ fn ac_v2_201_live_after_skips_earlier_replies_and_the_end_of_the_job_wins() {
     std::thread::sleep(Duration::from_millis(500));
     assert!(w.running());
     h.release_result();
-    let (out, _) = w.join(LONG);
+    let (out, _) = w.join(scaled(LONG));
     let d = data_of(&out, 0);
     assert_eq!(d["status"], "completed", "{d}");
     assert_eq!(d["replies"], json!([]), "{d}");
@@ -1491,7 +1504,7 @@ fn ac_v2_203_lost_is_failed_and_a_failed_job_without_an_error_record_is_failed()
             signal_group(pgid, Signal::KILL);
         }
     }
-    poll_until("the worker to be gone", LONG, || {
+    poll_until("the worker to be gone", scaled(LONG), || {
         (!pid_alive(worker)).then_some(())
     });
     let wait = rb
@@ -1683,7 +1696,7 @@ fn ac_v2_202_timeout_is_capped_at_24h_and_needs_wait_and_wait_conflicts_with_fol
         let out = rb.glen(args).run();
         failed(&out, "usage");
         assert!(
-            out.elapsed < Duration::from_secs(10),
+            out.elapsed < scaled(Duration::from_secs(10)),
             "{args:?} is refused at once"
         );
     }
@@ -1705,7 +1718,7 @@ fn ac_v2_202_an_unread_message_returns_at_once_with_the_normal_document_and_is_m
     let two = put(&rb, A.id, "two");
     let out = inbox_wait(&rb, &["--timeout", "20s"]);
     assert!(
-        out.elapsed < Duration::from_secs(10),
+        out.elapsed < scaled(Duration::from_secs(10)),
         "unread messages do not wait for the bound ({:?})",
         out.elapsed
     );
@@ -1746,11 +1759,11 @@ fn ac_v2_202_a_message_arriving_during_the_wait_wakes_it_within_one_second() {
         let text = format!("knock {i}");
         let rec = put(&rb, A.id, &text);
         let sent = Instant::now();
-        let (out, exited) = w.join(LONG);
+        let (out, exited) = w.join(scaled(LONG));
         let lag = exited.duration_since(sent);
         eprintln!("inbox wake lag ({scope:?}): {lag:?}");
         assert!(
-            lag <= ONE_SECOND,
+            lag <= scaled(ONE_SECOND),
             "woke {lag:?} after the append ({scope:?})\n{}",
             out.ctx()
         );
@@ -1767,7 +1780,7 @@ fn ac_v2_202_the_bound_gives_exit_10_with_no_messages_a_next_command_and_no_stat
     let rb = RpcBox::new();
     let out = inbox_wait(&rb, &["--timeout", "300ms"]);
     assert!(
-        out.elapsed >= Duration::from_millis(250) && out.elapsed < Duration::from_secs(10),
+        out.elapsed >= Duration::from_millis(250) && out.elapsed < scaled(Duration::from_secs(10)),
         "the bound is honoured ({:?})",
         out.elapsed
     );
@@ -1894,8 +1907,12 @@ fn ac_v2_202_session_decides_what_wakes_the_wait() {
     );
     let rec = put(&rb, A.id, "alpha");
     let sent = Instant::now();
-    let (out, exited) = w.join(LONG);
-    assert!(exited.duration_since(sent) <= ONE_SECOND, "{}", out.ctx());
+    let (out, exited) = w.join(scaled(LONG));
+    assert!(
+        exited.duration_since(sent) <= scaled(ONE_SECOND),
+        "{}",
+        out.ctx()
+    );
     let d = data_of(&out, 0);
     assert_eq!(d["total"], 1, "only the requested session: {d}");
     assert_eq!(d["messages"][0]["id"], rec["id"], "{d}");
@@ -1924,8 +1941,12 @@ fn ac_v2_202_cwd_decides_what_wakes_the_wait() {
     );
     let rec = put(&rb, A.id, "alpha");
     let sent = Instant::now();
-    let (out, exited) = w.join(LONG);
-    assert!(exited.duration_since(sent) <= ONE_SECOND, "{}", out.ctx());
+    let (out, exited) = w.join(scaled(LONG));
+    assert!(
+        exited.duration_since(sent) <= scaled(ONE_SECOND),
+        "{}",
+        out.ctx()
+    );
     let d = data_of(&out, 0);
     assert_eq!(d["total"], 1, "only the requested project: {d}");
     assert_eq!(d["messages"][0]["id"], rec["id"], "{d}");
@@ -1942,13 +1963,13 @@ fn ac_v2_202_cwd_decides_what_wakes_the_wait() {
 fn ac_v2_202_sigint_gives_the_bound_document_with_interrupted_true_and_exit_130() {
     let rb = RpcBox::new();
     let mut w = spawn_inbox(&rb, &["--timeout", "60s"]);
-    std::thread::sleep(Duration::from_millis(700));
+    await_sigint_handler(w.pid, Duration::from_millis(700));
     assert!(w.running());
     let sent = Instant::now();
     w.signal(Signal::INT);
-    let (out, exited) = w.join(LONG);
+    let (out, exited) = w.join(scaled(LONG));
     assert!(
-        exited.duration_since(sent) < Duration::from_secs(2),
+        exited.duration_since(sent) < scaled(Duration::from_secs(2)),
         "SIGINT ends the wait promptly"
     );
     let d = assert_inbox_bound(&out, 130);
@@ -1968,7 +1989,7 @@ fn ac_v2_202_sigterm_keeps_its_default_disposition() {
     std::thread::sleep(Duration::from_millis(700));
     assert!(w.running());
     w.signal(Signal::TERM);
-    let (out, _) = w.join(LONG);
+    let (out, _) = w.join(scaled(LONG));
     assert!(
         out.status.signal() == Some(15) || out.status.code() == Some(143),
         "SIGTERM terminates the process as usual: {:?}\n{}",
@@ -2009,14 +2030,14 @@ fn ac_v2_202_a_live_reply_reaching_the_inbox_wakes_inbox_wait_within_one_second(
     assert!(w.running(), "nothing is unread yet\n{}", lb.diag());
     let landed = watch_lines(lb.inbox_file(A.id), 1);
     h.release_run();
-    let (out, exited) = w.join(LONG);
+    let (out, exited) = w.join(scaled(LONG));
     let at = landed
-        .recv_timeout(LONG)
+        .recv_timeout(scaled(LONG))
         .expect("the extension wrote an inbox record");
     let lag = exited.saturating_duration_since(at);
     eprintln!("live inbox wake lag: {lag:?}");
     assert!(
-        lag <= ONE_SECOND,
+        lag <= scaled(ONE_SECOND),
         "woke {lag:?} after the record landed\n{}",
         out.ctx()
     );
@@ -2872,16 +2893,16 @@ fn ac_v2_206_the_offline_acceptance_self_test_passes() {
     }
     let sb = Sandbox::new();
     let tmp = sb.dir("tmp");
-    let out = Command::new("bash")
-        .arg(repo_root().join("tests/acceptance/self-test.sh"))
-        .env_clear()
-        .env("PATH", &path)
-        .env("HOME", &sb.home)
-        .env("TMPDIR", &tmp)
-        .current_dir(&sb.cwd)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run the acceptance self-test");
+    let out = try_output(
+        Command::new("bash")
+            .arg(repo_root().join("tests/acceptance/self-test.sh"))
+            .env_clear()
+            .env("PATH", &path)
+            .env("HOME", &sb.home)
+            .env("TMPDIR", &tmp)
+            .current_dir(&sb.cwd),
+    )
+    .expect("run the acceptance self-test");
     assert!(
         out.status.success(),
         "self-test failed ({:?})\n{}\n{}",
