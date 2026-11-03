@@ -1,4 +1,8 @@
+//! Upper bounds, setup waits and the `--timeout` of a control expected to succeed are multiplied
+//! by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); a `--timeout` under test,
+//! lower bounds and absence windows stay exact.
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use glen::{
     glen_home::GlenHome,
@@ -8,7 +12,7 @@ use serde_json::{Value, json};
 use std::{
     fs,
     path::Path,
-    process::{Output, Stdio},
+    process::Output,
     time::{Duration, Instant},
 };
 fn command(b: &RpcBox, args: &[&str]) -> std::process::Command {
@@ -36,7 +40,7 @@ fn checked(out: Output, exit: i32) -> Value {
     value
 }
 fn run(b: &RpcBox, args: &[&str], exit: i32) -> Value {
-    checked(command(b, args).output().unwrap(), exit)
+    checked(command(b, args).captured(), exit)
 }
 fn warning(value: &Value, code: &str) -> bool {
     value["warnings"]
@@ -50,8 +54,12 @@ fn home(b: &RpcBox) -> GlenHome {
         root: b.omp.glen_home.clone(),
     }
 }
+/// A `--timeout` value: `d` scaled.
+fn ms(d: Duration) -> String {
+    format!("{}ms", flake::scaled(d).as_millis())
+}
 fn accepted(b: &RpcBox, id: &str) {
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         (b.job(id).1["status"] == "accepted").then_some(())
     });
 }
@@ -67,13 +75,22 @@ fn launch(b: &RpcBox) -> Value {
     checked(
         command(b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     )
 }
 fn terminate_job(b: &RpcBox, id: &str) {
-    let value = run(b, &["abort", "e27c0de", "--timeout", "15s", "--json"], 0);
+    let value = run(
+        b,
+        &[
+            "abort",
+            "e27c0de",
+            "--timeout",
+            &ms(Duration::from_secs(15)),
+            "--json",
+        ],
+        0,
+    );
     assert_eq!(value["data"]["job_status"], "aborted");
     b.wait_worker_gone(id);
 }
@@ -319,8 +336,7 @@ fn ac362_compact_and_instructions() {
     let out = checked(
         command(&b, &["compact", "e27c0de", "--json"])
             .env("FAKE_OMP_SCENARIO", "compact_error")
-            .output()
-            .unwrap(),
+            .captured(),
         7,
     );
     assert_eq!(out["error"]["details"]["reason"], "omp_error");
@@ -337,8 +353,7 @@ fn ac354_rpc_safety() {
     let moved = checked(
         command(&b, &["model", "e27c0de", "fake/fake-2", "--json"])
             .env("FAKE_OMP_SCENARIO", "moved")
-            .output()
-            .unwrap(),
+            .captured(),
         7,
     );
     assert_eq!(moved["error"]["details"]["reason"], "session_moved");
@@ -347,8 +362,7 @@ fn ac354_rpc_safety() {
     let fork = checked(
         command(&b, &["thinking", "e27c0de", "high", "--json"])
             .env("FAKE_OMP_SCENARIO", "fork_control")
-            .output()
-            .unwrap(),
+            .captured(),
         11,
     );
     assert!(
@@ -392,23 +406,18 @@ fn ac363_rpc_bounds() {
                 "--json",
             ],
         );
-        cmd.env("FAKE_OMP_COMPACT_DELAY_MS", "8000")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.env("FAKE_OMP_COMPACT_DELAY_MS", "8000");
         let start = Instant::now();
-        let child = cmd.spawn().unwrap();
+        let child = flake::Captured::spawn(&mut cmd).unwrap();
         if interrupt {
-            poll(Duration::from_secs(3), || {
+            poll(flake::scaled(Duration::from_secs(3)), || {
                 (!b.frames_in("compact").is_empty()).then_some(())
             });
             let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
             rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
         }
-        let value = checked(
-            child.wait_with_output().unwrap(),
-            if interrupt { 130 } else { 7 },
-        );
-        assert!(start.elapsed() < Duration::from_secs(6));
+        let value = checked(child.wait_with_output(), if interrupt { 130 } else { 7 });
+        assert!(start.elapsed() < flake::scaled(Duration::from_secs(6)));
         if interrupt {
             assert_eq!(value["data"]["interrupted"], true);
         } else {
@@ -417,7 +426,7 @@ fn ac363_rpc_bounds() {
         assert!(b.frames_in("abort").is_empty());
         assert_eq!(fs::read(b.omp.session('A')).unwrap(), before);
         for start in b.fake_log().into_iter().filter(|r| r["event"] == "start") {
-            poll(Duration::from_secs(2), || {
+            poll(flake::scaled(Duration::from_secs(2)), || {
                 matches!(
                     glen::jobs::liveness::start_token(start["pid"].as_u64().unwrap() as u32),
                     glen::jobs::liveness::Probe::Gone
@@ -436,18 +445,16 @@ fn w8_err3_term_and_hup_stop_the_rpc_control() {
         let b = RpcBox::new();
         let before = fs::read(b.omp.session('A')).unwrap();
         let mut cmd = command(&b, &["compact", "e27c0de", "--timeout", "15s", "--json"]);
-        cmd.env("FAKE_OMP_COMPACT_DELAY_MS", "4000")
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.env("FAKE_OMP_COMPACT_DELAY_MS", "4000");
         let start = Instant::now();
-        let child = cmd.spawn().unwrap();
-        poll(Duration::from_secs(3), || {
+        let child = flake::Captured::spawn(&mut cmd).unwrap();
+        poll(flake::scaled(Duration::from_secs(3)), || {
             (!b.frames_in("compact").is_empty()).then_some(())
         });
         std::thread::sleep(Duration::from_millis(1500).saturating_sub(start.elapsed()));
         let pid = rustix::process::Pid::from_raw(child.id() as i32).unwrap();
         rustix::process::kill_process(pid, signal).unwrap();
-        let value = checked(child.wait_with_output().unwrap(), 130);
+        let value = checked(child.wait_with_output(), 130);
         assert_eq!(value["data"]["interrupted"], true, "{signal:?}");
         assert_eq!(value["data"]["route"], "rpc", "{signal:?}");
         let starts: Vec<_> = b
@@ -457,7 +464,7 @@ fn w8_err3_term_and_hup_stop_the_rpc_control() {
             .collect();
         assert!(!starts.is_empty());
         for start in starts {
-            poll(Duration::from_secs(2), || {
+            poll(flake::scaled(Duration::from_secs(2)), || {
                 matches!(
                     glen::jobs::liveness::start_token(start["pid"].as_u64().unwrap() as u32),
                     glen::jobs::liveness::Probe::Gone
@@ -504,7 +511,7 @@ fn ac352_job_route_and_ac364_controls_share_the_client() {
     assert!(b.frames_in("compact").is_empty());
     let start = Instant::now();
     terminate_job(&b, id);
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(3)));
 }
 #[test]
 fn ac364_deferred_and_expired_controls() {
@@ -514,12 +521,11 @@ fn ac364_deferred_and_expired_controls() {
         command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_READY_RELEASE", &release)
             .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("run-release"))
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let id = job_id(&launched);
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         glen::jobs::lock::holder(&home(&b), A_ID)
             .is_some()
             .then_some(())
@@ -547,7 +553,7 @@ fn ac364_deferred_and_expired_controls() {
     fs::write(&release, "go").unwrap();
     accepted(&b, id);
     let control = b.job_dir(id).join("control");
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         fs::read_dir(&control).ok().and_then(|entries| {
             entries
                 .flatten()
@@ -575,8 +581,7 @@ fn ac358_disk_without_thinking_and_ac367_width() {
     assert!(!b.omp.glen_home.exists());
     let out = command(&b, &["models", "--human"])
         .env("COLUMNS", "60")
-        .output()
-        .unwrap();
+        .captured();
     assert!(out.status.success());
     assert!(
         String::from_utf8(out.stdout)
@@ -635,8 +640,7 @@ fn ac352_live_controls_and_ac353_old_extension() {
             let value = checked(
                 command(&b.rpc, &args)
                     .env("GLEN_OMP_BIN", "/nonexistent")
-                    .output()
-                    .unwrap(),
+                    .captured(),
                 if old { 6 } else { 0 },
             );
             if old {
@@ -675,18 +679,26 @@ fn ac356_live_abort_settles_the_job() {
     let mut b = LiveBox::new();
     b.start_ext(A_ID, "never_settles", &[]);
     let launched = checked(
-        command(&b.rpc, &["send", "e27c0de", "hold", "--no-wait", "--json"])
-            .output()
-            .unwrap(),
+        command(&b.rpc, &["send", "e27c0de", "hold", "--no-wait", "--json"]).captured(),
         10,
     );
     let id = job_id(&launched);
     accepted(&b.rpc, id);
     let start = Instant::now();
     let aborted = run(&b.rpc, &["abort", "e27c0de", "--json"], 0);
-    assert!(start.elapsed() < Duration::from_secs(7));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(7)));
     assert_eq!(aborted["data"]["aborted"], true);
-    let result = run(&b.rpc, &["wait", id, "--timeout", "5s", "--json"], 7);
+    let result = run(
+        &b.rpc,
+        &[
+            "wait",
+            id,
+            "--timeout",
+            &ms(Duration::from_secs(5)),
+            "--json",
+        ],
+        7,
+    );
     assert_eq!(result["error"]["details"]["error"]["code"], "aborted");
     b.rpc.wait_worker_gone(id);
 }
@@ -781,8 +793,7 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
         command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
             .env("FAKE_OMP_STATE_DELAY_MS", "3000")
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let id = job_id(&launched);
@@ -794,12 +805,12 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
         "a.json",
         json!({"v":1,"op":"list_models","deadline_ms":now}).to_string(),
     );
-    poll(Duration::from_secs(2), || {
+    poll(flake::scaled(Duration::from_secs(2)), || {
         (b.frames_in("get_state").len() >= 2).then_some(())
     });
     // Worker polling can emit get_state, but only a.json asks for the model catalog.
     // Its final get_state is delayed by the serial fake, keeping a.json in flight.
-    poll(Duration::from_secs(10), || {
+    poll(flake::scaled(Duration::from_secs(10)), || {
         (!b.frames_in("get_available_models").is_empty()).then_some(())
     });
     assert!(!dir.join("a.done.json").exists());
@@ -811,8 +822,8 @@ fn ac364_abort_during_a_serial_control_and_no_dispatch_after_stop() {
         json!({"v":1,"op":"set_thinking_level","args":{"level":"high"},"deadline_ms":now})
             .to_string(),
     );
-    b.wait_terminal(id, Duration::from_secs(13));
-    assert!(start.elapsed() < Duration::from_secs(13));
+    b.wait_terminal(id, flake::scaled(Duration::from_secs(13)));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(13)));
     b.wait_worker_gone(id);
     let log = b.fake_log();
     let incoming: Vec<_> = log
@@ -872,39 +883,35 @@ fn ac364_request_before_ready_runs_after_release_and_job_ended_reroutes_once() {
             command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
                 .env("FAKE_OMP_READY_RELEASE", &release)
                 .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("run-release"))
-                .output()
-                .unwrap(),
+                .captured(),
             10,
         );
         let id = job_id(&launched);
-        poll(Duration::from_secs(3), || {
+        poll(flake::scaled(Duration::from_secs(3)), || {
             glen::jobs::lock::holder(&home(&b), A_ID)
                 .is_some()
                 .then_some(())
         });
-        poll(Duration::from_secs(3), || {
+        poll(flake::scaled(Duration::from_secs(3)), || {
             b.fake_log()
                 .iter()
                 .any(|r| r["event"] == "start")
                 .then_some(())
         });
-        let child = command(
+        let child = flake::Captured::spawn(&mut command(
             &b,
             &[
                 "model",
                 "e27c0de",
                 "fake/fake-2",
                 "--timeout",
-                "10s",
+                &ms(Duration::from_secs(10)),
                 "--json",
             ],
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
+        ))
         .unwrap();
         let dir = b.job_dir(id).join("control");
-        poll(Duration::from_secs(3), || {
+        poll(flake::scaled(Duration::from_secs(3)), || {
             fs::read_dir(&dir)
                 .ok()?
                 .filter_map(Result::ok)
@@ -914,10 +921,10 @@ fn ac364_request_before_ready_runs_after_release_and_job_ended_reroutes_once() {
         assert!(b.frames_in("set_model").is_empty());
         if end_job {
             write_control(&dir, "stop.json", r#"{"v":1,"op":"abort"}"#);
-            b.wait_terminal(id, Duration::from_secs(3));
+            b.wait_terminal(id, flake::scaled(Duration::from_secs(3)));
         }
         fs::write(&release, "go").unwrap();
-        let changed = checked(child.wait_with_output().unwrap(), 0);
+        let changed = checked(child.wait_with_output(), 0);
         assert_eq!(
             changed["data"]["route"],
             if end_job { "rpc" } else { "job" }
@@ -953,17 +960,26 @@ fn ac356_queued_jobs_and_ac365_legacy_holder_fallback() {
                 "FAKE_OMP_RUN_RELEASE",
                 b.omp.tmp.path().join("second-release"),
             )
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let second_id = job_id(&second);
-    poll(Duration::from_secs(2), || {
+    poll(flake::scaled(Duration::from_secs(2)), || {
         (b.job(second_id).1["waiting_for_lock"] == true).then_some(())
     });
     let listed = run(&b, &["models", "e27c0de", "--json"], 0);
     assert_eq!(listed["data"]["route"], "job");
-    let aborted = run(&b, &["abort", "e27c0de", "--timeout", "15s", "--json"], 0);
+    let aborted = run(
+        &b,
+        &[
+            "abort",
+            "e27c0de",
+            "--timeout",
+            &ms(Duration::from_secs(15)),
+            "--json",
+        ],
+        0,
+    );
     assert!(warning(&aborted, "jobs_queued"));
     assert!(
         aborted["data"]["queued_jobs"]
@@ -994,7 +1010,7 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
             let _ = kill_process(self.0, Signal::CONT);
         }
     }
-    struct Abort(std::process::Child);
+    struct Abort(flake::Captured);
     impl Drop for Abort {
         fn drop(&mut self) {
             if self.0.try_wait().unwrap().is_none() {
@@ -1013,29 +1029,34 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
                 "FAKE_OMP_RUN_RELEASE",
                 b.omp.tmp.path().join("second-release"),
             )
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let second_id = job_id(&second);
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         let status = b.job(second_id).1;
         (status["waiting_for_lock"] == true && status["status"] == "queued").then_some(())
     });
     let worker = Paused::new(b.job(first_id).1["worker_pid"].as_u64().unwrap() as u32);
     let mut abort = Abort(
-        command(&b, &["abort", "e27c0de", "--timeout", "15s", "--json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap(),
+        flake::Captured::spawn(&mut command(
+            &b,
+            &[
+                "abort",
+                "e27c0de",
+                "--timeout",
+                &ms(Duration::from_secs(15)),
+                "--json",
+            ],
+        ))
+        .unwrap(),
     );
     let requests = b.job_dir(first_id).join("control");
     // Wait for the request the worker can see, not merely one this test can read: the caller
     // fills a dotted temp and fsyncs it before renaming it to `<id>.json`, and the worker's
     // control::poll never reads the temp. Pausing the caller between write and rename would
     // hide the abort from j1 forever.
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         fs::read_dir(&requests)
             .ok()?
             .filter_map(Result::ok)
@@ -1053,38 +1074,16 @@ fn abort_reports_the_pre_abort_queue_even_after_the_next_job_is_accepted() {
     let caller = Paused::new(abort.0.id());
     drop(worker);
     assert_eq!(
-        b.wait_terminal(first_id, Duration::from_secs(5))["status"],
+        b.wait_terminal(first_id, flake::scaled(Duration::from_secs(5)))["status"],
         "aborted"
     );
     accepted(&b, second_id);
     assert!(abort.0.try_wait().unwrap().is_none());
     drop(caller);
-    let status = poll(Duration::from_secs(3), || abort.0.try_wait().unwrap());
-    use std::io::Read;
-    let mut stdout = vec![];
-    let mut stderr = vec![];
-    abort
-        .0
-        .stdout
-        .take()
-        .unwrap()
-        .read_to_end(&mut stdout)
-        .unwrap();
-    abort
-        .0
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_end(&mut stderr)
-        .unwrap();
-    let result = checked(
-        Output {
-            status,
-            stdout,
-            stderr,
-        },
-        0,
-    );
+    let status = poll(flake::scaled(Duration::from_secs(3)), || {
+        abort.0.try_wait().unwrap()
+    });
+    let result = checked(abort.0.output(status), 0);
     assert_eq!(result["data"]["route"], "job");
     assert_eq!(result["data"]["job_status"], "aborted");
     assert_eq!(
@@ -1109,15 +1108,14 @@ fn ac363_ready_deadline_stops_without_mutation() {
             "FAKE_OMP_READY_RELEASE",
             b.omp.tmp.path().join("never-ready"),
         )
-        .output()
-        .unwrap(),
+        .captured(),
         7,
     );
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(3)));
     assert_eq!(value["error"]["details"]["reason"], "timeout");
     assert!(b.frames_in("set_thinking_level").is_empty());
     for start in b.fake_log().into_iter().filter(|r| r["event"] == "start") {
-        poll(Duration::from_secs(3), || {
+        poll(flake::scaled(Duration::from_secs(3)), || {
             matches!(
                 glen::jobs::liveness::start_token(start["pid"].as_u64().unwrap() as u32),
                 glen::jobs::liveness::Probe::Gone
@@ -1140,8 +1138,8 @@ fn fakes_cover_every_op() {
         omp_rpc::ClientOptions {
             tools: vec![],
             uris: vec![],
-            ready_timeout: Duration::from_secs(3),
-            default_timeout: Duration::from_secs(2),
+            ready_timeout: flake::scaled(Duration::from_secs(3)),
+            default_timeout: flake::scaled(Duration::from_secs(2)),
         },
     )
     .unwrap();
@@ -1180,7 +1178,8 @@ fn fakes_cover_every_op() {
         Op::Compact(CompactArgs::default()),
     ] {
         assert_eq!(
-            glen::live::client::unary(&registry.socket, &op, Duration::from_secs(3)).unwrap()["session_id"],
+            glen::live::client::unary(&registry.socket, &op, flake::scaled(Duration::from_secs(3)))
+                .unwrap()["session_id"],
             A_ID
         );
     }
@@ -1190,31 +1189,32 @@ fn fakes_cover_every_op() {
 fn ac352_endpoint_after_lock_wait_and_live_lock_conflict() {
     let mut live = LiveBox::new();
     let lock = hold_glen_lock_as(&home(&live.rpc), A_ID, None);
-    let child = command(
-        &live.rpc,
-        &[
-            "model",
-            "e27c0de",
-            "fake/fake-2",
-            "--timeout",
-            "8s",
-            "--json",
-        ],
+    let child = flake::Captured::spawn(
+        command(
+            &live.rpc,
+            &[
+                "model",
+                "e27c0de",
+                "fake/fake-2",
+                "--timeout",
+                &ms(Duration::from_secs(8)),
+                "--json",
+            ],
+        )
+        .env("FAKE_CTL_LOCK_WAIT_GATE", "1"),
     )
-    .env("FAKE_CTL_LOCK_WAIT_GATE", "1")
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
     .unwrap();
     let gate = live.rpc.omp.glen_home.join("run/locks").join(format!(
         ".{}.{}.control-waiting",
         glen::jobs::lock::lock_key(A_ID),
         child.id()
     ));
-    poll(Duration::from_secs(3), || gate.exists().then_some(()));
+    poll(flake::scaled(Duration::from_secs(3)), || {
+        gate.exists().then_some(())
+    });
     live.start_ext(A_ID, "ok", &[]);
     drop(lock);
-    let value = checked(child.wait_with_output().unwrap(), 0);
+    let value = checked(child.wait_with_output(), 0);
     assert_eq!(value["data"]["route"], "live");
     assert!(live.rpc.fake_log().is_empty());
     let _held = live.rpc.hold_glen_lock(A_ID);
@@ -1240,7 +1240,7 @@ fn ac358_endpoint_only_fallback_and_ac363_live_timeout() {
             &["compact", "e27c0de", "--timeout", "1s", "--json"],
             7,
         );
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < flake::scaled(Duration::from_secs(2)));
         assert_eq!(value["error"]["details"]["reason"], "timeout");
         assert!(
             value["error"]["hint"]
@@ -1262,9 +1262,7 @@ fn ac356_abort_pending_and_ac362_live_busy() {
     {
         let mut live = LiveBox::new();
         live.start_ext(A_ID, "busy", &[]);
-        let output = command(&live.rpc, &["model", "e27c0de", "fake/fake-2", "--human"])
-            .output()
-            .unwrap();
+        let output = command(&live.rpc, &["model", "e27c0de", "fake/fake-2", "--human"]).captured();
         assert!(output.status.success());
         assert!(
             String::from_utf8(output.stdout)
@@ -1284,7 +1282,7 @@ fn ac352_unresponsive_live_endpoint_and_ac363_whole_hello_deadline() {
         &["abort", "e27c0de", "--timeout", "500ms", "--json"],
         7,
     );
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(1)));
     assert_eq!(value["error"]["details"]["reason"], "timeout");
     let start = Instant::now();
     run(
@@ -1294,12 +1292,12 @@ fn ac352_unresponsive_live_endpoint_and_ac363_whole_hello_deadline() {
             "e27c0de",
             "fake/fake-2",
             "--timeout",
-            "5s",
+            &ms(Duration::from_secs(5)),
             "--json",
         ],
         6,
     );
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(3)));
     assert!(live.rpc.fake_log().is_empty());
     assert!(
         live.ext_log()
@@ -1318,20 +1316,24 @@ fn fix1_terminal_job_waits_for_in_flight_ack_without_duplicate_model_change() {
         command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", &release)
             .env("FAKE_OMP_STATE_DELAY_MS", "950")
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let id = job_id(&launched);
     accepted(&b, id);
-    let child = command(&b, &["model", "e27c0de", "fake/fake-2", "--json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    std::thread::sleep(Duration::from_millis(500));
+    let states = b.frames_in("get_state").len();
+    let child = flake::Captured::spawn(&mut command(
+        &b,
+        &["model", "e27c0de", "fake/fake-2", "--json"],
+    ))
+    .unwrap();
+    // The worker has the control in flight once omp sees its preflight get_state (delayed
+    // 950 ms by the fake); release the turn then.
+    poll(flake::scaled(Duration::from_secs(3)), || {
+        (b.frames_in("get_state").len() > states).then_some(())
+    });
     fs::write(release, "go").unwrap();
-    let changed = checked(child.wait_with_output().unwrap(), 0);
+    let changed = checked(child.wait_with_output(), 0);
     assert_eq!(changed["data"]["route"], "job");
     b.wait_worker_gone(id);
     assert_eq!(b.frames_in("set_model").len(), 1);
@@ -1352,8 +1354,7 @@ fn fix2_inbox_preflight_past_request_deadline_never_sets_model() {
         command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
             .env("FAKE_OMP_STATE_DELAY_MS", "1500")
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let id = job_id(&launched);
@@ -1374,7 +1375,7 @@ fn fix2_inbox_preflight_past_request_deadline_never_sets_model() {
     assert_eq!(error["error"]["details"]["reason"], "timeout");
     assert!(b.frames_in("get_state").len() > before);
     let dir = b.job_dir(id).join("control");
-    let ack = poll(Duration::from_secs(5), || {
+    let ack = poll(flake::scaled(Duration::from_secs(5)), || {
         fs::read_dir(&dir).ok()?.flatten().find_map(|entry| {
             let path = entry.path();
             path.to_string_lossy()
@@ -1394,29 +1395,25 @@ fn fix7_closed_in_flight_control_after_terminal_retries_once() {
         command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
             .env("FAKE_OMP_STATE_DELAY_MS", "8000")
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let id = job_id(&launched);
     accepted(&b, id);
     let before = b.frames_in("get_state").len();
-    let child = command(
+    let child = flake::Captured::spawn(&mut command(
         &b,
         &[
             "model",
             "e27c0de",
             "fake/fake-2",
             "--timeout",
-            "25s",
+            &ms(Duration::from_secs(25)),
             "--json",
         ],
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
+    ))
     .unwrap();
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         (b.frames_in("get_state").len() > before).then_some(())
     });
     write_control(
@@ -1424,14 +1421,14 @@ fn fix7_closed_in_flight_control_after_terminal_retries_once() {
         "stop.json",
         r#"{"v":1,"op":"abort"}"#,
     );
-    b.wait_terminal(id, Duration::from_secs(13));
+    b.wait_terminal(id, flake::scaled(Duration::from_secs(13)));
     let fake_pid = b.fake_log().iter().find(|r| r["event"] == "start").unwrap()["pid"]
         .as_u64()
         .unwrap();
     // Closing the RPC peer unblocks the control while the worker joins it.
     let pid = rustix::process::Pid::from_raw(fake_pid as i32).unwrap();
     rustix::process::kill_process(pid, rustix::process::Signal::KILL).unwrap();
-    let changed = checked(child.wait_with_output().unwrap(), 0);
+    let changed = checked(child.wait_with_output(), 0);
     assert_eq!(changed["data"]["route"], "rpc");
     assert_eq!(b.frames_in("set_model").len(), 1);
     assert_eq!(
@@ -1464,20 +1461,26 @@ fn fix8_terminal_lock_holder_waits_or_reports_finishing() {
                 start: Some(identity.start),
             }),
         );
-        let mut child = command(&b, &["abort", "e27c0de", "--timeout", "5s", "--json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = flake::Captured::spawn(&mut command(
+            &b,
+            &[
+                "abort",
+                "e27c0de",
+                "--timeout",
+                &ms(Duration::from_secs(5)),
+                "--json",
+            ],
+        ))
+        .unwrap();
         let start = Instant::now();
         if release {
             std::thread::sleep(Duration::from_millis(400));
             assert!(child.try_wait().unwrap().is_none());
             drop(lock);
-            let result = checked(child.wait_with_output().unwrap(), 0);
+            let result = checked(child.wait_with_output(), 0);
             assert_eq!(result["data"]["was"], "idle");
         } else {
-            let error = checked(child.wait_with_output().unwrap(), 7);
+            let error = checked(child.wait_with_output(), 7);
             assert_eq!(error["error"]["details"]["reason"], "busy");
             assert!(
                 error["error"]["message"]
@@ -1486,7 +1489,7 @@ fn fix8_terminal_lock_holder_waits_or_reports_finishing() {
                     .contains("a glen job is finishing; retry")
             );
             assert!(start.elapsed() >= Duration::from_millis(1900));
-            assert!(start.elapsed() < Duration::from_secs(4));
+            assert!(start.elapsed() < flake::scaled(Duration::from_secs(4)));
             drop(lock);
         }
     }
@@ -1496,36 +1499,35 @@ fn fix8_terminal_lock_holder_waits_or_reports_finishing() {
 fn fix3_startup_cancel_reaps_omp_before_releasing_session_lock() {
     for (interrupt, baseline) in [(false, false), (true, false), (false, true), (true, true)] {
         let b = RpcBox::new();
-        let mut child = command(
-            &b,
-            &[
-                "model",
-                "e27c0de",
-                "fake/fake-2",
-                "--timeout",
-                if interrupt { "30s" } else { "1500ms" },
-                "--json",
-            ],
+        let mut child = flake::Captured::spawn(
+            command(
+                &b,
+                &[
+                    "model",
+                    "e27c0de",
+                    "fake/fake-2",
+                    "--timeout",
+                    if interrupt { "30s" } else { "1500ms" },
+                    "--json",
+                ],
+            )
+            // The ready sleep requires KILL; delayed get_state observes TERM.
+            .env(
+                "FAKE_OMP_READY_DELAY_MS",
+                if baseline { "0" } else { "60000" },
+            )
+            .env(
+                "FAKE_OMP_BASELINE_DELAY_MS",
+                if baseline { "60000" } else { "0" },
+            ),
         )
-        // The ready sleep requires KILL; delayed get_state observes TERM.
-        .env(
-            "FAKE_OMP_READY_DELAY_MS",
-            if baseline { "0" } else { "60000" },
-        )
-        .env(
-            "FAKE_OMP_BASELINE_DELAY_MS",
-            if baseline { "60000" } else { "0" },
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
         .unwrap();
-        let pid = poll(Duration::from_secs(5), || {
+        let pid = poll(flake::scaled(Duration::from_secs(5)), || {
             b.fake_log().iter().find(|r| r["event"] == "start")?["pid"].as_u64()
         });
         let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
         if baseline {
-            poll(Duration::from_secs(1), || {
+            poll(flake::scaled(Duration::from_secs(1)), || {
                 (!b.frames_in("get_state").is_empty()).then_some(())
             });
         }
@@ -1543,7 +1545,7 @@ fn fix3_startup_cancel_reaps_omp_before_releasing_session_lock() {
         }
         let start = Instant::now();
         // Observe the actual lock continuously, including while TERM is pending.
-        let lock = poll(Duration::from_secs(5), || {
+        let lock = poll(flake::scaled(Duration::from_secs(5)), || {
             let lock = glen::jobs::lock::try_acquire(&home(&b), A_ID).unwrap()?;
             assert_eq!(
                 rustix::process::test_kill_process_group(pid),
@@ -1556,18 +1558,17 @@ fn fix3_startup_cancel_reaps_omp_before_releasing_session_lock() {
             ));
             Some(lock)
         });
-        poll(Duration::from_secs(5), || child.try_wait().unwrap());
-        let value = checked(
-            child.wait_with_output().unwrap(),
-            if interrupt { 130 } else { 7 },
-        );
+        poll(flake::scaled(Duration::from_secs(5)), || {
+            child.try_wait().unwrap()
+        });
+        let value = checked(child.wait_with_output(), if interrupt { 130 } else { 7 });
         if interrupt {
             assert_eq!(value["data"]["interrupted"], true);
             assert_eq!(value["data"]["status"], "interrupted");
         } else {
             assert_eq!(value["error"]["details"]["reason"], "timeout");
         }
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < flake::scaled(Duration::from_secs(5)));
         assert!(b.frames_in("set_model").is_empty());
         drop(lock);
     }
@@ -1587,8 +1588,7 @@ fn fix3_ephemeral_teardown_closes_transport_before_escalating() {
         let value = checked(
             command(&b, &args)
                 .env("FAKE_OMP_SCENARIO", "wedge")
-                .output()
-                .unwrap(),
+                .captured(),
             0,
         );
         assert!(!warning(&value, "teardown_error"), "{args:?}: {value}");
@@ -1631,8 +1631,7 @@ fn fix4_startup_stderr_is_drained_into_json_warnings() {
         let value = checked(
             command(&b, &args)
                 .env("FAKE_OMP_STARTUP_STDERR", &message)
-                .output()
-                .unwrap(),
+                .captured(),
             0,
         );
         let warnings = value["warnings"].as_array().unwrap();
@@ -1663,8 +1662,7 @@ fn c2_3_startup_failure_surfaces_stderr_in_details_and_message() {
                 command(&b, &args)
                     .env("FAKE_OMP_STARTUP_STDERR", lines.join("\n"))
                     .env("FAKE_OMP_SCENARIO", "startup_exit")
-                    .output()
-                    .unwrap(),
+                    .captured(),
                 5,
             );
             let captured = &lines[..lines.len().min(16)];
@@ -1685,8 +1683,7 @@ fn c2_3_startup_failure_surfaces_stderr_in_details_and_message() {
     let out = command(&b, &["models", "--human"])
         .env("FAKE_OMP_STARTUP_STDERR", "fatal startup error\n")
         .env("FAKE_OMP_SCENARIO", "startup_exit")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(5));
     assert!(String::from_utf8_lossy(&out.stderr).contains("fatal startup error"));
 }
@@ -1706,8 +1703,7 @@ fn c2_3_startup_deadline_keeps_stderr_and_timeout_reason() {
                     "FAKE_OMP_BASELINE_DELAY_MS",
                     if baseline { "60000" } else { "0" },
                 )
-                .output()
-                .unwrap(),
+                .captured(),
             7,
         );
         assert_eq!(value["error"]["details"]["reason"], "timeout");
@@ -1731,8 +1727,7 @@ fn c2_1_disconnect_after_submission_reports_unknown_without_retry() {
         let value = checked(
             command(&b, &["model", "e27c0de", "fake/fake-2", "--json"])
                 .env("FAKE_OMP_SET_MODEL_DROP", drop_at)
-                .output()
-                .unwrap(),
+                .captured(),
             7,
         );
         assert_eq!(value["error"]["code"], "control_failed");
@@ -1759,28 +1754,24 @@ fn c2_1_terminal_job_submitted_control_never_retries() {
         command(&b, &["send", "e27c0de", "hold", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
             .env("FAKE_OMP_SET_MODEL_DELAY_MS", "20000")
-            .output()
-            .unwrap(),
+            .captured(),
         10,
     );
     let id = job_id(&launched);
     accepted(&b, id);
-    let child = command(
+    let child = flake::Captured::spawn(&mut command(
         &b,
         &[
             "model",
             "e27c0de",
             "fake/fake-2",
             "--timeout",
-            "25s",
+            &ms(Duration::from_secs(25)),
             "--json",
         ],
-    )
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
+    ))
     .unwrap();
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         (!b.frames_in("set_model").is_empty()).then_some(())
     });
     write_control(
@@ -1788,8 +1779,8 @@ fn c2_1_terminal_job_submitted_control_never_retries() {
         "stop.json",
         r#"{"v":1,"op":"abort"}"#,
     );
-    b.wait_terminal(id, Duration::from_secs(13));
-    let error = checked(child.wait_with_output().unwrap(), 7);
+    b.wait_terminal(id, flake::scaled(Duration::from_secs(13)));
+    let error = checked(child.wait_with_output(), 7);
     assert_eq!(error["error"]["code"], "control_failed");
     assert_eq!(error["error"]["details"]["reason"], "outcome_unknown");
     assert_eq!(b.frames_in("set_model").len(), 1);
@@ -1806,24 +1797,23 @@ fn c2_1_terminal_job_submitted_control_never_retries() {
 #[test]
 fn c2_2_sigint_during_preflight_exits_130_without_set_model() {
     let b = RpcBox::new();
-    let child = command(
-        &b,
-        &[
-            "model",
-            "e27c0de",
-            "fake/fake-2",
-            "--timeout",
-            "30s",
-            "--json",
-        ],
+    let child = flake::Captured::spawn(
+        command(
+            &b,
+            &[
+                "model",
+                "e27c0de",
+                "fake/fake-2",
+                "--timeout",
+                "30s",
+                "--json",
+            ],
+        )
+        .env("FAKE_OMP_STATE_DELAY_AT", "4")
+        .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "20000"),
     )
-    .env("FAKE_OMP_STATE_DELAY_AT", "4")
-    .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "20000")
-    .stdout(Stdio::piped())
-    .stderr(Stdio::piped())
-    .spawn()
     .unwrap();
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         (b.frames_in("get_state").len() == 4).then_some(())
     });
     rustix::process::kill_process(
@@ -1831,7 +1821,7 @@ fn c2_2_sigint_during_preflight_exits_130_without_set_model() {
         rustix::process::Signal::INT,
     )
     .unwrap();
-    let value = checked(child.wait_with_output().unwrap(), 130);
+    let value = checked(child.wait_with_output(), 130);
     assert_eq!(value["data"]["interrupted"], true);
     assert!(b.frames_in("set_model").is_empty());
 }
@@ -1843,12 +1833,11 @@ fn c2_4_compact_timeout_unblocks_teardown_promptly() {
     let value = checked(
         command(&b, &["compact", "e27c0de", "--timeout", "1s", "--json"])
             .env("FAKE_OMP_COMPACT_DELAY_MS", "20000")
-            .output()
-            .unwrap(),
+            .captured(),
         7,
     );
     assert!(
-        start.elapsed() < Duration::from_millis(1500),
+        start.elapsed() < flake::scaled(Duration::from_millis(1500)),
         "elapsed: {:?}",
         start.elapsed()
     );
@@ -1875,8 +1864,7 @@ fn c2_7_inbox_controls_cannot_outlive_job_deadline() {
                 .env("FAKE_OMP_RUN_RELEASE", b.omp.tmp.path().join("release"))
                 .env("FAKE_OMP_STATE_DELAY_MS", "3000")
                 .env("FAKE_OMP_SERIAL", "0")
-                .output()
-                .unwrap(),
+                .captured(),
             10,
         );
         let id = job_id(&launched);
@@ -1892,7 +1880,7 @@ fn c2_7_inbox_controls_cannot_outlive_job_deadline() {
             "c2-deadline.json",
             serde_json::to_vec(&request).unwrap(),
         );
-        let ack = poll(Duration::from_secs(10), || {
+        let ack = poll(flake::scaled(Duration::from_secs(10)), || {
             fs::read(dir.join("c2-deadline.done.json"))
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
@@ -1902,7 +1890,7 @@ fn c2_7_inbox_controls_cannot_outlive_job_deadline() {
             if malformed { "bad_request" } else { "timeout" }
         );
         assert!(b.frames_in("set_thinking_level").is_empty());
-        let terminal = b.wait_terminal(id, Duration::from_secs(10));
+        let terminal = b.wait_terminal(id, flake::scaled(Duration::from_secs(10)));
         assert_eq!(terminal["status"], "failed");
         assert_eq!(terminal["error"]["code"], "timeout");
         b.wait_worker_gone(id);
@@ -1920,15 +1908,20 @@ fn c2_9_success_after_apply_deadline_reaches_cli_with_warning() {
                 "e27c0de",
                 "fake/fake-2",
                 "--timeout",
-                "1s",
+                &ms(Duration::from_secs(1)),
                 "--json",
             ],
         )
-        // Fifth state request is the post-mutation read (after baseline and listing).
+        // Fifth state request is the post-mutation read (after baseline and listing). The
+        // deadline and the delay past it scale together.
         .env("FAKE_OMP_STATE_DELAY_AT", "5")
-        .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "1200")
-        .output()
-        .unwrap(),
+        .env(
+            "FAKE_OMP_PREFLIGHT_DELAY_MS",
+            flake::scaled(Duration::from_millis(1200))
+                .as_millis()
+                .to_string(),
+        )
+        .captured(),
         0,
     );
     assert_eq!(value["data"]["model"]["id"], "fake-2");
