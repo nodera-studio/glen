@@ -1,6 +1,7 @@
 //! W8 audit fixes for jobs: ERR-2 (unpersistable `lost`), DOC-10 (`forked.to_handle` in
 //! `glen jobs`) and DOC-11 (job `not_found` hint).
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use glen::{
     glen_home::GlenHome,
@@ -57,7 +58,7 @@ fn make(b: &RpcBox, state: State, worker_start: &str) -> JobId {
     id
 }
 fn run(b: &RpcBox, args: &[&str], code: i32) -> Value {
-    let o = b.glen(args).output().unwrap();
+    let o = b.glen(args).captured();
     assert_eq!(o.status.code(), Some(code), "{o:?}");
     assert!(
         o.stderr.is_empty(),

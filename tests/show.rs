@@ -1,4 +1,5 @@
 mod common;
+use common::flake::CaptureExt;
 use common::{OmpBox, data, json};
 use serde_json::json as j;
 #[test]
@@ -119,8 +120,7 @@ fn ac120_spill() {
     let o = sb
         .command(&["show", "0a3f417", "--json"], &sb.alpha())
         .env("GLEN_MAX_OUTPUT", "200")
-        .output()
-        .unwrap();
+        .captured();
     assert!(o.status.success());
     let v = json(&o);
     let path = std::path::Path::new(v["spilled"]["path"].as_str().unwrap());
@@ -138,8 +138,7 @@ fn ac120_spill() {
     let o = sb
         .command(&["show", "0a3f417", "--human"], &sb.alpha())
         .env("GLEN_MAX_OUTPUT", "200")
-        .output()
-        .unwrap();
+        .captured();
     assert!(
         String::from_utf8(o.stdout)
             .unwrap()
@@ -153,8 +152,7 @@ fn ac121_human() {
     let o = sb
         .command(&["show", "e27c0de", "--human"], &sb.alpha())
         .env("COLUMNS", "80")
-        .output()
-        .unwrap();
+        .captured();
     assert!(o.status.success());
     let s = String::from_utf8(o.stdout).unwrap();
     for part in [

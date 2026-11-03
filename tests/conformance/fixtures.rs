@@ -1,6 +1,7 @@
 //! The omp session fixtures, checked against the plan's Step 9 specification (AC-023).
 //! Read-only: these tests never write under tests/fixtures/.
 
+use crate::flake::CaptureExt;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -625,7 +626,7 @@ fn fake_omp_reports_a_version_and_rejects_everything_else() {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.output().unwrap()
+        cmd.captured()
     };
     let out = run(&["--version"], &[]);
     assert!(out.status.success());

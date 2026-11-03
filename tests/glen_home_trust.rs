@@ -1,5 +1,8 @@
 //! SEC-3 (W8 G3): glen refuses to write into a GLEN_HOME another user could write to.
 #![cfg(unix)]
+#[path = "common/flake.rs"]
+mod flake;
+use flake::CaptureExt;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 fn glen(home: &Path, glen_home: &Path, args: &[&str]) -> std::process::Output {
@@ -10,8 +13,7 @@ fn glen(home: &Path, glen_home: &Path, args: &[&str]) -> std::process::Output {
         .env("PATH", home)
         .env("GLEN_HOME", glen_home)
         .env("GLEN_MAX_OUTPUT", "10")
-        .output()
-        .unwrap()
+        .captured()
 }
 
 #[test]

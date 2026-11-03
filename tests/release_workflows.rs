@@ -1,4 +1,7 @@
 #![cfg(unix)]
+#[path = "common/flake.rs"]
+mod flake;
+use flake::CaptureExt;
 use glen::error::GlenError;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
@@ -51,7 +54,7 @@ fn deploy_checks_main_immediately_before_wrangler() -> Result {
             .env("REMOTE_SHA", remote)
             .env("GIT_CODE", git_code.to_string())
             .env("DEPLOY_MARKER", &marker)
-            .output()?;
+            .try_captured()?;
         assert_eq!(o.status.success(), succeeds, "{o:?}");
         assert_eq!(marker.exists(), deploys, "{o:?}");
         if remote == "newer" {
@@ -485,7 +488,7 @@ fn omp_latest_summary_names_version_outcomes_and_bump_candidate() -> Result {
             .env("OUTCOME_SURFACE", outcomes[1])
             .env("OUTCOME_FACTS", outcomes[2])
             .env("OUTCOME_DOCTOR", outcomes[3])
-            .output()?;
+            .try_captured()?;
         assert!(o.status.success(), "{o:?}");
         let text = fs::read_to_string(&summary)?;
         assert!(

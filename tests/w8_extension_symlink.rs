@@ -1,6 +1,7 @@
 //! W8 DEBT-2: `glen doctor` and `glen install-extension` judge a symlinked extension path the
 //! same way, so doctor never recommends an install that `--force` cannot perform.
 mod common;
+use common::flake::CaptureExt;
 use common::{OmpBox, data, fake_omp_bin, json};
 use std::{fs, os::unix::fs::symlink};
 
@@ -18,8 +19,7 @@ fn doctor_and_install_extension_agree_on_a_symlinked_extension_dir() {
     let o = b
         .command(&["doctor", "--json"], &b.alpha())
         .env("GLEN_OMP_BIN", fake_omp_bin())
-        .output()
-        .unwrap();
+        .captured();
     let d = data(&o);
     assert_eq!(d["extension"]["state"], "foreign", "{d}");
     assert_eq!(d["extension"]["current"], false);
@@ -44,7 +44,7 @@ fn doctor_and_install_extension_agree_on_a_symlinked_extension_dir() {
     for flags in [&[][..], &["--force"][..]] {
         let mut args = vec!["install-extension", "--json"];
         args.extend_from_slice(flags);
-        let o = b.command(&args, &b.alpha()).output().unwrap();
+        let o = b.command(&args, &b.alpha()).captured();
         assert_eq!(data(&o)["action"], "skipped", "{flags:?}");
         let warning = &json(&o)["warnings"][0];
         assert_eq!(warning["code"], "unsafe_path", "{flags:?}");

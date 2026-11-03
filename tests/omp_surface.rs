@@ -7,6 +7,7 @@
 //! owner's `~/.omp` and the repo's project config are unreachable. No prompt, steer, follow-up
 //! or model change is ever sent.
 mod common;
+use common::flake::{self, CaptureExt};
 use common::{fake_omp_bin, fixture};
 use omp_rpc::{
     Client, ClientOptions, GetAvailableModelsCommand, GetAvailableThinkingLevelsCommand,
@@ -104,7 +105,7 @@ fn end_group(child: &mut Child, grace: Duration) -> bool {
     }
     kill_group(pid);
     let _ = child.wait();
-    let end = Instant::now() + Duration::from_secs(5);
+    let end = Instant::now() + flake::scaled(Duration::from_secs(5));
     while !group_gone(pid) && Instant::now() < end {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -132,7 +133,7 @@ fn join_stderr(reader: JoinHandle<String>, timeout: Duration) -> String {
 fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> Seen {
     let who = if real { "real omp" } else { "fake_omp" };
     // (1) `--version` normalizes through glen's own parser.
-    let out = command(bin, home, env).arg("--version").output().unwrap();
+    let out = command(bin, home, env).arg("--version").captured();
     assert!(out.status.success(), "{who} --version: {out:?}");
     let line = String::from_utf8(out.stdout).unwrap();
     let line = line.lines().next().unwrap_or("");
@@ -140,7 +141,7 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
         .unwrap_or_else(|| panic!("{who} --version is not parseable: {line:?}"))
         .text;
     // (2) `--help` lists every flag glen passes.
-    let out = command(bin, home, env).arg("--help").output().unwrap();
+    let out = command(bin, home, env).arg("--help").captured();
     assert!(out.status.success(), "{who} --help: {out:?}");
     let help = String::from_utf8_lossy(&out.stdout);
     for flag in FLAGS {
@@ -165,8 +166,8 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
         ClientOptions {
             tools: vec![],
             uris: vec![],
-            ready_timeout: Duration::from_secs(30),
-            default_timeout: Duration::from_secs(10),
+            ready_timeout: flake::scaled(Duration::from_secs(30)),
+            default_timeout: flake::scaled(Duration::from_secs(10)),
         },
     );
     let (client, _events) = match connected {
@@ -175,7 +176,7 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
             end_group(&mut child, Duration::ZERO);
             panic!(
                 "{who} did not reach ready: {e}\nstderr: {}",
-                join_stderr(stderr, Duration::from_secs(5))
+                join_stderr(stderr, flake::scaled(Duration::from_secs(5)))
             );
         }
     };
@@ -232,8 +233,8 @@ fn assert_surface(bin: &Path, home: &Path, env: &[(&str, &str)], real: bool) -> 
     // (9) Closing stdin ends omp within 10 s; otherwise the test fails. Either way whatever is
     // left of the group is killed and the stderr join is bounded.
     let closed = client.close();
-    let exited = end_group(&mut child, Duration::from_secs(10));
-    let stderr = join_stderr(stderr, Duration::from_secs(5));
+    let exited = end_group(&mut child, flake::scaled(Duration::from_secs(10)));
+    let stderr = join_stderr(stderr, flake::scaled(Duration::from_secs(5)));
     let (protocol, models) = checks.unwrap_or_else(|e| panic!("{who}: {e}\nstderr: {stderr}"));
     assert!(closed.is_ok(), "{who}: close: {closed:?}");
     assert!(
@@ -279,14 +280,21 @@ fn teardown_kills_descendants_and_bounds_the_stderr_join() {
         let reader = read_stderr(child.stderr.take().unwrap());
         let start = Instant::now();
         assert_eq!(
-            end_group(&mut child, Duration::from_millis(500)),
+            end_group(&mut child, flake::scaled(Duration::from_millis(500))),
             leader_exits,
             "{case}"
         );
         assert!(group_gone(pid), "{case}: the group survived teardown");
-        assert_eq!(join_stderr(reader, Duration::from_secs(2)), "", "{case}");
+        assert_eq!(
+            join_stderr(reader, flake::scaled(Duration::from_secs(2))),
+            "",
+            "{case}"
+        );
         let elapsed = start.elapsed();
-        assert!(elapsed < Duration::from_secs(5), "{case}: {elapsed:?}");
+        assert!(
+            elapsed < flake::scaled(Duration::from_secs(5)),
+            "{case}: {elapsed:?}"
+        );
     }
 }
 #[test]
@@ -307,7 +315,10 @@ fn stderr_join_is_bounded_when_a_writer_outside_the_group_holds_the_pipe() {
     // The spawn's own copy of the write end is gone once `c` is.
     drop(c);
     let reader = read_stderr(pipe_read);
-    assert!(end_group(&mut child, Duration::from_millis(500)));
+    assert!(end_group(
+        &mut child,
+        flake::scaled(Duration::from_millis(500))
+    ));
     assert!(group_gone(pid), "the group survived teardown");
     // An outer bound, so an unbounded join fails here instead of hanging the suite.
     let timeout = Duration::from_millis(500);
@@ -316,7 +327,7 @@ fn stderr_join_is_bounded_when_a_writer_outside_the_group_holds_the_pipe() {
     let joiner = std::thread::spawn(move || {
         let _ = tx.send(join_stderr(reader, timeout));
     });
-    let joined = rx.recv_timeout(timeout + Duration::from_secs(1));
+    let joined = rx.recv_timeout(timeout + flake::scaled(Duration::from_secs(1)));
     let elapsed = start.elapsed();
     // Closing the last write end lets the reader, and an unbounded join, finish.
     drop(holder);

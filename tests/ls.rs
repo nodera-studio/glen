@@ -1,4 +1,5 @@
 mod common;
+use common::flake::CaptureExt;
 use common::{OmpBox, data, json};
 use std::{
     fs,
@@ -85,8 +86,7 @@ fn ac103_122_missing_and_usage() {
     let o = sb
         .command(&["ls"], &sb.alpha())
         .env("PI_CODING_AGENT_DIR", sb.tmp.path().join("missing"))
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(data(&o)["sessions"], serde_json::json!([]));
     sb.clean();
 }
@@ -103,8 +103,7 @@ fn ac121_123_width_and_sanitizing() {
         let o = sb
             .command(&["ls", "--human", "--all"], &sb.alpha())
             .env("COLUMNS", width.to_string())
-            .output()
-            .unwrap();
+            .captured();
         assert!(o.status.success());
         let s = String::from_utf8(o.stdout).unwrap();
         for l in s.lines() {
@@ -122,8 +121,7 @@ fn ac121_123_width_and_sanitizing() {
         .command(&["ls", "--human"], &sb.alpha())
         .env("NO_COLOR", "1")
         .env("CLICOLOR_FORCE", "1")
-        .output()
-        .unwrap();
+        .captured();
     assert!(!o.stdout.contains(&27));
     let p = sb.session('A');
     let b = fs::read_to_string(&p)

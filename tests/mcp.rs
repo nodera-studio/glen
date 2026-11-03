@@ -1,6 +1,7 @@
 //! `glen mcp` on the real binary with `fake_omp` (v0.2 W5, AC-v2-502 to AC-v2-504; design
 //! §A22): a scripted MCP client drives the server over its stdin and stdout.
 mod common;
+use common::flake::CaptureExt;
 use common::{
     A_ID, RpcBox,
     flake::{children_of, scaled},
@@ -391,7 +392,7 @@ fn deterministic_results_are_byte_equal_to_a_direct_run() {
     .enumerate()
     {
         let result = s.call(json!(10 + i), name, arguments);
-        let direct = rb.glen(&argv).output().unwrap();
+        let direct = rb.glen(&argv).captured();
         let direct = String::from_utf8(direct.stdout).unwrap();
         assert!(
             text(&result) == direct,
@@ -651,7 +652,7 @@ fn the_profile_and_cwd_of_the_server_reach_every_child() {
     s.init();
     let listed = envelope(&s.call(json!(1), "glen_ls", json!({})));
     let direct: Value =
-        serde_json::from_slice(&rb.glen(&["--json", "ls"]).output().unwrap().stdout).unwrap();
+        serde_json::from_slice(&rb.glen(&["--json", "ls"]).captured().stdout).unwrap();
     let ids = |doc: &Value| -> Vec<Value> {
         doc["data"]["sessions"]
             .as_array()
@@ -731,13 +732,9 @@ fn a_cancel_kills_the_observer_and_the_job_keeps_running() {
         s.messages().iter().all(|m| m["id"] != 1),
         "a cancelled call is never answered"
     );
-    let active: Value = serde_json::from_slice(
-        &rb.glen(&["--json", "jobs", "--active"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let active: Value =
+        serde_json::from_slice(&rb.glen(&["--json", "jobs", "--active"]).captured().stdout)
+            .unwrap();
     let listed = &active["data"]["jobs"];
     assert_eq!(listed.as_array().unwrap().len(), 1, "{active}");
     assert_eq!(listed[0]["id"], job.as_str());
@@ -917,7 +914,7 @@ fn startup_failures_stay_off_stdout_whatever_the_output_flags() {
         if relative_home {
             cmd.env("GLEN_HOME", "relative/home");
         }
-        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        let out = cmd.captured();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.stdout, b"", "{args:?}: stdout is the protocol's alone");
         assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
@@ -1047,7 +1044,7 @@ fn the_channel_emits_each_new_reply_of_this_project_once_and_marks_nothing_read(
     );
     // `glen inbox` afterwards still lists the replies unread.
     let unread: Value =
-        serde_json::from_slice(&rb.glen(&["--json", "inbox"]).output().unwrap().stdout).unwrap();
+        serde_json::from_slice(&rb.glen(&["--json", "inbox"]).captured().stdout).unwrap();
     let unread: Vec<&Value> = unread["data"]["messages"]
         .as_array()
         .unwrap()

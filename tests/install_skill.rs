@@ -1,4 +1,5 @@
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use glen::skill::{self, Agent};
 use serde_json::Value;
@@ -8,7 +9,7 @@ use std::{
     path::Path,
 };
 fn install(b: &OmpBox, args: &[&str]) -> Value {
-    data(&with_umask(b, args, "022").output().unwrap())
+    data(&with_umask(b, args, "022").captured())
 }
 fn with_umask(b: &OmpBox, args: &[&str], mask: &str) -> std::process::Command {
     let base = b.command(&[], &b.alpha());
@@ -69,8 +70,7 @@ fn ac405_targets() {
         let out = b
             .command(&["install-skill", "--claude"], &b.alpha())
             .env("CLAUDE_CONFIG_DIR", &value)
-            .output()
-            .unwrap();
+            .captured();
         let v = data(&out);
         let expected = if value.is_absolute() {
             value
@@ -265,15 +265,13 @@ fn ac407_output_and_preflight() {
     let out = b
         .command(&["install-skill"], &b.alpha())
         .env_remove("HOME")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(json(&out)["error"]["code"], "invalid_env");
     let out = b
         .command(&["install-skill"], &b.alpha())
         .env("HOME", " \t ")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(2));
     assert_eq!(json(&out)["error"]["code"], "invalid_env");
     let parent = user(&b, Agent::Codex).parent().unwrap().to_path_buf();
@@ -306,8 +304,7 @@ fn ac408_doctor_skill_checks() {
         data(
             &b.command(&["doctor"], &b.alpha())
                 .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-                .output()
-                .unwrap(),
+                .captured(),
         )
     };
     let before = tree(&b.home);
@@ -353,7 +350,7 @@ fn ac409_env_files() {
         if set {
             c.env("XDG_STATE_HOME", "/x");
         }
-        data(&c.output().unwrap())
+        data(&c.captured())
     };
     let v = doctor(false);
     assert_eq!(v["checks"][10]["status"], "warn");
@@ -376,8 +373,7 @@ fn ac409_env_files() {
         .env_remove("PI_CODING_AGENT_DIR")
         .env("XDG_STATE_HOME", "/x")
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(data(&out)["checks"][10]["status"], "warn");
     fs::set_permissions(b.home.join(".env"), fs::Permissions::from_mode(0o000)).unwrap();
     fs::set_permissions(b.alpha().join(".env"), fs::Permissions::from_mode(0o000)).unwrap();
@@ -394,9 +390,9 @@ fn ac410_sandbox() {
                 c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
             }
             let start = std::time::Instant::now();
-            let out = c.output().unwrap();
+            let out = c.captured();
             assert_eq!(out.status.code(), Some(6), "{out:?}");
-            assert!(start.elapsed() < std::time::Duration::from_secs(5));
+            assert!(start.elapsed() < flake::scaled(std::time::Duration::from_secs(5)));
             let v = json(&out);
             assert_eq!(v["error"]["details"]["reason"], "sandboxed");
             assert_eq!(v["error"]["details"]["network"], network);
@@ -414,14 +410,13 @@ fn ac410_sandbox() {
             if !network {
                 c.env("CODEX_SANDBOX_NETWORK_DISABLED", "1");
             }
-            data(&c.output().unwrap());
+            data(&c.captured());
         }
     }
     let out = b
         .glen(&["doctor"])
         .env("CODEX_SANDBOX", "seatbelt")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(data(&out)["checks"][13]["status"], "warn");
     fs::create_dir(&b.omp.glen_home).unwrap();
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o500)).unwrap();
@@ -429,8 +424,7 @@ fn ac410_sandbox() {
         .glen(&["show", "e27c0de"])
         .env("GLEN_MAX_OUTPUT", "200")
         .env("CODEX_SANDBOX", "seatbelt")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(6));
     assert_eq!(json(&out)["error"]["details"]["glen_home_writable"], false);
     assert!(
@@ -442,8 +436,7 @@ fn ac410_sandbox() {
     let out = b
         .glen(&["show", "e27c0de"])
         .env("GLEN_MAX_OUTPUT", "200")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(1));
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o700)).unwrap();
 }
@@ -454,13 +447,11 @@ fn cycle1_project_without_home_whitespace_config_and_umask() {
     let out = b
         .command(&["install-skill", "--project"], &b.alpha())
         .env_remove("HOME")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(data(&out)["scope"], "project");
     let out = with_umask(&b, &["install-skill", "--claude"], "077")
         .env("CLAUDE_CONFIG_DIR", "  ")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(
         data(&out)["targets"][0]["path"],
         user(&b, Agent::Claude).to_str().unwrap()
@@ -521,8 +512,7 @@ fn cycle1_dry_run_never_spills_or_prunes_and_human_verbs_fit() {
         let out = b
             .command(&args, &b.alpha())
             .env("GLEN_MAX_OUTPUT", "1")
-            .output()
-            .unwrap();
+            .captured();
         assert!(out.status.success(), "{out:?}");
         assert!(!b.glen_home.exists());
     }
@@ -538,16 +528,14 @@ fn cycle1_dry_run_never_spills_or_prunes_and_human_verbs_fit() {
     let out = b
         .command(&["install-skill", "--dry-run"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "1")
-        .output()
-        .unwrap();
+        .captured();
     data(&out);
     assert_eq!(tree(&b.glen_home), before);
     for width in ["40", "60"] {
         let out = b
             .command(&["install-skill", "--human", "--dry-run"], &b.alpha())
             .env("COLUMNS", width)
-            .output()
-            .unwrap();
+            .captured();
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("would install"));
         assert!(!text.contains("would installed"));
@@ -577,8 +565,7 @@ fn cycle1_doctor_home_symlink_is_user_copy_and_project_detail_has_no_leading_sep
     let out = b
         .command(&["doctor"], &b.home)
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     assert_eq!(v["skills"]["claude"]["project"], Value::Null);
     assert_eq!(v["checks"][11]["status"], "ok");
@@ -588,8 +575,7 @@ fn cycle1_doctor_home_symlink_is_user_copy_and_project_detail_has_no_leading_sep
     let out = b
         .command(&["doctor"], &b.alpha())
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     let detail = v["checks"][11]["detail"].as_str().unwrap();
     assert!(detail.starts_with("project copy"), "{detail}");
@@ -627,8 +613,7 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
         .glen(&["send", if linux { "@new" } else { "e27c0de" }, "hi"])
         .env("CODEX_SANDBOX", "")
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     assert_eq!(v["status"], "completed");
     b.wait_worker_gone(v["job"]["id"].as_str().unwrap());
@@ -636,8 +621,7 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
         let out = b
             .glen(&["send", "e27c0de", "hi"])
             .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(out.status.code(), Some(6), "{out:?}");
         assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
         assert_eq!(json(&out)["error"]["details"]["lease"], "unknown");
@@ -645,8 +629,7 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
     let out = b
         .glen(&["doctor"])
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     assert_eq!(v["checks"][13]["status"], "info");
     assert_eq!(
@@ -663,8 +646,7 @@ fn cycle1_network_disabled_only_allows_send_and_maps_actual_job_write_failure() 
         .glen(&["send", "@new", "hi"])
         .env("GLEN_HOME", b.omp.glen_home.join("blocked"))
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-        .output()
-        .unwrap();
+        .captured();
     fs::set_permissions(&b.omp.glen_home, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(out.status.code(), Some(6));
     assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
@@ -680,8 +662,7 @@ fn cycle2_doctor_absent_symlink_scopes_and_foreign_file_symlink() {
         .command(&["doctor"], &b.home)
         .env("HOME", &home_link)
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     for a in Agent::ALL {
         assert_eq!(v["skills"][a.as_str()]["project"], Value::Null);
@@ -699,8 +680,7 @@ fn cycle2_doctor_absent_symlink_scopes_and_foreign_file_symlink() {
         data(
             &b.command(&["doctor"], &b.alpha())
                 .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-                .output()
-                .unwrap(),
+                .captured(),
         )
     };
     assert_eq!(doctor()["skills"]["claude"]["project"], Value::Null);
@@ -759,8 +739,7 @@ fn cycle2_foreign_doctor_version_is_null() {
     let out = b
         .command(&["doctor"], &b.alpha())
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     assert_eq!(v["skills"]["claude"]["state"], "foreign");
     assert_eq!(v["skills"]["claude"]["version"], Value::Null);
@@ -779,8 +758,7 @@ fn cycle2_alias_process_environment_resolves_and_suppresses_dotenv_warning() {
         .env_remove("PI_CODING_AGENT_DIR")
         .env("OMP_CODING_AGENT_DIR", &alias)
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     let v = data(&out);
     assert_eq!(v["paths"]["agent_dir"], alias.to_str().unwrap());
     assert_eq!(v["paths"]["agent_dir_source"], "env");
@@ -793,8 +771,7 @@ fn cycle2_refusal_precedes_missing_omp_lookup() {
         .command(&["send", "@new", "hi"], &b.alpha())
         .env("CODEX_SANDBOX", "seatbelt")
         .env("GLEN_OMP_BIN", "/missing/omp")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(6));
     assert_eq!(json(&out)["error"]["details"]["reason"], "sandboxed");
     assert!(!b.glen_home.exists());
@@ -807,8 +784,7 @@ fn cycle2_footer_dry_run_and_line_boundaries_at_40_and_60() {
         let out = b
             .command(&["install-skill", "--human", "--dry-run"], &b.alpha())
             .env("COLUMNS", width)
-            .output()
-            .unwrap();
+            .captured();
         assert!(out.status.success());
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("session\nClaude Code:"), "{text}");
@@ -818,8 +794,7 @@ fn cycle2_footer_dry_run_and_line_boundaries_at_40_and_60() {
                 &b.alpha(),
             )
             .env("COLUMNS", width)
-            .output()
-            .unwrap();
+            .captured();
         assert!(out.status.success());
         let text = String::from_utf8(out.stdout).unwrap();
         assert!(text.contains("would uninstall"), "{text}");
@@ -838,8 +813,7 @@ fn cycle2_marker_only_spill_and_job_write_errors_are_truthful() {
             .env("GLEN_HOME", b.omp.glen_home.join("blocked"))
             .env("GLEN_MAX_OUTPUT", "1")
             .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(out.status.code(), Some(6));
         let v = json(&out);
         let message = v["error"]["message"].as_str().unwrap();
@@ -862,8 +836,7 @@ fn cycle2_worker_network_failures_reach_cli_as_sandboxed() {
             .glen(&["send", "@new", "hi"])
             .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
             .env("FAKE_OMP_SCENARIO", scenario)
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(out.status.code(), Some(6), "{out:?}");
         let v = json(&out);
         // wait's envelope nests the persisted worker error.
@@ -895,8 +868,7 @@ fn cycle2_worker_spawn_permission_failure_is_sandboxed() {
         .glen(&["send", "@new", "hi"])
         .env("GLEN_OMP_BIN", &executable)
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(6), "{out:?}");
     let v = json(&out);
     assert_eq!(
