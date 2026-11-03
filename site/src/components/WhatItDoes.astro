@@ -39,8 +39,8 @@ const send = `<div class="route">
 const cards = [
  { title: 'Find', commands: ['glen ls'], body: 'Lists the omp sessions in this folder, live or idle, each with a short handle.', stage: find },
  { title: 'Read', commands: ['glen show', 'glen tail -f'], body: 'Prints a session’s transcript, or follows it while it grows.', stage: read },
- { title: 'Send', commands: ['glen send', 'glen release'], body: 'Messages a live or idle session, or starts a new one with @new. With --warm, omp stays up for the next send; glen release ends it early.', stage: send },
- { title: 'Hear back', commands: ['glen_reply', 'glen wait --for reply', 'glen inbox --wait'], body: 'The omp model answers with glen_reply. glen wait --for reply returns the moment it does, so your agent never polls. Replies that come later wait in glen inbox.', stage: hear },
+ { title: 'Send', commands: ['glen send'], body: 'Messages a live or idle session, or starts a new one with @new.', stage: send },
+ { title: 'Hear back', commands: ['glen_reply', 'glen wait'], body: 'The omp model answers with glen_reply and glen hands it to your agent. Late replies wait in glen inbox.', stage: hear },
 ];
 const vars = palette.tokens.map(t => `--glen-${t.name}:${t.dark.hex}`).join(';');
 ---
