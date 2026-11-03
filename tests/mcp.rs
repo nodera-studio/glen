@@ -442,11 +442,7 @@ fn is_error_follows_ok_and_exits_10_11_and_130_are_results() {
     assert_eq!(doc["data"]["status"], "running");
     let job = job_id(&doc);
     // A SIGINT-interrupted observer: the exit-130 document.
-    s.start_call(json!(2), "glen_wait", json!({"job":job,"timeout":"60s"}));
-    let observer = poll(Duration::from_secs(10), || s.children().first().copied());
-    thread::sleep(Duration::from_millis(300));
-    signal(observer, rustix::process::Signal::INT);
-    let interrupted = s.answer(&json!(2))["result"].clone();
+    let interrupted = interrupted_wait(&mut s, &job);
     assert_eq!(interrupted["isError"], false, "{interrupted}");
     assert_eq!(
         envelope(&interrupted)["data"]["interrupted"],
@@ -475,6 +471,39 @@ fn is_error_follows_ok_and_exits_10_11_and_130_are_results() {
         }
         rb.wait_worker_gone(&job_id(&doc));
     }
+}
+
+/// Starts a `glen_wait` of `job`, SIGINTs its observer once the observer handles SIGINT, and
+/// returns the call's result. Linux shows the handler in `/proc/<pid>/status` (`SigCgt`), so the
+/// signal waits for exactly that. macOS has no such view (its `ps` has no caught-signal column),
+/// so there a signal that lands before glen installs its handler ends the observer by the default
+/// disposition (an `mcp_exec` result) and the next attempt waits longer.
+fn interrupted_wait(s: &mut Server, job: &str) -> Value {
+    for attempt in 1..=5u32 {
+        let id = json!(format!("wait-{attempt}"));
+        s.start_call(id.clone(), "glen_wait", json!({"job":job,"timeout":"60s"}));
+        let observer = poll(Duration::from_secs(10), || s.children().first().copied());
+        await_sigint_handler(observer, Duration::from_millis(300) * attempt);
+        signal(observer, rustix::process::Signal::INT);
+        let result = s.answer(&id)["result"].clone();
+        if envelope(&result)["error"]["details"]["reason"] != "mcp_exec" {
+            return result;
+        }
+    }
+    panic!("glen wait never reached its SIGINT handler");
+}
+#[cfg(target_os = "linux")]
+fn await_sigint_handler(pid: u32, _: Duration) {
+    poll(Duration::from_secs(10), || {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let mask = status.lines().find_map(|l| l.strip_prefix("SigCgt:"))?;
+        let mask = u64::from_str_radix(mask.trim(), 16).ok()?;
+        (mask & (1u64 << (libc::SIGINT - 1)) != 0).then_some(())
+    });
+}
+#[cfg(not(target_os = "linux"))]
+fn await_sigint_handler(_: u32, settle: Duration) {
+    thread::sleep(settle);
 }
 
 #[test]

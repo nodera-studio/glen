@@ -495,7 +495,7 @@ m_verdict() { # $1: the checks expected to fail (JSON array)
       (.pass == ($failing|length == 0))' "$Q/verdict.json" >/dev/null ||
       { echo "mode m: expected failing=$1" >&2; jq . "$Q/verdict.json" >&2; exit 1; }
 }
-: > "$Q/calls.ndjson"; printf 'reply: M-nonce\n' > "$Q/report.md"
+: > "$Q/calls.ndjson"; printf 'reply: M-nonce\n' > "$Q/report.md"; printf 'claude\n' > "$Q/m-leg"
 m_wire 2025-06-18 1 false wait; m_events ''; m_verdict '[]'
 jq -e '.checks[] | select(.id=="AC-505-initialize").evidence == "client=claude-code/2.1.316 protocol=2025-06-18 first_method=initialize"' "$Q/verdict.json" >/dev/null ||
   { echo 'mode m: AC-505-initialize evidence' >&2; jq . "$Q/verdict.json" >&2; exit 1; }
@@ -503,9 +503,17 @@ m_wire 2025-11-25 1 false wait; m_verdict '[]'
 m_events ToolSearch; m_verdict '[]'
 m_events Bash; m_verdict '["AC-505-no-shell"]'
 m_events mcp__glen__glen_inbox; m_verdict '["AC-505-no-shell"]'
+# The leg comes from the m-leg marker, never from whether m.jsonl exists: the Claude leg fails
+# without a stream to check, and so does a run with no (or an unknown) marker.
+rm "$Q/m.jsonl"; m_verdict '["AC-505-no-shell"]'
+: > "$Q/m.jsonl"; m_verdict '["AC-505-no-shell"]'
+m_events ''; rm "$Q/m-leg"; m_verdict '["AC-505-no-shell"]'
+printf 'gemini\n' > "$Q/m-leg"; m_verdict '["AC-505-no-shell"]'
 # The Codex leg leaves no m.jsonl: the wire log alone decides.
-rm "$Q/m.jsonl"; m_verdict '[]'
-m_events ''
+printf 'codex\n' > "$Q/m-leg"; rm "$Q/m.jsonl"; m_verdict '[]'
+jq -e '.checks[] | select(.id=="AC-505-no-shell").evidence | startswith("codex leg")' "$Q/verdict.json" >/dev/null ||
+  { echo 'mode m: codex leg evidence' >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+printf 'claude\n' > "$Q/m-leg"; m_events ''
 m_wire 2025-06-18 1 false nowait; m_verdict '["AC-505-wait"]'
 m_wire 2025-06-18 2 false wait; m_verdict '["AC-505-send"]'
 m_wire 2025-06-18 1 true wait; m_verdict '["AC-505-send","AC-505-wait"]'
@@ -523,7 +531,7 @@ if ! (unset CLAUDE_CONFIG_DIR; HOME="$Q/owner-home"
       teardown "$Q" "$Q/evidence") > "$Q/teardown.log" 2>&1; then
     echo 'mode m teardown failed' >&2; cat "$Q/teardown.log" >&2; exit 1
 fi
-for file in m.jsonl mcp-in.ndjson mcp-out.ndjson verdict.json manifest.json; do [[ -f $Q/evidence/$file ]] || { echo "mode m evidence lacks $file" >&2; exit 1; }; done
+for file in m.jsonl m-leg mcp-in.ndjson mcp-out.ndjson verdict.json manifest.json; do [[ -f $Q/evidence/$file ]] || { echo "mode m evidence lacks $file" >&2; exit 1; }; done
 [[ ! -e $Q/owner-sessions.after.json && ! -e $Q/evidence/sessions-left.txt ]] || { echo 'mode m took an owner-session snapshot' >&2; exit 1; }
 jq -e '.pass and (.checks|any(.id=="AC-419-teardown" and .pass))' "$Q/evidence/verdict.json" >/dev/null
 # Fake token is assembled at runtime so the repository does not itself contain a credential-shaped string.

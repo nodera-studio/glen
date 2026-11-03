@@ -81,8 +81,9 @@ generates the recording launcher from a manifest carrying `OMP_PROFILE`, `PI_CON
 fake server (bounded by a 10-second alarm, so a launcher that outlives the client's stdin fails) and
 checks that the server saw only the allowlisted names, a scratch `GLEN_HOME` and `mcp` as its argv,
 and that the wire log equals the session. It then checks a passing wire log (both protocol
-versions, with and without `ToolSearch`, and without `m.jsonl` as the Codex leg leaves it), a
-`Bash` or other tool in `m.jsonl` (fails `AC-505-no-shell`), a missing `glen_wait`, two `glen_send`,
+versions, with and without `ToolSearch`, and the Codex leg's marker without `m.jsonl`), a `Bash`
+or other tool in `m.jsonl`, a Claude-leg marker with `m.jsonl` missing or empty, and no or an
+unknown leg marker (each fails `AC-505-no-shell`), a missing `glen_wait`, two `glen_send`,
 an `isError:true` send, a protocol version outside the list, a missing `initialize`, a report
 without the nonce and a missing recording, and that teardown of a passing run exits 0 with the
 wire log in evidence and no owner-session snapshot. Its scratch directory is owned by that
@@ -245,6 +246,7 @@ shell timeout.
 A=tests/acceptance
 E=.claude/evidence/v020-wave-5-mcp/$(date -u +%Y%m%dT%H%M)
 S=$($A/acc.sh setup m)
+printf 'claude\n' > "$S/m-leg"
 (cd "$S/project" && claude -p "$(cat "$S/prompt-m-claude.md")" --mcp-config "$S/mcp.json" --strict-mcp-config \
   --allowedTools "mcp__glen__glen_ls,mcp__glen__glen_send,mcp__glen__glen_wait" \
   --permission-mode dontAsk --max-budget-usd 1.00 --output-format stream-json --verbose) > "$S/m.jsonl"
@@ -271,14 +273,16 @@ evidence `client=<name>/<version> protocol=<v> first_method=<m>`), `AC-505-list`
 was answered), `AC-505-ls` (a `glen_ls` answered `isError:false`), `AC-505-send` (exactly one
 `glen_send`, its `arguments.session` P's handle or id and `arguments.message` `NONCE_M`, answered
 `isError:false`), `AC-505-wait` (a `glen_wait` of that send's job handle or id answered
-`isError:false`), `AC-505-nonce` (the report quotes `NONCE_M`) and `AC-505-no-shell` (every
-`tool_use` in `m.jsonl` is `mcp__glen__glen_ls`, `mcp__glen__glen_send`, `mcp__glen__glen_wait` or
-`ToolSearch`; without `m.jsonl`, as in the Codex leg, the wire log alone decides). The evidence
+`isError:false`), `AC-505-nonce` (the report quotes `NONCE_M`) and `AC-505-no-shell`, which takes
+the leg from the marker `$S/m-leg` (`claude` or `codex`, written by whoever runs the agent): for
+`claude`, `m.jsonl` is present and not empty and every `tool_use` in it is `mcp__glen__glen_ls`,
+`mcp__glen__glen_send`, `mcp__glen__glen_wait` or `ToolSearch`; for `codex` there is no Claude
+stream and the wire log alone decides; no marker, or another word, fails it. The evidence
 strings of `AC-505-ls`, `-send` and `-wait` carry each call's exact `arguments` object, which shows
 whether the client fills schema defaults. Mode m has no `paired_calls`, `guard_refused` or
 `call_budget`. Teardown keeps gitleaks and the owner-skills comparison, skips the owner-session
-snapshot (mode m touches only scratch fixture copies) and copies `m.jsonl` and the wire log into
-evidence.
+snapshot (mode m touches only scratch fixture copies) and copies `m.jsonl`, `m-leg` and the wire
+log into evidence.
 
 Record in `$E/README.md`, reading `AC-505-initialize` first: the client's `initialize`
 `protocolVersion` and `clientInfo` and the first method from `mcp-in.ndjson`; `claude --version`,
@@ -300,8 +304,9 @@ untouched` unless a read-only inspection (`codex --help`, `codex mcp --help`, th
 run without writing `~/.codex/config.toml`, `$CODEX_HOME` or any credential file and without
 copying a credential; then it dispatches `codex:codex-rescue` with `--write --cwd $S/project
 --prompt-file $S/prompt-m-codex.md` and that route, and runs `check m`. Owner: register
-`[mcp_servers.glen]` from `$S/codex-mcp.toml` yourself, run `prompt-m-codex.md` in `$S/project`,
-then `acc.sh check m "$S"` and `acc.sh teardown "$S" "$E/m-codex-mcp"`.
+`[mcp_servers.glen]` from `$S/codex-mcp.toml` yourself, `printf 'codex\n' > "$S/m-leg"`, run
+`prompt-m-codex.md` in `$S/project`, then `acc.sh check m "$S"` and `acc.sh teardown "$S"
+"$E/m-codex-mcp"`.
 
 For every agent mode, before teardown, also run:
 

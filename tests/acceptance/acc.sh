@@ -243,9 +243,12 @@ check_mode() {
     local mode=$1 S=$2
     [[ $mode =~ ^(a|b|b2|b3|c1|c2|m|p)$ ]] || die 'unknown check mode'
     [[ -f $S/manifest.json ]] || die 'missing manifest'
+    # Mode m's leg (claude or codex), written by whoever ran the agent; check.jq never guesses it.
+    local leg=''
+    [[ ! -f $S/m-leg ]] || leg=$(tr -d '[:space:]' < "$S/m-leg")
     if [[ ! -f $S/calls.ndjson ]]; then
         # Reuse the mode's check IDs, but fail every check when setup left no recording.
-        jq -n --arg mode "$mode" --arg scratch "$S" --arg report '' --argjson person '{}' \
+        jq -n --arg mode "$mode" --arg scratch "$S" --arg report '' --arg leg "$leg" --argjson person '{}' \
           --argjson jobs_unchanged false --argjson config_restored false --slurpfile m "$S/manifest.json" \
           --argjson calls '[]' --argjson transcript '[]' --argjson discovered '[]' --argjson probe '[]' --argjson control '[]' \
           --argjson mcp_in '[]' --argjson mcp_out '[]' \
@@ -270,7 +273,7 @@ check_mode() {
     if [[ $mode == c2 && -f $S/config.before.sha256 ]]; then
         [[ $(shasum -a 256 "$HOME/.codex/config.toml" | cut -d ' ' -f1) == "$(cat "$S/config.before.sha256")" ]] && config=true
     fi
-    jq -n --arg mode "$mode" --arg scratch "$S" --arg report "$report" --argjson person "$person" --argjson jobs_unchanged "$jobs" --argjson config_restored "$config" \
+    jq -n --arg mode "$mode" --arg scratch "$S" --arg report "$report" --arg leg "$leg" --argjson person "$person" --argjson jobs_unchanged "$jobs" --argjson config_restored "$config" \
       --slurpfile m "$S/manifest.json" --slurpfile calls "${S}/calls.ndjson" \
       --slurpfile transcript "$([[ -f $S/transcript.jsonl ]] && printf '%s' "$S/transcript.jsonl" || printf '%s' "$empty")" \
       --slurpfile discovered "$([[ -f $discovered ]] && printf '%s' "$discovered" || printf '%s' "$empty")" \
@@ -312,7 +315,7 @@ teardown() {
     cmp -s "$S/owner-skills.before.txt" "$S/owner-skills.after.txt" || { printf 'FAIL owner skills changed\n' >&2; status=1; }
     mkdir -p "$evidence"
     local file
-    for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl p.jsonl m.jsonl mcp-in.ndjson mcp-out.ndjson b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
+    for file in manifest.json calls.ndjson provenance.json verdict.json report.md b3.jsonl p.jsonl m.jsonl m-leg mcp-in.ndjson mcp-out.ndjson b2-probe.jsonl b2-control.jsonl person-verdict.json owner-sessions.before.json owner-sessions.after.json owner-skills.before.txt owner-skills.after.txt; do [[ ! -f $S/$file ]] || cp "$S/$file" "$evidence/"; done
     copy_transcript "$S/transcript.jsonl" "$evidence/transcript.jsonl" || { printf 'FAIL transcript copy\n' >&2; status=1; }
     for file in "$S"/prompt-*.md "$S"/*.typescript "$S"/*.screen.txt; do [[ ! -f $file ]] || cp "$file" "$evidence/"; done
     jq -r '.buckets[]' "$S/manifest.json" > "$evidence/scratch-buckets.txt"

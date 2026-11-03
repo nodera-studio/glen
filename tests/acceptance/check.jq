@@ -106,10 +106,16 @@ $m[0] as $manifest | $calls as $all |
        any($wait[]; (.params.arguments.job? | IN($sent.data.job.handle, $sent.data.job.id)) and mcp_ok($mcp_out));
      "a glen_wait of the sent job, isError:false; arguments=\([$wait[].params.arguments]|tojson)"),
    check("AC-505-nonce"; $report | has_nonce($n); "report quotes NONCE_M"),
-   # Claude leg only: every tool_use is one of the three glen tools (ToolSearch when the run allowed it).
+   # The leg comes from the m-leg marker. Claude: m.jsonl is present and every tool_use is one of
+   # the three glen tools (ToolSearch when the run allowed it). Codex: no Claude stream to check.
    check("AC-505-no-shell";
-     ($discovered|length) == 0 or all($tools[]; IN("mcp__glen__glen_ls", "mcp__glen__glen_send", "mcp__glen__glen_wait", "ToolSearch"));
-     if ($discovered|length) == 0 then "no m.jsonl in scratch (the Codex leg)" else "tools=\($tools|unique|join(","))" end)]
+     if $leg == "claude" then ($discovered|length) > 0 and
+       all($tools[]; IN("mcp__glen__glen_ls", "mcp__glen__glen_send", "mcp__glen__glen_wait", "ToolSearch"))
+     else $leg == "codex" end;
+     if $leg == "claude" then
+       (if ($discovered|length) == 0 then "claude leg: m.jsonl is missing or empty" else "claude leg: tools=\($tools|unique|join(","))" end)
+     elif $leg == "codex" then "codex leg: no Claude stream to check"
+     else "no leg marker: write claude or codex to $S/m-leg (got \($leg|tojson))" end)]
  elif $mode == "p" then
   # AC-v2-206: does a background `glen wait --for reply` wake a `claude -p` run? The class is the
   # evidence: woke, no_wake, foreground_only or no_wait (Step 13 decides the skill wording by it).
