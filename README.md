@@ -210,7 +210,9 @@ host cuts a tool call sooner than 90 s, pass a shorter `wait` or `timeout`, or `
 `glen_wait` again — the job keeps running. A large result spills to a file, the same as on the
 command line. A tool call gives the host's model everything glen does, including sending messages
 into omp sessions, so keep the host's per-tool approval on rather than trusting every `glen_*`
-tool at once.
+tool at once. A script that drives `glen mcp` itself, rather than through a host, must keep its
+stdin pipe open until it has read every answer it is waiting for: once stdin reaches EOF (or the
+connection otherwise ends), glen ends every call still running at once and sends no reply for them.
 
 ## Website
 
