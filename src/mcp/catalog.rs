@@ -73,6 +73,8 @@ const REASONS: [&str; 6] = ["tty", "installer", "shell-setup", "server", "alias"
 enum Annotation {
     Tool {
         omit: Vec<String>,
+        /// Replaces clap's `about` in the description (CLI wording a tool cannot use).
+        about: Option<String>,
         note: Option<String>,
         output: Option<Value>,
     },
@@ -152,7 +154,7 @@ fn parse_annotation(line: &str) -> Result<Annotation, String> {
     }
     match verb {
         "tool" => {
-            let (mut omit, mut note, mut output) = (vec![], None, None);
+            let (mut omit, mut about, mut note, mut output) = (vec![], None, None, None);
             for (key, value) in pairs {
                 match (key, value) {
                     ("omit", Raw::Bare(v)) => {
@@ -161,11 +163,16 @@ fn parse_annotation(line: &str) -> Result<Annotation, String> {
                             return Err(format!("omit={v} has an empty property name"));
                         }
                     }
-                    ("note", Raw::Double(v)) => {
+                    (key @ ("about" | "note"), Raw::Double(v)) => {
                         if v.trim().is_empty() {
-                            return Err("note is empty".into());
+                            return Err(format!("{key} is empty"));
                         }
-                        note = Some(v.to_owned());
+                        let text = Some(v.to_owned());
+                        if key == "about" {
+                            about = text;
+                        } else {
+                            note = text;
+                        }
                     }
                     ("output", Raw::Single(v)) => {
                         let schema: Value = serde_json::from_str(v)
@@ -177,20 +184,25 @@ fn parse_annotation(line: &str) -> Result<Annotation, String> {
                         }
                         output = Some(schema);
                     }
-                    ("omit" | "note" | "output", _) => {
+                    ("omit" | "about" | "note" | "output", _) => {
                         return Err(format!(
                             "{key} takes {}",
                             match key {
                                 "omit" => "a bare comma-separated list",
-                                "note" => "double-quoted text",
-                                _ => "single-quoted JSON",
+                                "output" => "single-quoted JSON",
+                                _ => "double-quoted text",
                             }
                         ));
                     }
                     (other, _) => return Err(format!("unknown key {other} for tool")),
                 }
             }
-            Ok(Annotation::Tool { omit, note, output })
+            Ok(Annotation::Tool {
+                omit,
+                about,
+                note,
+                output,
+            })
         }
         "skip" => {
             let mut reason = None;
@@ -303,6 +315,7 @@ fn property(arg: &Arg, kind: ArgKind, at: &str) -> Result<Value, String> {
 fn tool(
     sub: &clap::Command,
     omit: &[String],
+    about: Option<&str>,
     note: Option<&str>,
     output: Option<Value>,
 ) -> Result<Tool, String> {
@@ -361,11 +374,16 @@ fn tool(
     if !required.is_empty() {
         schema["required"] = json!(required);
     }
-    let about = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+    let about = about.map_or_else(
+        || sub.get_about().map(|a| a.to_string()).unwrap_or_default(),
+        str::to_owned,
+    );
     Ok(Tool {
         name: format!("glen_{}", command.replace('-', "_")),
+        // The note is its own sentence after the summary.
         description: match note {
-            Some(note) => format!("{about} {note}"),
+            Some(note) if about.ends_with('.') => format!("{about} {note}"),
+            Some(note) => format!("{about}. {note}"),
             None => about,
         },
         input_schema: schema,
@@ -433,8 +451,14 @@ pub fn generate(json_md: &str, cmd: &clap::Command) -> Result<String, String> {
                     alias_of.unwrap_or_default()
                 )));
             }
-            Annotation::Tool { omit, note, output } => {
-                tools.push(tool(sub, &omit, note.as_deref(), output).map_err(at)?);
+            Annotation::Tool {
+                omit,
+                about,
+                note,
+                output,
+            } => {
+                let t = tool(sub, &omit, about.as_deref(), note.as_deref(), output);
+                tools.push(t.map_err(at)?);
             }
         }
     }
@@ -457,6 +481,7 @@ mod tests {
     fn annotation_grammar() {
         let tool = |omit: &[&str], note: Option<&str>, output: Option<Value>| Annotation::Tool {
             omit: omit.iter().map(|s| (*s).to_owned()).collect(),
+            about: None,
             note: note.map(str::to_owned),
             output,
         };
@@ -482,6 +507,15 @@ mod tests {
         ] {
             assert_eq!(parse_annotation(line).unwrap(), want, "{line}");
         }
+        assert_eq!(
+            parse_annotation("<!-- mcp: tool about=\"Print items\" note=\"N.\" -->").unwrap(),
+            Annotation::Tool {
+                omit: vec![],
+                about: Some("Print items".into()),
+                note: Some("N.".into()),
+                output: None,
+            }
+        );
         for reason in REASONS {
             assert_eq!(
                 parse_annotation(&format!("<!-- mcp: skip reason={reason} -->")).unwrap(),
@@ -509,6 +543,12 @@ mod tests {
             "<!-- mcp: tool note=\"has -- dashes\" -->",
             "<!-- mcp: tool note=\"a\"b -->",
             "<!-- mcp: tool note=\"a\" note=\"b\" -->",
+            "<!-- mcp: tool about=bare -->",
+            "<!-- mcp: tool about=\"\" -->",
+            "<!-- mcp: tool about='{}' -->",
+            "<!-- mcp: tool about=\"see --all\" -->",
+            "<!-- mcp: tool about=\"a\" about=\"b\" -->",
+            "<!-- mcp: skip reason=tty about=\"x\" -->",
             "<!-- mcp: tool output='[1]' -->",
             "<!-- mcp: tool output='{\"type\":\"string\"}' -->",
             "<!-- mcp: tool output='{nope' -->",
@@ -580,6 +620,24 @@ mod tests {
     }
 
     #[test]
+    fn about_replaces_the_clap_summary_and_a_note_follows_as_a_sentence() {
+        let doc = DOC.replace(
+            "## `glen ls`\n\n<!-- mcp: tool -->",
+            "## `glen ls`\n\n<!-- mcp: tool about=\"List things, all of them with all\" -->",
+        );
+        let doc = doc.replace(
+            "<!-- mcp: tool note=\"A note.\" -->",
+            "<!-- mcp: tool about=\"Send it.\" note=\"A note.\" -->",
+        );
+        let c = catalog(&doc, &root()).unwrap();
+        assert_eq!(c.tools[0].description, "List things, all of them with all");
+        assert_eq!(c.tools[1].description, "Send it. A note.");
+        // The schema is clap's either way.
+        let plain = catalog(DOC, &root()).unwrap();
+        assert_eq!(c.tools[0].input_schema, plain.tools[0].input_schema);
+    }
+
+    #[test]
     fn schemas_come_from_clap() {
         let c = catalog(DOC, &root()).unwrap();
         assert_eq!(
@@ -608,7 +666,10 @@ mod tests {
                 "all":{"type":"boolean","description":"every project"}}})
         );
         let send = &c.tools[1];
-        assert_eq!(send.description, "Send A note.");
+        assert_eq!(
+            send.description, "Send. A note.",
+            "the note is its own sentence"
+        );
         assert_eq!(send.input_schema["required"], json!(["session"]));
         assert_eq!(
             send.input_schema["properties"]["as"],

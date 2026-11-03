@@ -3,7 +3,7 @@
   "tools": [
     {
       "name": "glen_ls",
-      "description": "List omp sessions (current project; --all for every project)",
+      "description": "List omp sessions (current project; all for every project)",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -134,7 +134,7 @@
     },
     {
       "name": "glen_tail",
-      "description": "Print the latest transcript items (-f follows)",
+      "description": "Print the latest transcript items",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -190,7 +190,7 @@
     },
     {
       "name": "glen_send",
-      "description": "Send a message to an omp session and wait for the reply (default 90s) Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter wait or no_wait, then call glen_wait (the job keeps running). A large result names a spilled file to read. A message of - (stdin) is not available here, and one over about 100 KiB cannot be passed.",
+      "description": "Send a message to an omp session and wait for the reply (default 90s). Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter wait or no_wait, then call glen_wait (the job keeps running). A large result names a spilled file to read. A message of - (stdin) is not available here, and one over about 100 KiB cannot be passed.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -306,7 +306,7 @@
     },
     {
       "name": "glen_wait",
-      "description": "Wait for a glen job (default 90s) Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter timeout and call again (the job keeps running). A large result names a spilled file to read.",
+      "description": "Wait for a glen job (default 90s). Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter timeout and call again (the job keeps running). A large result names a spilled file to read.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -707,7 +707,7 @@
     },
     {
       "name": "glen_release",
-      "description": "End warm workers (glen send --warm)",
+      "description": "End warm workers (started by glen_send with warm)",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {

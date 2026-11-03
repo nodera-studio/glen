@@ -91,7 +91,7 @@ a later ACP transport and is never produced today.
 
 ## `glen ls`
 
-<!-- mcp: tool -->
+<!-- mcp: tool about="List omp sessions (current project; all for every project)" -->
 
 List this project (or `--cwd DIR`, `--all`) with filters applied before the limit.
 
@@ -245,7 +245,7 @@ Read the active branch. `--tools` and `--thinking` control detail; `--raw` retur
 
 ## `glen tail`
 
-<!-- mcp: tool omit=follow -->
+<!-- mcp: tool omit=follow about="Print the latest transcript items" -->
 
 Read latest items (default 10). `-n 0 -f` streams only new events.
 The tail item example is a shape catalogue: one example per item kind (and per assistant
@@ -925,7 +925,7 @@ omp TUI with no job. With `--cwd`, a reply from a session glen has not yet place
 
 ## `glen release`
 
-<!-- mcp: tool -->
+<!-- mcp: tool about="End warm workers (started by glen_send with warm)" -->
 
 Ends warm workers (`glen send --warm`, design §A21). Give exactly one of a target (a session id, a hex tail of 4
 or more, or a job handle, matched against warm workers only; a job handle names its session's worker, for `@new`

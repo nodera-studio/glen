@@ -291,6 +291,31 @@ fn the_catalog_holds_the_fourteen_tools_and_the_skips() {
     }
 }
 
+#[test]
+fn tool_descriptions_speak_in_tool_terms() {
+    let c = checked_in();
+    for t in &c.tools {
+        let d = &t.description;
+        // A CLI flag (`--all`, `-f`) names nothing a tool call can pass.
+        let short_flag = d
+            .as_bytes()
+            .windows(3)
+            .any(|w| w[0] == b' ' && w[1] == b'-' && w[2].is_ascii_alphabetic());
+        assert!(!d.contains("--") && !short_flag, "{}: {d}", t.name);
+        assert!(d.starts_with(char::is_uppercase), "{}: {d}", t.name);
+    }
+    // A note is its own sentence after the command's summary.
+    let send = c.tools.iter().find(|t| t.name == "glen_send").unwrap();
+    assert!(
+        send.description.contains("(default 90s). Over MCP: "),
+        "{}",
+        send.description
+    );
+    let ls = c.tools.iter().find(|t| t.name == "glen_ls").unwrap();
+    assert!(ls.input_schema["properties"]["all"].is_object());
+    assert!(ls.description.contains("all"), "{}", ls.description);
+}
+
 /// Applies `f` to the body of every `<!-- contract: -->` example block.
 fn map_examples(md: &str, f: impl Fn(&str) -> String) -> String {
     let mut out = String::new();
