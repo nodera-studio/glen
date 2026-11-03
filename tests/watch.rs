@@ -1352,16 +1352,58 @@ fn back_to_back_signals_exit_within_one_second_and_finish_teardown() {
             // Distinct pending signals can be yielded in either order by the OS/iterator.
             assert!([130, 143].contains(&code), "unexpected signal exit: {code}");
             pty.assert_teardown();
-            let bytes = pty.bytes();
-            let leave = b"\x1b[?2004l\x1b[?1049l\x1b[?25h";
-            assert_eq!(
-                bytes
-                    .windows(leave.len())
-                    .filter(|bytes| *bytes == leave)
-                    .count(),
-                1,
-                "teardown must be one complete, uninterrupted escape sequence: {bytes:?}"
-            );
+            assert_final_teardown(&pty.bytes());
+            assert!(!gate.exists());
+            b.omp.clean();
+        }
+    }
+}
+
+/// Teardown ran once, as one uninterrupted sequence, and nothing followed it: a frame written
+/// after it lands on the restored main screen and can hide the shell's cursor again.
+fn assert_final_teardown(bytes: &[u8]) {
+    let leave = b"\x1b[?2004l\x1b[?1049l\x1b[?25h";
+    let tail = bytes[bytes.len().saturating_sub(512)..].escape_ascii();
+    assert_eq!(
+        bytes
+            .windows(leave.len())
+            .filter(|run| *run == leave)
+            .count(),
+        1,
+        "teardown must be one complete, uninterrupted escape sequence; output ends: {tail}"
+    );
+    assert!(
+        bytes.ends_with(leave),
+        "nothing may be written after teardown; output ends: {tail}"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn frames_drawn_while_a_signal_teardown_runs_neither_split_nor_follow_it() {
+    for controlling in terminal_modes() {
+        for _ in 0..2 {
+            let b = RpcBox::new();
+            let gate = b.omp.tmp.path().join("teardown-probe");
+            let ready = gate.with_file_name("teardown-probe.ready");
+            let mut cmd = b.glen(&["watch", "e27c0de"]);
+            // The held submit animates every 80 ms, so the UI keeps drawing while teardown is
+            // held after its first step, as on a slow terminal.
+            cmd.env("TERM", "xterm-256color")
+                .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
+                .env("GLEN_WATCH_TEST_TEARDOWN_PAUSE_MS", "300");
+            let mut pty = Pty::open(120, 40);
+            pty.controlling = controlling;
+            pty.spawn(cmd);
+            pty.ready();
+            pty.send(b"\tin flight\r");
+            poll(START, || ready.exists().then_some(()));
+            pty.signal_process(Signal::TERM);
+            pty.signal_process(Signal::INT);
+            let code = pty.wait_exit(START);
+            assert!([130, 143].contains(&code), "unexpected signal exit: {code}");
+            pty.assert_teardown();
+            assert_final_teardown(&pty.bytes());
             assert!(!gate.exists());
             b.omp.clean();
         }
