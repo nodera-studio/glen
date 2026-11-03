@@ -290,8 +290,8 @@ fn ac_v2_301_acp_is_hidden_and_help_lists_exactly_the_visible_commands() {
     );
     assert_eq!(
         VISIBLE.len(),
-        19,
-        "VISIBLE lists 19 commands (v0.2 W4 adds release)"
+        20,
+        "VISIBLE lists 20 commands (v0.2 W5 adds mcp)"
     );
     assert!(!VISIBLE.contains(&"__acp"));
     let sb = Sandbox::new();

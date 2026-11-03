@@ -62,10 +62,16 @@ expect eof
 #[test]
 fn discovery_prompts_are_uncoached_and_snapshot_prerequisite_is_explicit() {
     let push = include_str!("acceptance/prompts/claude-push.md");
+    let mcp = [
+        include_str!("acceptance/prompts/claude-mcp.md"),
+        include_str!("acceptance/prompts/codex-mcp.md"),
+    ];
     for text in [
         include_str!("acceptance/prompts/codex.md"),
         include_str!("acceptance/prompts/claude-discover.md"),
         push,
+        mcp[0],
+        mcp[1],
     ] {
         for coaching in [
             "5-second",
@@ -92,6 +98,27 @@ fn discovery_prompts_are_uncoached_and_snapshot_prerequisite_is_explicit() {
     assert!(
         push.contains("{{PROJECT}}") && push.contains("{{NONCE_P}}") && push.contains("e27c0de")
     );
+    // AC-v2-505 (v0.2 W5): the MCP prompts name neither the protocol, the tools nor a shell.
+    for text in mcp {
+        let lower = text.to_lowercase();
+        for word in [
+            "mcp",
+            "glen_",
+            "inbox",
+            "--for reply",
+            "background",
+            "poll",
+            "bash",
+            "shell",
+        ] {
+            assert!(!lower.contains(word), "coached MCP prompt: {word}");
+        }
+        assert!(
+            text.contains("{{PROJECT}}")
+                && text.contains("{{NONCE_M}}")
+                && text.contains("e27c0de")
+        );
+    }
     assert!(include_str!("acceptance/README.md").contains("Close other omp sessions first"));
 }
 #[test]
@@ -151,4 +178,128 @@ fn real_omp_legs_run_under_the_glen_harness_profile() {
     let person = include_str!("acceptance/person.exp");
     assert!(!person.contains("PI_CODING_AGENT_DIR"));
     assert!(person.contains("glen() { command glen --profile glen-harness \"$@\"; }"));
+}
+#[test]
+fn mcp_mode_runs_no_omp_and_its_launcher_closes_the_environment() {
+    let acc = include_str!("acceptance/acc.sh");
+    assert_eq!(
+        acc.matches("[[ $mode =~ ^(a|b|b2|b3|c1|c2|m|p)$ ]]")
+            .count(),
+        2,
+        "mode m must be in setup's and check's mode regex"
+    );
+    let setup_m = acc
+        .split("\nsetup_m() {\n")
+        .nth(1)
+        .and_then(|rest| rest.split("\n}\n").next())
+        .expect("acc.sh defines setup_m");
+    // No real omp, no profile, no consent flag and no Codex config in mode m (J3, J5).
+    for banned in [
+        "need omp",
+        "omp --",
+        "exec omp",
+        "--profile",
+        "ACC_",
+        ".codex",
+    ] {
+        assert!(!setup_m.contains(banned), "setup_m: {banned}");
+    }
+    assert!(setup_m.contains("acceptance m needs W5"));
+    assert!(
+        setup_m.contains("^(HOME|PI_CODING_AGENT_DIR|GLEN_OMP_BIN|GLEN_HOME|FAKE_OMP_[A-Z0-9_]+)$"),
+        "mcp.json's env repeats only the launcher's names"
+    );
+    assert!(acc.contains("exec env -i PATH=/usr/bin:/bin "));
+    assert!(acc.contains("^(HOME|PI_CODING_AGENT_DIR|GLEN_OMP_BIN|FAKE_OMP_[A-Z0-9_]+)$"));
+    // Generate the launcher from a manifest that carries names it must drop.
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().canonicalize().unwrap();
+    let dir = dir.to_str().unwrap();
+    fs::create_dir(t.path().join("bin")).unwrap();
+    let manifest = serde_json::json!({"env": {
+        "HOME": format!("{dir}/omp-home"), "PI_CODING_AGENT_DIR": format!("{dir}/omp-agent"),
+        "GLEN_OMP_BIN": format!("{dir}/fake-bin/fake_omp"), "GLEN_HOME": "/elsewhere",
+        "FAKE_OMP_SCENARIO": "progress", "FAKE_OMP_DELAY_MS": "8000", "OMP_PROFILE": "default",
+        "PI_PROFILE": "default", "PI_CONFIG_DIR": ".omp-owner", "CLAUDE_CONFIG_DIR": "/c",
+        "CODEX_HOME": "/x", "LD_PRELOAD": "/p.so"}});
+    fs::write(t.path().join("manifest.json"), manifest.to_string()).unwrap();
+    let acc_path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/acceptance/acc.sh");
+    let out = match Command::new("bash")
+        .args([
+            "-c",
+            r#"source "$1" && write_mcp_launcher "$2""#,
+            "_",
+            acc_path,
+            dir,
+        ])
+        .output()
+    {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprintln!("launcher generation not run: bash is absent");
+            return;
+        }
+        Err(e) => panic!("cannot run bash: {e}"),
+    };
+    if !out.status.success() && Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("launcher generation not run: optional harness dependency jq is absent");
+        return;
+    }
+    assert!(
+        out.status.success(),
+        "write_mcp_launcher: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let launcher = fs::read_to_string(t.path().join("bin/glen-mcp")).unwrap();
+    let mut lines = launcher.lines();
+    assert_eq!(lines.next(), Some("#!/usr/bin/env bash"));
+    let exec = lines.next().unwrap();
+    assert_eq!(lines.next(), None, "{launcher}");
+    let rest = exec
+        .strip_prefix("exec env -i PATH=/usr/bin:/bin ")
+        .unwrap_or_else(|| panic!("launcher must close the environment: {exec}"));
+    for banned in [
+        "--profile",
+        "OMP_PROFILE",
+        "PI_PROFILE",
+        "PI_CONFIG_DIR",
+        "CLAUDE_",
+        "CODEX_",
+        "LD_PRELOAD",
+        "elsewhere",
+    ] {
+        assert!(!exec.contains(banned), "launcher passes {banned}: {exec}");
+    }
+    // Only the allowlisted names, a fixed scratch GLEN_HOME, and glen itself, never omp.
+    let (assignments, command) = rest
+        .split_once(&format!("{dir}/glen-bin/glen mcp "))
+        .unwrap();
+    let mut names: Vec<_> = assignments
+        .split_whitespace()
+        .map(|a| a.split_once('=').unwrap().0)
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "FAKE_OMP_DELAY_MS",
+            "FAKE_OMP_SCENARIO",
+            "GLEN_HOME",
+            "GLEN_OMP_BIN",
+            "HOME",
+            "PI_CODING_AGENT_DIR"
+        ],
+        "{exec}"
+    );
+    assert!(assignments.contains(&format!("GLEN_HOME='{dir}/home'")));
+    assert!(!exec.split_whitespace().any(|w| {
+        let w = w.trim_matches(['\'', '"']);
+        w == "omp" || w.ends_with("/omp")
+    }));
+    // The wire log is protocol messages only: two tees, no environment dump.
+    assert_eq!(
+        command,
+        format!("< <(tee -a {dir}/mcp-in.ndjson) > >(tee -a {dir}/mcp-out.ndjson)"),
+        "{exec}"
+    );
 }

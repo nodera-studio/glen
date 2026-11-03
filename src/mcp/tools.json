@@ -1,0 +1,815 @@
+{
+  "catalog": 1,
+  "tools": [
+    {
+      "name": "glen_ls",
+      "description": "List omp sessions (current project; all for every project)",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "description": "list every project",
+            "type": "boolean"
+          },
+          "cwd": {
+            "description": "list this project directory",
+            "type": "string"
+          },
+          "limit": {
+            "default": 20,
+            "description": "maximum rows (0 = no limit)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "live": {
+            "description": "show open sessions only",
+            "type": "boolean"
+          },
+          "since": {
+            "description": "updated within this duration",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "exec": {
+        "command": "ls",
+        "args": [
+          {
+            "name": "all",
+            "kind": "flag",
+            "long": "all"
+          },
+          {
+            "name": "cwd",
+            "kind": "option",
+            "long": "cwd"
+          },
+          {
+            "name": "limit",
+            "kind": "option",
+            "long": "limit"
+          },
+          {
+            "name": "live",
+            "kind": "flag",
+            "long": "live"
+          },
+          {
+            "name": "since",
+            "kind": "option",
+            "long": "since"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_show",
+      "description": "Read a session transcript (active branch)",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "description": "resolve the session in this project directory",
+            "type": "string"
+          },
+          "raw": {
+            "description": "return omp records unchanged",
+            "type": "boolean"
+          },
+          "session": {
+            "description": "session handle or @latest",
+            "type": "string"
+          },
+          "thinking": {
+            "description": "include model thinking",
+            "type": "boolean"
+          },
+          "tools": {
+            "default": "collapsed",
+            "description": "tool-call detail",
+            "enum": [
+              "collapsed",
+              "full",
+              "none"
+            ],
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "show",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "cwd",
+            "kind": "option",
+            "long": "cwd"
+          },
+          {
+            "name": "thinking",
+            "kind": "flag",
+            "long": "thinking"
+          },
+          {
+            "name": "tools",
+            "kind": "option",
+            "long": "tools"
+          },
+          {
+            "name": "raw",
+            "kind": "flag",
+            "long": "raw"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_tail",
+      "description": "Print the latest transcript items",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cwd": {
+            "description": "resolve the session in this project directory",
+            "type": "string"
+          },
+          "lines": {
+            "default": 10,
+            "description": "items (0 = only new with -f)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session": {
+            "description": "session handle or @latest",
+            "type": "string"
+          },
+          "thinking": {
+            "description": "include model thinking",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "tail",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "cwd",
+            "kind": "option",
+            "long": "cwd"
+          },
+          {
+            "name": "lines",
+            "kind": "option",
+            "long": "lines"
+          },
+          {
+            "name": "thinking",
+            "kind": "flag",
+            "long": "thinking"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_send",
+      "description": "Send a message to an omp session and wait for the reply (default 90s). Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter wait or no_wait, then call glen_wait (the job keeps running). A large result names a spilled file to read. A message of - (stdin) is not available here, and one over about 100 KiB cannot be passed.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "as": {
+            "default": "auto",
+            "description": "how to deliver the message",
+            "enum": [
+              "auto",
+              "steer",
+              "follow-up"
+            ],
+            "type": "string"
+          },
+          "cwd": {
+            "description": "with @new: the new session’s directory; otherwise: the project to resolve the session in",
+            "type": "string"
+          },
+          "follow_up": {
+            "description": "queue a follow-up after the active turn",
+            "type": "boolean"
+          },
+          "message": {
+            "description": "message text, or - to read stdin (use -- before a message that starts with -)",
+            "type": "string"
+          },
+          "no_wait": {
+            "description": "return the job handle immediately",
+            "type": "boolean"
+          },
+          "session": {
+            "description": "session handle, @latest for this project, or @new",
+            "type": "string"
+          },
+          "steer": {
+            "description": "steer the active turn (queued jobs send a prompt)",
+            "type": "boolean"
+          },
+          "thinking": {
+            "description": "omp's startup reasoning effort for the spawned process: off, minimal, low, medium, high, xhigh, max or auto",
+            "type": "string"
+          },
+          "wait": {
+            "default": "90s",
+            "description": "maximum foreground wait; the job continues afterwards",
+            "type": "string"
+          },
+          "warm": {
+            "description": "keep omp alive for DUR after this job so the next send to the session skips startup (at most 10m; 0 = off)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session",
+          "message"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "send",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "message",
+            "kind": "positional",
+            "position": 2
+          },
+          {
+            "name": "steer",
+            "kind": "flag",
+            "long": "steer"
+          },
+          {
+            "name": "follow_up",
+            "kind": "flag",
+            "long": "follow-up"
+          },
+          {
+            "name": "as",
+            "kind": "option",
+            "long": "as"
+          },
+          {
+            "name": "wait",
+            "kind": "option",
+            "long": "wait"
+          },
+          {
+            "name": "no_wait",
+            "kind": "flag",
+            "long": "no-wait"
+          },
+          {
+            "name": "cwd",
+            "kind": "option",
+            "long": "cwd"
+          },
+          {
+            "name": "thinking",
+            "kind": "option",
+            "long": "thinking"
+          },
+          {
+            "name": "warm",
+            "kind": "option",
+            "long": "warm"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_wait",
+      "description": "Wait for a glen job (default 90s). Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter timeout and call again (the job keeps running). A large result names a spilled file to read.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "after": {
+            "description": "skip replies up to this id (the last id from the previous wake)",
+            "type": "string"
+          },
+          "for": {
+            "description": "return when an unseen glen_reply arrives (exit 10, data.woke = reply), or when the job ends",
+            "enum": [
+              "reply"
+            ],
+            "type": "string"
+          },
+          "job": {
+            "description": "job handle or full job UUID",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "maximum foreground wait; the job continues afterwards",
+            "type": "string"
+          }
+        },
+        "required": [
+          "job"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "wait",
+        "args": [
+          {
+            "name": "job",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          },
+          {
+            "name": "for",
+            "kind": "option",
+            "long": "for"
+          },
+          {
+            "name": "after",
+            "kind": "option",
+            "long": "after"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_jobs",
+      "description": "List glen jobs (newest first)",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "description": "show only queued and accepted jobs",
+            "type": "boolean"
+          },
+          "limit": {
+            "default": 20,
+            "description": "maximum rows (0 = no limit)",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "session": {
+            "description": "a session id or hex tail",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "exec": {
+        "command": "jobs",
+        "args": [
+          {
+            "name": "session",
+            "kind": "option",
+            "long": "session"
+          },
+          {
+            "name": "active",
+            "kind": "flag",
+            "long": "active"
+          },
+          {
+            "name": "limit",
+            "kind": "option",
+            "long": "limit"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_abort",
+      "description": "Stop the running turn of a session",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "session": {
+            "description": "session handle or @latest",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "bound the whole command (default 90s)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "abort",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_models",
+      "description": "List models (with providers) a session can use",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "provider": {
+            "description": "filter providers case-insensitively",
+            "type": "string"
+          },
+          "session": {
+            "description": "session handle or @latest (omit for the profile's models)",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "bound the whole command (default 90s)",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "exec": {
+        "command": "models",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "provider",
+            "kind": "option",
+            "long": "provider"
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_model",
+      "description": "Switch a session's model and provider",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "model": {
+            "description": "exact provider/model or an unambiguous model id",
+            "type": "string"
+          },
+          "session": {
+            "description": "session handle or @latest",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "bound the whole command (default 90s)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session",
+          "model"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "model",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "model",
+            "kind": "positional",
+            "position": 2
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_thinking",
+      "description": "Set a session's thinking level",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "level": {
+            "description": "thinking level supported by the session's model",
+            "enum": [
+              "off",
+              "minimal",
+              "low",
+              "medium",
+              "high",
+              "xhigh",
+              "max"
+            ],
+            "type": "string"
+          },
+          "session": {
+            "description": "session handle or @latest",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "bound the whole command (default 90s)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session",
+          "level"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "thinking",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "level",
+            "kind": "positional",
+            "position": 2
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_compact",
+      "description": "Compact a session's context",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "instructions": {
+            "description": "instructions for the compaction (at most 512 KiB)",
+            "type": "string"
+          },
+          "session": {
+            "description": "session handle or @latest",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "bound the whole command (default 90s)",
+            "type": "string"
+          }
+        },
+        "required": [
+          "session"
+        ],
+        "type": "object"
+      },
+      "exec": {
+        "command": "compact",
+        "args": [
+          {
+            "name": "session",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "instructions",
+            "kind": "option",
+            "long": "instructions"
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_inbox",
+      "description": "Show replies omp sent back with glen_reply",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "description": "include messages already read",
+            "type": "boolean"
+          },
+          "cwd": {
+            "description": "show messages from this project directory",
+            "type": "string"
+          },
+          "peek": {
+            "description": "do not mark messages read",
+            "type": "boolean"
+          },
+          "session": {
+            "description": "a session id or hex tail",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "90s",
+            "description": "maximum --wait (at most 24h)",
+            "type": "string"
+          },
+          "wait": {
+            "description": "wait for an unread message: exit 0 with it, or exit 10 at --timeout",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "exec": {
+        "command": "inbox",
+        "args": [
+          {
+            "name": "cwd",
+            "kind": "option",
+            "long": "cwd"
+          },
+          {
+            "name": "session",
+            "kind": "option",
+            "long": "session"
+          },
+          {
+            "name": "peek",
+            "kind": "flag",
+            "long": "peek"
+          },
+          {
+            "name": "all",
+            "kind": "flag",
+            "long": "all"
+          },
+          {
+            "name": "wait",
+            "kind": "flag",
+            "long": "wait"
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_release",
+      "description": "End warm workers (started by glen_send with warm)",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "all": {
+            "description": "end every warm worker",
+            "type": "boolean"
+          },
+          "force": {
+            "description": "kill a worker that does not release in time (after a pid and start-time check)",
+            "type": "boolean"
+          },
+          "target": {
+            "description": "session handle, session id or job handle of a warm worker",
+            "type": "string"
+          },
+          "timeout": {
+            "default": "10s",
+            "description": "how long to wait for each worker to release",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "exec": {
+        "command": "release",
+        "args": [
+          {
+            "name": "target",
+            "kind": "positional",
+            "position": 1
+          },
+          {
+            "name": "all",
+            "kind": "flag",
+            "long": "all"
+          },
+          {
+            "name": "force",
+            "kind": "flag",
+            "long": "force"
+          },
+          {
+            "name": "timeout",
+            "kind": "option",
+            "long": "timeout"
+          }
+        ]
+      }
+    },
+    {
+      "name": "glen_doctor",
+      "description": "Check omp, paths, glen home, skills and the shell sandbox",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "probe": {
+            "description": "start omp briefly (no session, no prompt) and check its RPC capabilities",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "exec": {
+        "command": "doctor",
+        "args": [
+          {
+            "name": "probe",
+            "kind": "flag",
+            "long": "probe"
+          }
+        ]
+      }
+    }
+  ],
+  "skipped": [
+    {
+      "command": "stop",
+      "reason": "alias"
+    },
+    {
+      "command": "watch",
+      "reason": "tty"
+    },
+    {
+      "command": "mcp",
+      "reason": "server"
+    },
+    {
+      "command": "install-extension",
+      "reason": "installer"
+    },
+    {
+      "command": "install-skill",
+      "reason": "installer"
+    },
+    {
+      "command": "completions",
+      "reason": "shell-setup"
+    },
+    {
+      "command": "help",
+      "reason": "help"
+    }
+  ]
+}

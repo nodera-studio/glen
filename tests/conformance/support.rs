@@ -21,7 +21,7 @@ pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
 /// Shared public-command order, including session controls and watch.
-pub const VISIBLE: [&str; 19] = [
+pub const VISIBLE: [&str; 20] = [
     "ls",
     "show",
     "tail",
@@ -36,6 +36,7 @@ pub const VISIBLE: [&str; 19] = [
     "inbox",
     "release",
     "watch",
+    "mcp",
     "install-extension",
     "install-skill",
     "doctor",

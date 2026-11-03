@@ -91,6 +91,8 @@ a later ACP transport and is never produced today.
 
 ## `glen ls`
 
+<!-- mcp: tool about="List omp sessions (current project; all for every project)" -->
+
 List this project (or `--cwd DIR`, `--all`) with filters applied before the limit.
 
 | Field | Meaning |
@@ -141,6 +143,8 @@ List this project (or `--cwd DIR`, `--all`) with filters applied before the limi
 ```
 
 ## `glen show`
+
+<!-- mcp: tool -->
 
 Read the active branch. `--tools` and `--thinking` control detail; `--raw` returns original entries.
 
@@ -240,6 +244,8 @@ Read the active branch. `--tools` and `--thinking` control detail; `--raw` retur
 ```
 
 ## `glen tail`
+
+<!-- mcp: tool omit=follow about="Print the latest transcript items" -->
 
 Read latest items (default 10). `-n 0 -f` streams only new events.
 The tail item example is a shape catalogue: one example per item kind (and per assistant
@@ -427,6 +433,8 @@ The tail item example is a shape catalogue: one example per item kind (and per a
 
 ## `glen send`
 
+<!-- mcp: tool note="Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter wait or no_wait, then call glen_wait (the job keeps running). A large result names a spilled file to read. A message of - (stdin) is not available here, and one over about 100 KiB cannot be passed." -->
+
 Send once. Exits 10 and 130 leave the job running; never resend to poll. Use `wait`.
 A `--cwd` that is not an existing directory exits 2 `usage` with `details:{reason:"missing_cwd",cwd}`
 before stdin is read or a job is created.
@@ -602,6 +610,8 @@ the omp TUI cannot open it until the window ends or `glen release <handle>` ends
 ```
 
 ## `glen wait`
+
+<!-- mcp: tool note="Over MCP: if the host cuts tool calls sooner than 90 s, pass a shorter timeout and call again (the job keeps running). A large result names a spilled file to read." -->
 
 Observe the same job; completed output has the send shape. A bounded wait can return running again.
 A job whose worker died is reported `lost` (exit 7 `job_failed`). If glen cannot write that status to the
@@ -779,6 +789,8 @@ A large wake can spill like any document (`spilled`); `woke` and `next` are then
 
 ## `glen jobs`
 
+<!-- mcp: tool -->
+
 List jobs, newest first. Absent glen home gives an empty list without creating it.
 
 | Field | Meaning |
@@ -820,6 +832,8 @@ warning per job, including jobs the filter then drops.
 ```
 
 ## `glen inbox`
+
+<!-- mcp: tool omit=follow -->
 
 Replies omp sent with `glen_reply`, oldest first. Reading marks them read unless `--peek`; `--all` includes read ones.
 Missing glen home or inbox gives an empty list without creating it. `-f` streams NDJSON `message` events.
@@ -911,6 +925,8 @@ omp TUI with no job. With `--cwd`, a reply from a session glen has not yet place
 
 ## `glen release`
 
+<!-- mcp: tool about="End warm workers (started by glen_send with warm)" -->
+
 Ends warm workers (`glen send --warm`, design §A21). Give exactly one of a target (a session id, a hex tail of 4
 or more, or a job handle, matched against warm workers only; a job handle names its session's worker, for `@new`
 the session omp created) and `--all`. An idle worker is asked to cool and waited for until it is gone: its
@@ -968,6 +984,8 @@ and a hint naming `--force`. `--all` with no warm worker is exit 0 with `total:0
 ```
 
 ## `glen doctor`
+
+<!-- mcp: tool -->
 
 Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 
@@ -1080,6 +1098,8 @@ The `omp_env_files` check value is an array of absolute paths (empty when none n
 
 ## `glen completions`
 
+<!-- mcp: skip reason=shell-setup -->
+
 Raw script by default; JSON only when explicitly requested.
 `completions --json` always returns inline regardless of size and never creates `GLEN_HOME`.
 This is a deliberate exemption from the general `GLEN_MAX_OUTPUT` spill rule.
@@ -1102,6 +1122,8 @@ This is a deliberate exemption from the general `GLEN_MAX_OUTPUT` spill rule.
 ```
 
 ## `glen install-extension`
+
+<!-- mcp: skip reason=installer -->
 
 Install the bundled omp extension into the effective agent dir and profile. Dry runs make no changes.
 
@@ -1134,6 +1156,8 @@ Install the bundled omp extension into the effective agent dir and profile. Dry 
 ```
 
 ## `glen install-skill`
+
+<!-- mcp: skip reason=installer -->
 
 Install for both agents unless selected; --project means cwd. Dry runs make no changes.
 
@@ -1169,12 +1193,71 @@ Install for both agents unless selected; --project means cwd. Dry runs make no c
 
 ## `glen watch`
 
+<!-- mcp: skip reason=tty -->
+
 Full-screen interface for people in an interactive terminal. It requires TTY stdin and stdout,
 and `TERM` must not be `dumb`. `--json` or non-TTY use returns a `usage` error envelope with exit 2
 (human diagnostics with `--human`); there is no JSON success document for the TUI.
 Agents should use `glen tail -f <session>` and `glen inbox -f` instead.
 
+## `glen mcp`
+
+<!-- mcp: skip reason=server -->
+
+`glen mcp` serves glen's commands to an MCP host such as Claude Code or Codex over stdio
+(`claude mcp add glen -- glen mcp`, `codex mcp add glen -- glen mcp`). It prints no envelope of its
+own: stdout carries MCP JSON-RPC only, one message per line (protocol revisions `2025-11-25` and
+`2025-06-18`, no batches), and what glen reports about the server itself, such as a refusal, goes
+to stderr as text, even with `--json`. With a terminal on stdin it refuses with exit 2 (`usage`):
+a host always gives it a pipe. It exits 0 when stdin ends, and 130, 143 or 129 on SIGINT, SIGTERM
+or SIGHUP, after ending every call still running.
+
+Each tool is `glen_<command>` for a command this document annotates as a tool, 14 in all:
+`glen_ls`, `glen_show`, `glen_tail`, `glen_send`, `glen_wait`, `glen_jobs`, `glen_inbox`,
+`glen_release`, `glen_doctor`, `glen_abort`, `glen_models`, `glen_model`, `glen_thinking` and
+`glen_compact`. Streaming, terminal-only, installer and shell-setup commands are not tools. A
+tool's input properties are the command's own arguments: an option or flag under its long name
+with `-` written `_` (`no_wait`, `for`, `as`), a positional under its argument name (`session`,
+`message`, `job`). A flag is a boolean (`true` passes it); an absent or `null` property is unset.
+The global `--json`, `--human`, `--color` and `--profile` are never inputs; a call runs under the
+server's own profile when `glen mcp` was given one. The catalog is `src/mcp/tools.json`, generated
+from this document's `<!-- mcp: … -->` annotations and the CLI's own definitions.
+
+A call runs glen itself with `--json`, never a shell, with stdin `/dev/null` (a message of `-` is
+the CLI's own `usage` error) and the server's cwd and environment. The result holds one `text`
+item: that run's stdout byte for byte, the envelope this document describes for the command,
+spills included (read `spilled.path`). `isError` is `true` exactly when the envelope's `ok` is
+`false`. It follows the envelope, not the exit status: exits 10, 11 and 130 are ordinary results,
+and the deferred `inbox` cursor failure (`ok:true` with exit 6 or 1, see `glen inbox`) is
+`isError:false`, its messages coming back on the next read. The server passes exactly the
+arguments the host sent and never adds or strips one, so a host that fills schema defaults and
+sends `wait` with `no_wait:true` gets the CLI's own `usage` envelope. `send` and `wait` keep their
+90-second waits: with a host that cuts calls sooner, pass a shorter `wait` or `timeout` and call
+`glen_wait` again (the job keeps running).
+
+Two results come from the server rather than a glen run, both `isError:true` with a CLI-shaped
+envelope (see Error details). `usage` with `details.reason` `mcp_arguments`: the arguments do not
+fit the tool's schema (an unknown key, a wrong type, a missing required property, a value outside
+its list or a NUL in a string), and nothing runs. `internal` with `details.reason` `mcp_exec`: glen
+could not be run to an envelope, because it could not start (an argument too long to pass: a
+message over about 100 KiB cannot be sent through MCP), exited without a JSON envelope or was
+killed, printed output that is not UTF-8 or more than 16 MiB, or 16 calls were already running.
+The server keeps serving after either.
+
+`notifications/cancelled` for a running call interrupts that glen run (SIGINT, then SIGKILL after
+400 ms) and sends no response for it. A job the call started keeps running and is never aborted, so
+`glen_jobs` and `glen_wait` still find it. At end of input or on a signal the server ends every
+running call before it exits, at once (SIGKILL, no grace: the server is going); a closed stdout
+counts as the end of input.
+
+Hosts start the server with their own environment and, usually, the project as cwd. Codex cuts a
+tool call after `tool_timeout_sec`; with the 90-second waits set it to 120 in the
+`[mcp_servers.glen]` table. A tool result gives the host's model everything glen does (transcripts,
+messages into omp sessions), so keep the host's per-tool approval on.
+
 ## `glen help`
+
+<!-- mcp: skip reason=help -->
 
 Help and version are text in every output mode, with no JSON envelope.
 
@@ -1182,8 +1265,12 @@ Help and version are text in every output mode, with no JSON envelope.
 
 Usage errors may include clap diagnostics in details; for a missing required argument the message names it
 after the colon (`… were not provided: <MESSAGE>`). Usage `details.reason` values are `missing_cwd` (send,
-with `cwd`), `invalid_level` (thinking) and `unknown_reply` (`wait --after` names no reply of the job, with `job`
-and `after`). Not-found `details.reason` `not_warm` (release, with `target`) means no warm worker matched.
+with `cwd`), `invalid_level` (thinking), `unknown_reply` (`wait --after` names no reply of the job, with `job`
+and `after`) and `mcp_arguments` (a `glen mcp` tool call whose arguments do not fit the tool's schema, with
+`tool`, plus `argument` naming the property at fault when there is one; nothing ran). Internal `details.reason`
+`mcp_exec` (a `glen mcp` tool call glen could not run to an envelope, with `tool`, plus `stderr`, the end of
+what that run printed there, when it printed any). Not-found `details.reason` `not_warm` (release, with
+`target`) means no warm worker matched.
 Not-found errors supply a hint: `glen ls --all` for sessions,
 `glen jobs` for jobs, `glen models <session>` for models. When a session lookup misses while some session file
 or project directory could not be read, the error is `io` (exit 1) naming that path, with `details.unreadable`
@@ -1483,6 +1570,8 @@ New visible commands and visible aliases must add a section and contract runner 
 
 ## `glen abort`
 
+<!-- mcp: tool -->
+
 `glen abort <session> [--timeout DUR]` stops the active run. Data fields are `session:{id,handle,path}`, `route:live|job|none`, `was:busy|idle`, `aborted`, `idle_after`, `queued`, `queued_jobs` (job handles). The job route adds `job` and `job_status`; `aborted` means that job ended aborted. An idle abort starts nothing. `abort_pending` means omp has not become idle; `jobs_queued` means waiting glen jobs start next. Queued omp messages remain queued.
 
 <!-- contract: abort.idle -->
@@ -1531,9 +1620,13 @@ New visible commands and visible aliases must add a section and contract runner 
 
 ## `glen stop`
 
+<!-- mcp: skip reason=alias -->
+
 Visible alias of `glen abort`, with exactly the same arguments and envelope.
 
 ## `glen models`
+
+<!-- mcp: tool -->
 
 `glen models [session] [--provider P] [--timeout DUR]` returns `session` (null without a target), `route`, `current:{provider,id}|null`, `current_source:session|disk|null`, `thinking_level`, `thinking_configured`, `default_model:{provider,id}|null`, `total`, and `models`. Rows are `{provider,id,name,reasoning,thinking_levels,context_window,max_tokens,current}` sorted by provider then id. Provider filtering is case-insensitive and happens before `total`.
 
@@ -1761,6 +1854,8 @@ Without a target omp starts with `--no-session`; `default_model` is that in-memo
 
 ## `glen model`
 
+<!-- mcp: tool -->
+
 `glen model <session> <spec> [--timeout DUR]` returns `{session,route,model:{provider,id,name},previous:{provider,id}|null,changed,thinking_level,thinking_levels,busy,scope:"session",forked}`. Exact provider/id wins; otherwise a case-insensitive full pair or bare id must be unique. Ambiguity exits 4 with `details.candidates:[{provider,id,name}]`; not found exits 3. omp records even an unchanged model selection. `thinking_changed` reports a changed effective level. Busy changes apply to the next model request.
 
 <!-- contract: model -->
@@ -1804,6 +1899,8 @@ Without a target omp starts with `--no-session`; `default_model` is that in-memo
 
 ## `glen thinking`
 
+<!-- mcp: tool -->
+
 `glen thinking <session> <level> [--timeout DUR]` returns `{session,route,thinking_level,requested,previous,changed,model:{provider,id}|null,available,busy,scope:"session",forked}`. Levels are off|minimal|low|medium|high|xhigh|max, validated against the current model before a set call. Invalid model levels exit 2 usage with `details.reason:"invalid_level"`, available and model. `thinking_clamped` reports an effective level differing from requested. auto/inherit are not offered.
 
 <!-- contract: thinking -->
@@ -1840,6 +1937,8 @@ Without a target omp starts with `--no-session`; `default_model` is that in-memo
 ```
 
 ## `glen compact`
+
+<!-- mcp: tool -->
 
 `glen compact <session> [--instructions TEXT] [--timeout DUR]` returns `{session,route,compacted:true,tokens_before,tokens_after,forked}`. Instructions are at most 524288 bytes. Streaming, compacting, queued messages or an active job refuse with control_failed/busy. Token fields are null when not reported.
 

@@ -8,6 +8,7 @@ pub mod install_extension;
 pub mod install_skill;
 pub mod jobs;
 pub mod ls;
+pub mod mcp;
 pub(crate) mod open;
 pub mod release;
 pub mod send;
@@ -53,6 +54,10 @@ pub fn dispatch(cli: &Cli, env: &Env, ctx: &OutputCtx) -> Result<Outcome, GlenEr
         Command::Watch(_) => Err(GlenError::new(
             ErrorCode::Internal,
             "watch is dispatched before commands",
+        )),
+        Command::Mcp(_) => Err(GlenError::new(
+            ErrorCode::Internal,
+            "mcp is dispatched before commands",
         )),
     }
 }

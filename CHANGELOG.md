@@ -15,6 +15,8 @@ All notable changes to glen are listed here, newest first.
 - A hidden, unsupported `glen __acp <session|@new> <message>` talks to `omp acp` (ACP v1) for the v0.2 spike. It is not in `--help`, completions, the skill or `docs/json.md`, creates no job and writes no session file; `docs/design.md` §A23 records the experiment results and the verdict.
 - `glen send --warm DUR` (or `GLEN_WARM`, at most 10m) keeps a settled job's omp process alive so a following send to the same session skips omp's startup; the worker holds the session, and omp's own owner lease, until the window ends or `glen release <handle>` ends it early, so the omp TUI cannot open that session meanwhile. A queued job whose binary, profile, thinking level, cwd or environment digest differs is never adopted: the worker cools and it runs cold instead.
 - `glen release [<target>] [--all] [--force] [--timeout DUR]` ends warm workers: a target is a session id, a hex tail or a job handle, and `--all` ends every one. `--force` kills a worker that does not release in time, only after proving its pid and start time (and omp's own, when recorded) are unchanged.
+- `glen mcp` serves glen's commands to an MCP host such as Claude Code or Codex over stdio (`claude mcp add glen -- glen mcp`, `codex mcp add glen -- glen mcp`): 14 tools (`glen_ls`, `glen_send`, `glen_wait`, and the rest), each a byte-for-byte copy of the matching command's `--json` envelope. `isError` mirrors `ok:false`, so a still-running, forked or SIGINT-interrupted result (exits 10, 11, 130) is not an error. Cancelling a tool call (`notifications/cancelled`) stops the exec-self child but never aborts the job, which keeps running. Codex's default `tool_timeout_sec` (60 s) is shorter than `send`'s and `wait`'s 90 s defaults; set it higher (120 in the `[mcp_servers.glen]` example) or pass a shorter `wait`/`timeout`.
+- `src/mcp/tools.json`, the generated MCP tool catalog, is checked in and generated from `docs/json.md`'s `<!-- mcp: … -->` annotations plus clap; `cargo test --locked --test mcp_contract` fails on any drift between the catalog and either source, naming the regenerate command.
 
 ### Changed
 
@@ -24,12 +26,14 @@ All notable changes to glen are listed here, newest first.
 - Job views in `send`, `wait`, `jobs` and job error details gain `omp_reused`, true only for a job that ran on an omp process a warm worker kept from an earlier job.
 - `glen doctor` gains a `warm_workers` check, right after `live_endpoints`: how many warm-worker registries are fresh, stale (no heartbeat) or dead; it warns, never fails, naming the fix. `glen ls` shows warmth in `state_detail` and with a ` (warm)`/` (warm, stale)` suffix on the human state cell.
 - The agent skill gains one guarded bullet (shown once `glen release` is visible) telling agents to use `--warm` only when another send is coming soon, and to end it with `glen release`.
+- The agent skill gains two guarded lines (shown once `glen mcp` is visible) telling agents an MCP host can register `glen mcp` and call glen as tools instead of Bash, and that a tool call keeps the 90 s `send`/`wait` defaults.
 
 ### Documentation
 
 - `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). The CLI is unchanged.
 - §A20 describes push to the calling agent as shipped in v0.2 W2: the two receivers, the unseen-reply rule, why `wait` leaves the inbox marker alone, the two exit-10 documents and the per-caller delivery table. A background wait also wakes a headless `claude -p` run: verified on Claude Code 2.1.316 in stream-json mode, where the completion notification resumed the run after its first result. The skill's allowed-tools may not apply to that resumed turn under `--permission-mode dontAsk`.
 - §A21 describes the warm worker as shipped in v0.2 W4: the stay-warm rule, the on-disk registry and release request, the match key and the compare-and-claim protocol, the idle loop and its bounds, the one teardown and its reasons, `glen release`'s outcomes, controls and `ls`/doctor wording on a warm session, the queued-job liveness decision, the lease cost and two residual races.
+- §A22 describes the MCP layer as shipped in v0.2 W5: the supported protocol revisions and why (`initialize`-era only, no batching), the annotation grammar and the generated catalog, naming and schema rules, the exec-self argv and result-mapping rules, cancellation and shutdown, the limits, Codex's and Claude Code's host-specific quirks, and the security notes. It also records the hidden, unsupported `glen mcp --channel` notifier, tested at the protocol level only.
 
 ## v0.1.1 — 2026-11-01
 

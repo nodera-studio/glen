@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Offline verification: recordings and fake executables only. Never runs setup/person/teardown.
+# Offline verification: recordings and fake executables only. Never runs setup or person; runs
+# teardown only on mode m's hand-made recordings in its own scratch directory.
 set -euo pipefail
 A=$(cd -- "$(dirname -- "$0")" && pwd -P)
 # shellcheck source=tests/acceptance/acc.sh
@@ -431,6 +432,108 @@ jq -e '.data.argv==["--profile","glen-harness","ls","--json"]' <<< "$out" >/dev/
 jq -se '[.[]|select(.t=="end")]|last|.argv==["ls","--json"]' "$Q/calls.ndjson" >/dev/null
 jq '.profile="default"' "$Q/manifest.json" > "$Q/manifest.tmp"; mv "$Q/manifest.tmp" "$Q/manifest.json"
 if "$Q/bin/glen" ls >/dev/null 2>&1; then echo 'foreign profile allowed' >&2; exit 1; else [[ $? == 99 ]]; fi
+# Mode m (v0.2 W5, AC-v2-505): the recording launcher, then the wire-log checks and teardown.
+Q="$S/m"
+mkdir -p "$Q/bin" "$Q/glen-bin" "$Q/project"
+jq -n --arg s "$Q" '{mode:"m",scratch:$s,project:($s+"/project"),sessions_dir:($s+"/omp-agent/sessions"),
+  P:{id:"01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de",handle:"e27c0de"},NONCE_M:"M-nonce",
+  env:{HOME:($s+"/omp-home"),PI_CODING_AGENT_DIR:($s+"/omp-agent"),GLEN_OMP_BIN:($s+"/fake-bin/fake_omp"),GLEN_HOME:"/elsewhere",
+       FAKE_OMP_SCENARIO:"progress",FAKE_OMP_DELAY_MS:"8000",LD_PRELOAD:"/nonexistent/acc-preload.so",OMP_PROFILE:"default",
+       PI_CONFIG_DIR:".omp-owner",CLAUDE_CONFIG_DIR:"/nonexistent/claude",CODEX_HOME:"/nonexistent/codex"},buckets:[]}' > "$Q/manifest.json"
+# A stand-in for `glen mcp`: one answer per request line, carrying argv and environment names only.
+cat > "$Q/glen-bin/glen" <<'EOF'
+#!/usr/bin/perl
+use strict; use warnings; $| = 1;
+my $argv = join ",", map { "\"$_\"" } @ARGV;
+my $env = join ",", map { "\"$_\"" } sort keys %ENV;
+my $id = 0;
+while (<STDIN>) { print "{\"jsonrpc\":\"2.0\",\"id\":", $id++, ",\"result\":{\"argv\":[$argv],\"env\":[$env]}}\n"; }
+EOF
+chmod +x "$Q/glen-bin/glen"
+write_mcp_launcher "$Q"
+{ [[ $(head -n 1 "$Q/bin/glen-mcp") == '#!/usr/bin/env bash' ]] && grep -q 'exec env -i PATH=/usr/bin:/bin ' "$Q/bin/glen-mcp" &&
+  grep -qF "GLEN_HOME='$Q/home'" "$Q/bin/glen-mcp" && ! grep -qE 'elsewhere|LD_PRELOAD|OMP_PROFILE|PI_CONFIG_DIR|CLAUDE_|CODEX_' "$Q/bin/glen-mcp"; } ||
+  { echo 'mode m launcher does not close the environment' >&2; cat "$Q/bin/glen-mcp" >&2; exit 1; }
+# A scripted session: the launcher ends when the client closes stdin (perl's alarm bounds a hang),
+# the host's own environment does not reach the server, and the wire log holds both directions.
+printf '%s\n' '{"jsonrpc":"2.0","id":0,"method":"initialize"}' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' > "$Q/session-in.ndjson"
+out=$(env OMP_PROFILE=leak CLAUDE_CONFIG_DIR=/leak LD_PRELOAD=/nonexistent/acc-preload.so perl -e 'alarm 10; exec @ARGV or exit 127' "$Q/bin/glen-mcp" < "$Q/session-in.ndjson") ||
+  { echo "mode m launcher session failed: exit $?" >&2; exit 1; }
+jq -se 'length == 2 and all(.[]; .result.argv == ["mcp"] and
+  .result.env == ["FAKE_OMP_DELAY_MS","FAKE_OMP_SCENARIO","GLEN_HOME","GLEN_OMP_BIN","HOME","PATH","PI_CODING_AGENT_DIR"])' <<< "$out" >/dev/null ||
+  { echo "mode m launcher env: $out" >&2; exit 1; }
+{ cmp -s "$Q/session-in.ndjson" "$Q/mcp-in.ndjson" && [[ $(cat "$Q/mcp-out.ndjson") == "$out" ]]; } ||
+  { echo 'mode m wire log differs from the session' >&2; exit 1; }
+m_wire() { # $1: initialize protocolVersion ("" drops initialize), $2: glen_send calls, $3: the first send's isError, $4: wait or nowait
+    jq -cn --arg v "$1" --argjson sends "$2" --argjson err "$3" --arg wait "$4" '
+      def call($id; $name; $args): {jsonrpc:"2.0",id:$id,method:"tools/call",params:{name:$name,arguments:$args}};
+      def answer($id; $doc; $error): {jsonrpc:"2.0",id:$id,result:{content:[{type:"text",text:($doc|tojson)}],isError:$error}};
+      {v:1,ok:true,data:{job:{handle:"j1234567",id:"019a2b3c-0000-7000-8000-000000000001",session_id:"01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de"}}} as $job |
+      {in:[(if $v == "" then empty else {jsonrpc:"2.0",id:0,method:"initialize",params:{protocolVersion:$v,capabilities:{},clientInfo:{name:"claude-code",version:"2.1.316"}}} end),
+           {jsonrpc:"2.0",method:"notifications/initialized"},
+           {jsonrpc:"2.0",id:1,method:"tools/list"},
+           call(2; "glen_ls"; {}),
+           (range($sends) | call(3 + .; "glen_send"; {session:"e27c0de",message:"M-nonce",no_wait:true})),
+           (if $wait == "wait" then call(9; "glen_wait"; {job:"j1234567"}) else empty end)],
+       out:[(if $v == "" then empty else {jsonrpc:"2.0",id:0,result:{protocolVersion:"2025-06-18",capabilities:{tools:{}},serverInfo:{name:"glen",version:"0.2.0"}}} end),
+            {jsonrpc:"2.0",id:1,result:{tools:[]}},
+            answer(2; {v:1,ok:true,data:{sessions:[]}}; false),
+            (range($sends) | if . == 0 and $err then answer(3; {v:1,ok:false,error:{code:"usage",message:"bad arguments"}}; true) else answer(3 + .; $job; false) end),
+            (if $wait == "wait" then answer(9; {v:1,ok:true,data:{job:{handle:"j1234567"},replies:[{text:"reply: M-nonce"}]}}; false) else empty end)]}' > "$Q/wire.json"
+    jq -c '.in[]' "$Q/wire.json" > "$Q/mcp-in.ndjson"; jq -c '.out[]' "$Q/wire.json" > "$Q/mcp-out.ndjson"
+}
+m_events() { # $1: one more tool_use name in m.jsonl ("" for none)
+    jq -cn --arg extra "$1" '
+      {type:"system",subtype:"init"},
+      ((["mcp__glen__glen_ls","mcp__glen__glen_send","mcp__glen__glen_wait"] + (if $extra == "" then [] else [$extra] end))[] |
+        {type:"assistant",message:{content:[{type:"tool_use",id:.,name:.,input:{}}]}}),
+      {type:"result",result:"reply: M-nonce",num_turns:4,total_cost_usd:0.2}' > "$Q/m.jsonl"
+}
+m_verdict() { # $1: the checks expected to fail (JSON array)
+    "$A/acc.sh" check m "$Q" >/dev/null || true
+    jq -e --argjson failing "$1" '(.checks|length) == 7 and (.checks|map(select(.pass|not).id)) == $failing and
+      (.pass == ($failing|length == 0))' "$Q/verdict.json" >/dev/null ||
+      { echo "mode m: expected failing=$1" >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+}
+: > "$Q/calls.ndjson"; printf 'reply: M-nonce\n' > "$Q/report.md"; printf 'claude\n' > "$Q/m-leg"
+m_wire 2025-06-18 1 false wait; m_events ''; m_verdict '[]'
+jq -e '.checks[] | select(.id=="AC-505-initialize").evidence == "client=claude-code/2.1.316 protocol=2025-06-18 first_method=initialize"' "$Q/verdict.json" >/dev/null ||
+  { echo 'mode m: AC-505-initialize evidence' >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+m_wire 2025-11-25 1 false wait; m_verdict '[]'
+m_events ToolSearch; m_verdict '[]'
+m_events Bash; m_verdict '["AC-505-no-shell"]'
+m_events mcp__glen__glen_inbox; m_verdict '["AC-505-no-shell"]'
+# The leg comes from the m-leg marker, never from whether m.jsonl exists: the Claude leg fails
+# without a stream to check, and so does a run with no (or an unknown) marker.
+rm "$Q/m.jsonl"; m_verdict '["AC-505-no-shell"]'
+: > "$Q/m.jsonl"; m_verdict '["AC-505-no-shell"]'
+m_events ''; rm "$Q/m-leg"; m_verdict '["AC-505-no-shell"]'
+printf 'gemini\n' > "$Q/m-leg"; m_verdict '["AC-505-no-shell"]'
+# The Codex leg leaves no m.jsonl: the wire log alone decides.
+printf 'codex\n' > "$Q/m-leg"; rm "$Q/m.jsonl"; m_verdict '[]'
+jq -e '.checks[] | select(.id=="AC-505-no-shell").evidence | startswith("codex leg")' "$Q/verdict.json" >/dev/null ||
+  { echo 'mode m: codex leg evidence' >&2; jq . "$Q/verdict.json" >&2; exit 1; }
+printf 'claude\n' > "$Q/m-leg"; m_events ''
+m_wire 2025-06-18 1 false nowait; m_verdict '["AC-505-wait"]'
+m_wire 2025-06-18 2 false wait; m_verdict '["AC-505-send"]'
+m_wire 2025-06-18 1 true wait; m_verdict '["AC-505-send","AC-505-wait"]'
+m_wire 2026-07-28 1 false wait; m_verdict '["AC-505-initialize"]'
+m_wire '' 1 false wait; m_verdict '["AC-505-initialize"]'
+m_wire 2025-06-18 1 false wait; printf 'no nonce here\n' > "$Q/report.md"; m_verdict '["AC-505-nonce"]'
+printf 'reply: M-nonce\n' > "$Q/report.md"
+rm "$Q/calls.ndjson"
+if "$A/acc.sh" check m "$Q" >/dev/null; then echo 'missing m recording passed' >&2; exit 1; fi
+jq -e '(.pass|not) and (.checks|length)==7 and all(.checks[]; (.pass|not) and (.evidence|contains("missing recording")))' "$Q/verdict.json" >/dev/null
+# Teardown of a passing mode m run exits 0: no owner-session snapshot, the wire log in evidence.
+: > "$Q/calls.ndjson"; m_verdict '[]'
+if ! (unset CLAUDE_CONFIG_DIR; HOME="$Q/owner-home"
+      for dir in "$HOME/.claude/skills" "$HOME/.agents/skills"; do ls -lad "$dir" "$dir/glen" "$dir/glen/SKILL.md" 2>/dev/null || true; done > "$Q/owner-skills.before.txt"
+      teardown "$Q" "$Q/evidence") > "$Q/teardown.log" 2>&1; then
+    echo 'mode m teardown failed' >&2; cat "$Q/teardown.log" >&2; exit 1
+fi
+for file in m.jsonl m-leg mcp-in.ndjson mcp-out.ndjson verdict.json manifest.json; do [[ -f $Q/evidence/$file ]] || { echo "mode m evidence lacks $file" >&2; exit 1; }; done
+[[ ! -e $Q/owner-sessions.after.json && ! -e $Q/evidence/sessions-left.txt ]] || { echo 'mode m took an owner-session snapshot' >&2; exit 1; }
+jq -e '.pass and (.checks|any(.id=="AC-419-teardown" and .pass))' "$Q/evidence/verdict.json" >/dev/null
 # Fake token is assembled at runtime so the repository does not itself contain a credential-shaped string.
 mkdir "$S/leak"
 printf 'token = "sk-ant-%s-%s"\n' api03 "$(printf 'a1B2c3D4e5F6g7H8i9J0%.0s' {1..5} | head -c 93)AA" > "$S/leak/fake.txt"

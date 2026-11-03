@@ -599,6 +599,8 @@ fn ac351_help_lists_exactly_the_visible_commands_and_watch_is_visible_but_usage_
     want.push("watch".to_owned());
     // v0.2 W4 Step 11 made release visible.
     want.push("release".to_owned());
+    // v0.2 W5 Step 8 made mcp visible.
+    want.push("mcp".to_owned());
     got.sort();
     want.sort();
     assert_eq!(got, want, "AC-351 (R1, R2)\n{}", out.out());
