@@ -869,9 +869,11 @@ pub(crate) mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let pidfile = dir.path().join("yes");
-        // The child is killed at the cap, but `yes` (its child) still holds the pipe.
+        // The child is killed at the cap, but `yes` (its child) still holds the pipe. The
+        // grandchild writes its own pid before it becomes `yes`: a child that wrote it after
+        // starting `yes` could be killed at the cap first, under load (AC-v2-602).
         let e = envelope(&mapped(&format!(
-            "yes & echo $! > '{}'; wait",
+            "sh -c 'echo $$ > \"$0\"; exec yes' '{}' & wait",
             pidfile.display()
         )));
         assert!(e["error"]["message"].as_str().unwrap().contains("16 MiB"));

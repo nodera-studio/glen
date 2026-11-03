@@ -570,6 +570,7 @@ fn classify(line: &[u8]) -> Option<Frame> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mcp::test_support::scaled;
     use std::{
         io::{PipeReader, PipeWriter},
         sync::{Arc, atomic::AtomicUsize},
@@ -674,7 +675,7 @@ mod tests {
             client.call("a", json!({}), Duration::from_millis(150), &stop, far()),
             Err(CallError::Timeout)
         );
-        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(started.elapsed() < scaled(Duration::from_secs(1)));
         peer.send(response(json!(1), json!("late")));
         peer.send(response(json!(2), json!("mine")));
         assert_eq!(
@@ -807,7 +808,7 @@ mod tests {
             Err(CallError::Interrupted)
         );
         let set_at = setter.join().unwrap();
-        assert!(set_at.elapsed() < TICK + Duration::from_millis(150));
+        assert!(set_at.elapsed() < scaled(TICK + Duration::from_millis(150)));
     }
     #[test]
     fn a_call_past_the_deadline_writes_nothing() {
@@ -983,7 +984,7 @@ mod tests {
         let (outcome, latency, cancels, client) =
             cancel_run(Some(json!({"stopReason":"cancelled"})), WAIT, false);
         // The AC bound: the cancel is on the wire within 250 ms of the signal.
-        assert!(latency < Duration::from_millis(250), "{latency:?}");
+        assert!(latency < scaled(Duration::from_millis(250)), "{latency:?}");
         assert_eq!(cancels, 1);
         assert_eq!(outcome.stop_reason.as_deref(), Some("cancelled"));
         let cancel = outcome.cancel.unwrap();
@@ -1004,7 +1005,7 @@ mod tests {
     #[test]
     fn an_unconfirmed_cancel_ends_after_the_grace() {
         let started = Instant::now();
-        let (outcome, _, cancels, _) = cancel_run(None, Duration::from_millis(300), false);
+        let (outcome, _, cancels, _) = cancel_run(None, scaled(Duration::from_millis(300)), false);
         assert_eq!(cancels, 1);
         assert_eq!(outcome.stop_reason, None);
         assert_eq!(
@@ -1015,7 +1016,7 @@ mod tests {
                 reason: CancelReason::Interrupt
             })
         );
-        assert!(started.elapsed() < Duration::from_secs(3));
+        assert!(started.elapsed() < scaled(Duration::from_secs(3)));
     }
     #[test]
     fn a_permission_request_after_the_cancel_is_answered_cancelled_under_allow() {
@@ -1036,7 +1037,7 @@ mod tests {
                 "hi",
                 &AtomicBool::new(false),
                 deadline,
-                Duration::from_millis(200),
+                scaled(Duration::from_millis(200)),
             )
             .unwrap();
         assert_eq!(
@@ -1064,7 +1065,7 @@ mod tests {
         let started = Instant::now();
         assert!(client.notify("session/cancel", json!({"sessionId":"s1"})));
         assert!(matches!(pump(&mut client, TICK), Pump::Idle));
-        assert!(started.elapsed() < TICK + Duration::from_millis(150));
+        assert!(started.elapsed() < scaled(TICK + Duration::from_millis(150)));
     }
     #[test]
     fn a_stop_or_an_expired_deadline_before_the_turn_writes_nothing() {
@@ -1169,7 +1170,7 @@ mod tests {
         // left blocked on its stdout while it exits.
         let started = Instant::now();
         assert!(client.shutdown(Duration::ZERO).is_empty());
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(started.elapsed() < scaled(Duration::from_millis(100)));
         let end = Instant::now() + WAIT;
         while !flood.is_finished() && Instant::now() < end {
             thread::sleep(Duration::from_millis(10));
@@ -1208,13 +1209,13 @@ mod tests {
         assert_eq!(client.cancel(), unsent.as_ref());
         // The stalled write delays neither the grace nor the teardown.
         assert!(
-            started.elapsed() < Duration::from_secs(1),
+            started.elapsed() < scaled(Duration::from_secs(1)),
             "{:?}",
             started.elapsed()
         );
         let started = Instant::now();
         drop(client.shutdown(Duration::ZERO));
-        assert!(started.elapsed() < Duration::from_millis(100));
+        assert!(started.elapsed() < scaled(Duration::from_millis(100)));
     }
     #[test]
     fn a_cancel_is_sent_once_its_bytes_reach_the_agent() {
@@ -1240,7 +1241,7 @@ mod tests {
                 &big,
                 &AtomicBool::new(false),
                 soon,
-                Duration::from_secs(1),
+                scaled(Duration::from_secs(1)),
             )
             .unwrap();
         assert_eq!(

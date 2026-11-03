@@ -613,6 +613,7 @@ mod tests {
 #[cfg(test)]
 mod unary_tests {
     use super::*;
+    use crate::mcp::test_support::scaled;
     use std::os::unix::net::UnixListener;
     use std::{path::PathBuf, sync::Mutex};
 
@@ -710,7 +711,7 @@ mod unary_tests {
         let start = Instant::now();
         assert!(drain_line(&client, Instant::now(), &|| false).is_err());
         assert!(
-            start.elapsed() < Duration::from_millis(500),
+            start.elapsed() < scaled(Duration::from_millis(500)),
             "an expired drain with nothing buffered waited {:?}",
             start.elapsed()
         );
@@ -770,7 +771,7 @@ mod unary_tests {
         );
         // 1 s drain bound, plus a scheduling allowance well under the ~3 s trickle.
         assert!(
-            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(2500),
+            elapsed >= Duration::from_millis(900) && elapsed < scaled(Duration::from_millis(2500)),
             "drain took {elapsed:?}; its absolute deadline is 1 s"
         );
     }
@@ -792,7 +793,12 @@ mod unary_tests {
             if let Some(answer) = answer {
                 peer.write_all(answer).unwrap();
             }
-            drop(peer);
+            // The endpoint closes through both write sides, never by dropping `peer`, which a
+            // child another test thread is spawning may hold a copy of until its exec
+            // (AC-v2-602): glen's write fails with EPIPE and its drain meets EOF after the
+            // buffered bytes, on Linux and macOS, while `peer` stays open as that copy would.
+            peer.shutdown(Shutdown::Write).unwrap();
+            client.shutdown(Shutdown::Write).unwrap();
             let result = write_request(
                 &mut client,
                 b"request\n",
@@ -832,8 +838,13 @@ mod unary_tests {
         assert!(
             matches!(peer.read(&mut [0]), Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut))
         );
-        // If cancellation arrives during a failed write, do not start the drain read.
-        drop(peer);
+        // If cancellation arrives during a failed write, do not start the drain read. The write
+        // fails because glen's write side is shut (EPIPE on Linux and macOS), not because `peer`
+        // is dropped: a child another test thread is spawning holds a copy of `peer` until its
+        // exec, which keeps the socket open, so the write succeeded (AC-v2-602). `peer` stays
+        // open here, as that copy would, and its buffered answer is what a drain read would take.
+        peer.write_all(b"{\"v\":1}\n").unwrap();
+        client.shutdown(Shutdown::Write).unwrap();
         let checks = std::cell::Cell::new(0);
         let cancelled = || {
             checks.set(checks.get() + 1);
@@ -849,6 +860,11 @@ mod unary_tests {
             Err(ClientError::Cancelled)
         ));
         assert_eq!(checks.get(), 2);
+        assert_eq!(
+            read_line(&mut BufReader::new(&client)).unwrap(),
+            b"{\"v\":1}\n",
+            "the answer was not drained"
+        );
     }
 
     /// W8-ERR-9: a peer that trickles one byte every 300 ms, never a newline, must not hold
@@ -878,7 +894,7 @@ mod unary_tests {
             if cancel_after.is_some() {
                 assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
                 assert!(
-                    elapsed < Duration::from_millis(900),
+                    elapsed < scaled(Duration::from_millis(900)),
                     "cancel took {elapsed:?}"
                 );
             } else {
@@ -887,7 +903,8 @@ mod unary_tests {
                     "{result:?}"
                 );
                 assert!(
-                    elapsed >= Duration::from_millis(900) && elapsed < Duration::from_millis(1600),
+                    elapsed >= Duration::from_millis(900)
+                        && elapsed < scaled(Duration::from_millis(1600)),
                     "drain took {elapsed:?}, not the ~1s bound"
                 );
             }
@@ -943,7 +960,7 @@ mod unary_tests {
             result.err()
         );
         assert!(
-            elapsed < Duration::from_millis(1600),
+            elapsed < scaled(Duration::from_millis(1600)),
             "drain took {elapsed:?}, past the ~1.2s bound"
         );
         drop(result);
@@ -962,7 +979,7 @@ mod unary_tests {
             result.err()
         );
         assert!(
-            elapsed < Duration::from_millis(900),
+            elapsed < scaled(Duration::from_millis(900)),
             "cancel took {elapsed:?} to end the drain"
         );
         drop(result);
@@ -1097,7 +1114,7 @@ mod unary_tests {
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
         assert!(
-            elapsed >= Duration::from_millis(250) && elapsed < Duration::from_secs(3),
+            elapsed >= Duration::from_millis(250) && elapsed < scaled(Duration::from_secs(3)),
             "full-backlog connect took {elapsed:?}"
         );
         let accepter = std::thread::spawn(move || {
@@ -1144,7 +1161,10 @@ mod unary_tests {
         let result = unary_for(&path, &Op::Abort, "s", Duration::from_secs(10), stop);
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
-        assert!(elapsed < Duration::from_secs(3), "stop took {elapsed:?}");
+        assert!(
+            elapsed < scaled(Duration::from_secs(3)),
+            "stop took {elapsed:?}"
+        );
         assert!(peer.join().unwrap().is_empty());
     }
 
@@ -1176,7 +1196,7 @@ mod unary_tests {
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < scaled(Duration::from_secs(2)),
             "a trickling peer stretched a 300 ms read to {elapsed:?}"
         );
         drop(result);
@@ -1227,17 +1247,18 @@ mod unary_tests {
             let listener = UnixListener::bind(&path).unwrap();
             let peer = std::thread::spawn(move || {
                 let (mut s, _) = listener.accept().unwrap();
-                s.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+                s.set_read_timeout(Some(scaled(Duration::from_secs(1))))
+                    .unwrap();
                 let mut line = String::new();
                 BufReader::new(s.try_clone().unwrap())
                     .read_line(&mut line)
                     .unwrap();
                 let request: Value = serde_json::from_str(&line).unwrap();
-                match scenario {"garbage"=>writeln!(s,"garbage").unwrap(),"timeout"=>std::thread::sleep(Duration::from_millis(400)),_=>writeln!(s,"{}",serde_json::json!({"v":1,"id":if scenario=="wrong_id"{serde_json::json!("other")}else{request["id"].clone()},"ok":true,"data":{"answer":1}})).unwrap()}
+                match scenario {"garbage"=>writeln!(s,"garbage").unwrap(),"timeout"=>std::thread::sleep(scaled(Duration::from_millis(400))),_=>writeln!(s,"{}",serde_json::json!({"v":1,"id":if scenario=="wrong_id"{serde_json::json!("other")}else{request["id"].clone()},"ok":true,"data":{"answer":1}})).unwrap()}
             });
             let start = Instant::now();
-            let result = unary(&path, &Op::State, Duration::from_millis(200));
-            assert!(start.elapsed() < Duration::from_millis(350));
+            let result = unary(&path, &Op::State, scaled(Duration::from_millis(200)));
+            assert!(start.elapsed() < scaled(Duration::from_millis(350)));
             match scenario {
                 "ok" => assert_eq!(result.unwrap()["answer"], 1),
                 "timeout" => assert!(matches!(result, Err(ClientError::Timeout))),

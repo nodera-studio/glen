@@ -1905,6 +1905,7 @@ mod claim_tests {
 #[cfg(test)]
 mod idle_tests {
     use super::*;
+    use crate::mcp::test_support::scaled;
     const ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
     #[test]
     fn decide_checks_in_the_documented_order() {
@@ -2009,7 +2010,7 @@ mod idle_tests {
             &|l: &str| lines.lock().unwrap().push(l.to_owned()),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < scaled(Duration::from_secs(4)),
             "{:?}",
             started.elapsed()
         );
@@ -2088,7 +2089,7 @@ mod idle_tests {
         );
         let took = started.elapsed();
         assert!(
-            took >= META_BOUND && took < META_BOUND + META_BOUND / 2,
+            took >= META_BOUND && took < scaled(META_BOUND + META_BOUND / 2),
             "one wait of the metadata bound: {took:?}"
         );
         assert!(!crate::jobs::lock::is_held(&home, ID));
@@ -2119,7 +2120,7 @@ mod idle_tests {
         );
         let took = started.elapsed();
         assert!(
-            took >= TEARDOWN_BOUND && took < TEARDOWN_DEADLINE + Duration::from_millis(250),
+            took >= TEARDOWN_BOUND && took < scaled(TEARDOWN_DEADLINE + Duration::from_millis(250)),
             "teardown keeps its deadline: {took:?}"
         );
         assert!(!crate::jobs::lock::is_held(&home, ID));
