@@ -2,6 +2,11 @@
 //! probe `glen doctor --probe` (AC-v2-103) and the negotiated protocol in job status
 //! (AC-v2-104). Every case drives the built binary with a cleared environment; omp is the
 //! shell fixture or the `fake_omp` example, never a real omp.
+//!
+//! Every glen's output is captured in files (`flake::output`), never read from a pipe to end of
+//! file, which a process that inherited the pipe from a concurrent spawn could hold back. Under
+//! `scripts/flake-check.sh` the waits and the upper bounds are multiplied by
+//! `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run).
 mod common;
 use common::*;
 use serde_json::{Value, json};
@@ -279,10 +284,7 @@ impl ProbeBox {
         let fake = fake_omp_bin();
         let mut all = vec![("GLEN_OMP_BIN", fake.to_str().unwrap())];
         all.extend_from_slice(vars);
-        let o = self
-            .command(&["doctor", "--probe", "--json"], &all)
-            .output()
-            .unwrap();
+        let o = flake::output(&mut self.command(&["doctor", "--probe", "--json"], &all));
         assert!(o.stderr.is_empty(), "{o:?}");
         let code = o.status.code().unwrap();
         self.assert_fake_gone();
@@ -295,11 +297,11 @@ impl ProbeBox {
             .filter_map(|l| serde_json::from_str(l).ok())
             .collect()
     }
-    /// Every fake that started has no process group left (within 3 s).
+    /// Every fake that started has no process group left (within 3 s, scaled).
     fn assert_fake_gone(&self) {
         for start in self.log().iter().filter(|e| e["event"] == "start") {
             let pgid = start["pgid"].as_i64().unwrap() as i32;
-            poll(Duration::from_secs(3), || {
+            poll(flake::scaled(Duration::from_secs(3)), || {
                 let group = rustix::process::Pid::from_raw(pgid).unwrap();
                 (rustix::process::test_kill_process_group(group) == Err(rustix::io::Errno::SRCH))
                     .then_some(())
@@ -397,13 +399,10 @@ fn probe_has_no_side_effects() {
 fn doctor_without_probe_never_starts_omp_in_rpc_mode() {
     let b = ProbeBox::new();
     let fake = fake_omp_bin();
-    let o = b
-        .command(
-            &["doctor", "--json"],
-            &[("GLEN_OMP_BIN", fake.to_str().unwrap())],
-        )
-        .output()
-        .unwrap();
+    let o = flake::output(&mut b.command(
+        &["doctor", "--json"],
+        &[("GLEN_OMP_BIN", fake.to_str().unwrap())],
+    ));
     assert_eq!(o.status.code(), Some(0), "{o:?}");
     assert!(!b.log.exists(), "only --version ran, which logs nothing");
     assert_eq!(json(&o)["data"]["omp"]["capabilities"], Value::Null);
@@ -473,10 +472,7 @@ fn omp_that_exits_before_ready_is_a_warning_with_its_stderr() {
 #[test]
 fn probe_is_skipped_without_a_runnable_omp() {
     let b = ProbeBox::new();
-    let o = b
-        .command(&["doctor", "--probe", "--json"], &[])
-        .output()
-        .unwrap();
+    let o = flake::output(&mut b.command(&["doctor", "--probe", "--json"], &[]));
     assert_eq!(o.status.code(), Some(5), "{o:?}");
     let v = json(&o);
     assert_eq!(v["error"]["hint"], "install omp or set GLEN_OMP_BIN");
@@ -485,13 +481,10 @@ fn probe_is_skipped_without_a_runnable_omp() {
     assert_eq!(check["value"], "skipped");
     assert_eq!(check["detail"], "omp binary is missing");
     let failing = script(&b.cwd, "failing", "exit 1");
-    let o = b
-        .command(
-            &["doctor", "--probe", "--json"],
-            &[("GLEN_OMP_BIN", &failing)],
-        )
-        .output()
-        .unwrap();
+    let o = flake::output(&mut b.command(
+        &["doctor", "--probe", "--json"],
+        &[("GLEN_OMP_BIN", &failing)],
+    ));
     assert_eq!(o.status.code(), Some(5), "{o:?}");
     let v = json(&o);
     let check = row(report(&v), "omp_capabilities");
@@ -514,7 +507,10 @@ fn a_stalled_call_returns_within_the_budget() {
         ("GLEN_PROBE_BUDGET_MS", "1500"),
     ]);
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(5000), "{elapsed:?}");
+    assert!(
+        elapsed < flake::scaled(Duration::from_millis(5000)),
+        "{elapsed:?}"
+    );
     assert_eq!(code, 0, "{v}");
     assert_eq!(capabilities(&v)["protocol"], 2);
     assert_eq!(capabilities(&v)["host_tools"], "unknown");
@@ -538,7 +534,10 @@ fn a_late_ready_returns_within_the_budget_and_tears_omp_down() {
         ("GLEN_PROBE_BUDGET_MS", "1500"),
     ]);
     let elapsed = start.elapsed();
-    assert!(elapsed < Duration::from_millis(5000), "{elapsed:?}");
+    assert!(
+        elapsed < flake::scaled(Duration::from_millis(5000)),
+        "{elapsed:?}"
+    );
     assert_eq!(code, 0, "{v}");
     assert_eq!(
         *capabilities(&v),
@@ -585,7 +584,7 @@ fn sigint_during_the_probe_tears_omp_down_before_glen_exits() {
         .stderr(std::process::Stdio::null())
         .spawn()
         .unwrap();
-    poll(Duration::from_secs(10), || {
+    poll(flake::scaled(Duration::from_secs(10)), || {
         b.log().iter().any(|e| e["event"] == "start").then_some(())
     });
     rustix::process::kill_process(
@@ -594,11 +593,16 @@ fn sigint_during_the_probe_tears_omp_down_before_glen_exits() {
     )
     .unwrap();
     let start = Instant::now();
-    let status = poll(Duration::from_secs(10), || glen.try_wait().unwrap());
+    let status = poll(flake::scaled(Duration::from_secs(10)), || {
+        glen.try_wait().unwrap()
+    });
     let elapsed = start.elapsed();
     assert_eq!(status.signal(), Some(libc::SIGINT), "{status:?}");
     // Poll, 100 ms grace, 1 s after SIGTERM and the stderr join: well inside 4 s.
-    assert!(elapsed < Duration::from_millis(4000), "{elapsed:?}");
+    assert!(
+        elapsed < flake::scaled(Duration::from_millis(4000)),
+        "{elapsed:?}"
+    );
     // glen has exited, so the group must already be gone; this waits at most 3 s more.
     b.assert_fake_gone();
 }
@@ -610,7 +614,7 @@ fn status_records_the_negotiated_protocol() {
         if let Some(v2) = v2 {
             c.env("FAKE_OMP_V2", v2);
         }
-        let o: Output = c.output().unwrap();
+        let o: Output = flake::output(&mut c);
         assert_eq!(o.status.code(), Some(0), "{o:?}");
         let id = json(&o)["data"]["job"]["id"].as_str().unwrap().to_owned();
         b.wait_worker_gone(&id);
@@ -627,7 +631,7 @@ fn status_records_the_protocol_when_host_tools_are_rejected() {
         if let Some(v2) = v2 {
             c.env("FAKE_OMP_V2", v2);
         }
-        let o: Output = c.output().unwrap();
+        let o: Output = flake::output(&mut c);
         let v = json(&o);
         assert_eq!(v["error"]["code"], "job_failed", "{o:?}");
         let id = v["error"]["details"]["job"]["id"]
