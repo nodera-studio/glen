@@ -1,5 +1,11 @@
 //! v0.2 W2 push tier 1 (design §A20): `glen wait --for reply`, `glen inbox --wait` and the
 //! `task_state` job-view field, on the real binary with the `fake_omp` and `fake_ext` peers.
+//!
+//! Every glen's output is captured in files (`flake::output`, `flake::Captured`), never read from a
+//! pipe to end of file, which a process that inherited the pipe from a concurrent spawn could hold
+//! back. Under `scripts/flake-check.sh` the waits and the upper bounds (the one-second wakes among
+//! them) are multiplied by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); lower
+//! bounds are not.
 mod common;
 use common::*;
 use glen::{
@@ -40,15 +46,12 @@ fn ids(replies: &Value) -> Vec<&str> {
         .map(|r| r["id"].as_str().unwrap())
         .collect()
 }
-/// Spawns `cmd` and returns its output with the instant it exited.
+/// Spawns `cmd` and returns its output with the instant it exited (its reap, never a pipe's end of
+/// file).
 fn spawn_timed(mut cmd: Command) -> JoinHandle<(Output, Instant)> {
-    let child = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let child = flake::Captured::spawn(&mut cmd).unwrap();
     std::thread::spawn(move || {
-        let out = child.wait_with_output().unwrap();
+        let out = child.wait_with_output();
         (out, Instant::now())
     })
 }
@@ -61,7 +64,7 @@ fn seen_lines(path: &Path, n: usize) -> Instant {
             return Instant::now();
         }
         assert!(
-            start.elapsed() < Duration::from_secs(20),
+            start.elapsed() < flake::scaled(Duration::from_secs(20)),
             "{} never had {n} lines",
             path.display()
         );
@@ -86,10 +89,10 @@ fn send_no_wait(b: &RpcBox, vars: &[(&str, &Path)]) -> Value {
     for (k, v) in vars {
         cmd.env(k, v);
     }
-    envelope(&cmd.output().unwrap(), 10)
+    envelope(&flake::output(&mut cmd), 10)
 }
 fn accepted(b: &RpcBox, id: &str) {
-    poll(Duration::from_secs(10), || {
+    poll(flake::scaled(Duration::from_secs(10)), || {
         (b.job(id).1["status"] == "accepted").then_some(())
     });
 }
@@ -132,7 +135,10 @@ fn rpc_reply_wakes_wait_for_reply_within_a_second() {
     let appended = seen_lines(&b.job_dir(&id).join("replies.ndjson"), 1);
     let (out, exited) = waiter.join().unwrap();
     let latency = exited.saturating_duration_since(appended);
-    assert!(latency <= WAKE, "woke {latency:?} after the reply landed");
+    assert!(
+        latency <= flake::scaled(WAKE),
+        "woke {latency:?} after the reply landed"
+    );
     let d = &envelope(&out, 10)["data"];
     assert_eq!(d["woke"], "reply", "{d}");
     assert_eq!(d["status"], "running");
@@ -164,7 +170,7 @@ fn after_skips_seen_replies_and_the_end_carries_every_unseen_one() {
         let mut a = vec!["wait", h.as_str()];
         a.extend_from_slice(args);
         a.push("--json");
-        envelope(&b.glen(&a).output().unwrap(), code)
+        envelope(&flake::output(&mut b.glen(&a)), code)
     };
     // --after the first: only the second, as a wake.
     let d = &wait(&["--for", "reply", "--after", &one], 10)["data"];
@@ -187,19 +193,19 @@ fn after_skips_seen_replies_and_the_end_carries_every_unseen_one() {
     assert_eq!(e["details"]["reason"], "unknown_reply");
     assert_eq!(e["details"]["after"], "not-a-reply");
     // --after requires --for.
-    let o = b
-        .glen(&["wait", &h, "--after", &one, "--json"])
-        .output()
-        .unwrap();
+    let o = flake::output(&mut b.glen(&["wait", &h, "--after", &one, "--json"]));
     assert_eq!(o.status.code(), Some(2), "{o:?}");
     assert_eq!(json(&o)["error"]["code"], "usage");
     // wait never touches the inbox marker: both replies are still unread there.
     assert!(!b.omp.glen_home.join("inbox/.read").exists());
-    let inbox = envelope(&b.glen(&["inbox", "--peek", "--json"]).output().unwrap(), 0);
+    let inbox = envelope(
+        &flake::output(&mut b.glen(&["inbox", "--peek", "--json"])),
+        0,
+    );
     assert_eq!(inbox["data"]["total"], 2);
     // The job ends before the next wait: exit 0 with every unseen reply.
     fs::write(&result, "").unwrap();
-    b.wait_terminal(&id, Duration::from_secs(20));
+    b.wait_terminal(&id, flake::scaled(Duration::from_secs(20)));
     let d = &wait(&["--for", "reply", "--after", &one], 0)["data"];
     assert_eq!(d["status"], "completed");
     assert_eq!(ids(&d["replies"]), [two.as_str()]);
@@ -223,11 +229,11 @@ fn live_reply_wakes_wait_for_reply_within_a_second() {
         ],
     );
     let sent = envelope(
-        &b.rpc
-            .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-            .env("GLEN_OMP_BIN", "/nonexistent")
-            .output()
-            .unwrap(),
+        &flake::output(
+            b.rpc
+                .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+                .env("GLEN_OMP_BIN", "/nonexistent"),
+        ),
         10,
     );
     assert_eq!(sent["data"]["job"]["route"], "live");
@@ -244,7 +250,10 @@ fn live_reply_wakes_wait_for_reply_within_a_second() {
     let appended = seen_lines(&b.rpc.job_dir(&id).join("replies.ndjson"), 1);
     let (out, exited) = waiter.join().unwrap();
     let latency = exited.saturating_duration_since(appended);
-    assert!(latency <= WAKE, "woke {latency:?} after the reply landed");
+    assert!(
+        latency <= flake::scaled(WAKE),
+        "woke {latency:?} after the reply landed"
+    );
     let d = &envelope(&out, 10)["data"];
     assert_eq!(d["woke"], "reply", "{d}");
     assert_eq!(d["job"]["route"], "live");
@@ -252,12 +261,13 @@ fn live_reply_wakes_wait_for_reply_within_a_second() {
     assert_eq!(texts(&d["replies"])[0], "working");
     let last = ids(&d["replies"]).last().unwrap().to_string();
     fs::write(&result, "").unwrap();
-    b.rpc.wait_terminal(&id, Duration::from_secs(20));
-    let o = b
-        .rpc
-        .glen(&["wait", &h, "--for", "reply", "--after", &last, "--json"])
-        .output()
-        .unwrap();
+    b.rpc
+        .wait_terminal(&id, flake::scaled(Duration::from_secs(20)));
+    let o = flake::output(
+        &mut b
+            .rpc
+            .glen(&["wait", &h, "--for", "reply", "--after", &last, "--json"]),
+    );
     let d = &envelope(&o, 0)["data"];
     assert_eq!(d["status"], "completed");
     assert!(!ids(&d["replies"]).contains(&last.as_str()), "{d}");
@@ -378,7 +388,7 @@ fn terminal_mapping_carries_only_the_unseen_replies() {
             let mut a = vec!["wait", h.as_str()];
             a.extend_from_slice(args);
             a.push("--json");
-            envelope(&b.glen(&a).output().unwrap(), exit)
+            envelope(&flake::output(&mut b.glen(&a)), exit)
         };
         let ctx = format!("{state:?} {code:?} forked={forked}");
         let with = run(&["--for", "reply", "--after", "r1"]);
@@ -441,7 +451,10 @@ fn task_state_in_jobs_wait_and_error_details() {
         let (_, h) = craft(&b, state, code, forked);
         want.insert(h, task_state);
     }
-    let jobs = envelope(&b.glen(&["jobs", "-n", "0", "--json"]).output().unwrap(), 0);
+    let jobs = envelope(
+        &flake::output(&mut b.glen(&["jobs", "-n", "0", "--json"])),
+        0,
+    );
     let got: std::collections::BTreeMap<String, &str> = jobs["data"]["jobs"]
         .as_array()
         .unwrap()
@@ -456,10 +469,7 @@ fn task_state_in_jobs_wait_and_error_details() {
     assert_eq!(got, want);
     // The same field in wait (running and terminal) and in error.details.job.
     for (h, task_state) in &want {
-        let o = b
-            .glen(&["wait", h, "--timeout", "0", "--json"])
-            .output()
-            .unwrap();
+        let o = flake::output(&mut b.glen(&["wait", h, "--timeout", "0", "--json"]));
         let v = json(&o);
         let job = if v["ok"] == true {
             &v["data"]["job"]
@@ -515,7 +525,7 @@ fn inbox_wait_wakes_on_a_new_message_and_marks_it_after_output() {
         let (out, exited) = waiter.join().unwrap();
         let latency = exited.saturating_duration_since(appended);
         assert!(
-            latency <= WAKE,
+            latency <= flake::scaled(WAKE),
             "{scope}: woke {latency:?} after the append"
         );
         let d = &envelope(&out, 0)["data"];
@@ -536,9 +546,10 @@ fn inbox_wait_with_cwd_ignores_other_projects_and_peek_marks_nothing() {
     let alpha = b.alpha().to_str().unwrap().to_owned();
     append(&b, BETA_D, &record(BETA_D, "beta"));
     let started = Instant::now();
-    let out = inbox_wait(&b, &["--cwd", &alpha, "--timeout", "500ms"])
-        .output()
-        .unwrap();
+    let out = flake::output(&mut inbox_wait(
+        &b,
+        &["--cwd", &alpha, "--timeout", "500ms"],
+    ));
     assert!(started.elapsed() >= Duration::from_millis(500));
     let d = &envelope(&out, 10)["data"];
     assert_eq!(d["messages"], json!([]));
@@ -549,9 +560,10 @@ fn inbox_wait_with_cwd_ignores_other_projects_and_peek_marks_nothing() {
     // A message already unread returns at once, even with --timeout 0; --peek marks nothing.
     append(&b, A_ID, &record(A_ID, "alpha"));
     let d = &envelope(
-        &inbox_wait(&b, &["--cwd", &alpha, "--peek", "--timeout", "0"])
-            .output()
-            .unwrap(),
+        &flake::output(&mut inbox_wait(
+            &b,
+            &["--cwd", &alpha, "--peek", "--timeout", "0"],
+        )),
         0,
     )["data"];
     assert_eq!(texts(&d["messages"]), ["alpha"]);
@@ -566,25 +578,23 @@ fn inbox_wait_bound_document_marks_nothing_and_repeats_the_flags() {
     let p = b.glen_home.join("inbox").join(format!("{A_ID}.ndjson"));
     fs::create_dir_all(p.parent().unwrap()).unwrap();
     fs::write(&p, "not json\n").unwrap();
-    let out = inbox_wait(&b, &["--timeout", "300ms", "--session", "c0de", "--peek"])
-        .output()
-        .unwrap();
+    let out = flake::output(&mut inbox_wait(
+        &b,
+        &["--timeout", "300ms", "--session", "c0de", "--peek"],
+    ));
     let v = envelope(&out, 10);
     assert_eq!(
         v["data"],
         json!({"total":0,"marked_read":false,"skipped_lines":1,"messages":[],
             "next":"glen inbox --wait --timeout 300ms --session c0de --peek","interrupted":false})
     );
-    let out = inbox_wait(&b, &["--timeout", "300ms"]).output().unwrap();
+    let out = flake::output(&mut inbox_wait(&b, &["--timeout", "300ms"]));
     assert_eq!(envelope(&out, 10)["data"]["skipped_lines"], 1);
     assert!(!marker(&b).exists());
-    let human = b
-        .command(
-            &["inbox", "--wait", "--timeout", "1ms", "--human"],
-            &b.alpha(),
-        )
-        .output()
-        .unwrap();
+    let human = flake::output(&mut b.command(
+        &["inbox", "--wait", "--timeout", "1ms", "--human"],
+        &b.alpha(),
+    ));
     assert_eq!(human.status.code(), Some(10));
     assert_eq!(
         String::from_utf8(human.stdout).unwrap(),
@@ -610,18 +620,15 @@ fn inbox_wait_sigint_is_exit_130_with_interrupted() {
                 Ok(())
             });
         }
-        let child = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        std::thread::sleep(Duration::from_millis(300 * attempt));
+        let child = flake::Captured::spawn(&mut cmd).unwrap();
+        // Linux waits for the handler itself (`SigCgt`); macOS waits 300 ms per attempt, scaled.
+        flake::await_sigint_handler(child.id(), Duration::from_millis(300 * attempt));
         rustix::process::kill_process(
             rustix::process::Pid::from_child(&child),
             rustix::process::Signal::INT,
         )
         .unwrap();
-        let out = child.wait_with_output().unwrap();
+        let out = child.wait_with_output();
         if out.status.code().is_none() {
             continue;
         }
@@ -657,14 +664,39 @@ fn inbox_wait_with_a_closed_stdout_keeps_messages_unread() {
     append(&b, A_ID, &record(A_ID, "keep"));
     let (reader, writer) = std::io::pipe().unwrap();
     drop(reader);
-    let out = inbox_wait(&b, &["--timeout", "5s"])
-        .stdout(Stdio::from(writer))
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    // Stderr goes to a file, read at glen's exit; stdin is null, as `output()` makes it.
+    let stderr = flake::Capture::new();
+    let mut cmd = inbox_wait(&b, &["--timeout", "5s"]);
+    cmd.stdin(Stdio::null()).stdout(Stdio::from(writer));
+    stderr.attach_stderr(&mut cmd);
+    let out = stderr.output(cmd.status().unwrap());
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(out.stderr.is_empty(), "{out:?}");
     assert!(!marker(&b).exists());
     let peek = envelope(&b.glen(&["inbox", "--peek", "--json"], &b.alpha()), 0);
     assert_eq!(peek["data"]["total"], 1);
+}
+
+/// `flake::Captured::wait_with_output`, which `spawn_timed` uses, returns at the child's exit
+/// while another process still holds its stdout and stderr, as a worker holds a pipe it inherited
+/// from a concurrent spawn (on macOS std sets a pipe's `FD_CLOEXEC` after creating it).
+/// `Child::wait_with_output` reads to end of file, so it would wait for that process, and the
+/// exit instant of a wake measurement would be that process's end.
+#[test]
+fn harness_captured_wait_returns_at_exit_while_another_process_holds_the_output() {
+    let started = Instant::now();
+    let child = flake::Captured::spawn(
+        Command::new("/bin/sh").args(["-c", "/bin/sleep 30 & echo $!; echo done >&2"]),
+    )
+    .unwrap();
+    let out = child.wait_with_output();
+    let took = started.elapsed();
+    let holder: i32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    let _ = rustix::process::kill_process(
+        rustix::process::Pid::from_raw(holder).unwrap(),
+        rustix::process::Signal::KILL,
+    );
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stderr, b"done\n");
+    assert!(took < flake::scaled(Duration::from_secs(10)), "{took:?}");
 }
