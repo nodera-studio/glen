@@ -1,6 +1,6 @@
 //! Deadline-bearing requests to a job's held RPC client.
 use crate::{
-    glen_home::write_private_atomic,
+    glen_home::write_private_atomic_unnamed,
     jobs::{JobId, JobStore, liveness, lock},
     ops::{self, Op, OpError},
 };
@@ -45,7 +45,7 @@ pub fn request(
             format!("cannot serialize control request: {e}"),
         )
     })?;
-    write_private_atomic(&path, &bytes).map_err(|e| {
+    write_private_atomic_unnamed(&path, &bytes).map_err(|e| {
         OpError::new(
             ops::INTERNAL,
             format!("cannot write control {}: {e}", path.display()),

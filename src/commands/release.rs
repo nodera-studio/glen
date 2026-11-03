@@ -215,7 +215,7 @@ fn signal(target: Kill) -> std::io::Result<()> {
     match target {
         Kill::Group(pid) => rpc::kill_group(pid, rustix::process::Signal::KILL),
         Kill::Process(pid) => {
-            let p = rustix::process::Pid::from_raw(pid as i32)
+            let p = rpc::signal_pid(pid)
                 .ok_or_else(|| std::io::Error::other(format!("invalid worker pid {pid}")))?;
             match rustix::process::kill_process(p, rustix::process::Signal::KILL) {
                 Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
@@ -267,7 +267,7 @@ fn force_with(
     cleaned(home, e, "forced")
 }
 fn group_gone(pid: u32) -> bool {
-    rustix::process::Pid::from_raw(pid as i32).is_none_or(|pid| {
+    rpc::signal_pid(pid).is_none_or(|pid| {
         rustix::process::test_kill_process_group(pid) == Err(rustix::io::Errno::SRCH)
     })
 }

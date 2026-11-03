@@ -674,7 +674,8 @@ fn append_log(store: &JobStore, id: &JobId, handle: &str, line: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        // S-12: never append through a planted symlink.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     if let Err(e) = opts
         .open(&path)

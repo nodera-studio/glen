@@ -241,21 +241,24 @@ struct ProbeBox {
     home: PathBuf,
     glen_home: PathBuf,
     cwd: PathBuf,
+    tmpdir: PathBuf,
     log: PathBuf,
 }
 impl ProbeBox {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let root = std::fs::canonicalize(tmp.path()).unwrap();
-        let (home, cwd) = (root.join("home"), root.join("cwd"));
-        std::fs::create_dir(&home).unwrap();
-        std::fs::create_dir(&cwd).unwrap();
+        let (home, cwd, tmpdir) = (root.join("home"), root.join("cwd"), root.join("tmpdir"));
+        for dir in [&home, &cwd, &tmpdir] {
+            std::fs::create_dir(dir).unwrap();
+        }
         Self {
             glen_home: root.join("glen"),
             log: root.join("fake.ndjson"),
             _tmp: tmp,
             home,
             cwd,
+            tmpdir,
         }
     }
     fn command(&self, args: &[&str], vars: &[(&str, &str)]) -> Command {
@@ -264,6 +267,7 @@ impl ProbeBox {
             .env_clear()
             .env("HOME", &self.home)
             .env("GLEN_HOME", &self.glen_home)
+            .env("TMPDIR", &self.tmpdir)
             .env("PATH", "")
             .env("FAKE_OMP_LOG", &self.log)
             .envs(vars.iter().copied())
@@ -334,6 +338,9 @@ fn probe_reports_the_protocol_and_both_capabilities() {
 #[test]
 fn probe_has_no_side_effects() {
     let b = ProbeBox::new();
+    // S-02: a planted project extension in the caller's cwd is never in omp's reach.
+    std::fs::create_dir_all(b.cwd.join(".omp/extensions")).unwrap();
+    std::fs::write(b.cwd.join(".omp/extensions/x.ts"), "throw 1;\n").unwrap();
     // `wedge` ignores TERM, so only a stdin EOF before teardown lets it log its exit.
     let (v, code) = b.probe(&[("FAKE_OMP_V2", "1"), ("FAKE_OMP_SCENARIO", "wedge")]);
     assert_eq!(code, 0, "{v}");
@@ -342,7 +349,7 @@ fn probe_has_no_side_effects() {
         .unwrap()
         .map(|e| e.unwrap().file_name())
         .collect();
-    assert!(in_cwd.is_empty(), "no session file in the cwd: {in_cwd:?}");
+    assert_eq!(in_cwd, [".omp"], "no session file in the cwd");
     let log = b.log();
     let starts: Vec<_> = log.iter().filter(|e| e["event"] == "start").collect();
     assert_eq!(starts.len(), 1, "{log:?}");
@@ -352,9 +359,24 @@ fn probe_has_no_side_effects() {
         .iter()
         .map(|a| a.as_str().unwrap())
         .collect();
-    assert_eq!(argv, ["--mode", "rpc", "--no-ui", "--no-session"]);
+    assert_eq!(
+        argv,
+        [
+            "--mode",
+            "rpc",
+            "--no-ui",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules"
+        ]
+    );
     assert_eq!(starts[0]["env"]["GLEN_MANAGED"], "1");
-    assert_eq!(starts[0]["cwd"], json!(b.cwd));
+    // A fresh private directory under TMPDIR, removed once omp is gone.
+    let cwd = std::path::Path::new(starts[0]["cwd"].as_str().unwrap());
+    assert_eq!(cwd.parent(), Some(b.tmpdir.as_path()), "{}", cwd.display());
+    assert!(!cwd.exists(), "{}", cwd.display());
+    assert_eq!(std::fs::read_dir(&b.tmpdir).unwrap().count(), 0);
     let frames: Vec<&str> = log
         .iter()
         .filter(|e| e["event"] == "in")

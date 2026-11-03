@@ -1304,8 +1304,8 @@ fn ac_v2_103_an_omp_that_exits_before_ready_is_warn_with_everything_unknown() {
     }
 }
 
-/// The probe's wire behaviour: one omp, RPC mode without a session, glen's cwd, `GLEN_MANAGED=1`,
-/// the real `glen_reply` tool and no prompt.
+/// The probe's wire behaviour: one omp, RPC mode without a session and with discovery off, in a
+/// private empty cwd (S-02), `GLEN_MANAGED=1`, the real `glen_reply` tool and no prompt.
 #[test]
 fn ac_v2_103_probe_starts_one_sessionless_rpc_omp_and_sends_no_prompt() {
     let rb = RpcBox::new();
@@ -1319,18 +1319,31 @@ fn ac_v2_103_probe_starts_one_sessionless_rpc_omp_and_sends_no_prompt() {
     let argv: BTreeSet<String> = strings(&start["argv"]).into_iter().collect();
     assert_eq!(
         argv,
-        ["--mode", "rpc", "--no-ui", "--no-session"]
-            .map(str::to_owned)
-            .into_iter()
-            .collect(),
-        "§A19 probe process: omp --mode rpc --no-ui --no-session, no --resume\n{start}"
+        [
+            "--mode",
+            "rpc",
+            "--no-ui",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules"
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .collect(),
+        "§A19 probe process: omp --mode rpc --no-ui --no-session with discovery off, no --resume\n{start}"
     );
-    assert_eq!(strings(&start["argv"]).len(), 4, "{start}");
+    assert_eq!(strings(&start["argv"]).len(), 7, "{start}");
     assert_eq!(start["env"]["GLEN_MANAGED"], "1", "{start}");
+    // S-02: never glen's cwd, which may hold a planted `.omp`; a fresh directory, gone after.
+    let cwd = Path::new(start["cwd"].as_str().unwrap());
+    assert!(!same_file(cwd, &rb.bx.alpha), "{start}");
     assert!(
-        same_file(Path::new(start["cwd"].as_str().unwrap()), &rb.bx.alpha),
-        "the probe omp runs in glen's cwd: {start}"
+        cwd.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("glen-omp-")),
+        "{start}"
     );
+    assert!(!cwd.exists(), "the private cwd is removed: {start}");
     let inbound: BTreeSet<String> = recs
         .iter()
         .filter(|r| r["event"] == "in")
@@ -1415,7 +1428,8 @@ fn ac_v2_103_probe_passes_the_profile_on() {
         .position(|a| a == "--profile")
         .expect("--profile passed");
     assert_eq!(argv[at + 1], "ci", "{argv:?}");
-    assert_eq!(argv.len(), 6, "{argv:?}");
+    // `--mode rpc --no-ui --profile ci --no-session --no-extensions --no-skills --no-rules`.
+    assert_eq!(argv.len(), 9, "{argv:?}");
 }
 
 fn tree_with_contents(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
@@ -3024,16 +3038,20 @@ fn ac_v2_106_every_omp_command_runs_in_a_scratch_home_with_no_secrets() {
             }
         }
     }
-    // The probe runs from the scratch directory (§A19), so omp finds no project configuration.
+    // The probe omp runs in glen's own private empty directory (S-02), never the workspace, so
+    // it finds no project configuration; the directory is gone once the probe ends.
     for (head, vars) in calls
         .iter()
         .filter(|(h, _)| h.starts_with("omp --mode rpc"))
     {
-        assert_eq!(
-            fs::canonicalize(&vars["PWD"]).unwrap(),
-            scratch,
-            "`{head}` ran outside the scratch directory"
+        let pwd = Path::new(&vars["PWD"]);
+        assert!(
+            pwd.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("glen-omp-")),
+            "`{head}` ran outside a private directory: {pwd:?}"
         );
+        assert!(!pwd.starts_with(&r.ws), "`{head}` ran in the workspace");
+        assert!(!pwd.exists(), "`{head}`'s directory was left behind");
     }
     // The stub provider lives in the scratch home only.
     assert_eq!(

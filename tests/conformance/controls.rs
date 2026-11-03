@@ -2597,8 +2597,10 @@ fn ac368_on_the_rpc_route_only_omp_writes_the_session_and_glen_writes_only_its_h
     let outside = |lb: &LiveBox| -> Vec<(String, u64, SystemTime)> {
         snapshot(&lb.bx.root)
             .into_iter()
+            // `models` lists through a private cwd made and removed under TMPDIR (S-02): that
+            // touches only the directory's own mtime, and anything left inside it still shows.
             .filter(|(p, _, _)| {
-                !p.starts_with("logs") && !p.starts_with("extlogs") && *p != rel_file
+                !p.starts_with("logs") && !p.starts_with("extlogs") && *p != rel_file && *p != "tmp"
             })
             .collect()
     };

@@ -116,7 +116,7 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
             let result = probe::run(
                 bin,
                 cli.global.profile.as_deref(),
-                env.cwd(),
+                env,
                 probe_budget(env),
                 &stop,
             );

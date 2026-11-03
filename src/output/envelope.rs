@@ -1,7 +1,7 @@
 use super::{Mode, OutputCtx, stdout_failure_exit};
 use crate::{
     error::{ErrorCode, GlenError, OkExit, Warning},
-    glen_home::{self, write_private_atomic},
+    glen_home::{self, write_private_atomic_unnamed},
     render::{palette::Token, sanitize},
 };
 use serde_json::{Value, json};
@@ -275,7 +275,7 @@ fn spill(
     // Human output can be explicitly forced to colour on a pipe. Spill files stay plain.
     let plain = anstream::adapter::strip_str(std::str::from_utf8(bytes).map_err(io::Error::other)?)
         .to_string();
-    write_private_atomic(&path, plain.as_bytes())
+    write_private_atomic_unnamed(&path, plain.as_bytes())
         .map_err(|e| home_write_error(ctx, command, &path, "write", e))?;
     prune_spills(&dir, &path);
     if is_json {

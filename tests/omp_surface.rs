@@ -20,7 +20,7 @@ use std::{
     thread::JoinHandle,
     time::{Duration, Instant},
 };
-const FLAGS: [&str; 8] = [
+const FLAGS: [&str; 10] = [
     "--mode",
     "--no-ui",
     "--no-session",
@@ -29,6 +29,8 @@ const FLAGS: [&str; 8] = [
     "--thinking",
     "--extension",
     "--no-extensions",
+    "--no-skills",
+    "--no-rules",
 ];
 /// What one surface run saw, for the nightly log.
 struct Seen {

@@ -110,7 +110,9 @@ FLAGS
   --profile=<value>        Use an isolated profile for auth, sessions, settings, and caches
   --thinking=<value>       Set thinking level
   -e, --extension=<value>  Load an extension file (can be used multiple times)
-  --no-extensions          Disable extension discovery (explicit -e paths still work)"
+  --no-extensions          Disable extension discovery (explicit -e paths still work)
+  --no-skills              Disable skills discovery and loading
+  --no-rules               Disable rules discovery and loading"
         );
         return Ok(0);
     }
@@ -133,7 +135,8 @@ FLAGS
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--mode" if iter.next().map(String::as_str) == Some("rpc") => mode = true,
-            "--no-ui" => (),
+            // Discovery switches: logged in argv, nothing to discover here.
+            "--no-ui" | "--no-extensions" | "--no-skills" | "--no-rules" => (),
             "--no-session" => no_session = true,
             "--profile" => {
                 if iter.next().is_none() {

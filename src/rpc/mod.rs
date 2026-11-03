@@ -84,6 +84,65 @@ pub(crate) fn base_command(
     }
     command
 }
+/// omp loads project settings, extensions, skills and rules from its cwd with no trust gate
+/// (`extensibility/extensions/types.ts:814-820` in the omp clone), so a child that only lists
+/// models or probes capabilities (S-02) runs `--no-session` with discovery off
+/// (`--no-extensions --no-skills --no-rules`, launch flags omp 18.14.0 parses in every mode,
+/// `cli/args.ts:382-387`, and applies in `buildSessionOptions`), in a [`PrivateCwd`]. `send`
+/// and resumed controls keep the session's cwd: that directory is the session's by design.
+pub(crate) fn listing_command(
+    bin: &std::path::Path,
+    profile_flag: Option<&str>,
+    cwd: &PrivateCwd,
+) -> Command {
+    let mut command = base_command(bin, profile_flag, &cwd.0);
+    // omp falls back to $PWD when it cannot read its cwd (`getProjectDir`): never the caller's.
+    command
+        .args([
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules",
+        ])
+        .env("PWD", &cwd.0);
+    command
+}
+/// A new, empty 0700 directory under `$TMPDIR` (else `/tmp`) for a listing or probe child
+/// (S-02); removed on drop, after the child is gone. Creation fails rather than reuse a path
+/// that already exists.
+#[derive(Debug)]
+pub(crate) struct PrivateCwd(std::path::PathBuf);
+impl PrivateCwd {
+    pub(crate) fn new(env: &Env) -> io::Result<Self> {
+        let temp = env
+            .non_empty("TMPDIR")
+            .or_else(|| env.non_empty("TMP"))
+            .or_else(|| env.non_empty("TEMP"))
+            .map(std::path::Path::new)
+            .filter(|p| p.is_absolute())
+            .unwrap_or(std::path::Path::new("/tmp"));
+        let path = temp.join(format!("glen-omp-{}", uuid::Uuid::now_v7().simple()));
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&path).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot create a private directory for omp at {}: {e}",
+                    path.display()
+                ),
+            )
+        })?;
+        Ok(Self(path))
+    }
+}
+impl Drop for PrivateCwd {
+    fn drop(&mut self) {
+        // Best effort: a leftover empty directory under $TMPDIR is harmless.
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 pub fn omp_command(job: &Job) -> Command {
     let mut command = base_command(
         job.omp_bin.as_deref().unwrap_or(std::path::Path::new("")),
@@ -100,9 +159,18 @@ pub fn omp_command(job: &Job) -> Command {
     }
     command
 }
+/// A recorded pid glen may signal or probe (S-30): it fits `pid_t` and is above 1, so a
+/// corrupt or hostile record can never turn into `kill(0, _)` (the caller's group), `kill(-1, _)`
+/// (every process) or init.
+pub(crate) fn signal_pid(pid: u32) -> Option<rustix::process::Pid> {
+    i32::try_from(pid)
+        .ok()
+        .filter(|raw| *raw > 1)
+        .and_then(rustix::process::Pid::from_raw)
+}
 pub(crate) fn kill_group(pid: u32, signal: rustix::process::Signal) -> io::Result<()> {
-    let Some(pid) = rustix::process::Pid::from_raw(pid as i32) else {
-        return Err(io::Error::other("invalid omp pid"));
+    let Some(pid) = signal_pid(pid) else {
+        return Err(io::Error::other(format!("invalid omp pid {pid}")));
     };
     match rustix::process::kill_process_group(pid, signal) {
         Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
@@ -118,7 +186,8 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        // S-12: the worker's stdout and stderr never follow a planted symlink.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let path = home.root.join("jobs").join(id.as_str()).join("worker.log");
     let log = opts
@@ -228,6 +297,41 @@ mod tests {
                 );
             }
         }
+    }
+    /// S-12: a symlink planted at `worker.log` fails the spawn; its target is never written.
+    #[cfg(unix)]
+    #[test]
+    fn s12_the_worker_log_never_follows_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("glen"),
+        };
+        let id = JobId::new();
+        let dir = home.ensure_dir(&format!("jobs/{}", id.as_str())).unwrap();
+        let victim = t.path().join("victim.jsonl");
+        std::fs::write(&victim, b"kept\n").unwrap();
+        std::os::unix::fs::symlink(&victim, dir.join("worker.log")).unwrap();
+        let e = spawn_worker(&home, &id).unwrap_err();
+        assert!(e.to_string().contains("worker.log"), "{e}");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"kept\n");
+    }
+    #[test]
+    fn s30_only_a_pid_above_one_that_fits_pid_t_is_signalled() {
+        for pid in [0, 1, 1 << 31, u32::MAX] {
+            assert!(signal_pid(pid).is_none(), "{pid}");
+        }
+        // A wrapped pid is refused before any signal (SIGCONT, so a regression stays harmless:
+        // `pid as i32` once turned u32::MAX into a signal for init).
+        for pid in [0, 1 << 31, u32::MAX] {
+            let error = kill_group(pid, rustix::process::Signal::CONT).unwrap_err();
+            assert!(error.to_string().contains("invalid omp pid"), "{error}");
+        }
+        assert_eq!(signal_pid(2).map(|p| p.as_raw_nonzero().get()), Some(2));
+        let me = std::process::id();
+        assert_eq!(
+            signal_pid(me).map(|p| p.as_raw_nonzero().get() as u32),
+            Some(me)
+        );
     }
     #[test]
     fn s25_a_non_plain_session_id_never_reaches_a_handle() {

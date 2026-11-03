@@ -3,7 +3,7 @@ pub mod lock;
 pub mod wait;
 use crate::{
     error::{ErrorCode, GlenError, Warning},
-    glen_home::{GlenHome, write_private_atomic},
+    glen_home::{GlenHome, write_private_atomic_unnamed},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
@@ -385,7 +385,8 @@ impl JobStore {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
+            // S-12: a planted symlink must never make glen lock (or create) another file.
+            opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
         }
         let file = opts.open(&path).map_err(|e| {
             map(
@@ -562,7 +563,8 @@ fn write_json_mapped<T: Serialize>(
         )
     })?;
     b.push(b'\n');
-    write_private_atomic(path, &b).map_err(|e| map(path, e))
+    // Every map names the path itself.
+    write_private_atomic_unnamed(path, &b).map_err(|e| map(path, e))
 }
 /// Appends one NDJSON record. A torn tail (a previous append cut off before its newline, for
 /// example by ENOSPC) is terminated first, so the new record never merges into it (W8-ERR-4).
@@ -572,7 +574,8 @@ pub(crate) fn append_line(path: &Path, bytes: &[u8]) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        // S-12: never append through a planted symlink (the extension's twin has O_NOFOLLOW).
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut b = Vec::with_capacity(bytes.len() + 2);
     opts.open(path)
@@ -1135,5 +1138,57 @@ mod w8_g2_tests {
         let e = tests::store(t.path()).resolve("j1234567").unwrap_err();
         assert_eq!(e.code, ErrorCode::NotFound);
         assert_eq!(e.hint.as_deref(), Some("run `glen jobs`"));
+    }
+}
+
+#[cfg(all(test, unix))]
+mod s12_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
+    /// S-12: a symlink planted at `status.lock` never makes glen create, lock or touch the file
+    /// it names, live or dangling.
+    #[test]
+    fn status_lock_never_follows_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let store = tests::store(t.path());
+        let j = tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let lock = store.dir(&id).join("status.lock");
+        let victim = t.path().join("victim.lock");
+        for exists in [true, false] {
+            if exists {
+                fs::write(&victim, b"keep").unwrap();
+            }
+            fs::remove_file(&lock).unwrap();
+            symlink(&victim, &lock).unwrap();
+            let e = store.status_lock(&id).unwrap_err();
+            assert!(e.message.contains("status.lock"), "{}", e.message);
+            assert_eq!(
+                victim.exists(),
+                exists,
+                "a dangling target is never created"
+            );
+            if exists {
+                assert_eq!(fs::read(&victim).unwrap(), b"keep");
+                // Not locked through the link: another open can take it at once.
+                let other = fs::File::open(&victim).unwrap();
+                assert!(other.try_lock().is_ok());
+                fs::remove_file(&victim).unwrap();
+            }
+            assert!(store.write_status(&id, &Status::default()).is_err());
+        }
+    }
+    /// S-12: an NDJSON append never writes through a symlink.
+    #[test]
+    fn append_line_never_follows_a_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let victim = t.path().join("victim.jsonl");
+        fs::write(&victim, b"{\"type\":\"session\"}\n").unwrap();
+        let link = t.path().join("replies.ndjson");
+        symlink(&victim, &link).unwrap();
+        let e = append_line(&link, b"{}").unwrap_err();
+        assert!(e.to_string().contains("replies.ndjson"), "{e}");
+        assert_eq!(fs::read(&victim).unwrap(), b"{\"type\":\"session\"}\n");
     }
 }

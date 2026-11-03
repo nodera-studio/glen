@@ -128,6 +128,64 @@ fn ac357_models_no_session() {
         assert_eq!(start["env"]["GLEN_MANAGED"], "1");
     }
 }
+/// S-02: `models` (with or without a session) only lists, so its omp child never runs in the
+/// caller's directory, which may hold a planted `.omp/extensions`: it runs with discovery off
+/// in a fresh private directory under TMPDIR that is gone afterwards.
+#[test]
+fn s02_models_children_run_in_a_private_empty_cwd_with_discovery_off() {
+    let b = RpcBox::new();
+    let planted = b.omp.alpha().join(".omp/extensions");
+    fs::create_dir_all(&planted).unwrap();
+    fs::write(planted.join("x.ts"), "throw new Error('loaded');\n").unwrap();
+    run(&b, &["models", "--json"], 0);
+    run(&b, &["models", "e27c0de", "--json"], 0);
+    let starts: Vec<Value> = b
+        .fake_log()
+        .into_iter()
+        .filter(|r| r["event"] == "start")
+        .collect();
+    assert_eq!(starts.len(), 2, "{starts:?}");
+    for start in &starts {
+        let argv: Vec<&str> = start["argv"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a.as_str().unwrap())
+            .collect();
+        assert_eq!(
+            argv,
+            [
+                "--mode",
+                "rpc",
+                "--no-ui",
+                "--no-session",
+                "--no-extensions",
+                "--no-skills",
+                "--no-rules"
+            ]
+        );
+        let cwd = Path::new(start["cwd"].as_str().unwrap());
+        assert!(
+            cwd.parent() == Some(b.omp.tmpdir.as_path()),
+            "{} is not under {}",
+            cwd.display(),
+            b.omp.tmpdir.display()
+        );
+        assert!(
+            cwd.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("glen-omp-")
+        );
+        assert!(!cwd.exists(), "the private cwd is removed");
+    }
+    assert_ne!(
+        starts[0]["cwd"], starts[1]["cwd"],
+        "one directory per child"
+    );
+    assert_eq!(fs::read_dir(&b.omp.tmpdir).unwrap().count(), 0);
+    assert!(!b.omp.glen_home.exists());
+}
 #[test]
 fn ac355_persisted_and_ac359_resolution() {
     let b = RpcBox::new();
