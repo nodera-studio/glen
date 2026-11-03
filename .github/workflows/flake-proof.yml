@@ -20,7 +20,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 120
+    # 20 repeats take about 5 minutes each on ubuntu and about 8 on macos (run 41601896723: 16
+    # clean macos repeats in the 120 minutes, then the job was cancelled by this limit).
+    timeout-minutes: 210
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
