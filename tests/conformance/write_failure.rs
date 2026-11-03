@@ -8,11 +8,11 @@ use std::{
 
 use crate::support::*;
 
-/// A pipe whose read end is already closed: every write gets EPIPE.
+/// A stdout every write to which gets EPIPE: a FIFO no process holds a reader of
+/// (`flake::closed_stdout`; a dropped `std::io::pipe()` reader can survive in a process another
+/// test thread spawned, on macOS).
 fn closed_stdout() -> Stdio {
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    drop(reader);
-    Stdio::from(writer)
+    Stdio::from(crate::flake::closed_stdout())
 }
 
 fn assert_silent_exit(out: &Out, expected: i32) {

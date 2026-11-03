@@ -154,15 +154,38 @@ impl std::ops::DerefMut for Captured {
     }
 }
 
+/// Joins a thread that reads an exited child's stdout pipe to end of file, if it finishes within
+/// 5 s (scaled): its result, else `None`. A process another test thread spawned can hold the
+/// pipe's write end for its life (see [`Capture`]), so end of file may not come; the lines a test
+/// waits for have arrived by then.
+pub fn join_reader<T>(reader: std::thread::JoinHandle<T>) -> Option<T> {
+    let deadline = std::time::Instant::now() + scaled(Duration::from_secs(5));
+    while !reader.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    Some(reader.join().unwrap())
+}
+
 /// A file every write to which fails with EPIPE, for a child's stdout: the write end of a FIFO
 /// whose only reader has closed. A pipe from `std::io::pipe()` with its reader dropped is not
 /// enough on macOS: std sets the pipe's `FD_CLOEXEC` after `pipe()`, so a process another test
-/// thread spawns in between keeps the read end for its life, and the child's writes succeed. Both
-/// FIFO ends are opened with `O_CLOEXEC`, so a process forked meanwhile holds the reader only until
-/// its exec; this returns once a probe write fails with EPIPE, the FIFO's path already removed, so
-/// from then on no process holds or can open a reader.
+/// thread spawns in between keeps the read end for its life, and the child's writes succeed.
 pub fn closed_stdout() -> File {
-    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    let (reader, writer) = fifo();
+    drop(reader);
+    await_no_reader(&writer);
+    writer
+}
+
+/// The read and write ends of a FIFO, both blocking, for a child's stdout that the test reads and
+/// later closes. Both ends are opened with `O_CLOEXEC` and the path is removed before this
+/// returns, so no process can open another reader, and one forked meanwhile holds the reader only
+/// until its exec ([`await_no_reader`] waits that out).
+pub fn fifo() -> (File, File) {
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, io::AsRawFd};
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("stdout");
     let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
@@ -176,18 +199,28 @@ pub fn closed_stdout() -> File {
         .unwrap();
     // A reader exists, so this blocking open returns at once.
     let writer = File::options().write(true).open(&path).unwrap();
-    drop(reader);
-    drop(dir);
-    // A probe byte lands only while a forked child still holds the reader (it never reads it).
+    // SAFETY: F_GETFL and F_SETFL on a descriptor `reader` owns.
+    let unblocked = unsafe {
+        let flags = libc::fcntl(reader.as_raw_fd(), libc::F_GETFL);
+        flags >= 0 && libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK) == 0
+    };
+    assert!(unblocked, "fcntl: {}", std::io::Error::last_os_error());
+    (reader, writer)
+}
+
+/// Returns once a write to `writer`, a [`fifo`]'s write end, fails with EPIPE: its reader has
+/// closed, and so has every copy a process forked meanwhile held until its exec (a probe byte
+/// lands only while one is left, and nothing reads it). Bounded at 10 s, scaled.
+pub fn await_no_reader(writer: &File) {
     let deadline = std::time::Instant::now() + scaled(Duration::from_secs(10));
     loop {
-        match std::io::Write::write(&mut &writer, b"\0") {
-            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return writer,
+        match std::io::Write::write(&mut &*writer, b"\0") {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return,
             Ok(_) => assert!(
                 std::time::Instant::now() < deadline,
-                "a reader of the closed stdout outlived its holder's exec"
+                "a reader of the FIFO outlived its holder's exec"
             ),
-            Err(e) => panic!("probe the closed stdout: {e}"),
+            Err(e) => panic!("probe the FIFO: {e}"),
         }
         std::thread::sleep(Duration::from_millis(1));
     }

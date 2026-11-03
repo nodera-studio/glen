@@ -1,5 +1,5 @@
 mod common;
-use common::{OmpBox, data, json};
+use common::{OmpBox, data, flake, json};
 use serde_json::{Value, json as j};
 use std::{
     fs::{self, OpenOptions},
@@ -35,7 +35,7 @@ impl Following {
     }
     fn line(&self) -> String {
         self.lines
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(flake::scaled(Duration::from_secs(10)))
             .expect("stream line within 10s")
     }
     fn event(&self) -> Value {
@@ -56,7 +56,7 @@ impl Following {
                 return s;
             }
             assert!(
-                start.elapsed() < Duration::from_secs(3),
+                start.elapsed() < flake::scaled(Duration::from_secs(3)),
                 "child failed to exit"
             );
             thread::sleep(Duration::from_millis(20));
@@ -87,16 +87,21 @@ fn tail_follow_with_a_closed_stdout_exits_0_silently() {
     for close_after_backlog in [false, true] {
         let sb = OmpBox::new();
         let mut command = sb.command(&["tail", "e27c0de", "-f", "--json"], &sb.alpha());
-        if close_after_backlog {
-            command.stdout(Stdio::piped());
+        // stdout is a FIFO no other process can keep a reader of (`flake::fifo`); stderr comes
+        // back from a file, read at glen's exit.
+        let (stdout, probe) = if close_after_backlog {
+            let (reader, writer) = flake::fifo();
+            let probe = writer.try_clone().unwrap();
+            command.stdout(writer);
+            (Some(reader), Some(probe))
         } else {
-            let (reader, writer) = std::io::pipe().unwrap();
-            drop(reader);
-            command.stdout(Stdio::from(writer));
-        }
-        let mut child = command.stderr(Stdio::piped()).spawn().unwrap();
-        if close_after_backlog {
-            let stdout = child.stdout.take().unwrap();
+            command.stdout(flake::closed_stdout());
+            (None, None)
+        };
+        let stderr = flake::Capture::new();
+        stderr.attach_stderr(&mut command);
+        let mut child = command.spawn().unwrap();
+        if let (Some(stdout), Some(probe)) = (stdout, probe) {
             let (tx, rx) = mpsc::channel();
             let reader = thread::spawn(move || {
                 let mut reader = BufReader::new(stdout);
@@ -109,27 +114,32 @@ fn tail_follow_with_a_closed_stdout_exits_0_silently() {
                 drop(reader);
                 tx.send(()).unwrap();
             });
-            if let Err(error) = rx.recv_timeout(Duration::from_secs(10)) {
+            if let Err(error) = rx.recv_timeout(flake::scaled(Duration::from_secs(10))) {
                 child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
+                let output = stderr.output(child.wait().unwrap());
                 panic!("tail backlog did not arrive: {error}: {output:?}");
             }
             reader.join().unwrap();
+            // Glen's next write fails only once no process holds a reader.
+            flake::await_no_reader(&probe);
             append(
                 &sb.session('A'),
                 &message("10000010", "10000009", "after reader closed"),
             );
         }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while child.try_wait().unwrap().is_none() {
+        let deadline = Instant::now() + flake::scaled(Duration::from_secs(10));
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
             if Instant::now() >= deadline {
                 child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
+                let output = stderr.output(child.wait().unwrap());
                 panic!("tail did not stop after EPIPE: {output:?}");
             }
             thread::sleep(Duration::from_millis(20));
-        }
-        let output = child.wait_with_output().unwrap();
+        };
+        let output = stderr.output(status);
         assert_eq!(output.status.code(), Some(0), "{output:?}");
         assert!(output.stderr.is_empty(), "{output:?}");
     }
@@ -385,7 +395,7 @@ fn ac124_sigint_trailer() {
     );
     assert_eq!(f.event(), j!({"v":1,"event":"end","ok":true}));
     assert_eq!(f.wait().code(), Some(130));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(2)));
     assert!(f.lines.recv_timeout(Duration::from_millis(500)).is_err());
     sb.clean();
 }
@@ -422,7 +432,7 @@ fn human_follow_and_zero_backlog() {
         if l.contains("❯ user") {
             break;
         }
-        assert!(start.elapsed() < Duration::from_secs(5));
+        assert!(start.elapsed() < flake::scaled(Duration::from_secs(5)));
     }
     assert_eq!(f.line(), "  human more");
     sb.clean();
@@ -448,16 +458,14 @@ fn follow_never_spills_and_broken_pipe() {
     let sb = OmpBox::new();
     let mut c = sb.command(&["tail", "e27c0de", "-f", "--json"], &sb.alpha());
     c.env("GLEN_MAX_OUTPUT", "1");
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    let mut child = c.stdout(Stdio::from(writer)).spawn().unwrap();
+    let mut child = c.stdout(flake::closed_stdout()).spawn().unwrap();
     let start = Instant::now();
     loop {
         if let Some(s) = child.try_wait().unwrap() {
             assert_eq!(s.code(), Some(0));
             break;
         }
-        if start.elapsed() > Duration::from_secs(3) {
+        if start.elapsed() > flake::scaled(Duration::from_secs(3)) {
             child.kill().unwrap();
             panic!("follower did not stop on broken pipe")
         }
@@ -730,7 +738,7 @@ fn cwd_scopes_latest_and_follow_but_never_rebases_explicit_paths() {
     )
     .unwrap();
     assert_eq!(
-        common::poll(Duration::from_secs(10), || following
+        common::poll(flake::scaled(Duration::from_secs(10)), || following
             .child
             .try_wait()
             .unwrap())

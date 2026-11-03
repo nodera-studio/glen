@@ -1,4 +1,5 @@
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use glen::{
     glen_home::GlenHome,
@@ -70,7 +71,7 @@ fn make(b: &RpcBox, state: State, raw: Option<&str>) -> JobId {
     id
 }
 fn run(b: &RpcBox, args: &[&str], code: i32) -> Value {
-    let o = b.glen(args).output().unwrap();
+    let o = b.glen(args).captured();
     assert_eq!(o.status.code(), Some(code), "{o:?}");
     assert!(o.stderr.is_empty());
     assert!(!o.stdout.contains(&27));
@@ -82,7 +83,7 @@ fn ac220_empty_lazy() {
     let v = run(&b, &["jobs", "--json"], 0);
     assert_eq!(v["data"], json!({"total":0,"jobs":[]}));
     assert!(!b.omp.glen_home.exists());
-    let o = b.glen(&["jobs", "--human"]).output().unwrap();
+    let o = b.glen(&["jobs", "--human"]).captured();
     assert_eq!(o.stdout, b"no glen jobs yet\n");
     assert!(!b.omp.glen_home.exists());
 }
@@ -139,8 +140,7 @@ fn ac220_order_limits_filters_and_lost_check() {
     let o = b
         .glen(&["jobs", "--human", "-n", "2"])
         .env("COLUMNS", "60")
-        .output()
-        .unwrap();
+        .captured();
     assert!(o.status.success());
     let text = String::from_utf8(o.stdout).unwrap();
     assert!(text.contains("3 jobs"));
@@ -272,7 +272,7 @@ fn ac223_send_prunes_only_old_terminal_jobs() {
     for (id, keep) in expected {
         assert_eq!(s.dir(&id).exists(), keep);
     }
-    assert!(b.wait_terminal(id, Duration::from_secs(1))["status"] == "completed");
+    assert!(b.wait_terminal(id, flake::scaled(Duration::from_secs(1)))["status"] == "completed");
     assert!(fs::metadata(s.dir(&JobId::parse(id).unwrap())).is_ok());
 }
 
@@ -311,8 +311,7 @@ fn review13_human_duration_multiline_replies_and_session_handle() {
     let o = b
         .glen(&["wait", id.as_str(), "--human"])
         .env("COLUMNS", "40")
-        .output()
-        .unwrap();
+        .captured();
     assert!(o.status.success());
     let text = String::from_utf8(o.stdout).unwrap();
     assert!(text.contains("1m 05s"), "{text}");
@@ -330,8 +329,7 @@ fn review13_human_duration_multiline_replies_and_session_handle() {
         let o = b
             .glen(&["jobs", "--human"])
             .env("COLUMNS", width)
-            .output()
-            .unwrap();
+            .captured();
         assert!(o.status.success());
         let text = String::from_utf8(o.stdout).unwrap();
         assert!(text.contains("bcdef01"), "{width}: {text}");
@@ -366,8 +364,7 @@ fn cycle3_narrow_jobs_preserve_full_job_handle() {
         let o = b
             .glen(&["jobs", "--human"])
             .env("COLUMNS", width.to_string())
-            .output()
-            .unwrap();
+            .captured();
         assert!(o.status.success());
         let text = String::from_utf8(o.stdout).unwrap();
         assert!(text.contains(&id.handle()), "{width}: {text}");

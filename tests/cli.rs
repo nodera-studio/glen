@@ -1,4 +1,5 @@
 mod common;
+use common::flake::{self, CaptureExt};
 use common::{fixture, glen, json};
 use std::{
     fs,
@@ -7,10 +8,16 @@ use std::{
 fn fake() -> String {
     fixture("bin/fake-omp").to_str().unwrap().into()
 }
+/// A stdout every write to which fails with EPIPE (`flake::closed_stdout`).
 fn closed_stdout() -> Stdio {
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    Stdio::from(writer)
+    Stdio::from(flake::closed_stdout())
+}
+/// `cmd.output()` for a command that sets its own stdout: its stderr comes back from a file, so
+/// the wait ends at glen's exit.
+fn stderr_output(cmd: &mut Command) -> std::process::Output {
+    let capture = flake::Capture::new();
+    capture.attach_stderr(cmd.stdin(Stdio::null()));
+    capture.output(cmd.status().unwrap())
 }
 #[test]
 fn public_help() {
@@ -319,16 +326,15 @@ fn lazy_state() {
 #[test]
 fn closed_stdout_pipe() {
     let t = tempfile::tempdir().unwrap();
-    let o = Command::new(env!("CARGO_BIN_EXE_glen"))
-        .args(["doctor", "--human"])
-        .env_clear()
-        .env("HOME", t.path())
-        .env("GLEN_OMP_BIN", fake())
-        .env("PATH", t.path())
-        .stdout(closed_stdout())
-        .stderr(Stdio::piped())
-        .output()
-        .unwrap();
+    let o = stderr_output(
+        Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args(["doctor", "--human"])
+            .env_clear()
+            .env("HOME", t.path())
+            .env("GLEN_OMP_BIN", fake())
+            .env("PATH", t.path())
+            .stdout(closed_stdout()),
+    );
     assert_eq!(o.status.code(), Some(0));
     assert!(o.stderr.is_empty());
 }
@@ -346,22 +352,22 @@ fn closed_stdout_keeps_each_commands_outcome() {
         (vec!["doctor", "--human"], false, 5),
     ] {
         let t = tempfile::tempdir().unwrap();
-        let o = Command::new(env!("CARGO_BIN_EXE_glen"))
-            .args(&args)
-            .env_clear()
-            .env("HOME", t.path())
-            .env("PATH", t.path())
-            .env(
-                "GLEN_OMP_BIN",
-                if healthy_omp {
-                    fake()
-                } else {
-                    "/nonexistent".into()
-                },
-            )
-            .stdout(closed_stdout())
-            .output()
-            .unwrap();
+        let o = stderr_output(
+            Command::new(env!("CARGO_BIN_EXE_glen"))
+                .args(&args)
+                .env_clear()
+                .env("HOME", t.path())
+                .env("PATH", t.path())
+                .env(
+                    "GLEN_OMP_BIN",
+                    if healthy_omp {
+                        fake()
+                    } else {
+                        "/nonexistent".into()
+                    },
+                )
+                .stdout(closed_stdout()),
+        );
         assert_eq!(o.status.code(), Some(exit), "{args:?}: {o:?}");
         assert!(o.stderr.is_empty(), "{args:?}: {o:?}");
     }
@@ -369,11 +375,10 @@ fn closed_stdout_keeps_each_commands_outcome() {
 #[test]
 fn a_failure_envelope_on_a_closed_stdout_keeps_its_exit_code() {
     let b = common::OmpBox::new();
-    let o = b
-        .command(&["show", "fffffff", "--json"], &b.alpha())
-        .stdout(closed_stdout())
-        .output()
-        .unwrap();
+    let o = stderr_output(
+        b.command(&["show", "fffffff", "--json"], &b.alpha())
+            .stdout(closed_stdout()),
+    );
     assert_eq!(o.status.code(), Some(3));
     assert!(o.stderr.is_empty());
 }
@@ -382,15 +387,15 @@ fn readonly_stdout_exits_one_without_another_document() {
     for args in [vec!["doctor", "--json"], vec!["ls"]] {
         let t = tempfile::tempdir().unwrap();
         let file = tempfile::NamedTempFile::new().unwrap();
-        let o = Command::new(env!("CARGO_BIN_EXE_glen"))
-            .args(&args)
-            .env_clear()
-            .env("HOME", t.path())
-            .env("PATH", t.path())
-            .env("GLEN_OMP_BIN", fake())
-            .stdout(fs::File::open(file.path()).unwrap())
-            .output()
-            .unwrap();
+        let o = stderr_output(
+            Command::new(env!("CARGO_BIN_EXE_glen"))
+                .args(&args)
+                .env_clear()
+                .env("HOME", t.path())
+                .env("PATH", t.path())
+                .env("GLEN_OMP_BIN", fake())
+                .stdout(fs::File::open(file.path()).unwrap()),
+        );
         assert_eq!(o.status.code(), Some(1), "{args:?}: {o:?}");
         assert!(o.stderr.is_empty());
         assert!(fs::read(file.path()).unwrap().is_empty());
@@ -407,19 +412,28 @@ fn human_usage_depends_on_stderr_even_when_stdout_is_broken() {
             } else {
                 closed_stdout()
             };
-            let o = Command::new(env!("CARGO_BIN_EXE_glen"))
-                .args(["bogus", "--human"])
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_glen"));
+            cmd.args(["bogus", "--human"])
                 .env_clear()
                 .env("HOME", t.path())
                 .env("PATH", t.path())
-                .stdout(stdout)
-                .stderr(match stderr {
-                    "closed" => closed_stdout(),
-                    "readonly" => Stdio::from(fs::File::open(file.path()).unwrap()),
-                    _ => Stdio::piped(),
-                })
-                .output()
-                .unwrap();
+                .stdout(stdout);
+            let o = match stderr {
+                "ok" => stderr_output(&mut cmd),
+                broken => std::process::Output {
+                    status: cmd
+                        .stdin(Stdio::null())
+                        .stderr(if broken == "closed" {
+                            closed_stdout()
+                        } else {
+                            Stdio::from(fs::File::open(file.path()).unwrap())
+                        })
+                        .status()
+                        .unwrap(),
+                    stdout: vec![],
+                    stderr: vec![],
+                },
+            };
             assert_eq!(
                 o.status.code(),
                 Some(if stderr == "ok" { 2 } else { 1 }),
@@ -700,8 +714,7 @@ fn non_utf8_home_is_an_error_envelope_without_panic() {
         .env_clear()
         .env("HOME", &home)
         .env("GLEN_OMP_BIN", fake())
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(o.status.code(), Some(2), "{o:?}");
     assert_eq!(json(&o)["error"]["code"], "invalid_env");
     assert!(o.stderr.is_empty());
@@ -719,8 +732,7 @@ fn non_utf8_profile_keeps_original_clap_diagnostic() {
             .arg("doctor")
             .env_clear()
             .env("HOME", t.path())
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(o.status.code(), Some(2), "{o:?}");
         if mode == "--human" {
             assert!(o.stdout.is_empty());
@@ -763,8 +775,7 @@ fn non_utf8_home_allows_a_full_human_doctor_report() {
             .env_clear()
             .env("HOME", &home)
             .env("GLEN_OMP_BIN", bin)
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(o.status.code(), Some(code), "{o:?}");
         let text = String::from_utf8(o.stdout).unwrap();
         for row in [

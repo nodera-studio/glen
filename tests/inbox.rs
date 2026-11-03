@@ -1,4 +1,5 @@
 mod common;
+use common::flake::{self, CaptureExt};
 use common::{OmpBox, data, poll};
 use serde_json::{Value, json as j};
 use std::{
@@ -8,10 +9,12 @@ use std::{
     process::Stdio,
     time::Duration,
 };
-fn closed_stdout() -> Stdio {
-    let (reader, writer) = std::io::pipe().unwrap();
-    drop(reader);
-    Stdio::from(writer)
+/// Runs `cmd` with a stdout no process reads (`flake::closed_stdout`); its stderr comes back from
+/// a file, so the wait ends at glen's exit.
+fn closed_run(cmd: &mut std::process::Command) -> std::process::Output {
+    let capture = flake::Capture::new();
+    capture.attach_stderr(cmd.stdin(Stdio::null()).stdout(flake::closed_stdout()));
+    capture.output(cmd.status().unwrap())
 }
 const A: &str = common::A_ID;
 const B: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e2fffff";
@@ -37,7 +40,7 @@ fn append(b: &OmpBox, id: &str, r: &Value) {
 fn inbox(b: &OmpBox, flags: &[&str]) -> std::process::Output {
     let mut a = vec!["inbox", "--json"];
     a.extend_from_slice(flags);
-    b.command(&a, &b.alpha()).output().unwrap()
+    b.command(&a, &b.alpha()).captured()
 }
 #[test]
 fn ac319_unread_all_peek_filters_and_order() {
@@ -110,8 +113,7 @@ fn ac319_missing_home_is_lazy_and_human_is_sanitized() {
     append(&b, A, &record(A, "text\u{1b}[31m", "2026-10-30T00:00:00Z"));
     let o = b
         .command(&["inbox", "--human", "--peek"], &b.alpha())
-        .output()
-        .unwrap();
+        .captured();
     assert!(o.status.success());
     assert!(!o.stdout.contains(&27));
     let h = String::from_utf8(o.stdout).unwrap();
@@ -132,12 +134,10 @@ fn ac319_output_failure_keeps_cursor() {
             ),
         );
     }
-    let o = b
-        .command(&["inbox", "--json"], &b.alpha())
-        .env("GLEN_MAX_OUTPUT", "0")
-        .stdout(closed_stdout())
-        .output()
-        .unwrap();
+    let o = closed_run(
+        b.command(&["inbox", "--json"], &b.alpha())
+            .env("GLEN_MAX_OUTPUT", "0"),
+    );
     assert_eq!(o.status.code(), Some(0));
     assert!(o.stderr.is_empty());
     assert!(!b.glen_home.join("inbox/.read").exists());
@@ -166,26 +166,32 @@ fn ac320_follow_backlog_new_files_peek_and_sigint() {
             }
         });
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(3)).unwrap()["message"]["text"],
+            rx.recv_timeout(flake::scaled(Duration::from_secs(3)))
+                .unwrap()["message"]["text"],
             "backlog"
         );
         append(&b, A, &record(A, "appended", "2026-10-30T00:00:01Z"));
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap()["message"]["text"],
+            rx.recv_timeout(flake::scaled(Duration::from_secs(1)))
+                .unwrap()["message"]["text"],
             "appended"
         );
         append(&b, B, &record(B, "new session", "2026-10-30T00:00:02Z"));
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap()["message"]["text"],
+            rx.recv_timeout(flake::scaled(Duration::from_secs(1)))
+                .unwrap()["message"]["text"],
             "new session"
         );
         let pid = rustix::process::Pid::from_raw(c.id() as i32).unwrap();
         rustix::process::kill_process(pid, rustix::process::Signal::INT).unwrap();
         assert_eq!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            rx.recv_timeout(flake::scaled(Duration::from_secs(1)))
+                .unwrap(),
             j!({"v":1,"event":"end","ok":true})
         );
-        let status = poll(Duration::from_secs(2), || c.try_wait().unwrap());
+        let status = poll(flake::scaled(Duration::from_secs(2)), || {
+            c.try_wait().unwrap()
+        });
         assert_eq!(status.code(), Some(130));
         assert_eq!(b.glen_home.join("inbox/.read").exists(), !peek);
     }
@@ -196,8 +202,7 @@ fn ac325_rpc_reply_nulls() {
     let o = b
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("FAKE_OMP_SCENARIO", "reply")
-        .output()
-        .unwrap();
+        .captured();
     let d = data(&o);
     let id = d["job"]["id"].as_str().unwrap();
     b.wait_worker_gone(id);
@@ -245,8 +250,7 @@ fn sandboxed_mark_read_failure_is_exit_six_and_leaves_messages_unread() {
     let o = b
         .command(&["inbox", "--json"], &b.alpha())
         .env("CODEX_SANDBOX", "seatbelt")
-        .output()
-        .unwrap();
+        .captured();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(o.status.code(), Some(6), "{o:?}");
     assert!(o.stderr.is_empty(), "{o:?}");
@@ -318,7 +322,7 @@ fn human_footer_says_marked_read_only_when_a_cursor_moves() {
     let human = |args: &[&str]| {
         let mut argv = vec!["inbox", "--human"];
         argv.extend(args);
-        let o = b.command(&argv, &b.alpha()).output().unwrap();
+        let o = b.command(&argv, &b.alpha()).captured();
         assert!(o.status.success(), "{args:?}");
         String::from_utf8(o.stdout).unwrap()
     };
@@ -363,8 +367,7 @@ fn footer_counts_only_sessions_with_displayed_messages() {
     inbox(&b, &["--session", B]);
     let o = b
         .command(&["inbox", "--human", "--peek"], &b.alpha())
-        .output()
-        .unwrap();
+        .captured();
     assert!(
         String::from_utf8(o.stdout)
             .unwrap()
@@ -373,8 +376,7 @@ fn footer_counts_only_sessions_with_displayed_messages() {
     append(&b, B, &record(B, "two", "2026-10-30T00:00:01Z"));
     let o = b
         .command(&["inbox", "--human", "--peek"], &b.alpha())
-        .output()
-        .unwrap();
+        .captured();
     assert!(
         String::from_utf8(o.stdout)
             .unwrap()
@@ -386,11 +388,7 @@ fn footer_counts_only_sessions_with_displayed_messages() {
 fn closed_stdout_does_not_mark_inbox_read() {
     let b = OmpBox::new();
     append(&b, A, &record(A, "keep", "2026-10-30T00:00:00Z"));
-    let o = b
-        .command(&["inbox", "--json"], &b.alpha())
-        .stdout(closed_stdout())
-        .output()
-        .unwrap();
+    let o = closed_run(&mut b.command(&["inbox", "--json"], &b.alpha()));
     assert_eq!(o.status.code(), Some(0));
     assert!(!b.glen_home.join("inbox/.read").exists());
     assert!(o.stderr.is_empty());
@@ -406,22 +404,23 @@ fn inbox_with_a_closed_stdout_keeps_messages_unread() {
         } else {
             vec!["inbox", "--json"]
         };
-        let mut child = b
-            .command(&args, &b.alpha())
-            .stdout(closed_stdout())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while child.try_wait().unwrap().is_none() {
+        let mut cmd = b.command(&args, &b.alpha());
+        let stderr = flake::Capture::new();
+        stderr.attach_stderr(cmd.stdout(flake::closed_stdout()));
+        let mut child = cmd.spawn().unwrap();
+        let deadline = std::time::Instant::now() + flake::scaled(Duration::from_secs(10));
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
             if std::time::Instant::now() >= deadline {
                 child.kill().unwrap();
-                let output = child.wait_with_output().unwrap();
+                let output = stderr.output(child.wait().unwrap());
                 panic!("inbox did not stop after EPIPE: {output:?}");
             }
             std::thread::sleep(Duration::from_millis(20));
-        }
-        let o = child.wait_with_output().unwrap();
+        };
+        let o = stderr.output(status);
         assert_eq!(o.status.code(), Some(0), "{o:?}");
         assert!(o.stderr.is_empty(), "{o:?}");
         assert!(!b.glen_home.join("inbox/.read").exists());
@@ -552,22 +551,19 @@ fn cwd_inbox_follow_discovers_new_sessions_and_reclassifies_an_orphan_within_ten
     for (id, text) in [(A, "alpha"), (beta.as_str(), "beta"), (B, "orphan")] {
         append(&b, id, &record(id, text, "2026-10-30T00:00:00Z"));
     }
-    let mut child = ScopedInboxChild(
-        b.command(
-            &[
-                "inbox",
-                "-f",
-                "--cwd",
-                b.alpha().to_str().unwrap(),
-                "--json",
-            ],
-            &b.alpha(),
-        )
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap(),
+    let stderr = flake::Capture::new();
+    let mut cmd = b.command(
+        &[
+            "inbox",
+            "-f",
+            "--cwd",
+            b.alpha().to_str().unwrap(),
+            "--json",
+        ],
+        &b.alpha(),
     );
+    stderr.attach_stderr(cmd.stdout(Stdio::piped()));
+    let mut child = ScopedInboxChild(cmd.spawn().unwrap());
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -579,7 +575,8 @@ fn cwd_inbox_follow_discovers_new_sessions_and_reclassifies_an_orphan_within_ten
         }
     });
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()["message"]["text"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(10)))
+            .unwrap()["message"]["text"],
         "alpha"
     );
     assert!(matches!(
@@ -603,7 +600,9 @@ fn cwd_inbox_follow_discovers_new_sessions_and_reclassifies_an_orphan_within_ten
         ),
     )
     .unwrap();
-    let message = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let message = rx
+        .recv_timeout(flake::scaled(Duration::from_secs(10)))
+        .unwrap();
     assert_eq!(message["event"], "message");
     assert_eq!(message["message"]["session_id"], new);
     rustix::process::kill_process(
@@ -612,16 +611,16 @@ fn cwd_inbox_follow_discovers_new_sessions_and_reclassifies_an_orphan_within_ten
     )
     .unwrap();
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(10)))
+            .unwrap()["event"],
         "end"
     );
-    assert_eq!(
-        poll(Duration::from_secs(10), || child.0.try_wait().unwrap()).code(),
-        Some(130)
-    );
-    reader.join().unwrap();
-    let mut err = String::new();
-    std::io::Read::read_to_string(&mut child.0.stderr.take().unwrap(), &mut err).unwrap();
+    let status = poll(flake::scaled(Duration::from_secs(10)), || {
+        child.0.try_wait().unwrap()
+    });
+    assert_eq!(status.code(), Some(130));
+    flake::join_reader(reader);
+    let err = String::from_utf8(stderr.output(status).stderr).unwrap();
     assert!(err.is_empty(), "{err}");
     assert!(b.glen_home.join("inbox/.read").join(A).exists());
     assert!(b.glen_home.join("inbox/.read").join(new).exists());
