@@ -1541,6 +1541,8 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
 | `extension_version_mismatch` | send, abort, models, model, thinking, compact | live extension version differs from glen |
 | `steer_queued` | send, wait | another glen job held the session, so the steer waited and was sent as a prompt |
 | `lost_write_failed` | send, wait, jobs | the job is reported lost, but its status file could not be written |
+| `replies_truncated` | send, wait | a live job kept its first 256 replies or 8 MiB of reply text; later replies are only in `glen inbox` |
+| `session_identity_unverified` | send, wait | omp did not confirm the session id after the turn (asked twice within the job deadline), so a fork may be unreported; the worker does not stay warm |
 | `unreadable_session` | ls, show, tail | a session file or project directory could not be read and was left out |
 | `branch_truncated` | show, tail | a malformed line cut the active branch; earlier entries may be hidden |
 | `abort_pending` | abort | omp has not become idle yet |

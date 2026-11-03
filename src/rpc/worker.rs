@@ -594,8 +594,9 @@ impl Worker {
         self.drive(client, events, replies, sink, &baseline.session_id)
     }
     /// The stay-warm rule (design §A21): a settled, unforked, uncancelled `completed` RPC or
-    /// `@new` job sent with a warm duration. Failed, aborted, timed-out, unsettled, forked and
-    /// live-route jobs never stay warm.
+    /// `@new` job sent with a warm duration whose final session identity was verified. Failed,
+    /// aborted, timed-out, unsettled, forked, unverified (S-27) and live-route jobs never stay
+    /// warm.
     pub(crate) fn keep_warm(&self) -> bool {
         self.job.warm_ms.is_some_and(|ms| ms > 0)
             && matches!(self.job.route, Route::Rpc | Route::New)
@@ -603,6 +604,11 @@ impl Worker {
             && self.status.status == State::Completed
             && self.settled
             && self.status.forked.is_none()
+            && !self
+                .status
+                .warnings
+                .iter()
+                .any(|w| w.code == SESSION_IDENTITY_UNVERIFIED)
             && !self.cancel.load(Ordering::SeqCst)
     }
     fn start(&mut self) -> Result<Option<Started>, Failure> {
@@ -847,6 +853,8 @@ impl Worker {
             let mut state_pending = None;
             let mut final_checked = false;
             let mut final_sequence = None;
+            // S-27: a failed final identity query is retried once inside the job deadline.
+            let mut final_retried = false;
             // Terminal status is published before joining any outstanding state call.
             let mut persistence_failure = None;
             loop {
@@ -884,6 +892,7 @@ impl Worker {
                     if state_pending == Some(sequence) {
                         state_pending = None;
                     }
+                    let failed = state.as_ref().err().map(ToString::to_string);
                     let checked = match state {
                         Ok(s) => {
                             if states.apply(sequence) {
@@ -899,12 +908,29 @@ impl Worker {
                             ))
                         }
                     };
+                    if final_query {
+                        match failed {
+                            None => final_checked = true,
+                            // Asked again by the terminal arm below, with its own budget.
+                            Some(_) if !final_retried && Instant::now() < self.deadline => {
+                                final_retried = true;
+                                final_sequence = None;
+                            }
+                            // Never counted as checked silently: a fork may be unreported.
+                            Some(e) => {
+                                final_checked = true;
+                                self.status.warnings.push(Warning {
+                                    code: SESSION_IDENTITY_UNVERIFIED.into(),
+                                    message: format!(
+                                        "omp did not confirm the session id after the turn ({e}), so a fork may be unreported; check `glen ls`"
+                                    ),
+                                });
+                            }
+                        }
+                    }
                     if let Some(reply) = reply {
                         reply_pending = false;
                         reply::PendingReply::finish(reply, sink, checked);
-                    }
-                    if final_query {
-                        final_checked = true;
                     }
                 }
                 // Host tools run on SDK threads. Resolve identity after receiving each reply,
@@ -1347,6 +1373,8 @@ use super::polling_command;
 polling_command!(SubmitPrompt, PromptCommand, 100);
 polling_command!(PollState, GetStateCommand, 100);
 polling_command!(StateSecond, GetStateCommand, 1000);
+/// The warning for a completed job whose final session identity omp never confirmed (S-27).
+pub(crate) const SESSION_IDENTITY_UNVERIFIED: &str = "session_identity_unverified";
 pub(crate) fn query_state(
     client: &Client,
     left: Duration,

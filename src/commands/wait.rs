@@ -154,7 +154,9 @@ impl ReplyView {
             .collect()
     }
 }
-/// The `↩ …` lines of reply records (`✓` on a final one), muted and wrapped.
+/// The `↩ …` lines of reply records (`✓` on a final one), muted and wrapped. A reply with no
+/// job came from a shared live batch (several glen jobs active in one omp turn, S-07): it is
+/// labelled `shared`, since another job's caller received the same record.
 fn reply_lines(ctx: &OutputCtx, replies: &[Reply]) -> Vec<String> {
     let mut human = vec![];
     for reply in replies {
@@ -165,7 +167,15 @@ fn reply_lines(ctx: &OutputCtx, replies: &[Reply]) -> Vec<String> {
                 ctx.width.map(|w| usize::from(w).saturating_sub(4).max(1)),
             ) {
                 let line = if first {
-                    format!("↩ {part}{}", if reply.is_final { " ✓" } else { "" })
+                    format!(
+                        "↩ {}{part}{}",
+                        if reply.job_id.is_none() {
+                            "shared · "
+                        } else {
+                            ""
+                        },
+                        if reply.is_final { " ✓" } else { "" }
+                    )
                 } else {
                     format!("  {part}")
                 };
@@ -764,6 +774,21 @@ mod tests {
                 format!("glen wait {} --for reply --after r2", j.handle),
             ]
         );
+    }
+    /// S-07: a reply with no job (a shared live batch) is labelled `shared` in human output.
+    #[test]
+    fn a_shared_batch_reply_is_labelled_shared() {
+        let t = tempfile::tempdir().unwrap();
+        let store = fixtures::store(t.path());
+        let j = fixtures::job();
+        store.create(&j).unwrap();
+        let mut shared = reply(&j, "r1", "for everyone", true);
+        shared.job_id = None;
+        let lines = reply_lines(
+            &ctx(t.path(), true),
+            &[shared, reply(&j, "r2", "mine", false)],
+        );
+        assert_eq!(lines, ["↩ shared · for everyone ✓", "↩ mine"]);
     }
     /// W2 review 1 (LOW-001, LOW-004): a reply `next` repeats a non-default `--timeout`, as
     /// inbox's does, and passes the reply id as one shell word.

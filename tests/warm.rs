@@ -685,6 +685,30 @@ fn f5_the_release_timeout_hint_names_force_only_without_it() {
     stand_in.wait().unwrap();
 }
 
+/// S-27: a job whose final session identity omp never confirmed (every get_state from the
+/// third on answers after 4 s, past its 1 s budget, so the retry fails too) completes with the
+/// `session_identity_unverified` warning and does not stay warm.
+#[test]
+fn s27_an_unverified_identity_never_stays_warm() {
+    let b = WarmBox::with(&[
+        ("FAKE_OMP_STATE_DELAY_AT", "3+"),
+        ("FAKE_OMP_PREFLIGHT_DELAY_MS", "4000"),
+    ]);
+    let out = b.run(&["send", "e27c0de", "hi", "--warm", "30s", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json(&out);
+    let codes: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert_eq!(codes, ["session_identity_unverified"], "{v}");
+    b.wait_worker_gone(&job_id(&v["data"]));
+    assert!(b.registry().is_none(), "no warm registry");
+    assert!(!b.held(), "the session lock is free");
+}
+
 /// A flock on session A's metadata lock file from this process, as a holder stopped inside its
 /// step keeps it: glen's own acquisitions give up after their bound.
 fn hold_meta_lock(b: &WarmBox) -> std::fs::File {

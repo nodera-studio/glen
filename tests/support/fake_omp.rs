@@ -305,10 +305,14 @@ FLAGS
                         if stage != 0 {
                             running_queries += 1;
                         }
-                        let delay = if knob("FAKE_OMP_STATE_DELAY_AT")
-                            .and_then(|v| v.parse::<usize>().ok())
-                            == Some(state_queries)
-                        {
+                        // `N` delays the Nth get_state; `N+` delays it and every later one.
+                        let delayed_at = knob("FAKE_OMP_STATE_DELAY_AT").and_then(|v| {
+                            match v.strip_suffix('+') {
+                                Some(n) => n.parse::<usize>().ok().map(|n| state_queries >= n),
+                                None => v.parse::<usize>().ok().map(|n| state_queries == n),
+                            }
+                        });
+                        let delay = if delayed_at == Some(true) {
                             ms("FAKE_OMP_PREFLIGHT_DELAY_MS", 0)
                         } else if scenario == "stale_state" && running_queries == 1 {
                             id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);

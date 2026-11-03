@@ -246,6 +246,61 @@ fn ac206_fork_detected() {
         assert!(b.frames_in("get_state").len() >= 2);
     }
 }
+/// S-27 (the audit's reproduction): the final identity query after a silent fork times out
+/// once (the third get_state answers after 4 s, past its 1 s budget). It is asked again inside
+/// the job deadline, so the fork is still reported (exit 11), never exit 0.
+#[test]
+fn s27_a_failed_final_identity_query_is_retried_once() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hello", "--json"])
+        .env("FAKE_OMP_SCENARIO", "fork_silent")
+        .env("FAKE_OMP_STATE_DELAY_AT", "3")
+        .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "4000")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 11);
+    b.wait_worker_gone(&job_id(&v));
+    assert_eq!(v["data"]["forked"]["from"], A_ID);
+    assert!(
+        v["data"]["forked"]["to"]
+            .as_str()
+            .unwrap()
+            .ends_with("f0f0")
+    );
+    assert!(b.frames_in("get_state").len() >= 4, "asked again");
+    assert!(!warning_codes(&v).contains(&"session_identity_unverified".to_owned()));
+}
+/// S-27: when both final identity queries fail, the job is not silently `checked`: it completes
+/// with the `session_identity_unverified` warning.
+#[test]
+fn s27_an_unverified_final_identity_is_a_warning() {
+    let b = RpcBox::new();
+    let o = b
+        .glen(&["send", "e27c0de", "hello", "--json"])
+        .env("FAKE_OMP_SCENARIO", "fork_silent")
+        .env("FAKE_OMP_STATE_DELAY_AT", "3+")
+        .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "4000")
+        .output()
+        .unwrap();
+    let v = envelope(&o, 0);
+    b.wait_worker_gone(&job_id(&v));
+    assert!(v["data"]["forked"].is_null(), "{v}");
+    assert_eq!(
+        warning_codes(&v),
+        ["session_identity_unverified".to_owned()],
+        "{v}"
+    );
+    assert!(b.frames_in("get_state").len() >= 4, "asked twice");
+}
+fn warning_codes(v: &Value) -> Vec<String> {
+    v["warnings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["code"].as_str().map(str::to_owned))
+        .collect()
+}
 #[test]
 fn ac207_live_owner_refused() {
     let b = RpcBox::new();
