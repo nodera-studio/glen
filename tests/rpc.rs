@@ -1,4 +1,8 @@
+//! Upper bounds and setup waits, and the fake delays and job deadlines tied to them, are
+//! multiplied by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); lower bounds
+//! and the fake delays that must outlast a fixed glen budget stay exact.
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use serde_json::{Value, json};
 use std::{
@@ -21,11 +25,7 @@ fn envelope(o: &Output, code: i32) -> Value {
 fn send(b: &RpcBox, scenario: &str, more: &[&str], code: i32) -> Value {
     let mut args = vec!["send", "e27c0de", "hello", "--json"];
     args.extend(more);
-    let o = b
-        .glen(&args)
-        .env("FAKE_OMP_SCENARIO", scenario)
-        .output()
-        .unwrap();
+    let o = b.glen(&args).env("FAKE_OMP_SCENARIO", scenario).captured();
     let v = envelope(&o, code);
     let id = job_id(&v);
     b.wait_worker_gone(&id);
@@ -43,22 +43,47 @@ fn launch(b: &RpcBox, scenario: &str, delay: &str) -> Value {
         .glen(&["send", "e27c0de", "hello", "--no-wait", "--json"])
         .env("FAKE_OMP_SCENARIO", scenario)
         .env("FAKE_OMP_DELAY_MS", delay)
-        .output()
-        .unwrap();
+        .captured();
     envelope(&o, 10)
 }
 fn wait(b: &RpcBox, v: &Value, code: i32) -> Value {
     let id = job_id(v);
+    let timeout = ms(flake::scaled(Duration::from_secs(25)));
     let o = b
-        .glen(&["wait", &id, "--timeout", "25s", "--json"])
-        .output()
-        .unwrap();
+        .glen(&["wait", &id, "--timeout", &timeout, "--json"])
+        .captured();
     let v = envelope(&o, code);
     b.wait_worker_gone(&id);
     v
 }
+/// A `GLEN_JOB_TIMEOUT` or `--timeout` value.
+fn ms(d: Duration) -> String {
+    format!("{}ms", d.as_millis())
+}
+/// The 30 s `--wait` of a foreground send that the test ends itself (scaled).
+fn wait_bound() -> String {
+    ms(flake::scaled(Duration::from_secs(30)))
+}
+/// A `FAKE_OMP_*_MS` value.
+fn millis(d: Duration) -> String {
+    d.as_millis().to_string()
+}
+/// Returns once the worker has most likely consumed the fake's completed `prompt_result`.
+/// The fake logs a frame before it writes it, and glen publishes nothing when its worker
+/// takes the result (one event per loop turn, controls checked after each), so no real
+/// signal can order an abort control after that consumption: the log line plus a scaled
+/// grace is the closest one.
+fn after_prompt_result(b: &RpcBox) {
+    poll(flake::scaled(Duration::from_secs(5)), || {
+        b.fake_log()
+            .iter()
+            .any(|v| v["event"] == "out" && v["frame"]["type"] == "prompt_result")
+            .then_some(())
+    });
+    std::thread::sleep(flake::scaled(Duration::from_millis(200)));
+}
 fn accepted(b: &RpcBox, id: &str) {
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         let s = b.job(id).1;
         (s["status"] == "accepted").then_some(())
     });
@@ -155,8 +180,7 @@ fn w2_latest_cwd_falls_back_and_is_recorded() {
                 "--json",
             ])
             .current_dir(&b.omp.home)
-            .output()
-            .unwrap();
+            .captured();
         let value = envelope(&out, 0);
         let id = job_id(&value);
         b.wait_worker_gone(&id);
@@ -218,8 +242,7 @@ fn ac204_bounded_wait_then_wait() {
     let o = b
         .glen(&["send", "e27c0de", "hello", "--wait", "300ms", "--json"])
         .env("FAKE_OMP_RUN_RELEASE", &release)
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 10);
     assert_eq!(v["data"]["status"], "running");
     accepted(&b, &job_id(&v));
@@ -227,8 +250,12 @@ fn ac204_bounded_wait_then_wait() {
     fs::write(release, "go").unwrap();
     wait(&b, &v, 0);
     let start = Instant::now();
-    let v = launch(&b, "ok", "1500");
-    assert!(start.elapsed() < Duration::from_secs(2));
+    let v = launch(
+        &b,
+        "ok",
+        &millis(flake::scaled(Duration::from_millis(1500))),
+    );
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(2)));
     wait(&b, &v, 0);
 }
 #[test]
@@ -257,8 +284,7 @@ fn s27_a_failed_final_identity_query_is_retried_once() {
         .env("FAKE_OMP_SCENARIO", "fork_silent")
         .env("FAKE_OMP_STATE_DELAY_AT", "3")
         .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "4000")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 11);
     b.wait_worker_gone(&job_id(&v));
     assert_eq!(v["data"]["forked"]["from"], A_ID);
@@ -281,8 +307,7 @@ fn s27_an_unverified_final_identity_is_a_warning() {
         .env("FAKE_OMP_SCENARIO", "fork_silent")
         .env("FAKE_OMP_STATE_DELAY_AT", "3+")
         .env("FAKE_OMP_PREFLIGHT_DELAY_MS", "4000")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
     b.wait_worker_gone(&job_id(&v));
     assert!(v["data"]["forked"].is_null(), "{v}");
@@ -305,12 +330,7 @@ fn warning_codes(v: &Value) -> Vec<String> {
 fn ac207_live_owner_refused() {
     let b = RpcBox::new();
     let mut owner = b.hold_lease(A_ID);
-    let refusal = envelope(
-        &b.glen(&["send", "e27c0de", "hi", "--json"])
-            .output()
-            .unwrap(),
-        6,
-    );
+    let refusal = envelope(&b.glen(&["send", "e27c0de", "hi", "--json"]).captured(), 6);
     assert_eq!(refusal["error"]["details"]["reason"], "live_owner");
     assert!(!b.omp.glen_home.exists());
     assert!(b.fake_log().is_empty());
@@ -349,7 +369,7 @@ fn unreadable_lease_names_unknown_lease_for_send_and_controls() {
         vec!["send", "e27c0de", "hi", "--json"],
         vec!["compact", "e27c0de", "--json"],
     ] {
-        let out = b.glen(&args).output().unwrap();
+        let out = b.glen(&args).captured();
         let value = envelope(&out, 6);
         assert_eq!(value["error"]["details"]["reason"], "unknown_lease");
     }
@@ -378,7 +398,7 @@ fn a_non_token_session_id_names_unknown_lease_for_send_and_controls() {
         vec!["send", target, "hi", "--json"],
         vec!["compact", target, "--json"],
     ] {
-        let out = b.glen(&args).output().unwrap();
+        let out = b.glen(&args).captured();
         let value = envelope(&out, 6);
         assert_eq!(value["error"]["code"], "no_route", "{args:?}: {value}");
         assert_eq!(
@@ -401,14 +421,12 @@ fn a_non_token_session_id_names_unknown_lease_for_send_and_controls() {
 fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
     let b = RpcBox::new();
     let gate = b.omp.home.join("reason-probe-release");
-    let mut child = b
-        .glen(&["send", "e27c0de", "hi", "--wait", "30s", "--json"])
-        .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    poll(Duration::from_secs(10), || {
+    let mut child = flake::Captured::spawn(
+        b.glen(&["send", "e27c0de", "hi", "--wait", &wait_bound(), "--json"])
+            .env("FAKE_OMP_LEASE_PROBE_GATE", &gate),
+    )
+    .unwrap();
+    poll(flake::scaled(Duration::from_secs(10)), || {
         gate.with_extension("ready").exists().then_some(())
     });
     // The foreground already saw a free glen lock. Holding it now makes its fresh
@@ -416,7 +434,7 @@ fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
     let lock = b.hold_glen_lock(A_ID);
     let mut owner = b.hold_lease(A_ID);
     fs::write(&gate, "go").unwrap();
-    let id = poll(Duration::from_secs(10), || {
+    let id = poll(flake::scaled(Duration::from_secs(10)), || {
         fs::read_dir(b.omp.glen_home.join("jobs"))
             .ok()?
             .filter_map(Result::ok)
@@ -431,20 +449,20 @@ fn worker_refusal_keeps_top_level_reason_and_job_context_in_send_and_wait() {
     });
     let handle = b.job(&id).0["handle"].as_str().unwrap().to_owned();
     drop(lock);
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + flake::scaled(Duration::from_secs(10));
     while child.try_wait().unwrap().is_none() {
         if Instant::now() >= deadline {
             child.kill().unwrap();
-            let output = child.wait_with_output().unwrap();
+            let output = child.wait_with_output();
             panic!("send did not report the worker refusal: {output:?}");
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    let sent = envelope(&child.wait_with_output().unwrap(), 6);
+    let sent = envelope(&child.wait_with_output(), 6);
+    let timeout = ms(flake::scaled(Duration::from_secs(10)));
     let waited = envelope(
-        &b.glen(&["wait", &handle, "--timeout", "10s", "--json"])
-            .output()
-            .unwrap(),
+        &b.glen(&["wait", &handle, "--timeout", &timeout, "--json"])
+            .captured(),
         6,
     );
     for value in [&sent, &waited] {
@@ -481,8 +499,7 @@ fn ac207_startup_recovery_lease_does_not_refuse_our_child() {
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("FAKE_OMP_STARTUP_RECOVERY", "1")
         .env("FAKE_OMP_OWNERS_DIR", b.owners())
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
     b.wait_worker_gone(&job_id(&v));
     assert!(fs::read(b.omp.session('A')).unwrap().starts_with(&before));
@@ -504,8 +521,7 @@ fn ac208_queue_serialises() {
             .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
             .env("FAKE_OMP_RUN_RELEASE", &release)
             .env("FAKE_OMP_OWNERS_DIR", b.owners())
-            .output()
-            .unwrap();
+            .captured();
         envelope(&o, 10)
     };
     let one = launch();
@@ -541,11 +557,7 @@ fn ac209_new_session_and_profile() {
         if flag {
             args.extend(["--profile", "work"]);
         }
-        let o = b
-            .glen(&args)
-            .env("OMP_PROFILE", "inherited")
-            .output()
-            .unwrap();
+        let o = b.glen(&args).env("OMP_PROFILE", "inherited").captured();
         let v = envelope(&o, 0);
         b.wait_worker_gone(&job_id(&v));
         let (j, s) = b.job(&job_id(&v));
@@ -587,16 +599,14 @@ fn ac209_new_session_and_profile() {
     let b = RpcBox::new();
     let outside = envelope(
         &b.glen(&["send", "e27c0de", "hi", "--cwd", "/tmp", "--json"])
-            .output()
-            .unwrap(),
+            .captured(),
         3,
     );
     assert_eq!(outside["error"]["details"]["reason"], "outside_cwd");
     // W8-ERR-8: a missing --cwd is a usage error (exit 2, reason missing_cwd), not not_found.
     let missing = envelope(
         &b.glen(&["send", "@new", "hi", "--cwd", "/missing-glen-dir", "--json"])
-            .output()
-            .unwrap(),
+            .captured(),
         2,
     );
     assert_eq!(missing["error"]["code"], "usage");
@@ -619,8 +629,7 @@ fn w9_send_passes_profile_and_config_overlay_env() {
             "--json",
         ])
         .env("PI_CONFIG_FILES", "/abs/policy.yml")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
     b.wait_worker_gone(&job_id(&v));
     let start = b
@@ -650,7 +659,7 @@ fn w9_send_passes_thinking_flag() {
         if let Some(level) = thinking {
             args.extend(["--thinking", level]);
         }
-        let o = b.glen(&args).output().unwrap();
+        let o = b.glen(&args).captured();
         let v = envelope(&o, 0);
         b.wait_worker_gone(&job_id(&v));
         let start = b
@@ -697,7 +706,7 @@ fn ac212_local_command() {
     let b = RpcBox::new();
     let start = Instant::now();
     let v = send(&b, "local", &[], 0);
-    assert!(start.elapsed() < Duration::from_secs(3));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(3)));
     assert!(v["data"]["assistant_text"].is_null());
     assert_eq!(v["data"]["command_output"], json!(["fake command output"]));
 }
@@ -736,10 +745,12 @@ fn ac215_deadline() {
         let b = RpcBox::new();
         let o = b
             .glen(&["send", "e27c0de", "hi", "--json"])
-            .env("GLEN_JOB_TIMEOUT", "2s")
+            .env(
+                "GLEN_JOB_TIMEOUT",
+                ms(flake::scaled(Duration::from_secs(2))),
+            )
             .env("FAKE_OMP_SCENARIO", scenario)
-            .output()
-            .unwrap();
+            .captured();
         let code = if matches!(scenario, "never_settles" | "unsettled") {
             0
         } else {
@@ -797,14 +808,12 @@ fn ac216_teardown() {
 fn ac217_sigint_foreground_keeps_job() {
     let b = RpcBox::new();
     let release = b.omp.home.join("release-run");
-    let child = b
-        .glen(&["send", "e27c0de", "hi", "--wait", "30s", "--json"])
-        .env("FAKE_OMP_RUN_RELEASE", &release)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    let id = poll(Duration::from_secs(3), || {
+    let child = flake::Captured::spawn(
+        b.glen(&["send", "e27c0de", "hi", "--wait", &wait_bound(), "--json"])
+            .env("FAKE_OMP_RUN_RELEASE", &release),
+    )
+    .unwrap();
+    let id = poll(flake::scaled(Duration::from_secs(3)), || {
         let ids = glen::jobs::JobStore::new(glen::glen_home::GlenHome {
             root: b.omp.glen_home.clone(),
         })
@@ -817,7 +826,7 @@ fn ac217_sigint_foreground_keeps_job() {
         rustix::process::Signal::INT,
     )
     .unwrap();
-    let v = envelope(&child.wait_with_output().unwrap(), 130);
+    let v = envelope(&child.wait_with_output(), 130);
     assert_eq!(v["data"]["interrupted"], true);
     fs::write(release, "go").unwrap();
     wait(&b, &v, 0);
@@ -847,14 +856,16 @@ fn ac218_control_inbox() {
     accepted(&b, &id);
     control(&b, &id, "unsupported", json!({"v":1,"op":"set_model"}));
     let done = b.job_dir(&id).join("control/unsupported.done.json");
-    poll(Duration::from_secs(2), || done.exists().then_some(()));
+    poll(flake::scaled(Duration::from_secs(2)), || {
+        done.exists().then_some(())
+    });
     let d: Value = serde_json::from_slice(&fs::read(done).unwrap()).unwrap();
     assert_eq!(d["error"]["code"], "bad_request");
     assert_eq!(b.job(&id).1["status"], "accepted");
     let start = Instant::now();
     control(&b, &id, "a", json!({"v":1,"op":"abort"}));
-    b.wait_terminal(&id, Duration::from_secs(2));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    b.wait_terminal(&id, flake::scaled(Duration::from_secs(2)));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(2)));
     let v = wait(&b, &v, 7);
     assert_eq!(v["error"]["details"]["error"]["code"], "cancelled");
     let d: Value =
@@ -872,7 +883,7 @@ fn ac218_abort_while_queued() {
     let v = launch(&b, "ok", "0");
     let id = job_id(&v);
     control(&b, &id, "a", json!({"v":1,"op":"abort"}));
-    b.wait_terminal(&id, Duration::from_secs(2));
+    b.wait_terminal(&id, flake::scaled(Duration::from_secs(2)));
     let v = wait(&b, &v, 7);
     assert_eq!(v["error"]["details"]["error"]["code"], "cancelled");
     assert!(b.fake_log().is_empty());
@@ -882,8 +893,12 @@ fn ac218_abort_while_queued() {
 fn ac219_pipes_close_when_send_exits() {
     let b = RpcBox::new();
     let start = Instant::now();
-    let v = launch(&b, "ok", "3000");
-    assert!(start.elapsed() < Duration::from_secs(1));
+    let v = launch(
+        &b,
+        "ok",
+        &millis(flake::scaled(Duration::from_millis(3000))),
+    );
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(1)));
     accepted(&b, &job_id(&v));
     assert_eq!(b.job(&job_id(&v)).1["status"], "accepted");
     wait(&b, &v, 0);
@@ -900,7 +915,7 @@ fn ac222_failures_before_the_job_leave_no_state() {
         if let Some(bin) = bin {
             c.env("GLEN_OMP_BIN", bin);
         }
-        envelope(&c.output().unwrap(), code);
+        envelope(&c.captured(), code);
         assert!(!b.omp.glen_home.exists());
     }
 }
@@ -913,18 +928,16 @@ fn ac224_message_rules() {
         (vec![255], 2),
     ] {
         let b = RpcBox::new();
-        let mut child = b
-            .glen(&["send", "e27c0de", "-", "--json"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
+        let mut child = flake::Captured::spawn(
+            b.glen(&["send", "e27c0de", "-", "--json"])
+                .stdin(Stdio::piped()),
+        )
+        .unwrap();
         let written = child.stdin.take().unwrap().write_all(&bytes);
         if let Err(e) = written {
             assert_eq!(e.kind(), std::io::ErrorKind::BrokenPipe);
         }
-        let v = envelope(&child.wait_with_output().unwrap(), code);
+        let v = envelope(&child.wait_with_output(), code);
         if code == 0 {
             b.wait_worker_gone(&job_id(&v));
             assert_eq!(v["data"]["assistant_text"], "pong: hi");
@@ -990,10 +1003,7 @@ fn ac226_event_filter() {
 #[test]
 fn ac227_json_and_human_modes() {
     let b = RpcBox::new();
-    let o = b
-        .glen(&["send", "e27c0de", "hello", "--human"])
-        .output()
-        .unwrap();
+    let o = b.glen(&["send", "e27c0de", "hello", "--human"]).captured();
     assert!(o.status.success(), "{o:?}");
     assert!(o.stderr.is_empty());
     let human = String::from_utf8(o.stdout).unwrap();
@@ -1007,9 +1017,11 @@ fn ac227_json_and_human_modes() {
     b.wait_worker_gone(id.as_str());
     let o = b
         .glen(&["send", "e27c0de", "hi", "--human", "--no-wait"])
-        .env("FAKE_OMP_DELAY_MS", "500")
-        .output()
-        .unwrap();
+        .env(
+            "FAKE_OMP_DELAY_MS",
+            millis(flake::scaled(Duration::from_millis(500))),
+        )
+        .captured();
     assert_eq!(o.status.code(), Some(10));
     assert!(String::from_utf8(o.stdout).unwrap().contains("glen wait j"));
     let id = glen::jobs::JobStore::new(glen::glen_home::GlenHome {
@@ -1022,8 +1034,7 @@ fn ac227_json_and_human_modes() {
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("GLEN_MAX_OUTPUT", "2000")
         .env("FAKE_OMP_REPLY_BYTES", "40000")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
     assert!(v["spilled"]["path"].as_str().is_some());
     let id = glen::jobs::JobStore::new(glen::glen_home::GlenHome {
@@ -1040,8 +1051,7 @@ fn v2_negotiation() {
         let o = b
             .glen(&["send", "e27c0de", "hi", "--json"])
             .env("FAKE_OMP_V2", advertisement)
-            .output()
-            .unwrap();
+            .captured();
         let v = envelope(&o, 0);
         b.wait_worker_gone(&job_id(&v));
         assert_eq!(
@@ -1056,8 +1066,7 @@ fn ac202_relative_owners_dir_is_frozen() {
     let o = b
         .glen(&["send", "e27c0de", "hello", "--json"])
         .env("PI_CONFIG_DIR", "relative-omp")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
     b.wait_worker_gone(&job_id(&v));
     assert_eq!(
@@ -1071,12 +1080,14 @@ fn ac218_abort_while_starting() {
     let b = RpcBox::new();
     let out = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_READY_DELAY_MS", "5000")
-        .output()
-        .unwrap();
+        .env(
+            "FAKE_OMP_READY_DELAY_MS",
+            millis(flake::scaled(Duration::from_secs(5))),
+        )
+        .captured();
     let value = envelope(&out, 10);
     let id = job_id(&value);
-    let pid = poll(Duration::from_secs(3), || {
+    let pid = poll(flake::scaled(Duration::from_secs(3)), || {
         b.fake_log()
             .into_iter()
             .find(|v| v["event"] == "start")
@@ -1085,14 +1096,14 @@ fn ac218_abort_while_starting() {
     // The explicit start event is the readiness signal: omp is blocked before its ready frame.
     let started = Instant::now();
     control(&b, &id, "a", json!({"v":1,"op":"abort"}));
-    let status = b.wait_terminal(&id, Duration::from_millis(1500));
-    poll(Duration::from_millis(1500), || {
+    let status = b.wait_terminal(&id, flake::scaled(Duration::from_millis(1500)));
+    poll(flake::scaled(Duration::from_millis(1500)), || {
         b.job_dir(&id)
             .join("control/a.done.json")
             .exists()
             .then_some(())
     });
-    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert!(started.elapsed() < flake::scaled(Duration::from_millis(1500)));
     assert_eq!(status["status"], "aborted");
     assert_eq!(status["error"]["code"], "cancelled");
     let done: Value =
@@ -1118,13 +1129,17 @@ fn w2_ready_bound_before_deadline_is_omp_unavailable() {
     let b = RpcBox::new();
     let out = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("GLEN_JOB_TIMEOUT", "61s")
+        // One second past omp's 60 s ready bound; the margin is scaled because the deadline
+        // starts at job creation and the ready bound at the worker's spawn.
+        .env(
+            "GLEN_JOB_TIMEOUT",
+            ms(Duration::from_secs(60) + flake::scaled(Duration::from_secs(1))),
+        )
         .env("FAKE_OMP_READY_DELAY_MS", "120000")
-        .output()
-        .unwrap();
+        .captured();
     let value = envelope(&out, 10);
     let id = job_id(&value);
-    let status = b.wait_terminal(&id, Duration::from_secs(75));
+    let status = b.wait_terminal(&id, flake::scaled(Duration::from_secs(75)));
     assert_eq!(status["status"], "failed");
     assert_eq!(status["error"]["code"], "omp_unavailable");
     b.wait_worker_gone(&id);
@@ -1143,11 +1158,10 @@ fn ac215_deadline_while_starting() {
                 "FAKE_OMP_READY_DELAY_MS",
                 if scenario == "ok" { "5000" } else { "0" },
             )
-            .output()
-            .unwrap();
+            .captured();
         let value = envelope(&out, 10);
         let id = job_id(&value);
-        let status = b.wait_terminal(&id, Duration::from_secs(2));
+        let status = b.wait_terminal(&id, flake::scaled(Duration::from_secs(2)));
         assert_eq!(status["status"], "failed");
         assert_eq!(status["error"]["code"], "timeout");
         b.wait_worker_gone(&id);
@@ -1187,7 +1201,7 @@ fn ac202_latest_scope_and_continuation() {
         if target == "@latest" {
             args.extend(["--cwd", cwd.to_str().unwrap()]);
         }
-        let out = b.glen(&args).output().unwrap();
+        let out = b.glen(&args).captured();
         let value = envelope(&out, 0);
         b.wait_worker_gone(&job_id(&value));
         assert_eq!(value["data"]["session"]["path"], json!(expected));
@@ -1199,20 +1213,22 @@ fn review1_abort_in_prompt_submission_gap_never_sends_prompt() {
     let b = RpcBox::new();
     let o = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .env("FAKE_OMP_PROMPT_SUBMIT_DELAY_MS", "5000")
-        .output()
-        .unwrap();
+        .env(
+            "FAKE_OMP_PROMPT_SUBMIT_DELAY_MS",
+            millis(flake::scaled(Duration::from_secs(5))),
+        )
+        .captured();
     let v = envelope(&o, 10);
     let id = job_id(&v);
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         fs::read_to_string(b.job_dir(&id).join("worker.log"))
             .ok()
             .filter(|s| s.contains("prompt: sending message"))
     });
     let start = Instant::now();
     control(&b, &id, "gap", json!({"v":1,"op":"abort"}));
-    let s = b.wait_terminal(&id, Duration::from_millis(1500));
-    assert!(start.elapsed() < Duration::from_millis(1500));
+    let s = b.wait_terminal(&id, flake::scaled(Duration::from_millis(1500)));
+    assert!(start.elapsed() < flake::scaled(Duration::from_millis(1500)));
     assert_eq!(s["status"], "aborted");
     assert_eq!(s["error"]["code"], "cancelled");
     wait(&b, &v, 7);
@@ -1244,20 +1260,22 @@ fn review5_delayed_state_query_does_not_delay_abort() {
     let o = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
         .env("FAKE_OMP_SCENARIO", "delayed_state")
-        .env("FAKE_OMP_STATE_DELAY_MS", "5000")
-        .output()
-        .unwrap();
+        .env(
+            "FAKE_OMP_STATE_DELAY_MS",
+            millis(flake::scaled(Duration::from_secs(5))),
+        )
+        .captured();
     let v = envelope(&o, 10);
     let id = job_id(&v);
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         (b.frames_in("get_state").len() >= 2).then_some(())
     });
     let start = Instant::now();
     control(&b, &id, "slow-state", json!({"v":1,"op":"abort"}));
-    let s = b.wait_terminal(&id, Duration::from_millis(1500));
+    let s = b.wait_terminal(&id, flake::scaled(Duration::from_millis(1500)));
     assert_eq!(s["status"], "aborted");
     assert_eq!(s["error"]["code"], "cancelled");
-    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert!(start.elapsed() < flake::scaled(Duration::from_millis(1500)));
     wait(&b, &v, 7);
     assert!(!b.frames_in("abort").is_empty());
 }
@@ -1266,26 +1284,26 @@ fn review6_stdin_routing_reprobes_after_predecessor_releases_lease() {
     let b = RpcBox::new();
     let o = b
         .glen(&["send", "e27c0de", "first", "--no-wait", "--json"])
-        .env("FAKE_OMP_DELAY_MS", "2000")
+        .env(
+            "FAKE_OMP_DELAY_MS",
+            millis(flake::scaled(Duration::from_secs(2))),
+        )
         .env("FAKE_OMP_OWNERS_DIR", b.owners())
-        .output()
-        .unwrap();
+        .captured();
     let first = envelope(&o, 10);
     accepted(&b, &job_id(&first));
     assert!(matches!(
         glen::omp::lease::probe(&b.owners(), A_ID),
         glen::omp::lease::Lease::Held
     ));
-    let mut second = b
-        .glen(&["send", "e27c0de", "-", "--json"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    let mut second = flake::Captured::spawn(
+        b.glen(&["send", "e27c0de", "-", "--json"])
+            .stdin(Stdio::piped()),
+    )
+    .unwrap();
     wait(&b, &first, 0);
     second.stdin.take().unwrap().write_all(b"second").unwrap();
-    let v = envelope(&second.wait_with_output().unwrap(), 0);
+    let v = envelope(&second.wait_with_output(), 0);
     b.wait_worker_gone(&job_id(&v));
     assert_eq!(v["data"]["assistant_text"], "pong: second");
 }
@@ -1297,17 +1315,16 @@ fn review8_queue_marker_distinguishes_waiting_from_startup() {
     let o = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
         .env("FAKE_OMP_READY_RELEASE", &release)
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 10);
     let id = job_id(&v);
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         b.job(&id).1["waited_ms"].as_u64().filter(|n| *n > 0)
     });
     assert_eq!(b.job(&id).1["status"], "queued");
     assert_eq!(b.job(&id).1["waiting_for_lock"], true);
     drop(lock);
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         (!b.fake_log().is_empty()).then_some(())
     });
     assert_eq!(b.job(&id).1["status"], "queued");
@@ -1321,11 +1338,10 @@ fn review8_queue_marker_distinguishes_waiting_from_startup() {
     let o = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
         .env("FAKE_OMP_READY_RELEASE", &release)
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 10);
     let id = job_id(&v);
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         (!b.fake_log().is_empty()).then_some(())
     });
     assert_eq!(b.job(&id).1["status"], "queued");
@@ -1338,12 +1354,7 @@ fn review9_abort_after_completed_result_preserves_answer() {
     let b = RpcBox::new();
     let v = launch(&b, "never_settles", "0");
     let id = job_id(&v);
-    poll(Duration::from_secs(5), || {
-        b.fake_log()
-            .iter()
-            .any(|v| v["event"] == "out" && v["frame"]["type"] == "prompt_result")
-            .then_some(())
-    });
+    after_prompt_result(&b);
     control(&b, &id, "settle", json!({"v":1,"op":"abort"}));
     let v = wait(&b, &v, 0);
     assert_eq!(v["data"]["assistant_text"], "pong: hello");
@@ -1365,10 +1376,9 @@ fn review10_local_result_has_bounded_settle_wait() {
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("GLEN_JOB_TIMEOUT", "60m")
         .env("FAKE_OMP_SCENARIO", "local_result_unsettled")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
-    assert!(start.elapsed() < Duration::from_secs(15));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(15)));
     b.wait_worker_gone(&job_id(&v));
     assert_eq!(v["data"]["session_settled"], false);
     assert!(
@@ -1413,8 +1423,7 @@ fn review5_delayed_final_state_still_detects_silent_fork() {
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("FAKE_OMP_SCENARIO", "fork_silent")
         .env("FAKE_OMP_STATE_DELAY_MS", "500")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 11);
     b.wait_worker_gone(&job_id(&v));
     assert_eq!(v["data"]["forked"]["from"], A_ID);
@@ -1434,10 +1443,9 @@ fn cycle3_eof_after_unsettled_completion_finishes_promptly() {
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("FAKE_OMP_SCENARIO", "unsettled_exit")
         .env("GLEN_JOB_TIMEOUT", "60m")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(2)));
     assert_eq!(v["data"]["session_settled"], false);
     assert!(
         v["warnings"]
@@ -1453,14 +1461,12 @@ fn cycle3_eof_after_unsettled_completion_finishes_promptly() {
 fn cycle3_fresh_probe_queues_when_glen_claims_lock_and_lease() {
     let b = RpcBox::new();
     let gate = b.omp.home.join("probe-release");
-    let child = b
-        .glen(&["send", "e27c0de", "second", "--no-wait", "--json"])
-        .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    poll(Duration::from_secs(3), || {
+    let child = flake::Captured::spawn(
+        b.glen(&["send", "e27c0de", "second", "--no-wait", "--json"])
+            .env("FAKE_OMP_LEASE_PROBE_GATE", &gate),
+    )
+    .unwrap();
+    poll(flake::scaled(Duration::from_secs(3)), || {
         gate.with_extension("ready").exists().then_some(())
     });
     // The first is_held has already returned false. A real glen worker now claims both locks.
@@ -1469,8 +1475,7 @@ fn cycle3_fresh_probe_queues_when_glen_claims_lock_and_lease() {
         .glen(&["send", "e27c0de", "first", "--no-wait", "--json"])
         .env("FAKE_OMP_RUN_RELEASE", &release)
         .env("FAKE_OMP_OWNERS_DIR", b.owners())
-        .output()
-        .unwrap();
+        .captured();
     let first = envelope(&first, 10);
     accepted(&b, &job_id(&first));
     assert!(matches!(
@@ -1478,9 +1483,9 @@ fn cycle3_fresh_probe_queues_when_glen_claims_lock_and_lease() {
         glen::omp::lease::Lease::Held
     ));
     fs::write(&gate, "go").unwrap();
-    let second = envelope(&child.wait_with_output().unwrap(), 10);
+    let second = envelope(&child.wait_with_output(), 10);
     let id = job_id(&second);
-    poll(Duration::from_secs(3), || {
+    poll(flake::scaled(Duration::from_secs(3)), || {
         (b.job(&id).1["waiting_for_lock"] == true).then_some(())
     });
     fs::write(release, "go").unwrap();
@@ -1498,8 +1503,7 @@ fn cycle3_local_ack_survives_eof_before_forwarding() {
         .glen(&["send", "e27c0de", "hi", "--json"])
         .env("FAKE_OMP_SCENARIO", "local_exit")
         .env("FAKE_OMP_ACK_FORWARD_DELAY_MS", "400")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 0);
     assert_eq!(v["data"]["command_output"], json!(["fake command output"]));
     b.wait_worker_gone(&job_id(&v));
@@ -1517,17 +1521,18 @@ fn cycle3_final_identity_check_after_deadline_or_cancel_detects_silent_fork() {
             .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
             .env("FAKE_OMP_SCENARIO", "fork_silent")
             .env("FAKE_OMP_NEVER_SETTLE", "1")
-            .env("GLEN_JOB_TIMEOUT", if cancel { "30s" } else { "1500ms" })
-            .output()
-            .unwrap();
+            .env(
+                "GLEN_JOB_TIMEOUT",
+                if cancel {
+                    "30s".into()
+                } else {
+                    ms(flake::scaled(Duration::from_millis(1500)))
+                },
+            )
+            .captured();
         let v = envelope(&o, 10);
         let id = job_id(&v);
-        poll(Duration::from_secs(3), || {
-            b.fake_log()
-                .iter()
-                .any(|v| v["event"] == "out" && v["frame"]["type"] == "prompt_result")
-                .then_some(())
-        });
+        after_prompt_result(&b);
         if cancel {
             control(&b, &id, "completed-cancel", json!({"v":1,"op":"abort"}));
         }
@@ -1553,8 +1558,7 @@ fn cycle3_reply_during_delayed_fork_query_uses_new_identity() {
         .env("FAKE_OMP_SCENARIO", "fork_reply")
         .env("FAKE_OMP_DELAY_MS", "0")
         .env("FAKE_OMP_STATE_DELAY_MS", "400")
-        .output()
-        .unwrap();
+        .captured();
     let v = envelope(&o, 11);
     b.wait_worker_gone(&job_id(&v));
     let new = v["data"]["forked"]["to"].as_str().unwrap();
@@ -1596,17 +1600,16 @@ fn cycle3_queue_marker_cleared_on_cancel_and_timeout() {
         let o = b
             .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
             .env("GLEN_JOB_TIMEOUT", if cancel { "30s" } else { "1500ms" })
-            .output()
-            .unwrap();
+            .captured();
         let v = envelope(&o, 10);
         let id = job_id(&v);
-        poll(Duration::from_secs(3), || {
+        poll(flake::scaled(Duration::from_secs(3)), || {
             (b.job(&id).1["waiting_for_lock"] == true).then_some(())
         });
         if cancel {
             control(&b, &id, "queued-cancel", json!({"v":1,"op":"abort"}));
         }
-        let s = b.wait_terminal(&id, Duration::from_secs(3));
+        let s = b.wait_terminal(&id, flake::scaled(Duration::from_secs(3)));
         assert_ne!(s["waiting_for_lock"], true);
         assert_ne!(s["waited_ms"], 1);
         assert_eq!(
@@ -1632,16 +1635,18 @@ fn cycle3_stale_state_responses_cannot_revert_reply_identity() {
             .env("FAKE_OMP_OLD_STATE_DELAY_MS", delay)
             .env("FAKE_OMP_RUN_RELEASE", &run_release)
             .env("FAKE_OMP_RESULT_RELEASE", &result_release)
-            .env("GLEN_JOB_TIMEOUT", "8s")
-            .output()
-            .unwrap();
+            .env(
+                "GLEN_JOB_TIMEOUT",
+                ms(flake::scaled(Duration::from_secs(8))),
+            )
+            .captured();
         let v = envelope(&o, 10);
-        poll(Duration::from_secs(3), || {
+        poll(flake::scaled(Duration::from_secs(3)), || {
             (b.frames_in("get_state").len() >= 2).then_some(())
         });
         let old_request = b.frames_in("get_state")[1]["id"].clone();
         fs::write(run_release, "go").unwrap();
-        poll(Duration::from_secs(4), || {
+        poll(flake::scaled(Duration::from_secs(4)), || {
             (b.frames_in("host_tool_result").len() == 2).then_some(())
         });
         let log = b.fake_log();
@@ -1719,8 +1724,7 @@ fn cwd_resolves_a_handle_in_its_bucket_but_recorded_cwd_still_wins() {
             scope.to_str().unwrap(),
             "--json",
         ])
-        .output()
-        .unwrap();
+        .captured();
     let value = envelope(&out, 0);
     let log = b.fake_log();
     let started = log.iter().find(|event| event["event"] == "start").unwrap();
