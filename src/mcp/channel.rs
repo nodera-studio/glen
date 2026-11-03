@@ -66,7 +66,11 @@ pub(crate) struct Poller {
 impl Poller {
     /// One `glen --json inbox --peek --cwd <cwd>`; `None` for a failed, stopped or unparsable
     /// poll. `GLEN_MAX_OUTPUT=0` keeps the envelope inline.
-    pub(crate) fn poll(&self, bound: Duration, stop: &AtomicBool) -> Option<Vec<Value>> {
+    pub(crate) fn poll(
+        &self,
+        bound: Duration,
+        stop: &(dyn Fn() -> bool + Sync),
+    ) -> Option<Vec<Value>> {
         let mut argv: Vec<OsString> = vec!["--json".into()];
         if let Some(p) = &self.profile {
             argv.push(format!("--profile={p}").into());
@@ -77,7 +81,7 @@ impl Poller {
             deadline: Instant::now() + bound,
             stop,
         };
-        let Run::Exited { stdout, .. } =
+        let Some(Run::Exited { stdout, .. }) =
             dispatch::run_child(&self.launcher, &argv, &[("GLEN_MAX_OUTPUT", "0")], watch)
         else {
             return None;
@@ -88,10 +92,11 @@ impl Poller {
         }
         envelope["data"]["messages"].as_array().cloned()
     }
-    /// The baseline, taken while answering `initialize`.
-    pub(crate) fn baseline(&self, bound: Duration) -> Seen {
+    /// The baseline, taken while answering `initialize`; `stop` (a signal to the server) ends
+    /// it early, leaving the set empty.
+    pub(crate) fn baseline(&self, bound: Duration, stop: &(dyn Fn() -> bool + Sync)) -> Seen {
         let mut seen = Seen::default();
-        if let Some(messages) = self.poll(bound, &AtomicBool::new(false)) {
+        if let Some(messages) = self.poll(bound, stop) {
             seen.take(&messages);
         }
         seen
@@ -117,9 +122,10 @@ pub(crate) fn spawn(
 }
 
 fn run(poller: &Poller, mut seen: Seen, writer: &Writer, stop: &AtomicBool, period: Duration) {
-    while !stop.load(Ordering::SeqCst) {
+    let stopped = || stop.load(Ordering::SeqCst);
+    while !stopped() {
         let started = Instant::now();
-        if let Some(messages) = poller.poll(POLL_BOUND, stop) {
+        if let Some(messages) = poller.poll(POLL_BOUND, &stopped) {
             for message in seen.take(&messages) {
                 writer.send(&notification(message));
             }
@@ -371,7 +377,7 @@ mod tests {
         let polls = ["fail".to_owned(), inbox(&["a"]), inbox(&["a", "b"])];
         let polls: Vec<&str> = polls.iter().map(String::as_str).collect();
         let poller = scripted(dir.path(), &polls);
-        let seen = poller.baseline(Duration::from_secs(2));
+        let seen = poller.baseline(Duration::from_secs(2), &|| false);
         assert!(!seen.baselined && seen.ids.is_empty());
         let out = drive(dir.path(), &poller, seen, 4);
         assert_eq!(notified(&out), ["b"]);
@@ -380,7 +386,7 @@ mod tests {
         let polls = [inbox(&["a"]), inbox(&["a", "b"])];
         let polls: Vec<&str> = polls.iter().map(String::as_str).collect();
         let poller = scripted(dir.path(), &polls);
-        let seen = poller.baseline(Duration::from_secs(2));
+        let seen = poller.baseline(Duration::from_secs(2), &|| false);
         assert!(seen.baselined);
         assert_eq!(notified(&drive(dir.path(), &poller, seen, 3)), ["b"]);
     }
@@ -393,18 +399,10 @@ mod tests {
             cwd: "/".into(),
         };
         let start = Instant::now();
-        assert!(
-            poller
-                .poll(Duration::from_millis(200), &AtomicBool::new(false))
-                .is_none()
-        );
+        assert!(poller.poll(Duration::from_millis(200), &|| false).is_none());
         assert!(start.elapsed() < Duration::from_secs(2));
         let start = Instant::now();
-        assert!(
-            poller
-                .poll(Duration::from_secs(30), &AtomicBool::new(true))
-                .is_none()
-        );
+        assert!(poller.poll(Duration::from_secs(30), &|| true).is_none());
         assert!(start.elapsed() < Duration::from_secs(1));
     }
 }

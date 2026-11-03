@@ -53,6 +53,9 @@ pub enum Mode {
 pub enum OutputKind {
     Document,
     Raw,
+    /// stdout belongs to a protocol (`glen mcp`): glen's own errors, clap's included, go to
+    /// stderr as text whatever `--json` or `--human` says.
+    Protocol,
 }
 pub struct Terminal {
     pub stdout_tty: bool,
@@ -69,7 +72,9 @@ impl Terminal {
     }
 }
 pub fn decide_mode(json: bool, human: bool, kind: OutputKind, stdout_tty: bool) -> Mode {
-    if json {
+    if matches!(kind, OutputKind::Protocol) {
+        Mode::Raw
+    } else if json {
         Mode::Json
     } else if human {
         Mode::Human
@@ -258,8 +263,10 @@ fn pre_options(argv: &[OsString]) -> (bool, bool, ColorWhen, OutputKind) {
             }
             value if !value.starts_with('-') && !command_seen => {
                 command_seen = true;
-                if value == "completions" || value == "mcp" {
+                if value == "completions" {
                     kind = OutputKind::Raw;
+                } else if value == "mcp" {
+                    kind = OutputKind::Protocol;
                 }
             }
             _ => {}
@@ -414,6 +421,12 @@ mod tests {
     #[test]
     fn modes() {
         for tty in [false, true] {
+            for (json, human) in [(true, false), (false, true), (false, false), (true, true)] {
+                assert_eq!(
+                    decide_mode(json, human, OutputKind::Protocol, tty),
+                    Mode::Raw
+                );
+            }
             for kind in [OutputKind::Document, OutputKind::Raw] {
                 assert_eq!(decide_mode(true, false, kind, tty), Mode::Json);
                 assert_eq!(decide_mode(false, true, kind, tty), Mode::Human);

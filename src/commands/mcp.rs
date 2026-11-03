@@ -1,5 +1,6 @@
 //! `glen mcp`: serve glen's commands to an MCP host over stdio (v0.2 W5, design §A22).
-//! stdout carries protocol messages only; refusals go to stderr (`OutputKind::Raw`).
+//! stdout carries protocol messages only; refusals go to stderr, even with `--json`
+//! (`OutputKind::Protocol`).
 use crate::{
     cli::{Cli, McpArgs},
     env::Env,

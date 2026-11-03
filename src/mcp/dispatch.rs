@@ -156,7 +156,8 @@ pub(crate) fn argv(
     argv
 }
 
-/// What a child run produced.
+/// What a child that was not cancelled produced. A cancelled run has no `Run` (`run_child`
+/// returns `None`), so it can never become a response.
 #[derive(Debug)]
 pub(crate) enum Run {
     Exited {
@@ -170,15 +171,19 @@ pub(crate) enum Run {
     },
     NotStarted(io::Error),
     Lost(io::Error),
-    /// Cancelled: never started, or signalled and reaped. A cancelled call is never answered.
-    Cancelled,
 }
 
 /// The in-flight `tools/call` registry (design §A22 "Cancellation"). Every transition happens
 /// under its one lock, which is never held across a stdout write, a spawn or a wait; the call
 /// thread reaps its child only under the lock, so no signal ever reaches a reaped pid.
 #[derive(Default)]
-pub(crate) struct Registry(Mutex<HashMap<String, CallState>>);
+pub(crate) struct Registry(Mutex<Calls>);
+#[derive(Default)]
+struct Calls {
+    map: HashMap<String, CallState>,
+    /// The server is exiting: a cancelled child is SIGKILLed at once, without `CANCEL_GRACE`.
+    closing: bool,
+}
 #[derive(Default)]
 struct CallState {
     cancelled: bool,
@@ -194,88 +199,103 @@ pub(crate) enum Refused {
     /// `MAX_IN_FLIGHT` calls are running.
     Full,
 }
-fn sigint(pid: u32) -> bool {
+fn signal(pid: u32, signal: rustix::process::Signal) -> bool {
     i32::try_from(pid)
         .ok()
         .and_then(rustix::process::Pid::from_raw)
-        .is_some_and(|pid| rustix::process::kill_process(pid, rustix::process::Signal::INT).is_ok())
+        .is_some_and(|pid| rustix::process::kill_process(pid, signal).is_ok())
+}
+impl CallState {
+    /// Signals the stored child of a cancelled call: SIGKILL at once while the server exits,
+    /// else the first SIGINT. Called under the registry lock only. Returns whether it signalled.
+    fn stop(&mut self, closing: bool) -> bool {
+        let Some(pid) = self.child_pid else {
+            return false;
+        };
+        if closing && !self.killed {
+            self.killed = true;
+            return signal(pid, rustix::process::Signal::KILL);
+        }
+        if !closing && self.sigint_at.is_none() {
+            self.sigint_at = Some(Instant::now());
+            return signal(pid, rustix::process::Signal::INT);
+        }
+        false
+    }
 }
 impl Registry {
-    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, CallState>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Calls> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
     pub(crate) fn insert(&self, key: &str) -> Result<(), Refused> {
         let mut calls = self.lock();
-        if calls.contains_key(key) {
+        if calls.map.contains_key(key) {
             return Err(Refused::Duplicate);
         }
-        if calls.len() >= MAX_IN_FLIGHT {
+        if calls.map.len() >= MAX_IN_FLIGHT {
             return Err(Refused::Full);
         }
-        calls.insert(key.to_owned(), CallState::default());
+        calls.map.insert(key.to_owned(), CallState::default());
         Ok(())
     }
     /// (1) A call cancelled before its child exists never starts one.
     fn may_start(&self, key: &str) -> bool {
-        self.lock().get(key).is_some_and(|s| !s.cancelled)
+        self.lock().map.get(key).is_some_and(|s| !s.cancelled)
     }
-    /// (2) Records the child; a cancel that came in meanwhile gets its SIGINT now. Returns
+    /// (2) Records the child; a cancel that came in meanwhile gets its signal now. Returns
     /// whether a signal was sent.
     pub(crate) fn started(&self, key: &str, pid: u32) -> bool {
         let mut calls = self.lock();
-        let Some(s) = calls.get_mut(key) else {
+        let closing = calls.closing;
+        let Some(s) = calls.map.get_mut(key) else {
             return false;
         };
         s.child_pid = Some(pid);
-        if s.cancelled && s.sigint_at.is_none() {
-            s.sigint_at = Some(Instant::now());
-            return sigint(pid);
-        }
-        false
+        s.cancelled && s.stop(closing)
     }
     /// (3) `notifications/cancelled`: marks the call and SIGINTs its child when it has one.
     /// Ignored for an id that is not in flight. Returns whether a signal was sent.
     pub(crate) fn cancel(&self, key: &str) -> bool {
         let mut calls = self.lock();
-        let Some(s) = calls.get_mut(key) else {
+        let closing = calls.closing;
+        let Some(s) = calls.map.get_mut(key) else {
             return false;
         };
         s.cancelled = true;
-        match (s.child_pid, s.sigint_at) {
-            (Some(pid), None) => {
-                s.sigint_at = Some(Instant::now());
-                sigint(pid)
-            }
-            _ => false,
-        }
+        s.stop(closing)
     }
-    /// Shutdown: cancels every call at once.
-    pub(crate) fn cancel_all(&self) {
-        let keys: Vec<String> = self.lock().keys().cloned().collect();
-        for key in keys {
-            self.cancel(&key);
+    /// Shutdown: the server is exiting, so every call is cancelled and its child SIGKILLed at
+    /// once (no `CANCEL_GRACE`); a child stored later is killed by `started`.
+    pub(crate) fn shutdown(&self) {
+        let mut calls = self.lock();
+        calls.closing = true;
+        for s in calls.map.values_mut() {
+            s.cancelled = true;
+            s.stop(true);
         }
     }
     /// (4) and (5): one poll of the call's child. SIGKILL once `CANCEL_GRACE` has passed since
-    /// the SIGINT; the exit is observed and the pid cleared in one critical section.
+    /// the SIGINT (at once while closing); the exit is observed and the pid cleared in one
+    /// critical section.
     fn poll(&self, key: &str, child: &mut Child) -> io::Result<Option<ExitStatus>> {
         let mut calls = self.lock();
+        let closing = calls.closing;
         let status = match child.try_wait() {
             Ok(status) => status,
             Err(e) => {
                 // The caller kills and reaps it outside the lock: no signal may target it now.
-                if let Some(s) = calls.get_mut(key) {
+                if let Some(s) = calls.map.get_mut(key) {
                     s.child_pid = None;
                 }
                 return Err(e);
             }
         };
-        if let Some(s) = calls.get_mut(key) {
+        if let Some(s) = calls.map.get_mut(key) {
             if status.is_some() {
                 s.child_pid = None;
             } else if s.cancelled
                 && !s.killed
-                && s.sigint_at.is_some_and(|t| t.elapsed() >= CANCEL_GRACE)
+                && (closing || s.sigint_at.is_some_and(|t| t.elapsed() >= CANCEL_GRACE))
             {
                 // Best effort: an error means the child is already gone.
                 let _ = child.kill();
@@ -285,15 +305,15 @@ impl Registry {
         Ok(status)
     }
     fn cancelled(&self, key: &str) -> bool {
-        self.lock().get(key).is_some_and(|s| s.cancelled)
+        self.lock().map.get(key).is_some_and(|s| s.cancelled)
     }
     /// (6) Ends the call: `true` when its response may be written (it was not cancelled).
     /// Removing the entry makes a later cancel for that id a no-op.
     pub(crate) fn finish(&self, key: &str) -> bool {
-        self.lock().remove(key).is_some_and(|s| !s.cancelled)
+        self.lock().map.remove(key).is_some_and(|s| !s.cancelled)
     }
     pub(crate) fn is_in_flight(&self, key: &str) -> bool {
-        self.lock().contains_key(key)
+        self.lock().map.contains_key(key)
     }
 }
 
@@ -302,10 +322,11 @@ impl Registry {
 pub(crate) enum Watch<'a> {
     /// A `tools/call`: its registry entry decides.
     Call(&'a Registry, &'a str),
-    /// A helper child (the channel's inbox poll): SIGKILLed past `deadline` or once `stop` is set.
+    /// A helper child (the channel's inbox poll): SIGKILLed past `deadline` or once `stop`
+    /// says so (the notifier's stop flag, or a signal to the server during the baseline).
     Bounded {
         deadline: Instant,
-        stop: &'a AtomicBool,
+        stop: &'a (dyn Fn() -> bool + Sync),
     },
 }
 
@@ -321,8 +342,10 @@ impl Capture {
     }
 }
 
-/// Reads `pipe` on its own thread: the first `limit` bytes (then flags an overflow and keeps
-/// draining), or with `tail` only the last `limit` bytes.
+/// Reads `pipe` on its own thread: the first `limit` bytes, or with `tail` only the last
+/// `limit` bytes. Past `limit` (without `tail`) it flags an overflow and closes the pipe, so a
+/// writer that outlives the kill (a grandchild holding the pipe) meets EPIPE instead of a
+/// reader that drains it forever.
 fn capture(pipe: Option<impl Read + Send + 'static>, limit: usize, tail: bool) -> Arc<Capture> {
     let cap = Arc::new(Capture::default());
     let Some(mut pipe) = pipe else {
@@ -347,6 +370,7 @@ fn capture(pipe: Option<impl Read + Send + 'static>, limit: usize, tail: bool) -
                             bytes.extend_from_slice(&chunk[..n]);
                         } else {
                             shared.overflow.store(true, Ordering::SeqCst);
+                            break;
                         }
                     }
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
@@ -373,21 +397,22 @@ fn spawn(launcher: &Launcher, argv: &[OsString], env: &[(&str, &str)]) -> io::Re
 }
 
 /// Runs one child to its end: stdin `/dev/null`, stdout and stderr captured, `env` added to the
-/// inherited environment (that child only), cwd inherited.
+/// inherited environment (that child only), cwd inherited. `None` when the call was cancelled
+/// or the helper stopped: never started, or signalled and reaped. Such a run is never answered.
 pub(crate) fn run_child(
     launcher: &Launcher,
     argv: &[OsString],
     env: &[(&str, &str)],
     watch: Watch,
-) -> Run {
+) -> Option<Run> {
     if let Watch::Call(registry, key) = watch
         && !registry.may_start(key)
     {
-        return Run::Cancelled;
+        return None;
     }
     let child = match spawn(launcher, argv, env) {
         Ok(child) => child,
-        Err(e) => return Run::NotStarted(e),
+        Err(e) => return Some(Run::NotStarted(e)),
     };
     if let Watch::Call(registry, key) = watch {
         registry.started(key, child.id());
@@ -397,8 +422,8 @@ pub(crate) fn run_child(
 
 /// Polls a started child every `CALL_TICK` until it exits: cancellation escalates to SIGKILL
 /// after `CANCEL_GRACE`, a bounded helper is killed at its bound, and a stdout flood past
-/// `MAX_OUTPUT` is killed at once.
-pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
+/// `MAX_OUTPUT` is killed at once. `None` for a cancelled call or a stopped helper.
+pub(crate) fn supervise(mut child: Child, watch: Watch) -> Option<Run> {
     let out = capture(child.stdout.take(), MAX_OUTPUT, false);
     let err = capture(child.stderr.take(), STDERR_TAIL, true);
     let (mut killed, mut stopped) = (false, false);
@@ -414,7 +439,7 @@ pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
                 // Best effort: the child is unobservable, so stop it before reporting.
                 let _ = child.kill();
                 let _ = child.wait();
-                return Run::Lost(e);
+                return Some(Run::Lost(e));
             }
         }
         if !killed && out.overflow.load(Ordering::SeqCst) {
@@ -424,7 +449,7 @@ pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
         }
         if let Watch::Bounded { deadline, stop } = watch
             && !stopped
-            && (Instant::now() >= deadline || stop.load(Ordering::SeqCst))
+            && (Instant::now() >= deadline || stop())
         {
             let _ = child.kill();
             stopped = true;
@@ -437,7 +462,7 @@ pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
         Watch::Bounded { .. } => stopped,
     };
     if cancelled {
-        return Run::Cancelled;
+        return None;
     }
     let deadline = Instant::now() + READER_JOIN;
     while !(out.done.load(Ordering::SeqCst) && err.done.load(Ordering::SeqCst))
@@ -446,13 +471,13 @@ pub(crate) fn supervise(mut child: Child, watch: Watch) -> Run {
         thread::sleep(CALL_TICK);
     }
     if killed || out.overflow.load(Ordering::SeqCst) {
-        return Run::Overflow { stderr: err.take() };
+        return Some(Run::Overflow { stderr: err.take() });
     }
-    Run::Exited {
+    Some(Run::Exited {
         status,
         stdout: out.take(),
         stderr: err.take(),
-    }
+    })
 }
 
 /// The `tools/call` result for a finished run (design §A22 "Result mapping").
@@ -480,7 +505,6 @@ pub(crate) fn result(tool: &Tool, run: Run) -> Value {
         }
         Run::NotStarted(e) => return exec_failure(name, &format!("cannot start glen: {e}"), b""),
         Run::Lost(e) => return exec_failure(name, &format!("cannot wait for glen: {e}"), b""),
-        Run::Cancelled => return exec_failure(name, "the call was cancelled", b""),
     };
     if let Some(signal) = status.signal() {
         return exec_failure(
@@ -808,6 +832,37 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_overflow_drops_the_pipe_so_a_flooding_grandchild_ends() {
+        /// Kills the grandchild if the test fails before it is gone.
+        struct Reap(u32);
+        impl Drop for Reap {
+            fn drop(&mut self) {
+                if let Some(pid) = rustix::process::Pid::from_raw(self.0 as i32) {
+                    let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("yes");
+        // The child is killed at the cap, but `yes` (its child) still holds the pipe.
+        let e = envelope(&mapped(&format!(
+            "yes & echo $! > '{}'; wait",
+            pidfile.display()
+        )));
+        assert!(e["error"]["message"].as_str().unwrap().contains("16 MiB"));
+        let flood = Reap(wait_file(&pidfile).trim().parse().unwrap());
+        // Once the reader dropped the pipe, `yes` meets EPIPE and its SIGPIPE ends it.
+        let start = Instant::now();
+        while !gone(flood.0) {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "the reader kept draining a flood past the cap"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
     fn an_oversize_argument_is_an_exec_failure() {
         // Linux refuses one argument over 128 KiB and macOS a whole argv over 1 MiB.
         let big = OsString::from("x".repeat(2 * 1024 * 1024));
@@ -838,7 +893,7 @@ pub(crate) mod tests {
     pub(crate) fn run_free(launcher: &Launcher, argv: &[OsString], env: &[(&str, &str)]) -> Run {
         let registry = Registry::default();
         registry.insert("free").unwrap();
-        run_child(launcher, argv, env, Watch::Call(&registry, "free"))
+        run_child(launcher, argv, env, Watch::Call(&registry, "free")).expect("nobody cancels it")
     }
     fn gone(pid: u32) -> bool {
         let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
@@ -870,7 +925,7 @@ pub(crate) mod tests {
         assert!(!registry.cancel("k"), "no child yet, so no signal");
         let script = format!("touch '{}'", marker.display());
         let run = run_child(&sh(&script), &[], &[], Watch::Call(&registry, "k"));
-        assert!(matches!(run, Run::Cancelled), "{run:?}");
+        assert!(run.is_none(), "{run:?}");
         assert!(!marker.exists());
         assert!(!registry.finish("k"), "a cancelled call is not answered");
     }
@@ -896,7 +951,7 @@ pub(crate) mod tests {
         assert!(!registry.cancel("k"), "a second cancel sends nothing");
         let run = thread.join().unwrap();
         let took = start.elapsed();
-        assert!(matches!(run, Run::Cancelled), "{run:?}");
+        assert!(run.is_none(), "{run:?}");
         assert!(gone(pid));
         assert!(!registry.finish("k"));
         took
@@ -931,12 +986,45 @@ pub(crate) mod tests {
         );
         let run = supervise(child, Watch::Call(&registry, "k"));
         let took = start.elapsed();
-        assert!(matches!(run, Run::Cancelled), "{run:?}");
+        assert!(run.is_none(), "{run:?}");
         assert!(
             took >= CANCEL_GRACE && took < Duration::from_secs(1),
             "{took:?}"
         );
         assert!(gone(pid));
+    }
+
+    #[test]
+    fn shutdown_kills_at_once_even_a_child_stored_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        let registry = Registry::default();
+        registry.insert("a").unwrap();
+        registry.insert("b").unwrap();
+        let ignoring = format!("trap '' INT; echo > '{}'; exec sleep 30", ready.display());
+        let a = spawn(&sh(&ignoring), &[], &[]).unwrap();
+        let (pid_a, b) = (
+            a.id(),
+            spawn(&sh("trap '' INT; exec sleep 30"), &[], &[]).unwrap(),
+        );
+        let pid_b = b.id();
+        assert!(!registry.started("a", pid_a));
+        wait_file(&ready);
+        let start = Instant::now();
+        registry.shutdown();
+        assert!(
+            registry.started("b", pid_b),
+            "a child stored later is killed on store"
+        );
+        assert!(supervise(a, Watch::Call(&registry, "a")).is_none());
+        assert!(supervise(b, Watch::Call(&registry, "b")).is_none());
+        let took = start.elapsed();
+        assert!(
+            took < CANCEL_GRACE,
+            "no grace while the server exits: {took:?}"
+        );
+        assert!(gone(pid_a) && gone(pid_b));
+        assert!(!registry.finish("a") && !registry.finish("b"));
     }
 
     #[test]
@@ -966,7 +1054,7 @@ pub(crate) mod tests {
         assert!(registry.finish("n:0"));
         assert_eq!(registry.insert("n:99"), Ok(()));
         assert_eq!(registry.insert("n:100"), Err(Refused::Full));
-        registry.cancel_all();
+        registry.shutdown();
         assert!(
             (0..MAX_IN_FLIGHT)
                 .skip(1)

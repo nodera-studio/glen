@@ -1208,9 +1208,9 @@ Agents should use `glen tail -f <session>` and `glen inbox -f` instead.
 (`claude mcp add glen -- glen mcp`, `codex mcp add glen -- glen mcp`). It prints no envelope of its
 own: stdout carries MCP JSON-RPC only, one message per line (protocol revisions `2025-11-25` and
 `2025-06-18`, no batches), and what glen reports about the server itself, such as a refusal, goes
-to stderr as text. With a terminal on stdin it refuses with exit 2 (`usage`): a host always gives
-it a pipe. It exits 0 when stdin ends, and 130, 143 or 129 on SIGINT, SIGTERM or SIGHUP, after
-ending every call still running.
+to stderr as text, even with `--json`. With a terminal on stdin it refuses with exit 2 (`usage`):
+a host always gives it a pipe. It exits 0 when stdin ends, and 130, 143 or 129 on SIGINT, SIGTERM
+or SIGHUP, after ending every call still running.
 
 Each tool is `glen_<command>` for a command this document annotates as a tool, 14 in all:
 `glen_ls`, `glen_show`, `glen_tail`, `glen_send`, `glen_wait`, `glen_jobs`, `glen_inbox`,
@@ -1247,7 +1247,8 @@ The server keeps serving after either.
 `notifications/cancelled` for a running call interrupts that glen run (SIGINT, then SIGKILL after
 400 ms) and sends no response for it. A job the call started keeps running and is never aborted, so
 `glen_jobs` and `glen_wait` still find it. At end of input or on a signal the server ends every
-running call the same way before it exits.
+running call before it exits, at once (SIGKILL, no grace: the server is going); a closed stdout
+counts as the end of input.
 
 Hosts start the server with their own environment and, usually, the project as cwd. Codex cuts a
 tool call after `tool_timeout_sec`; with the 90-second waits set it to 120 in the

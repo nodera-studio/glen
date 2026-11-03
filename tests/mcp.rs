@@ -5,7 +5,7 @@ use common::{A_ID, RpcBox, poll};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
-    process::{Child, ChildStdin, Command, ExitStatus, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
@@ -20,25 +20,34 @@ struct Server {
     stdin: Option<ChildStdin>,
     lines: Arc<Mutex<Vec<String>>>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// The server's stdout when nobody reads it (`start_unread`): a host that stopped reading.
+    unread: Option<ChildStdout>,
 }
 impl Server {
-    fn start(mut cmd: Command) -> Self {
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let lines = Arc::new(Mutex::new(vec![]));
-        let stderr = Arc::new(Mutex::new(vec![]));
-        let out = BufReader::new(child.stdout.take().unwrap());
-        let shared = lines.clone();
+    fn start(cmd: Command) -> Self {
+        let mut s = Self::spawn(cmd);
+        let out = BufReader::new(s.unread.take().unwrap());
+        let shared = s.lines.clone();
         thread::spawn(move || {
             for line in out.lines() {
                 let Ok(line) = line else { break };
                 shared.lock().unwrap().push(line);
             }
         });
+        s
+    }
+    /// A server whose stdout pipe is kept open but never read.
+    fn start_unread(cmd: Command) -> Self {
+        Self::spawn(cmd)
+    }
+    fn spawn(mut cmd: Command) -> Self {
+        let mut child = cmd
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = Arc::new(Mutex::new(vec![]));
         let mut err = child.stderr.take().unwrap();
         let shared = stderr.clone();
         thread::spawn(move || {
@@ -48,10 +57,20 @@ impl Server {
         });
         Self {
             stdin: child.stdin.take(),
+            unread: child.stdout.take(),
             child,
-            lines,
+            lines: Arc::default(),
             stderr,
         }
+    }
+    /// Bytes waiting unread in the pipe of a `start_unread` server.
+    fn unread_bytes(&self) -> usize {
+        use std::os::fd::AsRawFd;
+        let fd = self.unread.as_ref().unwrap().as_raw_fd();
+        let mut n: libc::c_int = 0;
+        // SAFETY: FIONREAD writes one c_int to `n`, a live local, for an fd this struct owns.
+        assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) }, 0);
+        usize::try_from(n).unwrap()
     }
     fn pid(&self) -> u32 {
         self.child.id()
@@ -288,6 +307,37 @@ fn the_error_table_over_the_wire() {
     s.send(&json!({"jsonrpc":"2.0","id":8,"result":{}}));
     assert_eq!(s.request(json!(9), "ping", json!({}))["result"], json!({}));
     assert!(s.messages().iter().all(|m| m["id"] != 8));
+}
+
+#[test]
+fn a_request_without_jsonrpc_2_0_is_invalid_and_runs_nothing() {
+    let rb = RpcBox::new();
+    let mut s = server(&rb, &[], &[]);
+    s.init();
+    for (i, version) in [None, Some(json!(2)), Some(json!(2.0)), Some(json!("1.0"))]
+        .into_iter()
+        .enumerate()
+    {
+        let mut ping = json!({"id":format!("p{i}"),"method":"ping"});
+        let mut call = json!({"id":10 + i,"method":"tools/call",
+            "params":{"name":"glen_send","arguments":{"session":"e27c0de","message":"m"}}});
+        if let Some(v) = version {
+            ping["jsonrpc"] = v.clone();
+            call["jsonrpc"] = v;
+        }
+        for m in [ping, call] {
+            s.send(&m);
+            let e = s.answer(&m["id"]);
+            assert_eq!(e["error"]["code"], -32600, "{m}: {e}");
+            assert_eq!(e["jsonrpc"], "2.0");
+        }
+    }
+    assert_eq!(
+        s.request(json!("ok"), "ping", json!({}))["result"],
+        json!({})
+    );
+    assert!(s.children().is_empty(), "no child started");
+    assert!(!rb.log.exists(), "the fake omp never started");
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -708,6 +758,118 @@ fn eof_and_signals_stop_every_child_within_two_seconds() {
         rb.wait_worker_gone(&job);
     }
     assert!(rb.frames_in("abort").is_empty());
+}
+
+/// Releases a held `fake_omp` when a test ends, passing or not, so no job outlives it.
+struct Release(String);
+impl Drop for Release {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.0, b"go");
+    }
+}
+
+fn unread_server(rb: &RpcBox, vars: &[(&str, &str)]) -> Server {
+    let mut cmd = rb.glen(&["mcp"]);
+    cmd.envs(vars.iter().copied());
+    let mut s = Server::start_unread(cmd);
+    s.raw(CLAUDE_INIT.as_bytes());
+    s.send(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}));
+    s
+}
+
+#[test]
+fn a_host_that_stops_reading_stdout_can_still_cancel_and_stop_the_server() {
+    let rb = RpcBox::new();
+    let hold = hold_path(&rb);
+    let _release = Release(hold.clone());
+    let mut s = unread_server(&rb, &[("FAKE_OMP_RUN_RELEASE", &hold)]);
+    let (job, observer) = held_send(&rb, &mut s, json!(1));
+    // Answers far past any pipe buffer, which the host never reads.
+    for i in 0..64 {
+        s.send(&json!({"jsonrpc":"2.0","id":100 + i,"method":"tools/list"}));
+    }
+    // Readiness: the pipe is full (its unread byte count holds still).
+    let full = poll(Duration::from_secs(10), || {
+        let before = s.unread_bytes();
+        thread::sleep(Duration::from_millis(200));
+        (before >= 8 * 1024 && s.unread_bytes() == before).then_some(before)
+    });
+    let start = Instant::now();
+    s.cancel(json!(1));
+    poll(Duration::from_secs(1), || gone(observer).then_some(()));
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{full} bytes unread"
+    );
+    let start = Instant::now();
+    signal(s.pid(), rustix::process::Signal::TERM);
+    let status = s.exit_within(Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(status.code(), Some(143));
+    std::fs::write(&hold, b"go").unwrap();
+    assert_eq!(
+        rb.wait_terminal(&job, Duration::from_secs(25))["status"],
+        "completed"
+    );
+    rb.wait_worker_gone(&job);
+    assert!(rb.frames_in("abort").is_empty());
+}
+
+#[test]
+fn a_host_that_closes_stdout_mid_call_leaves_no_child_behind() {
+    let rb = RpcBox::new();
+    let hold = hold_path(&rb);
+    let _release = Release(hold.clone());
+    let mut s = unread_server(&rb, &[("FAKE_OMP_RUN_RELEASE", &hold)]);
+    let (job, observer) = held_send(&rb, &mut s, json!(1));
+    drop(s.unread.take());
+    // The next answer meets EPIPE, which counts as the end of input.
+    let start = Instant::now();
+    s.send(&json!({"jsonrpc":"2.0","id":"p","method":"ping"}));
+    let status = s.exit_within(Duration::from_secs(2));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    assert_eq!(status.code(), Some(0));
+    assert!(gone(observer));
+    assert!(s.children().is_empty());
+    std::fs::write(&hold, b"go").unwrap();
+    assert_eq!(
+        rb.wait_terminal(&job, Duration::from_secs(25))["status"],
+        "completed",
+        "the job outlived the server"
+    );
+    rb.wait_worker_gone(&job);
+    assert!(rb.frames_in("abort").is_empty());
+}
+
+#[test]
+fn startup_failures_stay_off_stdout_whatever_the_output_flags() {
+    let rb = RpcBox::new();
+    for (args, relative_home) in [
+        (vec!["--json", "mcp"], true),
+        (vec!["mcp", "--json"], true),
+        (vec!["--json", "mcp", "--bogus"], false),
+        (vec!["--json", "--color", "always", "mcp", "--bogus"], false),
+        (vec!["--human", "mcp", "--bogus"], false),
+    ] {
+        let mut cmd = rb.glen(&args);
+        if relative_home {
+            cmd.env("GLEN_HOME", "relative/home");
+        }
+        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.stdout, b"", "{args:?}: stdout is the protocol's alone");
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        assert!(
+            !stderr.trim().is_empty() && !stderr.contains("\"ok\""),
+            "{args:?}: {stderr}"
+        );
+        let needle = if relative_home {
+            "GLEN_HOME"
+        } else {
+            "--bogus"
+        };
+        assert!(stderr.contains(needle), "{args:?}: {stderr}");
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

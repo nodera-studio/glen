@@ -9,9 +9,11 @@ pub mod server;
 
 use serde_json::Value;
 use std::{
+    collections::VecDeque,
     io::{self, BufRead, Read, Write},
-    sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    thread,
+    time::{Duration, Instant},
 };
 
 /// Protocol revisions served, preferred first (both without JSON-RPC batching).
@@ -36,8 +38,12 @@ pub const CHANNEL_POLL: Duration = Duration::from_secs(1);
 pub const CHANNEL_BASELINE: Duration = Duration::from_secs(2);
 /// The longest channel notification `content`, in bytes.
 pub const CHANNEL_MAX_CONTENT: usize = 8 * 1024;
-/// Reply ids the channel notifier remembers.
+/// Reply ids the channel notifier remembers once they are no longer listed (ids a poll still
+/// lists are always kept).
 pub const SEEN_CAP: usize = 10_000;
+/// Unwritten stdout bytes past which a call or the notifier waits for the host to read; past
+/// twice this a host that keeps sending requests without reading counts as gone.
+pub const OUTPUT_QUEUE: usize = 32 * 1024 * 1024;
 
 /// One framed input line.
 #[derive(Debug, PartialEq)]
@@ -74,41 +80,144 @@ pub(crate) fn read_line(
     Ok(Line::Text(std::mem::take(buf)))
 }
 
-/// The one writer every protocol message goes through: compact JSON, one line, flushed.
+/// The one writer every protocol message goes through: compact JSON, one line, flushed, in
+/// queue order. A thread of its own does the blocking writes, so a host that stops reading
+/// stdout never stalls the main loop (cancellation, EOF and signals stay live).
 #[derive(Clone)]
-pub(crate) struct Writer(Arc<Mutex<WriterState>>);
-struct WriterState {
-    out: Box<dyn Write + Send>,
+pub(crate) struct Writer(Arc<Pipe>);
+#[derive(Default)]
+struct Pipe {
+    queue: Mutex<Queue>,
+    changed: Condvar,
+}
+#[derive(Default)]
+struct Queue {
+    lines: VecDeque<Vec<u8>>,
+    bytes: usize,
+    /// The writer thread is writing a line it already took off `lines`.
+    writing: bool,
+    /// A write failed (EPIPE included), or the host left too much unread.
     gone: bool,
+    /// Shutdown began: `send` stops waiting for room.
+    closing: bool,
+    /// Shutdown drained the queue: the writer thread ends once it is empty.
+    done: bool,
+}
+impl Pipe {
+    fn lock(&self) -> MutexGuard<'_, Queue> {
+        self.queue.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+    fn wait<'a>(&self, queue: MutexGuard<'a, Queue>) -> MutexGuard<'a, Queue> {
+        self.changed
+            .wait(queue)
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+    fn write_all(&self, mut out: impl Write) {
+        let mut queue = self.lock();
+        loop {
+            if queue.gone {
+                return;
+            }
+            let Some(line) = queue.lines.pop_front() else {
+                if queue.done {
+                    return;
+                }
+                queue = self.wait(queue);
+                continue;
+            };
+            queue.writing = true;
+            drop(queue);
+            let written = out.write_all(&line).and_then(|()| out.flush());
+            queue = self.lock();
+            queue.writing = false;
+            // `push` empties the queue when it declares the host gone mid-write.
+            queue.bytes = queue.bytes.saturating_sub(line.len());
+            if written.is_err() {
+                queue.gone = true;
+                queue.lines.clear();
+                queue.bytes = 0;
+            }
+            self.changed.notify_all();
+        }
+    }
 }
 impl Writer {
     pub(crate) fn new(out: impl Write + Send + 'static) -> Self {
-        Self(Arc::new(Mutex::new(WriterState {
-            out: Box::new(out),
-            gone: false,
-        })))
+        let pipe = Arc::new(Pipe::default());
+        let shared = pipe.clone();
+        let spawned = thread::Builder::new()
+            .name("glen-mcp-stdout".into())
+            .spawn(move || shared.write_all(out));
+        if spawned.is_err() {
+            pipe.lock().gone = true;
+        }
+        Self(pipe)
     }
-    /// Writes one message; a write error (EPIPE included) marks the client gone.
+    /// Queues one message from a call or the notifier: while more than `OUTPUT_QUEUE` bytes
+    /// wait unread, it waits for the host to catch up (until shutdown begins).
     pub(crate) fn send(&self, message: &Value) {
+        self.push(message, true);
+    }
+    /// Queues one message from the main loop, never waiting.
+    pub(crate) fn post(&self, message: &Value) {
+        self.push(message, false);
+    }
+    fn push(&self, message: &Value, wait: bool) {
         let Ok(mut line) = serde_json::to_vec(message) else {
             return;
         };
         line.push(b'\n');
-        let mut state = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if state.gone {
+        let mut queue = self.0.lock();
+        while wait
+            && !queue.gone
+            && !queue.closing
+            && queue.bytes > 0
+            && queue.bytes + line.len() > OUTPUT_QUEUE
+        {
+            queue = self.0.wait(queue);
+        }
+        if queue.gone {
             return;
         }
-        if state
-            .out
-            .write_all(&line)
-            .and_then(|()| state.out.flush())
-            .is_err()
-        {
-            state.gone = true;
+        if queue.bytes + line.len() > 2 * OUTPUT_QUEUE {
+            // A host that keeps asking but leaves this much unread is not reading at all.
+            queue.gone = true;
+            queue.lines.clear();
+            queue.bytes = 0;
+        } else {
+            queue.bytes += line.len();
+            queue.lines.push_back(line);
         }
+        self.0.changed.notify_all();
     }
     pub(crate) fn gone(&self) -> bool {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner).gone
+        self.0.lock().gone
+    }
+    /// Shutdown begins: no sender waits for room any longer.
+    pub(crate) fn close(&self) {
+        self.0.lock().closing = true;
+        self.0.changed.notify_all();
+    }
+    /// Shutdown ends: waits until everything queued is written, the client is gone, or
+    /// `deadline` passes (a wedged write is left to the process exit), then lets the writer
+    /// thread end.
+    pub(crate) fn finish(&self, deadline: Instant) {
+        let mut queue = self.0.lock();
+        queue.closing = true;
+        while !queue.gone && (queue.writing || !queue.lines.is_empty()) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            queue = self
+                .0
+                .changed
+                .wait_timeout(queue, left)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        queue.done = true;
+        self.0.changed.notify_all();
     }
 }
 
@@ -186,11 +295,16 @@ mod tests {
                 let (writer, big) = (writer.clone(), &big);
                 s.spawn(move || {
                     for i in 0..25 {
-                        writer.send(&serde_json::json!({"t":t,"i":i,"pad":big}));
+                        if i % 2 == 0 {
+                            writer.send(&serde_json::json!({"t":t,"i":i,"pad":big}));
+                        } else {
+                            writer.post(&serde_json::json!({"t":t,"i":i,"pad":big}));
+                        }
                     }
                 });
             }
         });
+        writer.finish(Instant::now() + Duration::from_secs(10));
         let lines = out.lines();
         assert_eq!(lines.len(), 100);
         assert!(
@@ -214,6 +328,46 @@ mod tests {
         let writer = Writer::new(Broken);
         assert!(!writer.gone());
         writer.send(&serde_json::json!({}));
+        writer.finish(Instant::now() + Duration::from_secs(10));
         assert!(writer.gone());
+        writer.post(&serde_json::json!({}));
+        assert!(writer.gone());
+    }
+
+    #[test]
+    fn a_host_that_stops_reading_never_blocks_the_main_loop() {
+        // Nobody reads `unread`: the first writes fill the pipe and the writer thread blocks.
+        let (unread, out) = io::pipe().unwrap();
+        let writer = Writer::new(out);
+        let big = serde_json::json!({"pad":"x".repeat(64 * 1024)});
+        let start = Instant::now();
+        for _ in 0..32 {
+            writer.post(&big);
+        }
+        assert!(!writer.gone());
+        assert!(start.elapsed() < Duration::from_secs(2), "post waited");
+        // Shutdown takes `send` out of its wait for room, and the drain is bounded.
+        let huge = serde_json::json!({"pad":"y".repeat(OUTPUT_QUEUE)});
+        let blocked = {
+            let (writer, huge) = (writer.clone(), huge.clone());
+            thread::spawn(move || writer.send(&huge))
+        };
+        thread::sleep(Duration::from_millis(100));
+        assert!(!blocked.is_finished(), "send waits while the queue is full");
+        writer.close();
+        blocked.join().unwrap();
+        let start = Instant::now();
+        writer.finish(Instant::now() + Duration::from_millis(200));
+        let took = start.elapsed();
+        assert!(
+            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            "{took:?}"
+        );
+        assert!(!writer.gone());
+        // Past twice `OUTPUT_QUEUE` unread, the host counts as gone.
+        writer.post(&huge);
+        assert!(writer.gone());
+        // The blocked write fails once the reading end is gone, and the writer thread ends.
+        drop(unread);
     }
 }

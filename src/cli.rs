@@ -575,11 +575,12 @@ impl Command {
         }
     }
     pub fn output_kind(&self) -> OutputKind {
-        // `mcp`'s stdout carries MCP JSON-RPC only, so its refusals go to stderr as text (J10).
-        if matches!(self, Self::Completions(_) | Self::Mcp(_)) {
-            OutputKind::Raw
-        } else {
-            OutputKind::Document
+        match self {
+            Self::Completions(_) => OutputKind::Raw,
+            // `mcp`'s stdout carries MCP JSON-RPC only, so its refusals go to stderr as text
+            // even with `--json` (J10).
+            Self::Mcp(_) => OutputKind::Protocol,
+            _ => OutputKind::Document,
         }
     }
 }
@@ -959,7 +960,7 @@ mod mcp_tests {
     fn mcp(args: &[&str]) -> McpArgs {
         let cli = Cli::try_parse_from(std::iter::once("glen").chain(args.iter().copied())).unwrap();
         assert_eq!(cli.command.name(), "mcp");
-        assert!(matches!(cli.command.output_kind(), OutputKind::Raw));
+        assert!(matches!(cli.command.output_kind(), OutputKind::Protocol));
         match cli.command {
             Command::Mcp(a) => a,
             other => panic!("not mcp: {}", other.name()),

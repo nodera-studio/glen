@@ -59,6 +59,8 @@ struct Server {
     baseline: Option<Seen>,
     /// The running channel notifier and its stop flag.
     notifier: Option<(Arc<AtomicBool>, thread::JoinHandle<()>)>,
+    /// The signal that stops the server (0 while none arrived).
+    signal: Arc<AtomicUsize>,
 }
 
 /// Serves MCP on `input` and `output` until stdin EOF, a gone client or a signal recorded in
@@ -83,7 +85,7 @@ where
                 }
             }
         });
-    let mut server = Server::new(config, Writer::new(output));
+    let mut server = Server::new(config, Writer::new(output), signal.clone());
     let exit = if reader.is_err() {
         Exit::Eof
     } else {
@@ -113,7 +115,7 @@ where
 }
 
 impl Server {
-    fn new(config: Config, writer: Writer) -> Self {
+    fn new(config: Config, writer: Writer, signal: Arc<AtomicUsize>) -> Self {
         let tools = config.catalog.tools.iter().map(listed).collect();
         Self {
             config: Arc::new(config),
@@ -124,15 +126,17 @@ impl Server {
             registry: Arc::default(),
             baseline: None,
             notifier: None,
+            signal,
         }
     }
+    // The main loop only queues its messages, so a host that stops reading never stalls it.
     fn result(&self, id: Value, result: Value) {
         self.writer
-            .send(&json!({"jsonrpc":"2.0","id":id,"result":result}));
+            .post(&json!({"jsonrpc":"2.0","id":id,"result":result}));
     }
     fn error(&self, id: Value, code: i64, message: String) {
         self.writer
-            .send(&json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}));
+            .post(&json!({"jsonrpc":"2.0","id":id,"error":{"code":code,"message":message}}));
     }
     fn handle(&mut self, bytes: &[u8]) {
         if bytes.iter().all(u8::is_ascii_whitespace) {
@@ -162,11 +166,22 @@ impl Server {
                 );
             }
         };
+        // The server sends no requests, so a response from the client is ignored.
+        if !message.contains_key("method")
+            && id.is_some()
+            && (message.contains_key("result") || message.contains_key("error"))
+        {
+            return;
+        }
+        // Checked before anything is dispatched: a malformed notification has no effect.
+        if message.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return self.error(
+                id.unwrap_or(Value::Null),
+                INVALID_REQUEST,
+                r#"jsonrpc must be "2.0""#.into(),
+            );
+        }
         let Some(method) = message.get("method") else {
-            // The server sends no requests, so a response from the client is ignored.
-            if id.is_some() && (message.contains_key("result") || message.contains_key("error")) {
-                return;
-            }
             return self.error(
                 id.unwrap_or(Value::Null),
                 INVALID_REQUEST,
@@ -234,8 +249,11 @@ impl Server {
         if self.config.channel {
             result["capabilities"]["experimental"] = json!({"claude/channel":{}});
             result["instructions"] = json!(INSTRUCTIONS);
-            // Replies present before the client can see this result are the silent baseline.
-            self.baseline = Some(self.poller().baseline(CHANNEL_BASELINE));
+            // Replies present before the client can see this result are the silent baseline. It
+            // runs inline (J6), so a signal to the server ends it early.
+            let signal = self.signal.clone();
+            let signalled = move || signal.load(Ordering::SeqCst) != 0;
+            self.baseline = Some(self.poller().baseline(CHANNEL_BASELINE, &signalled));
         }
         self.result(id, result);
         self.initialized = true;
@@ -311,12 +329,13 @@ impl Server {
             .name("glen-mcp-call".into())
             .spawn(move || {
                 let watch = Watch::Call(&registry, &call_key);
-                let result = dispatch::result(
-                    &tool,
-                    dispatch::run_child(&config.launcher, &argv, &[], watch),
-                );
-                // Exactly one response per request, and none for a cancelled one.
-                if registry.finish(&call_key) {
+                let run = dispatch::run_child(&config.launcher, &argv, &[], watch);
+                // Exactly one response per request, and none for a cancelled one: a cancel
+                // before the exit leaves no run, one after it makes `finish` refuse.
+                let result = run.map(|run| dispatch::result(&tool, run));
+                if registry.finish(&call_key)
+                    && let Some(result) = result
+                {
                     writer.send(&json!({"jsonrpc":"2.0","id":answer,"result":result}));
                 }
             });
@@ -329,9 +348,12 @@ impl Server {
             }
         }
     }
-    /// Cancels every call in parallel and waits up to `SHUTDOWN_JOIN` for their threads.
+    /// SIGKILLs every call's child at once (the server is exiting, so no `CANCEL_GRACE`), then
+    /// within `SHUTDOWN_JOIN` waits for the call threads and writes out what is queued; a host
+    /// that stopped reading cannot hold the exit past that.
     fn shutdown(&mut self) {
-        self.registry.cancel_all();
+        self.writer.close();
+        self.registry.shutdown();
         if let Some((stop, _)) = &self.notifier {
             stop.store(true, Ordering::SeqCst);
         }
@@ -343,6 +365,7 @@ impl Server {
         while running(self) && Instant::now() < deadline {
             thread::sleep(CALL_TICK);
         }
+        self.writer.finish(deadline);
     }
 }
 
@@ -603,26 +626,48 @@ pub(crate) mod tests {
         assert_eq!(exit, Exit::Signal(15));
     }
 
+    /// A `Shared` output that fails every write once `broken` is set: a host that closed stdout.
+    #[derive(Clone, Default)]
+    struct Breakable {
+        out: Shared,
+        broken: Arc<AtomicBool>,
+    }
+    impl Write for Breakable {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            if self.broken.load(Ordering::SeqCst) {
+                return Err(std::io::ErrorKind::BrokenPipe.into());
+            }
+            self.out.write(b)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// A server on a pipe that stays open, for calls that are still running.
     pub(crate) struct Live {
         input: Option<std::io::PipeWriter>,
         pub(crate) out: Shared,
         handle: Option<thread::JoinHandle<Exit>>,
         pub(crate) signal: Arc<AtomicUsize>,
+        /// Set it to make every later write to the host fail (EPIPE).
+        pub(crate) broken: Arc<AtomicBool>,
     }
     impl Live {
         pub(crate) fn start(config: Config) -> Self {
             let (reader, input) = std::io::pipe().unwrap();
-            let (out, signal) = (Shared::default(), Arc::new(AtomicUsize::new(0)));
+            let (output, signal) = (Breakable::default(), Arc::new(AtomicUsize::new(0)));
+            let (out, broken) = (output.out.clone(), output.broken.clone());
             let handle = {
-                let (out, signal) = (out.clone(), signal.clone());
-                thread::spawn(move || run(std::io::BufReader::new(reader), out, config, signal))
+                let signal = signal.clone();
+                thread::spawn(move || run(std::io::BufReader::new(reader), output, config, signal))
             };
             let mut live = Self {
                 input: Some(input),
                 out,
                 handle: Some(handle),
                 signal,
+                broken,
             };
             live.send(INIT);
             live.wait(|m| m["id"] == 0);
@@ -883,5 +928,166 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
         assert!(pids(&dir.path().join("pids")).is_empty());
         assert_eq!(s.out.lines().len(), 1);
         assert_eq!(s.close().0, Exit::Eof);
+    }
+
+    #[test]
+    fn a_message_without_jsonrpc_2_0_is_refused_before_dispatch() {
+        // A refused initialize leaves the server uninitialized.
+        let out = session(
+            false,
+            &[
+                &INIT.replace(r#""jsonrpc":"2.0","#, ""),
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            ],
+        );
+        assert_eq!(
+            (out[0]["id"].clone(), code(&out[0])),
+            (json!(0), INVALID_REQUEST)
+        );
+        assert_eq!(code(&out[1]), INVALID_REQUEST);
+        assert_eq!(out.len(), 2);
+
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, pidfile) = live(&dir);
+        for (i, version) in [None, Some(json!("1.0")), Some(json!(2.0)), Some(json!(2))]
+            .into_iter()
+            .enumerate()
+        {
+            let mut call = json!({"id":10 + i,"method":"tools/call",
+                "params":{"name":"glen_show","arguments":{"session":"x"}}});
+            let mut ping = json!({"id":format!("p{i}"),"method":"ping"});
+            if let Some(v) = &version {
+                call["jsonrpc"] = v.clone();
+                ping["jsonrpc"] = v.clone();
+            }
+            s.send(&call.to_string());
+            s.send(&ping.to_string());
+            for id in [json!(10 + i), json!(format!("p{i}"))] {
+                let e = s.wait(|m| m["id"] == id);
+                assert_eq!(e["error"]["code"], INVALID_REQUEST, "{version:?}: {e}");
+            }
+        }
+        // An id that is not valid is answered with id null.
+        s.send(r#"{"jsonrpc":"1.0","id":1.5,"method":"ping"}"#);
+        // A malformed notification has no effect: this cancel stops nothing.
+        s.call(json!("held"), "glen_jobs", json!({}));
+        let pid = wait_pids(&pidfile, 1)[0];
+        s.send(
+            r#"{"jsonrpc":"1.0","method":"notifications/cancelled","params":{"requestId":"held"}}"#,
+        );
+        s.send(r#"{"method":"notifications/cancelled","params":{"requestId":"held"}}"#);
+        s.send(r#"{"jsonrpc":"2.0","id":"sync","method":"ping"}"#);
+        s.wait(|m| m["id"] == "sync");
+        thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!gone(pid), "a malformed cancel stopped the call");
+        assert_eq!(
+            pids(&pidfile).len(),
+            1,
+            "a refused tools/call started a child"
+        );
+        let nulls = s.out.lines().into_iter().filter(|m| m["id"].is_null());
+        assert!(nulls.map(|m| code(&m)).eq([INVALID_REQUEST; 3]));
+        s.cancel(json!("held"));
+        let start = Instant::now();
+        while !gone(pid) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(s.close().0, Exit::Eof);
+
+        // A malformed `notifications/initialized` starts no notifier.
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Live::start(config(true, &inbox_script(dir.path())));
+        s.send(r#"{"method":"notifications/initialized"}"#);
+        s.send(r#"{"jsonrpc":"2.0","id":"sync","method":"ping"}"#);
+        s.wait(|m| m["id"] == "sync");
+        thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            pids(&dir.path().join("pids")).len(),
+            1,
+            "only the baseline ran"
+        );
+        s.send(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#);
+        wait_pids(&dir.path().join("pids"), 2);
+        assert_eq!(s.close().0, Exit::Eof);
+    }
+
+    #[test]
+    fn a_gone_client_or_a_signal_kills_every_child_without_the_grace() {
+        for how in ["gone", "signal"] {
+            let dir = tempfile::tempdir().unwrap();
+            let (mut s, pidfile) = live(&dir);
+            // `doctor` ignores SIGINT: only a SIGKILL ends it.
+            s.call(json!(1), "glen_doctor", json!({}));
+            s.call(json!(2), "glen_jobs", json!({}));
+            let children = wait_pids(&pidfile, 2);
+            let start = Instant::now();
+            if how == "gone" {
+                s.broken.store(true, Ordering::SeqCst);
+                s.send(r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#);
+            } else {
+                s.signal.store(15, Ordering::SeqCst);
+            }
+            let (exit, _) = s.join();
+            let took = start.elapsed();
+            let want = if how == "gone" {
+                Exit::Eof
+            } else {
+                Exit::Signal(15)
+            };
+            assert_eq!(exit, want);
+            assert!(children.iter().all(|p| gone(*p)), "{how}: {children:?}");
+            // The server is exiting, so no child gets the cancel grace.
+            assert!(took < super::super::CANCEL_GRACE, "{how}: {took:?}");
+        }
+    }
+
+    #[test]
+    fn a_cancelled_call_killed_after_the_grace_is_never_answered() {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut s, pidfile) = live(&dir);
+        s.call(json!(1), "glen_doctor", json!({}));
+        let pid = wait_pids(&pidfile, 1)[0];
+        s.cancel(json!(1));
+        let start = Instant::now();
+        while !gone(pid) {
+            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            thread::sleep(std::time::Duration::from_millis(5));
+        }
+        s.send(r#"{"jsonrpc":"2.0","id":"after","method":"ping"}"#);
+        s.wait(|m| m["id"] == "after");
+        thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(s.answers(&json!(1)), 0, "{:?}", s.out.lines());
+        assert_eq!(s.close().0, Exit::Eof);
+    }
+
+    #[test]
+    fn a_signal_during_the_channel_baseline_is_honoured() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("pids");
+        let hang = format!("echo $$ >> '{}'; exec sleep 30", pidfile.display());
+        let (reader, mut input) = std::io::pipe().unwrap();
+        let signal = Arc::new(AtomicUsize::new(0));
+        let handle = {
+            let signal = signal.clone();
+            let config = config(true, &hang);
+            thread::spawn(move || {
+                run(
+                    std::io::BufReader::new(reader),
+                    Shared::default(),
+                    config,
+                    signal,
+                )
+            })
+        };
+        writeln!(input, "{INIT}").unwrap();
+        let child = wait_pids(&pidfile, 1)[0];
+        let start = Instant::now();
+        signal.store(15, Ordering::SeqCst);
+        let exit = handle.join().unwrap();
+        let took = start.elapsed();
+        assert_eq!(exit, Exit::Signal(15));
+        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        assert!(gone(child));
     }
 }
