@@ -183,6 +183,35 @@ on Claude Code 2.1.316), so a headless run that waits in the background may need
 on `--allowedTools` as well.
 <!-- W4:end -->
 
+## Use from an MCP host (`glen mcp`)
+
+`glen mcp` serves every non-interactive glen command as an MCP tool over stdio, for a host that
+speaks MCP instead of running glen from a shell:
+
+```sh
+claude mcp add glen -- glen mcp
+codex mcp add glen -- glen mcp
+```
+
+Codex's default tool timeout (60 s) is shorter than `send`'s and `wait`'s 90 s defaults, so set it
+higher:
+
+```toml
+[mcp_servers.glen]
+command = "glen"
+args = ["mcp"]
+tool_timeout_sec = 120
+```
+
+Each tool (`glen_ls`, `glen_send`, `glen_wait`, and the rest — 14 in all) is one glen command, and
+a call's result is the identical `--json` envelope this README and `docs/json.md` describe:
+`isError` mirrors `ok:false`, so a job that is still running or has forked is not an error. If a
+host cuts a tool call sooner than 90 s, pass a shorter `wait` or `timeout`, or `no_wait`, then call
+`glen_wait` again — the job keeps running. A large result spills to a file, the same as on the
+command line. A tool call gives the host's model everything glen does, including sending messages
+into omp sessions, so keep the host's per-tool approval on rather than trusting every `glen_*`
+tool at once.
+
 ## Website
 
 <!-- site-url: keep in sync with the default in site/astro.config.mjs; tests/readme.rs checks they match. -->
