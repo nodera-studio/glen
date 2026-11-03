@@ -18,6 +18,8 @@
 //! The signal cases measure the plan's bounds: `session/cancel` is written within 250 ms of the
 //! signal (asserted with 250 ms of scheduling slack, measured from the signal to the moment the
 //! frame shows in the fake's log), and the process exits within 11 s (3.5 s before the prompt).
+//! Under `scripts/flake-check.sh` these upper bounds and the waits are multiplied by
+//! `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); lower bounds are not.
 //! The real-omp experiments E1 to E3 are the orchestrator's and live in evidence; AC-v2-304 is
 //! checked here over the documents that record them.
 
@@ -29,6 +31,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
+use crate::flake::scaled;
 use crate::live_support::*;
 use crate::reader::*;
 use crate::rpc_support::*;
@@ -130,11 +133,36 @@ fn is_cancel(r: &Value) -> bool {
 }
 
 /// An `agent_message_chunk` the fake wrote (the turn is under way).
+/// The turn's first agent chunk: one logged after the `session/prompt` frame. `session/load`
+/// replays an existing session's history as agent chunks too, and a signal sent on one of those
+/// lands before the prompt, when there is no turn to cancel.
 fn first_chunk_logged(recs: &[Value]) -> bool {
-    recs.iter().any(|r| {
-        r["event"] == "out"
-            && r["frame"]["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
-    })
+    recs.iter()
+        .skip_while(|r| !(r["event"] == "in" && r["frame"]["method"] == "session/prompt"))
+        .any(|r| {
+            r["event"] == "out"
+                && r["frame"]["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
+        })
+}
+
+#[test]
+fn the_first_chunk_is_the_turns_never_a_session_load_replay() {
+    let chunk = |text: &str| {
+        json!({"event":"out","frame":{"method":"session/update","params":{"update":{
+            "sessionUpdate":"agent_message_chunk","content":{"type":"text","text":text}}}}})
+    };
+    let method = |m: &str| json!({"event":"in","frame":{"method":m}});
+    // Run 41621490685's log at the signal: a load whose replay holds an agent chunk.
+    let mut recs = vec![
+        method("initialize"),
+        method("session/load"),
+        chunk("REPLAYED ANSWER"),
+    ];
+    assert!(!first_chunk_logged(&recs));
+    recs.push(method("session/prompt"));
+    assert!(!first_chunk_logged(&recs));
+    recs.push(chunk("Hel"));
+    assert!(first_chunk_logged(&recs));
 }
 
 fn initialize_logged(recs: &[Value]) -> bool {
@@ -166,7 +194,7 @@ fn assert_omp_gone(rb: &RpcBox) {
         let pgid = st["pgid"].as_i64().unwrap_or(0);
         poll_until(
             "the omp process and its group to be gone",
-            Duration::from_secs(3),
+            scaled(Duration::from_secs(3)),
             || (!pid_alive(pid) && (pgid == mine || !group_alive(pgid))).then_some(()),
         );
     }
@@ -513,7 +541,7 @@ fn ac_v2_302_an_unanswered_initialize_times_out_acp_timeout() {
     let err = failed(&out, "omp_unavailable");
     assert_eq!(err["details"]["reason"], "acp_timeout", "{err}");
     assert!(
-        out.elapsed < Duration::from_secs(15),
+        out.elapsed < scaled(Duration::from_secs(15)),
         "the setup bound is 300 ms plus teardown, took {:?}",
         out.elapsed
     );
@@ -969,16 +997,20 @@ fn cancel_flow(sig: Signal) {
     rb.wait_log("the first agent chunk", first_chunk_logged);
     let t = Instant::now();
     signal(pid, sig);
-    let seen = wait_for_cancel_frame(&rb, Duration::from_secs(10))
+    let seen = wait_for_cancel_frame(&rb, scaled(Duration::from_secs(10)))
         .unwrap_or_else(|| panic!("no session/cancel after {sig:?}\n{}", rb.diag()));
     let latency = seen.duration_since(t);
     assert!(
-        latency < CANCEL_BOUND,
+        latency < scaled(CANCEL_BOUND),
         "session/cancel took {latency:?} after {sig:?} (bound 250 ms)"
     );
-    let out = finish(child, "__acp @new (signalled)", Duration::from_secs(30));
+    let out = finish(
+        child,
+        "__acp @new (signalled)",
+        scaled(Duration::from_secs(30)),
+    );
     assert!(
-        t.elapsed() < Duration::from_secs(11),
+        t.elapsed() < scaled(Duration::from_secs(11)),
         "exit within 11 s of the signal, took {:?}",
         t.elapsed()
     );
@@ -1045,12 +1077,16 @@ fn ac_v2_302_an_unconfirmed_cancel_still_exits_130_within_the_bound() {
     rb.wait_log("the first agent chunk", first_chunk_logged);
     let t = Instant::now();
     signal(pid, Signal::INT);
-    let seen = wait_for_cancel_frame(&rb, Duration::from_secs(10))
+    let seen = wait_for_cancel_frame(&rb, scaled(Duration::from_secs(10)))
         .unwrap_or_else(|| panic!("no session/cancel\n{}", rb.diag()));
-    assert!(seen.duration_since(t) < CANCEL_BOUND);
-    let out = finish(child, "__acp A (cancel ignored)", Duration::from_secs(30));
+    assert!(seen.duration_since(t) < scaled(CANCEL_BOUND));
+    let out = finish(
+        child,
+        "__acp A (cancel ignored)",
+        scaled(Duration::from_secs(30)),
+    );
     assert!(
-        t.elapsed() < Duration::from_secs(9),
+        t.elapsed() < scaled(Duration::from_secs(9)),
         "an unconfirmed cancel exits within 8.3 s, took {:?}",
         t.elapsed()
     );
@@ -1079,10 +1115,10 @@ fn ac_v2_302_a_signal_before_the_prompt_sends_no_cancel_and_exits_fast() {
         let out = finish(
             child,
             "__acp @new (before the prompt)",
-            Duration::from_secs(30),
+            scaled(Duration::from_secs(30)),
         );
         assert!(
-            t.elapsed() < Duration::from_millis(3500),
+            t.elapsed() < scaled(Duration::from_millis(3500)),
             "exit within 3.5 s of {sig:?} before the prompt, took {:?}",
             t.elapsed()
         );
@@ -1300,7 +1336,7 @@ fn ac_v2_303_the_session_lock_is_held_for_the_whole_turn_existing_and_new() {
             &[("FAKE_OMP_LOG", s(&log).as_str())],
         );
         let pid = i64::from(child.id());
-        poll_until("the first agent chunk", LONG, || {
+        poll_until("the first agent chunk", scaled(LONG), || {
             first_chunk_logged(&records(&log)).then_some(())
         });
         assert!(
@@ -1318,7 +1354,7 @@ fn ac_v2_303_the_session_lock_is_held_for_the_whole_turn_existing_and_new() {
             assert!(records(&second).is_empty(), "the refused run started omp");
         }
         signal(pid, Signal::INT);
-        let out = finish(child, "__acp (lock held)", Duration::from_secs(30));
+        let out = finish(child, "__acp (lock held)", scaled(Duration::from_secs(30)));
         ok_doc(&out, 130);
         assert!(
             rb.glen_lock_free(id),
