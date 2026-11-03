@@ -92,6 +92,24 @@ pub fn try_output(cmd: &mut Command) -> std::io::Result<Output> {
     Ok(capture.output(status))
 }
 
+/// [`output`] and [`try_output`] as methods, for a `Command` built in a chain: `cmd.captured()`
+/// in place of `cmd.output().unwrap()`.
+pub trait CaptureExt {
+    /// [`output`]: what the child wrote, read from files once it has exited.
+    fn captured(&mut self) -> Output;
+    /// [`try_output`]: the same, with a spawn error returned.
+    fn try_captured(&mut self) -> std::io::Result<Output>;
+}
+
+impl CaptureExt for Command {
+    fn captured(&mut self) -> Output {
+        output(self)
+    }
+    fn try_captured(&mut self) -> std::io::Result<Output> {
+        try_output(self)
+    }
+}
+
 /// A spawned child whose stdout and stderr go to a [`Capture`]; it derefs to its [`Child`].
 /// Stdin is left as the command sets it.
 pub struct Captured {
@@ -140,8 +158,9 @@ impl std::ops::DerefMut for Captured {
 /// whose only reader has closed. A pipe from `std::io::pipe()` with its reader dropped is not
 /// enough on macOS: std sets the pipe's `FD_CLOEXEC` after `pipe()`, so a process another test
 /// thread spawns in between keeps the read end for its life, and the child's writes succeed. Both
-/// FIFO ends are opened with `O_CLOEXEC`, and its path is removed before this returns, so no other
-/// process can hold or open a reader.
+/// FIFO ends are opened with `O_CLOEXEC`, so a process forked meanwhile holds the reader only until
+/// its exec; this returns once a probe write fails with EPIPE, the FIFO's path already removed, so
+/// from then on no process holds or can open a reader.
 pub fn closed_stdout() -> File {
     use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
     let dir = tempfile::tempdir().unwrap();
@@ -158,7 +177,20 @@ pub fn closed_stdout() -> File {
     // A reader exists, so this blocking open returns at once.
     let writer = File::options().write(true).open(&path).unwrap();
     drop(reader);
-    writer
+    drop(dir);
+    // A probe byte lands only while a forked child still holds the reader (it never reads it).
+    let deadline = std::time::Instant::now() + scaled(Duration::from_secs(10));
+    loop {
+        match std::io::Write::write(&mut &writer, b"\0") {
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return writer,
+            Ok(_) => assert!(
+                std::time::Instant::now() < deadline,
+                "a reader of the closed stdout outlived its holder's exec"
+            ),
+            Err(e) => panic!("probe the closed stdout: {e}"),
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// Lets `settle` pass (a window in which the caller may check that nothing happened), then waits
