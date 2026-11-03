@@ -187,8 +187,9 @@ struct Calls {
 #[derive(Default)]
 struct CallState {
     cancelled: bool,
-    /// Its response is being queued: a cancel comes too late, and the slot is held until
-    /// `release`, so a host that stops reading cannot pile up more than `MAX_IN_FLIGHT` answers.
+    /// `finish` decided its response (being queued, or none when cancelled): a cancel comes too
+    /// late, and the slot is held until `release`, so a host that stops reading cannot pile up
+    /// more than `MAX_IN_FLIGHT` answers.
     responded: bool,
     child_pid: Option<u32>,
     sigint_at: Option<Instant>,
@@ -311,23 +312,16 @@ impl Registry {
         self.lock().map.get(key).is_some_and(|s| s.cancelled)
     }
     /// (6) Decides the call's response: `true` when it may be written (it was not cancelled);
-    /// from then on a cancel for that id is a no-op. A cancelled call's entry goes at once, an
-    /// answered one's at `release`.
+    /// from then on a cancel or a shutdown ignores that id. The entry stays, cancelled or not,
+    /// until the call's one `release`: were it removed here, a request reusing the id could be
+    /// registered before that `release`, which would then remove the newer call's entry.
     pub(crate) fn finish(&self, key: &str) -> bool {
-        let mut calls = self.lock();
-        match calls.map.get_mut(key) {
-            Some(s) if !s.cancelled => {
-                s.responded = true;
-                true
-            }
-            Some(_) => {
-                calls.map.remove(key);
-                false
-            }
-            None => false,
-        }
+        self.lock().map.get_mut(key).is_some_and(|s| {
+            s.responded = true;
+            !s.cancelled
+        })
     }
-    /// Frees the call's slot once its response is queued (or it has none).
+    /// Frees the call's slot once its response is queued (or it has none). The only removal.
     pub(crate) fn release(&self, key: &str) {
         self.lock().map.remove(key);
     }
@@ -852,11 +846,23 @@ pub(crate) mod tests {
 
     #[test]
     fn an_overflow_drops_the_pipe_so_a_flooding_grandchild_ends() {
-        /// Kills the grandchild if the test fails before it is gone.
-        struct Reap(u32);
+        /// Kills the grandchild if the test fails before it is seen gone. Seeing it gone disarms
+        /// the guard: its pid may be reused from then on.
+        struct Reap(Option<u32>);
+        impl Reap {
+            fn gone(&mut self) -> bool {
+                if self.0.is_some_and(gone) {
+                    self.0 = None;
+                }
+                self.0.is_none()
+            }
+        }
         impl Drop for Reap {
             fn drop(&mut self) {
-                if let Some(pid) = rustix::process::Pid::from_raw(self.0 as i32) {
+                if let Some(pid) = self
+                    .0
+                    .and_then(|p| rustix::process::Pid::from_raw(p as i32))
+                {
                     let _ = rustix::process::kill_process(pid, rustix::process::Signal::KILL);
                 }
             }
@@ -869,10 +875,10 @@ pub(crate) mod tests {
             pidfile.display()
         )));
         assert!(e["error"]["message"].as_str().unwrap().contains("16 MiB"));
-        let flood = Reap(wait_file(&pidfile).trim().parse().unwrap());
+        let mut flood = Reap(Some(wait_file(&pidfile).trim().parse().unwrap()));
         // Once the reader dropped the pipe, `yes` meets EPIPE and its SIGPIPE ends it.
         let start = Instant::now();
-        while !gone(flood.0) {
+        while !flood.gone() {
             assert!(
                 start.elapsed() < Duration::from_secs(5),
                 "the reader kept draining a flood past the cap"
@@ -917,6 +923,17 @@ pub(crate) mod tests {
     fn gone(pid: u32) -> bool {
         let pid = rustix::process::Pid::from_raw(pid as i32).unwrap();
         rustix::process::test_kill_process(pid) == Err(rustix::io::Errno::SRCH)
+    }
+    /// Reaps `child` without the registry, so no poll can signal it, and returns how it ended.
+    fn reaped(child: &mut Child) -> ExitStatus {
+        let start = Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                return status;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "still running");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
     fn wait_file(path: &std::path::Path) -> String {
         let start = Instant::now();
@@ -1014,6 +1031,31 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn an_ignored_sigint_escalates_to_sigkill_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = dir.path().join("ready");
+        // Ready only once SIGINT is ignored, whatever the disposition the child inherited.
+        let script = format!("trap '' INT; echo > '{}'; exec sleep 30", ready.display());
+        let registry = Registry::default();
+        registry.insert("k").unwrap();
+        let mut child = spawn(&sh(&script), &[], &[]).unwrap();
+        assert!(!registry.started("k", child.id()));
+        wait_file(&ready);
+        let start = Instant::now();
+        assert!(registry.cancel("k"), "the SIGINT goes out");
+        let status = loop {
+            if let Some(status) = registry.poll("k", &mut child).unwrap() {
+                break status;
+            }
+            assert!(start.elapsed() < Duration::from_secs(5), "still running");
+            thread::sleep(CALL_TICK);
+        };
+        let took = start.elapsed();
+        assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
+        assert!(took >= CANCEL_GRACE, "{took:?}");
+    }
+
+    #[test]
     fn shutdown_kills_at_once_even_a_child_stored_after_it() {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
@@ -1021,8 +1063,8 @@ pub(crate) mod tests {
         registry.insert("a").unwrap();
         registry.insert("b").unwrap();
         let ignoring = format!("trap '' INT; echo > '{}'; exec sleep 30", ready.display());
-        let a = spawn(&sh(&ignoring), &[], &[]).unwrap();
-        let (pid_a, b) = (
+        let mut a = spawn(&sh(&ignoring), &[], &[]).unwrap();
+        let (pid_a, mut b) = (
             a.id(),
             spawn(&sh("trap '' INT; exec sleep 30"), &[], &[]).unwrap(),
         );
@@ -1035,13 +1077,16 @@ pub(crate) mod tests {
             registry.started("b", pid_b),
             "a child stored later is killed on store"
         );
+        // Nothing polls them yet, and only a poll applies `CANCEL_GRACE`: `shutdown` and
+        // `started` SIGKILLed them themselves, with no grace.
+        for child in [&mut a, &mut b] {
+            assert_eq!(reaped(child).signal(), Some(libc::SIGKILL));
+        }
+        // The call threads then see that exit and answer nothing.
         assert!(supervise(a, Watch::Call(&registry, "a")).is_none());
         assert!(supervise(b, Watch::Call(&registry, "b")).is_none());
         let took = start.elapsed();
-        assert!(
-            took < CANCEL_GRACE,
-            "no grace while the server exits: {took:?}"
-        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
         assert!(gone(pid_a) && gone(pid_b));
         assert!(!registry.finish("a") && !registry.finish("b"));
     }
@@ -1060,6 +1105,31 @@ pub(crate) mod tests {
         assert!(!registry.cancel("k"), "a reaped pid is never signalled");
         assert!(!registry.finish("k"), "the cancel still drops the response");
         assert!(!registry.cancel("k"), "a finished call is ignored");
+    }
+
+    #[test]
+    fn a_cancelled_call_keeps_its_id_until_its_one_release() {
+        let registry = Registry::default();
+        registry.insert("n:1").unwrap();
+        for i in 2..=MAX_IN_FLIGHT {
+            registry.insert(&format!("n:{i}")).unwrap();
+        }
+        registry.cancel("n:1");
+        // The call thread's cleanup: `finish`, then `release`.
+        assert!(!registry.finish("n:1"));
+        // The main loop reads a request reusing the id between the two steps.
+        assert_eq!(
+            registry.insert("n:1"),
+            Err(Refused::Duplicate),
+            "the id was free before the old call's release"
+        );
+        assert_eq!(registry.insert("n:99"), Err(Refused::Full));
+        assert!(!registry.cancel("n:1"), "a finished call is ignored");
+        registry.release("n:1");
+        // Now a replacement takes the id, and nothing of the old call can remove it.
+        assert_eq!(registry.insert("n:1"), Ok(()));
+        assert!(registry.is_in_flight("n:1"));
+        assert_eq!(registry.insert("n:99"), Err(Refused::Full));
     }
 
     #[test]

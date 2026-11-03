@@ -723,14 +723,16 @@ pub(crate) mod tests {
     }
 
     /// `jobs` holds (SIGINT ends it), `doctor` holds and ignores SIGINT, `show` answers at once
-    /// and `ls` floods stdout. Every started child appends its pid to `pids`.
+    /// and `ls` floods stdout. Every started child appends its pid to `pids`; `doctor` does so
+    /// only once it ignores SIGINT, so no signal sent after that can reach it unprotected.
     fn script(pids: &std::path::Path) -> String {
         let p = pids.display();
         format!(
-            r#"echo $$ >> '{p}'
+            r#"[ "$2" = doctor ] && trap '' INT
+echo $$ >> '{p}'
 case "$2" in
   jobs) exec sleep 30;;
-  doctor) trap '' INT; exec sleep 30;;
+  doctor) exec sleep 30;;
   show) printf '{{"v":1,"ok":true,"data":{{"n":"%s"}}}}\n' "$4";;
   ls) exec yes;;
 esac"#
@@ -1053,12 +1055,16 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
         let (mut s, pidfile) = live(&dir);
         s.call(json!(1), "glen_doctor", json!({}));
         let pid = wait_pids(&pidfile, 1)[0];
-        s.cancel(json!(1));
         let start = Instant::now();
+        s.cancel(json!(1));
         while !gone(pid) {
             assert!(start.elapsed() < std::time::Duration::from_secs(1));
             thread::sleep(std::time::Duration::from_millis(5));
         }
+        // It survived the SIGINT through the whole grace: only the SIGKILL after it ended it
+        // (dispatch's `an_ignored_sigint_escalates_to_sigkill_after_the_grace` sees the signal).
+        let took = start.elapsed();
+        assert!(took >= super::super::CANCEL_GRACE, "{took:?}");
         s.send(r#"{"jsonrpc":"2.0","id":"after","method":"ping"}"#);
         s.wait(|m| m["id"] == "after");
         thread::sleep(std::time::Duration::from_millis(100));
