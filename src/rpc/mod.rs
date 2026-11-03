@@ -150,7 +150,17 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
         )
     })
 }
+/// The last 7 non-hyphen characters of a plain id (`lease_name`'s rule: ASCII letters, digits,
+/// `_` and `-`), as omp's UUIDs always are. Any other id is untrusted text that could carry
+/// terminal escapes (S-25), so it is never shown: its handle is `h` and 6 hex digits of its
+/// hash, which no UUID tail matches.
 pub fn session_handle(id: &str) -> String {
+    if crate::omp::lease::lease_name(id).is_none() {
+        return format!(
+            "h{:06x}",
+            xxhash_rust::xxh64::xxh64(id.as_bytes(), 0) & 0xff_ffff
+        );
+    }
     let simple: String = id.chars().filter(|c| *c != '-').collect();
     simple
         .chars()
@@ -218,6 +228,30 @@ mod tests {
                 );
             }
         }
+    }
+    #[test]
+    fn s25_a_non_plain_session_id_never_reaches_a_handle() {
+        assert_eq!(
+            session_handle("01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de"),
+            "e27c0de"
+        );
+        assert_eq!(session_handle("abc"), "abc");
+        assert_eq!(session_handle("a_b-cdefghij"), "defghij");
+        for hostile in [
+            "aaaa-zz\x1b[2Jabc",
+            "x\u{202e}gpj",
+            "tag\u{e0069}",
+            "a.b",
+            "",
+            &"a".repeat(129),
+        ] {
+            let h = session_handle(hostile);
+            assert_eq!(h.len(), 7, "{hostile:?}: {h}");
+            assert!(h.starts_with('h'), "{h}");
+            assert!(h[1..].bytes().all(|b| b.is_ascii_hexdigit()), "{h}");
+            assert_eq!(h, session_handle(hostile), "stable");
+        }
+        assert_ne!(session_handle("a.b"), session_handle("a.c"));
     }
     #[test]
     fn timeout_env_table() {

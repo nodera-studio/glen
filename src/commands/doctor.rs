@@ -519,7 +519,9 @@ fn warm_row(
         match i.entry.class(i.mtime, now, bound) {
             Class::Fresh => fresh += 1,
             Class::Dead => dead += 1,
-            Class::Stale => stale.push(crate::rpc::session_handle(&i.entry.session_id)),
+            Class::Stale => stale.push(crate::render::text::single_line(
+                &crate::rpc::session_handle(&i.entry.session_id),
+            )),
         }
     }
     let value = format!("{fresh} warm, {} stale, {dead} dead", stale.len());

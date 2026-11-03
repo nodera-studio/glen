@@ -6,7 +6,7 @@ use crate::{
     glen_home::{self, GlenHome},
     jobs::{JobId, JobStore, liveness::Liveness, lock, matches_session},
     output::{Outcome, OutputCtx},
-    render::palette::Token,
+    render::{palette::Token, text},
     rpc::{
         self,
         warm::{self, Class, EntryState, Indexed},
@@ -129,7 +129,8 @@ fn row(t: &Indexed, state: &str, outcome: &str) -> Value {
 
 fn human_line(ctx: &OutputCtx, t: &Indexed, outcome: &str) -> String {
     let p = &ctx.painter;
-    let handle = rpc::session_handle(&t.entry.session_id);
+    // The registry is a file under GLEN_HOME: its ids are untrusted text (S-25).
+    let handle = text::single_line(&rpc::session_handle(&t.entry.session_id));
     match outcome {
         "released" => p.paint(
             Token::Success,
@@ -140,7 +141,7 @@ fn human_line(ctx: &OutputCtx, t: &Indexed, outcome: &str) -> String {
             &format!(
                 "◐ {handle} cools after {}",
                 JobId::parse(&t.entry.job_id)
-                    .map_or_else(|| t.entry.job_id.clone(), |id| id.handle())
+                    .map_or_else(|| text::single_line(&t.entry.job_id), |id| id.handle())
             ),
         ),
         "forced" => p.paint(Token::Warning, &format!("! killed {handle}")),
