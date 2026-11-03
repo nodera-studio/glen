@@ -399,7 +399,10 @@ fn listed(tool: &Tool) -> Value {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::mcp::{catalog, test_support::Shared};
+    use crate::mcp::{
+        catalog,
+        test_support::{Shared, scaled},
+    };
     use std::io::Cursor;
 
     pub(crate) fn config(channel: bool, script: &str) -> Config {
@@ -698,7 +701,7 @@ pub(crate) mod tests {
                     return m;
                 }
                 assert!(
-                    start.elapsed() < std::time::Duration::from_secs(10),
+                    start.elapsed() < scaled(std::time::Duration::from_secs(10)),
                     "{:?}",
                     self.out.lines()
                 );
@@ -753,7 +756,7 @@ esac"#
                 return p;
             }
             assert!(
-                start.elapsed() < std::time::Duration::from_secs(10),
+                start.elapsed() < scaled(std::time::Duration::from_secs(10)),
                 "{p:?}"
             );
             thread::sleep(std::time::Duration::from_millis(5));
@@ -778,7 +781,7 @@ esac"#
         let start = Instant::now();
         s.send(r#"{"jsonrpc":"2.0","id":"p","method":"ping"}"#);
         s.wait(|m| m["id"] == "p");
-        assert!(start.elapsed() < std::time::Duration::from_secs(1));
+        assert!(start.elapsed() < scaled(std::time::Duration::from_secs(1)));
         // A second call with an id in flight is refused; `"1"` is another request.
         s.call(json!(1), "glen_show", json!({"session":"x"}));
         assert_eq!(s.wait(|m| m["id"] == 1)["error"]["code"], INVALID_REQUEST);
@@ -789,7 +792,7 @@ esac"#
         let start = Instant::now();
         s.cancel(json!(1));
         while !gone(pid) {
-            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            assert!(start.elapsed() < scaled(std::time::Duration::from_secs(1)));
             thread::sleep(std::time::Duration::from_millis(5));
         }
         thread::sleep(std::time::Duration::from_millis(500));
@@ -851,7 +854,7 @@ esac"#
         );
         let (exit, took) = s.close();
         assert_eq!(exit, Exit::Eof);
-        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert!(took < scaled(std::time::Duration::from_secs(2)), "{took:?}");
         assert!(children.iter().all(|p| gone(*p)), "{children:?}");
     }
 
@@ -865,7 +868,7 @@ esac"#
         s.signal.store(15, Ordering::SeqCst);
         let (exit, took) = s.join();
         assert_eq!(exit, Exit::Signal(15));
-        assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+        assert!(took < scaled(std::time::Duration::from_secs(2)), "{took:?}");
         assert!(children.iter().all(|p| gone(*p)));
     }
 
@@ -923,7 +926,7 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
         assert_eq!(s.out.lines().iter().filter(|m| channel(m)).count(), 1);
         let (exit, took) = s.close();
         assert_eq!(exit, Exit::Eof);
-        assert!(took < std::time::Duration::from_secs(2));
+        assert!(took < scaled(std::time::Duration::from_secs(2)));
     }
 
     #[test]
@@ -997,7 +1000,7 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
         s.cancel(json!("held"));
         let start = Instant::now();
         while !gone(pid) {
-            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            assert!(start.elapsed() < scaled(std::time::Duration::from_secs(1)));
             thread::sleep(std::time::Duration::from_millis(5));
         }
         assert_eq!(s.close().0, Exit::Eof);
@@ -1045,7 +1048,7 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
             assert_eq!(exit, want);
             assert!(children.iter().all(|p| gone(*p)), "{how}: {children:?}");
             // The server is exiting, so no child gets the cancel grace.
-            assert!(took < super::super::CANCEL_GRACE, "{how}: {took:?}");
+            assert!(took < scaled(super::super::CANCEL_GRACE), "{how}: {took:?}");
         }
     }
 
@@ -1058,7 +1061,7 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
         let start = Instant::now();
         s.cancel(json!(1));
         while !gone(pid) {
-            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            assert!(start.elapsed() < scaled(std::time::Duration::from_secs(1)));
             thread::sleep(std::time::Duration::from_millis(5));
         }
         // It survived the SIGINT through the whole grace: only the SIGKILL after it ended it
@@ -1098,7 +1101,7 @@ if [ $n = 1 ]; then printf '%s\n' '{one}'; else printf '%s\n' '{two}'; fi"#,
         let exit = handle.join().unwrap();
         let took = start.elapsed();
         assert_eq!(exit, Exit::Signal(15));
-        assert!(took < std::time::Duration::from_secs(1), "{took:?}");
+        assert!(took < scaled(std::time::Duration::from_secs(1)), "{took:?}");
         assert!(gone(child));
     }
 }

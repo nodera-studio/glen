@@ -586,7 +586,7 @@ pub(crate) fn exec_failure(tool: &str, message: &str, stderr: &[u8]) -> Value {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
-    use crate::mcp::catalog;
+    use crate::mcp::{catalog, test_support::scaled};
 
     pub(crate) fn tool(name: &str) -> Tool {
         catalog::load()
@@ -836,7 +836,7 @@ pub(crate) mod tests {
         let start = Instant::now();
         let e = envelope(&mapped("exec yes"));
         assert!(
-            start.elapsed() < Duration::from_secs(10),
+            start.elapsed() < scaled(Duration::from_secs(10)),
             "{:?}",
             start.elapsed()
         );
@@ -880,7 +880,7 @@ pub(crate) mod tests {
         let start = Instant::now();
         while !flood.gone() {
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < scaled(Duration::from_secs(5)),
                 "the reader kept draining a flood past the cap"
             );
             thread::sleep(Duration::from_millis(10));
@@ -931,7 +931,10 @@ pub(crate) mod tests {
             if let Some(status) = child.try_wait().unwrap() {
                 return status;
             }
-            assert!(start.elapsed() < Duration::from_secs(5), "still running");
+            assert!(
+                start.elapsed() < scaled(Duration::from_secs(5)),
+                "still running"
+            );
             thread::sleep(Duration::from_millis(5));
         }
     }
@@ -944,7 +947,7 @@ pub(crate) mod tests {
                 return s;
             }
             assert!(
-                start.elapsed() < Duration::from_secs(5),
+                start.elapsed() < scaled(Duration::from_secs(5)),
                 "{}",
                 path.display()
             );
@@ -996,10 +999,10 @@ pub(crate) mod tests {
     #[test]
     fn a_cancelled_child_is_gone_within_a_second() {
         let took = cancel_running(false);
-        assert!(took < Duration::from_secs(1), "{took:?}");
+        assert!(took < scaled(Duration::from_secs(1)), "{took:?}");
         let took = cancel_running(true);
         assert!(
-            took >= CANCEL_GRACE && took < Duration::from_secs(1),
+            took >= CANCEL_GRACE && took < scaled(Duration::from_secs(1)),
             "{took:?}"
         );
     }
@@ -1024,7 +1027,7 @@ pub(crate) mod tests {
         let took = start.elapsed();
         assert!(run.is_none(), "{run:?}");
         assert!(
-            took >= CANCEL_GRACE && took < Duration::from_secs(1),
+            took >= CANCEL_GRACE && took < scaled(Duration::from_secs(1)),
             "{took:?}"
         );
         assert!(gone(pid));
@@ -1047,7 +1050,10 @@ pub(crate) mod tests {
             if let Some(status) = registry.poll("k", &mut child).unwrap() {
                 break status;
             }
-            assert!(start.elapsed() < Duration::from_secs(5), "still running");
+            assert!(
+                start.elapsed() < scaled(Duration::from_secs(5)),
+                "still running"
+            );
             thread::sleep(CALL_TICK);
         };
         let took = start.elapsed();
@@ -1086,7 +1092,7 @@ pub(crate) mod tests {
         assert!(supervise(a, Watch::Call(&registry, "a")).is_none());
         assert!(supervise(b, Watch::Call(&registry, "b")).is_none());
         let took = start.elapsed();
-        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert!(took < scaled(Duration::from_secs(2)), "{took:?}");
         assert!(gone(pid_a) && gone(pid_b));
         assert!(!registry.finish("a") && !registry.finish("b"));
     }
@@ -1099,7 +1105,7 @@ pub(crate) mod tests {
         assert!(!registry.started("k", child.id()));
         let start = Instant::now();
         while registry.poll("k", &mut child).unwrap().is_none() {
-            assert!(start.elapsed() < Duration::from_secs(5));
+            assert!(start.elapsed() < scaled(Duration::from_secs(5)));
             thread::sleep(CALL_TICK);
         }
         assert!(!registry.cancel("k"), "a reaped pid is never signalled");

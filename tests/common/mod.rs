@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+pub mod flake;
+use flake::scaled;
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -245,7 +247,7 @@ impl RpcBox {
     pub fn job(&self, id: &str) -> (serde_json::Value, serde_json::Value) {
         let dir = self.job_dir(id);
         // The directory becomes visible before create() has atomically published both files.
-        poll(std::time::Duration::from_secs(3), || {
+        poll(scaled(std::time::Duration::from_secs(3)), || {
             let read = |name| match std::fs::read(dir.join(name)) {
                 Ok(bytes) => Some(serde_json::from_slice(&bytes).unwrap()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -265,8 +267,8 @@ impl RpcBox {
         })
     }
     pub fn wait_worker_gone(&self, id: &str) {
-        let s = self.wait_terminal(id, std::time::Duration::from_secs(25));
-        poll(std::time::Duration::from_secs(10), || {
+        let s = self.wait_terminal(id, scaled(std::time::Duration::from_secs(25)));
+        poll(scaled(std::time::Duration::from_secs(10)), || {
             let dead = s["worker_pid"].as_u64().is_none_or(|pid| {
                 matches!(
                     glen::jobs::liveness::start_token(pid as u32),

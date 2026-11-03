@@ -1,6 +1,8 @@
 #!/bin/sh
 # Repeat the test suite under CPU load, stopping at the first failure.
 # Usage: scripts/flake-check.sh [RUNS] [-- cargo-test-args]
+# Exports GLEN_TEST_TIME_SCALE (default 5, a whole number from 1): the tests multiply their waits
+# and their upper bounds on the product's timing by it. A plain `cargo test` leaves it unset (1).
 # Exit codes: 0 success, 1 runtime failure, 2 usage error.
 set -eu
 
@@ -35,6 +37,11 @@ main() {
         [ "$1" = -- ] || usage_error 'cargo test arguments must follow --'
         shift
     fi
+    scale=${GLEN_TEST_TIME_SCALE-5}
+    case "$scale" in ''|*[!0-9]*) usage_error 'GLEN_TEST_TIME_SCALE must be a whole number from 1' ;; esac
+    [ "$scale" -gt 0 ] 2>/dev/null || usage_error 'GLEN_TEST_TIME_SCALE must be a whole number from 1'
+    GLEN_TEST_TIME_SCALE=$scale
+    export GLEN_TEST_TIME_SCALE
 
     command -v node >/dev/null 2>&1 || fail 'Node >=22.6 is required to run the extension suites'
     node_version=$(node --version) || fail 'cannot determine the Node version (>=22.6 required)'
@@ -53,6 +60,7 @@ main() {
         printf 'HEAD: %s\n' "$head"
         printf 'OS: %s\n' "$os"
         printf 'n: %s\nthreads: %s\n' "$n" "$threads"
+        printf 'time scale: %s\n' "$scale"
     } > "$out/summary.txt"
 
     cargo test --locked --no-run "$@" || fail 'cargo test compilation failed'

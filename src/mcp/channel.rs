@@ -233,7 +233,10 @@ fn notification(message: &Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mcp::{dispatch::tests::sh, test_support::Shared};
+    use crate::mcp::{
+        dispatch::tests::sh,
+        test_support::{Shared, scaled},
+    };
     use std::path::Path;
 
     fn reply(id: &str, text: &str) -> Value {
@@ -459,7 +462,7 @@ mod tests {
                 .and_then(|s| s.trim().parse::<usize>().ok())
                 .is_none_or(|n| n < polls)
             {
-                assert!(start.elapsed() < Duration::from_secs(10));
+                assert!(start.elapsed() < scaled(Duration::from_secs(10)));
                 thread::sleep(Duration::from_millis(5));
             }
             thread::sleep(Duration::from_millis(60));
@@ -495,7 +498,7 @@ mod tests {
         let polls = ["fail".to_owned(), inbox(&["a"]), inbox(&["a", "b"])];
         let polls: Vec<&str> = polls.iter().map(String::as_str).collect();
         let poller = scripted(dir.path(), &polls);
-        let seen = poller.baseline(Duration::from_secs(2), &|| false);
+        let seen = poller.baseline(scaled(Duration::from_secs(2)), &|| false);
         assert!(!seen.baselined && seen.ids.is_empty());
         let out = drive(dir.path(), &poller, seen, 4);
         assert_eq!(notified(&out), ["b"]);
@@ -504,7 +507,7 @@ mod tests {
         let polls = [inbox(&["a"]), inbox(&["a", "b"])];
         let polls: Vec<&str> = polls.iter().map(String::as_str).collect();
         let poller = scripted(dir.path(), &polls);
-        let seen = poller.baseline(Duration::from_secs(2), &|| false);
+        let seen = poller.baseline(scaled(Duration::from_secs(2)), &|| false);
         assert!(seen.baselined);
         assert_eq!(notified(&drive(dir.path(), &poller, seen, 3)), ["b"]);
     }
@@ -518,9 +521,9 @@ mod tests {
         };
         let start = Instant::now();
         assert!(poller.poll(Duration::from_millis(200), &|| false).is_none());
-        assert!(start.elapsed() < Duration::from_secs(2));
+        assert!(start.elapsed() < scaled(Duration::from_secs(2)));
         let start = Instant::now();
         assert!(poller.poll(Duration::from_secs(30), &|| true).is_none());
-        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(start.elapsed() < scaled(Duration::from_secs(1)));
     }
 }

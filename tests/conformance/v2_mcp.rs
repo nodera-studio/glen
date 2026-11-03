@@ -14,8 +14,10 @@
 //! over its stdio, with a cleared environment, a scratch HOME and GLEN_HOME and `fake_omp` as
 //! `GLEN_OMP_BIN`, never a live omp, `claude`, Codex, `~/.omp` or `~/.codex`. A held job is a
 //! `FAKE_OMP_RUN_RELEASE` file that does not exist yet. The server's exec-self children are found
-//! with `/bin/ps` (the server's pid as ppid). Every server, child, job worker and fake omp is gone
-//! before a test returns (a drop guard kills a leftover after a failed assertion).
+//! in the kernel's process table (the server's pid as ppid), with `/bin/ps` only where a check
+//! needs their command lines. Every server, child, job worker and fake omp is gone before a test
+//! returns (a drop guard kills a leftover after a failed assertion). Waits and the upper bounds on
+//! the product's timing scale with `GLEN_TEST_TIME_SCALE` (`scripts/flake-check.sh`; 1 otherwise).
 //!
 //! Not covered here (owned elsewhere): the generator-level criteria AC-v2-501a to 501c and
 //! AC-v2-506a to 506c that need the generator itself or a fixture document (the Implementer's
@@ -38,6 +40,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
+use crate::flake::{children_of, scaled};
 use crate::live_support::*;
 use crate::reader::*;
 use crate::rpc_support::*;
@@ -354,6 +357,7 @@ impl Mcp {
     }
 
     fn wait_for(&mut self, what: &str, timeout: Duration, pred: impl Fn(&Value) -> bool) -> Value {
+        let timeout = scaled(timeout);
         match self.find(timeout, pred) {
             Some(m) => m,
             None => panic!("no {what} within {timeout:?}\n{}", self.ctx()),
@@ -460,9 +464,9 @@ impl Mcp {
 
     /// At least `n` live children, once they exist.
     fn wait_children(&self, n: usize) -> Vec<u32> {
-        poll_until("the server's exec-self child", LONG, || {
-            let kids = self.live_children();
-            (kids.len() >= n).then(|| kids.into_iter().map(|(p, _)| p).collect())
+        poll_until("the server's exec-self child", scaled(LONG), || {
+            let kids = children_of(self.pid);
+            (kids.len() >= n).then_some(kids)
         })
     }
 
@@ -471,6 +475,7 @@ impl Mcp {
     }
 
     fn wait_exit(&mut self, timeout: Duration) -> ExitStatus {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(st) = self.child.try_wait().expect("try_wait") {
@@ -490,7 +495,7 @@ impl Mcp {
 
 impl Drop for Mcp {
     fn drop(&mut self) {
-        for (p, _) in live_children_of(self.pid) {
+        for p in children_of(self.pid) {
             kill(p, Signal::KILL);
         }
         let _ = self.child.kill();
@@ -1450,7 +1455,7 @@ fn ac502c_ping_is_answered_within_a_second_while_a_call_is_in_flight() {
         let r = m.request_bare("ping");
         assert_result_is_empty_object(&r);
         assert!(
-            t.elapsed() < ONE_SECOND,
+            t.elapsed() < scaled(ONE_SECOND),
             "ping took {:?} with a call in flight",
             t.elapsed()
         );
@@ -1807,11 +1812,11 @@ fn cancel_case(call_id: Value) {
     let t0 = Instant::now();
     poll_until(
         "the child gone (signalled and reaped) after the cancel",
-        ONE_SECOND,
+        scaled(ONE_SECOND),
         || kids.iter().all(|k| gone(*k)).then_some(()),
     );
     assert!(
-        t0.elapsed() < ONE_SECOND,
+        t0.elapsed() < scaled(ONE_SECOND),
         "the child outlived the cancel by {:?}",
         t0.elapsed()
     );
@@ -1988,7 +1993,7 @@ fn shutdown_case(end: End) {
     assert_eq!(st.code(), Some(want), "exit status {st:?}\n{}", m.ctx());
     poll_until(
         "every in-flight child gone",
-        TWO_SECONDS.saturating_sub(t0.elapsed()) + Duration::from_millis(250),
+        scaled(TWO_SECONDS).saturating_sub(t0.elapsed()) + Duration::from_millis(250),
         || kids.iter().all(|k| gone(*k)).then_some(()),
     );
     assert!(
@@ -2078,7 +2083,7 @@ fn ac502e_a_host_that_stops_reading_stdout_cannot_wedge_shutdown() {
         m.pause_reading();
         // 40 answers of about 8 KB each: several times the pipe buffer, a small backlog.
         m.write_bytes(&flood(40));
-        std::thread::sleep(Duration::from_millis(400));
+        std::thread::sleep(scaled(Duration::from_millis(400)));
         let t0 = Instant::now();
         let want = match end {
             End::Eof => {
@@ -2098,7 +2103,7 @@ fn ac502e_a_host_that_stops_reading_stdout_cannot_wedge_shutdown() {
             m.ctx()
         );
         assert!(
-            t0.elapsed() <= TWO_SECONDS,
+            t0.elapsed() <= scaled(TWO_SECONDS),
             "{label}: exited after {:?}",
             t0.elapsed()
         );
@@ -2464,7 +2469,7 @@ fn ac503b_no_wait_returns_the_running_document_at_once() {
         json!({"session": A.handle, "message": "nw", "no_wait": true}),
     );
     assert!(
-        t0.elapsed() < Duration::from_secs(15),
+        t0.elapsed() < scaled(Duration::from_secs(15)),
         "no_wait must not wait: {:?}",
         t0.elapsed()
     );
@@ -2921,7 +2926,7 @@ fn ac503e_the_17th_concurrent_call_gets_an_mcp_exec_error_at_once() {
     let refused = Tool::of(m.response(&json!(17), FIVE_SECONDS));
     refused.assert_exec_error("glen_wait");
     assert!(
-        t0.elapsed() < FIVE_SECONDS,
+        t0.elapsed() < scaled(FIVE_SECONDS),
         "refused at once, not after a wait"
     );
     assert!(
@@ -3095,7 +3100,7 @@ fn ac504b_one_notification_per_new_reply_in_the_servers_project_exactly_once() {
     let t0 = Instant::now();
     let p = channel_note(&mut m, FIVE_SECONDS);
     assert!(
-        t0.elapsed() <= FIVE_SECONDS,
+        t0.elapsed() <= scaled(FIVE_SECONDS),
         "within 5 s: {:?}",
         t0.elapsed()
     );
