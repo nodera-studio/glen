@@ -1,6 +1,6 @@
 #![cfg(unix)]
 use glen::error::GlenError;
-use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
 type Result<T = ()> = std::result::Result<T, GlenError>;
 const CI: &str = include_str!("../.github/workflows/ci.yml");
@@ -98,7 +98,7 @@ fn release_reuses_main_git_cache_and_manifest_changes_trigger_it() {
     let key = "key: omp-git-v1-${{ hashFiles('Cargo.lock') }}";
     assert!(CI.contains(key) && RELEASE.contains(key));
     assert!(CI.contains(&format!(
-        "      - if: {MAIN_PUSH} && runner.os == 'Linux'\n        uses: actions/cache@v4\n        with:\n          path: ~/.cargo/git\n          {key}"
+        "      - if: {MAIN_PUSH} && runner.os == 'Linux'\n        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0\n        with:\n          path: ~/.cargo/git\n          {key}"
     )));
     // W8 SEC-7: the restore action is pinned to the v4 commit, not the moving tag.
     assert!(
@@ -138,25 +138,93 @@ fn sha_pinned(action: &str) -> bool {
     sha.len() == 40 && sha.bytes().all(|b| b.is_ascii_hexdigit()) && !comment.trim().is_empty()
 }
 
-#[test]
-fn third_party_actions_are_pinned_to_commit_shas() {
-    // W8 SEC-7: every action in the release build, and every non-`actions/*`
-    // action anywhere, is a full commit SHA with a version comment.
-    let release = uses(RELEASE);
-    assert!(release.len() >= 8, "{release:?}");
-    for action in release {
-        assert!(sha_pinned(action), "release.yml: {action}");
+/// Every workflow file, read at test time so a new workflow is covered without a list edit.
+fn workflows() -> Result<Vec<(String, String)>> {
+    let mut all = Vec::new();
+    for entry in fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join(".github/workflows"))? {
+        let path = entry?.path();
+        if let (Some("yml" | "yaml"), Some(name)) = (
+            path.extension().and_then(|e| e.to_str()),
+            path.file_name().and_then(|n| n.to_str()),
+        ) {
+            all.push((name.to_owned(), fs::read_to_string(&path)?));
+        }
     }
-    for (name, workflow) in [("ci.yml", CI), ("flake-proof.yml", FLAKE)] {
-        let third_party = uses(workflow)
-            .into_iter()
-            .filter(|action| !action.starts_with("actions/"))
-            .collect::<Vec<_>>();
-        assert!(!third_party.is_empty(), "{name}");
-        for action in third_party {
+    all.sort();
+    let names = all
+        .iter()
+        .map(|(name, _)| name.as_str())
+        .collect::<Vec<_>>();
+    for known in ["ci.yml", "flake-proof.yml", "omp-latest.yml", "release.yml"] {
+        assert!(names.contains(&known), "{known} not in {names:?}");
+    }
+    Ok(all)
+}
+
+#[test]
+fn every_action_in_every_workflow_is_pinned_to_a_commit_sha() -> Result {
+    // W8 SEC-7 pinned the release build and third-party actions; v0.2 W6 (S-06)
+    // pins GitHub's own `actions/*` too, in every workflow: a full commit SHA with
+    // a version comment, never a moving tag.
+    assert!(uses(RELEASE).len() >= 8, "{:?}", uses(RELEASE));
+    for (name, workflow) in workflows()? {
+        let actions = uses(&workflow);
+        assert!(!actions.is_empty(), "{name}");
+        // A `uses:` written in a form the line parser misses would skip the check.
+        assert_eq!(actions.len(), workflow.matches("uses:").count(), "{name}");
+        for action in actions {
             assert!(sha_pinned(action), "{name}: {action}");
         }
     }
+    Ok(())
+}
+
+/// The workflow-level `permissions:` entries, or `None` when there is no such block.
+fn top_level_permissions(workflow: &str) -> Option<Vec<&str>> {
+    let mut lines = workflow.lines().skip_while(|line| *line != "permissions:");
+    lines.next()?;
+    Some(
+        lines
+            .take_while(|line| line.starts_with("  "))
+            .map(str::trim)
+            .collect(),
+    )
+}
+
+#[test]
+fn every_workflow_defaults_to_a_read_only_token() -> Result {
+    // v0.2 W6 (S-06): ci.yml had no workflow-level block, so its jobs ran with the
+    // repository's default token permission. A job that needs more declares its own.
+    assert!(CI.contains("\npermissions:\n  contents: read\n\njobs:\n"));
+    for (name, workflow) in workflows()? {
+        let entries = top_level_permissions(&workflow)
+            .unwrap_or_else(|| panic!("{name}: no workflow-level permissions block"));
+        assert!(!entries.is_empty(), "{name}");
+        for entry in entries {
+            assert!(
+                entry.ends_with(": read") || entry.ends_with(": none"),
+                "{name}: {entry}"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn npm_installs_run_no_lifecycle_scripts() -> Result {
+    // v0.2 W6 (S-06): the site job builds the dist/ that site-deploy ships, and
+    // site-deploy later holds CLOUDFLARE_API_TOKEN; no dependency install script runs
+    // in either, so none can tamper with the deployed files or node_modules/.bin.
+    assert_eq!(CI.matches("- run: npm ci --ignore-scripts\n").count(), 2);
+    for (name, workflow) in workflows()? {
+        assert_eq!(
+            workflow.matches("npm ci").count(),
+            workflow.matches("npm ci --ignore-scripts").count(),
+            "{name}"
+        );
+        assert!(!workflow.contains("npm install"), "{name}");
+    }
+    Ok(())
 }
 
 #[test]
@@ -232,7 +300,8 @@ fn release_archives_carry_generated_third_party_licenses() {
 #[test]
 fn site_deploy_uses_the_locked_wrangler() -> Result {
     // W8 SEC-6: wrangler is an exact devDependency with an integrity hash, and
-    // `npm ci` installs it in a step that never sees the Cloudflare token.
+    // `npm ci` installs it, without lifecycle scripts (S-06), in a step that never
+    // sees the Cloudflare token.
     let package: serde_json::Value = serde_json::from_str(include_str!("../site/package.json"))
         .map_err(std::io::Error::other)?;
     assert_eq!(package["devDependencies"]["wrangler"], "4.124.0");
@@ -256,7 +325,9 @@ fn site_deploy_uses_the_locked_wrangler() -> Result {
         .split("\n  site-deploy:\n")
         .nth(1)
         .expect("site-deploy job");
-    let npm_ci = deploy.find("      - run: npm ci\n").expect("npm ci step");
+    let npm_ci = deploy
+        .find("      - run: npm ci --ignore-scripts\n")
+        .expect("npm ci step");
     assert!(npm_ci < deploy.find("--dry-run").expect("dry run"));
     assert!(npm_ci < deploy.find("CLOUDFLARE_API_TOKEN").expect("token"));
     Ok(())
@@ -264,7 +335,7 @@ fn site_deploy_uses_the_locked_wrangler() -> Result {
 
 #[test]
 fn omp_latest_pins_every_action_to_a_commit_sha() {
-    // AC-v2-106: `actions/*` included, unlike the ci.yml rule above.
+    // AC-v2-106: `actions/*` included (every workflow now holds to this, above).
     let actions = uses(OMP_LATEST);
     assert!(actions.len() >= 3, "{actions:?}");
     for action in actions {

@@ -2,7 +2,8 @@
 # Install a verified glen release without sudo.
 # Usage: curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- [--version X.Y.Z] [--prefix DIR] [--dry-run]
 # Exit codes: 0 success, 1 runtime failure, 2 usage error.
-# GLEN_INSTALL_BASE_URL overrides the release base URL for mirrors and tests.
+# GLEN_INSTALL_BASE_URL overrides the release base URL: an https:// mirror, or a file://
+# directory, the local mechanism for installs from a local release and for tests.
 set -eu
 
 usage() {
@@ -13,6 +14,7 @@ Usage: install.sh [--version X.Y.Z] [--prefix DIR] [--dry-run]
   --dry-run      Print target, URLs and install path without downloads or writes
   -h, --help     Show this help
 Environment: GLEN_INSTALL_BASE_URL overrides https://github.com/nodera-studio/glen/releases
+  with an https:// mirror or a file:// directory
 Uninstall: rm <dir>/glen (default dir: $HOME/.local/bin)
 HELP
 }
@@ -100,6 +102,13 @@ main() {
     esac
     base=${GLEN_INSTALL_BASE_URL:-https://github.com/nodera-studio/glen/releases}
     while [ "${base%/}" != "$base" ]; do base=${base%/}; done
+    # A network mirror must be https: over plain http a network attacker replaces the
+    # archive and its checksum together (S-24). file:// stays allowed as the local
+    # mechanism (test fixtures, the release smoke install); it never touches the network.
+    case "$base" in
+        https://*|file://*) ;;
+        *) usage_error "GLEN_INSTALL_BASE_URL must start with https:// (a mirror) or file:// (a local directory): $base" ;;
+    esac
     asset=glen-$target.tar.gz
     if [ -n "$ver" ]; then
         archive=$base/download/v$ver/$asset
@@ -129,6 +138,7 @@ main() {
             download "$archive" -o "$tmp/$asset" --proto '=https' --tlsv1.2
             download "$checksum" -o "$tmp/checksum" --proto '=https' --tlsv1.2 ;;
         *)
+            # file:// only, checked above: a local directory, no transport to protect.
             download "$archive" -o "$tmp/$asset"
             download "$checksum" -o "$tmp/checksum" ;;
     esac

@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Read-only token for every job; a job that needs more declares its own block.
+permissions:
+  contents: read
+
 jobs:
   check:
     strategy:
@@ -12,8 +16,8 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '26'
       # The toolchain comes from rust-toolchain.toml (W8 DEBT-7).
@@ -36,7 +40,7 @@ jobs:
       # Publish the populated git checkout for release jobs, once on main.
       # Check for an existing key without downloading over the checkout again.
       - if: github.event_name == 'push' && github.ref == 'refs/heads/main' && runner.os == 'Linux'
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cargo/git
           key: omp-git-v1-${{ hashFiles('Cargo.lock') }}
@@ -47,7 +51,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # The toolchain comes from rust-toolchain.toml (W8 DEBT-7).
       - id: toolchain
         shell: bash
@@ -75,7 +79,7 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - id: msrv
         shell: bash
         # RUSTUP_TOOLCHAIN outranks rust-toolchain.toml for every later step.
@@ -100,26 +104,28 @@ jobs:
     env:
       ASTRO_TELEMETRY_DISABLED: "1"
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: site/.nvmrc
           cache: npm
           cache-dependency-path: site/package-lock.json
-      - run: npm ci
+      # No dependency lifecycle scripts: this job builds the dist/ that site-deploy ships, and
+      # the build, the tests and Lighthouse pass without them (S-06).
+      - run: npm ci --ignore-scripts
       - run: npm run check
       - run: npm run build
       - run: npm run test:unit
       - run: npm run budgets
       - run: npm run links
-      - uses: actions/cache@v4
+      - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
           key: ${{ runner.os }}-playwright-${{ hashFiles('site/package-lock.json') }}
       - run: npx playwright install --with-deps chromium
       - run: npm run test:e2e
       - run: npm run lhci
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: site-reports
@@ -145,13 +151,14 @@ jobs:
     env:
       WRANGLER_SEND_METRICS: "false"
     steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version-file: site/.nvmrc
-      # Install the locked wrangler before the token exists in any step (W8 SEC-6).
-      - run: npm ci
-      - uses: actions/download-artifact@v8
+      # Install the locked wrangler before the token exists in any step (W8 SEC-6), with no
+      # lifecycle scripts, so nothing an install script writes reaches the token step (S-06).
+      - run: npm ci --ignore-scripts
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: site-reports
           path: site

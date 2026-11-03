@@ -516,6 +516,68 @@ fn missing_archive_and_checksum_name_url_and_source_fallback() -> Result {
 }
 
 #[test]
+fn network_mirrors_must_use_https() -> Result {
+    // v0.2 W6 (S-24): over plain http a network attacker replaces the archive and its
+    // checksum together. Only https mirrors and file:// directories (every other
+    // test here) are accepted; anything else is refused before any download or write.
+    let b = Installer::new()?;
+    b.release()?;
+    let log = b.root.join("curl.log");
+    executable(
+        &b.shim.join("curl"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CURL_LOG\"\nexit 22\n",
+    )?;
+    for base in [
+        "http://127.0.0.1:9/glen",
+        "HTTP://mirror.invalid/glen",
+        "ftp://mirror.invalid/glen",
+        "mirror.invalid/glen",
+        "//mirror.invalid/glen",
+    ] {
+        for args in [&[][..], &["--dry-run"]] {
+            let o = b
+                .command("sh")
+                .arg("install.sh")
+                .args(args)
+                .env("GLEN_INSTALL_BASE_URL", base)
+                .env("CURL_LOG", &log)
+                .output()?;
+            check(&o, 2);
+            let err = stderr(&o);
+            assert!(
+                err.contains(&format!(
+                    "GLEN_INSTALL_BASE_URL must start with https:// (a mirror) or file:// (a local directory): {base}"
+                )),
+                "{o:?}"
+            );
+            assert!(!err.contains("downloading"), "{o:?}");
+            assert!(o.stdout.is_empty(), "{o:?}");
+            assert!(!log.exists(), "{base}: curl ran");
+            assert!(!b.home.join(".local").exists());
+        }
+    }
+    // An https mirror still takes the TLS-only branch (no network: curl is a shim).
+    let o = b
+        .command("sh")
+        .arg("install.sh")
+        .env("GLEN_INSTALL_BASE_URL", "https://mirror.invalid/glen/")
+        .env("CURL_LOG", &log)
+        .output()?;
+    check(&o, 1);
+    let calls = fs::read_to_string(&log)?;
+    let url = format!(
+        "https://mirror.invalid/glen/latest/download/glen-{}.tar.gz -o ",
+        target()
+    );
+    assert!(
+        calls.contains(&url) && calls.trim_end().ends_with(" --proto =https --tlsv1.2"),
+        "{calls}"
+    );
+    assert!(!b.home.join(".local").exists());
+    b.cleaned()
+}
+
+#[test]
 fn dry_run_is_a_write_free_plan() -> Result {
     let b = Installer::new()?;
     b.platform("Linux", "aarch64", "0")?;
