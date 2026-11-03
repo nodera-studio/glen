@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
+use crate::flake::scaled;
 use crate::support::*;
 
 pub const ALPHA: &str = "-work-alpha";
@@ -699,6 +700,8 @@ pub struct Stream {
     child: Child,
     rx: mpsc::Receiver<String>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// Disconnects once the stderr reader is done (end of file).
+    stderr_done: mpsc::Receiver<()>,
     /// Every stdout line received so far, newline included.
     pub lines: Vec<String>,
     desc: String,
@@ -730,7 +733,9 @@ impl Stream {
         });
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&stderr);
+        let (done, stderr_done) = mpsc::channel::<()>();
         std::thread::spawn(move || {
+            let _done = done;
             let mut chunk = [0u8; 4096];
             while let Ok(n) = err_pipe.read(&mut chunk) {
                 if n == 0 {
@@ -743,6 +748,7 @@ impl Stream {
             child,
             rx,
             stderr,
+            stderr_done,
             lines: Vec::new(),
             desc,
             status: None,
@@ -815,6 +821,7 @@ impl Stream {
 
     /// Read human lines until one contains `needle`.
     pub fn wait_for_text(&mut self, needle: &str, timeout: Duration) {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -838,8 +845,10 @@ impl Stream {
         assert!(ok, "kill -INT failed");
     }
 
-    /// Wait for the process to exit, then collect the rest of stdout.
+    /// Wait for the process to exit, then collect the rest of stdout and stderr: an exit seen
+    /// before a reader thread has run leaves output it wrote still unread.
     pub fn wait(&mut self, timeout: Duration) -> ExitStatus {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(st) = self.child.try_wait().unwrap() {
@@ -851,9 +860,14 @@ impl Stream {
             std::thread::sleep(Duration::from_millis(20));
         };
         self.status = Some(status);
-        while let Ok(l) = self.rx.recv_timeout(Duration::from_secs(5)) {
+        while let Ok(l) = self.rx.recv_timeout(scaled(Duration::from_secs(5))) {
             self.lines.push(l);
         }
+        // End of file, or a writer outside glen still holds the pipe (a child another test thread
+        // is spawning, between its fork and exec): either way the reader has had its turn.
+        let _ = self
+            .stderr_done
+            .recv_timeout(scaled(Duration::from_secs(5)));
         status
     }
 
