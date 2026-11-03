@@ -198,7 +198,7 @@ pub fn fake_omp_bin() -> PathBuf {
             if dir.file_name().unwrap() == "release" {
                 cmd.arg("--release");
             }
-            let out = cmd.output().unwrap();
+            let out = flake::output(&mut cmd);
             assert!(
                 out.status.success(),
                 "{}",
@@ -345,7 +345,7 @@ pub fn fake_ext_bin() -> PathBuf {
         if dir.file_name().unwrap() == "release" {
             c.arg("--release");
         }
-        let out = c.output().unwrap();
+        let out = flake::output(&mut c);
         assert!(
             out.status.success(),
             "{}",
@@ -363,6 +363,8 @@ pub struct LiveBox {
 }
 impl LiveBox {
     pub fn new() -> Self {
+        // Built before the test starts anything with a window (a warm worker's), never inside it.
+        fake_ext_bin();
         let mut rpc = RpcBox::new();
         let short = tempfile::Builder::new()
             .prefix("gle-")

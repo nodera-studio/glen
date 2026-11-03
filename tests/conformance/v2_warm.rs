@@ -17,12 +17,17 @@
 //! by deleting and recreating a knob's file between the jobs, never by changing an env value.
 //! Every warm worker is ended (release, expiry, a signal) and every omp group is gone before a
 //! test returns.
+//!
+//! Under `scripts/flake-check.sh` the waits and the upper bounds on the product's timing (the
+//! AC-v2-402 500 ms claim, the AC-v2-403 1 s and 4 s bounds) are multiplied by
+//! `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); lower bounds and the windows in
+//! which something must not happen are not.
 
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -31,6 +36,7 @@ use std::time::{Duration, Instant, SystemTime};
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
+use crate::flake::{Capture, scaled};
 use crate::live_support::*;
 use crate::reader::*;
 use crate::rpc_support::*;
@@ -223,13 +229,16 @@ impl<'a> Wm<'a> {
         job_id(&data_of(&self.run(&a).run(), 10))
     }
 
-    /// A foreground send as a child process, so a test can look while it runs.
+    /// A foreground send as a child process, so a test can look while it runs. Its output goes
+    /// to files: a pipe can be held open by a process another test spawned meanwhile.
     fn spawn_send(&self, target: &str, text: &str, extra: &[&str]) -> Fg {
         let args = Self::send_args(target, text, extra);
         let mut cmd = self.command(&args);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let capture = Capture::new();
+        capture.attach(&mut cmd);
         Fg {
             child: Some(cmd.spawn().expect("spawn glen send")),
+            capture,
             desc: args.join(" "),
         }
     }
@@ -257,7 +266,7 @@ impl<'a> Wm<'a> {
     /// The registry once it is idle and names `job` as the last job.
     fn cycle_of(&self, job: &str) -> Cycle {
         let rb = self.rb;
-        let reg = poll_until("an idle warm registry for the job", LONG, || {
+        let reg = poll_until("an idle warm registry for the job", scaled(LONG), || {
             registry(rb, A.id).filter(|r| {
                 r["state"] == "idle" && (r["job_id"] == job || r["job_id"] == job_handle(job))
             })
@@ -282,6 +291,7 @@ impl<'a> Wm<'a> {
 /// A foreground `glen send` run as a child.
 struct Fg {
     child: Option<Child>,
+    capture: Capture,
     desc: String,
 }
 
@@ -295,8 +305,30 @@ impl Fg {
             .is_none()
     }
 
+    /// The send's exit within `timeout` (scaled), and what it wrote.
     fn finish(mut self, timeout: Duration) -> Out {
-        finish(self.child.take().expect("child"), &self.desc, timeout)
+        let timeout = scaled(timeout);
+        let mut child = self.child.take().expect("child");
+        let started = Instant::now();
+        let status = loop {
+            if let Some(st) = child.try_wait().unwrap() {
+                break st;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("`glen {}` did not exit within {timeout:?}", self.desc);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let output = self.capture.output(status);
+        Out {
+            desc: format!("glen {}", self.desc),
+            status,
+            stdout: output.stdout,
+            stderr: output.stderr,
+            elapsed: started.elapsed(),
+        }
     }
 }
 
@@ -356,7 +388,7 @@ impl Drop for Appeared {
 /// the instant a `--warm` send returns can meet an empty `run/warm`; wait for the registry (or for
 /// the worker to be gone) first.
 fn end_warmth(rb: &RpcBox) {
-    poll_until("a warm registry, or no live worker", LONG, || {
+    poll_until("a warm registry, or no live worker", scaled(LONG), || {
         (reg_file(rb, A.id).exists() || rb.live_processes().is_empty()).then_some(())
     });
     let out = rb.glen(["release", "--all", "--json"]).run();
@@ -371,7 +403,7 @@ fn watch_status(
 ) -> mpsc::Receiver<Instant> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + scaled(Duration::from_secs(30));
         while Instant::now() < deadline {
             if read_json(&path).is_some_and(|st| pred(&st)) {
                 let _ = tx.send(Instant::now());
@@ -391,7 +423,7 @@ fn watch_claim(
 ) -> mpsc::Receiver<(String, Instant, Instant)> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
-        let deadline = Instant::now() + Duration::from_secs(30);
+        let deadline = Instant::now() + scaled(Duration::from_secs(30));
         let mut created: Option<(String, Instant)> = None;
         while Instant::now() < deadline {
             if created.is_none()
@@ -425,6 +457,7 @@ fn watch_claim(
 /// registry and the release request are removed, and the teardown logged `warm: cooling (<reason>)`
 /// with this reason and no other (AC-v2-403d).
 fn assert_cooled(rb: &RpcBox, c: &Cycle, reason: &str, from: Instant, within: Duration) {
+    let within = scaled(within);
     let deadline = from + within;
     loop {
         let omp = omp_gone(c.omp_pid, c.omp_pgid);
@@ -484,10 +517,11 @@ fn assert_cold_end(rb: &RpcBox, id: &str, what: &str) {
         if worker_gone && omp && lock {
             break;
         }
-        if started.elapsed() >= FOUR_SECONDS {
+        if started.elapsed() >= scaled(FOUR_SECONDS) {
             panic!(
                 "{what}: worker gone={worker_gone} omp gone={omp} lock free={lock} \
-                 {FOUR_SECONDS:?} after the terminal status (it stayed warm?)\n{}",
+                 {:?} after the terminal status (it stayed warm?)\n{}",
+                scaled(FOUR_SECONDS),
                 rb.diag()
             );
         }
@@ -907,7 +941,7 @@ fn ac_v2_402_the_registry_and_the_lock_describe_an_idle_warm_worker() {
     // The registry goes idle first; the lock holder record follows within a moment.
     let h = poll_until(
         "the lock holder to read `warm`",
-        Duration::from_secs(2),
+        scaled(Duration::from_secs(2)),
         || holder(&rb, A.id).filter(|h| h["kind"] == "warm"),
     );
     assert_eq!(h["pid"], c.pid, "{h}");
@@ -943,13 +977,14 @@ fn ac_v2_402_a_second_send_within_the_window_is_stolen_within_500ms_on_the_same_
     let claim = watch_claim(rb.jobs_dir(), known);
     let id2 = w.send_nowait(A.handle, "two", &["--warm", "30s"]);
     let (claimed_id, created, claimed) = claim
-        .recv_timeout(LONG)
+        .recv_timeout(scaled(LONG))
         .unwrap_or_else(|_| panic!("job 2 was never claimed\n{}", rb.diag()));
     assert_eq!(claimed_id, id2);
     let took = claimed.duration_since(created);
     assert!(
-        took <= HALF_SECOND,
-        "AC-v2-402a: claimed {took:?} after its creation (limit {HALF_SECOND:?})\n{}",
+        took <= scaled(HALF_SECOND),
+        "AC-v2-402a: claimed {took:?} after its creation (limit {:?})\n{}",
+        scaled(HALF_SECOND),
         rb.diag()
     );
 
@@ -989,7 +1024,7 @@ fn ac_v2_402_the_claim_names_the_warm_worker_and_the_cold_worker_never_rewrites_
     run.close();
 
     let id2 = w.send_nowait(A.handle, "two", &["--warm", "30s"]);
-    let st = rb.wait_status(&id2, "claimed and running", LONG, |s| {
+    let st = rb.wait_status(&id2, "claimed and running", scaled(LONG), |s| {
         s["omp_reused"] == true && s["status"] == "accepted"
     });
     assert_eq!(st["worker_pid"], c.pid, "AC-v2-402b worker_pid: {st}");
@@ -1001,12 +1036,14 @@ fn ac_v2_402_the_claim_names_the_warm_worker_and_the_cold_worker_never_rewrites_
 
     // §A21: while the warm worker runs the adopted job, the lock holder is that job and the
     // registry is busy.
-    let h = poll_until("the lock holder to name the adopted job", LONG, || {
-        holder(&rb, A.id).filter(|h| h["kind"] == "job")
-    });
+    let h = poll_until(
+        "the lock holder to name the adopted job",
+        scaled(LONG),
+        || holder(&rb, A.id).filter(|h| h["kind"] == "job"),
+    );
     assert!(h["job_id"] == id2 || h["job_id"] == job_handle(&id2), "{h}");
     assert_eq!(h["pid"], c.pid, "{h}");
-    let reg = poll_until("a busy registry", LONG, || {
+    let reg = poll_until("a busy registry", scaled(LONG), || {
         registry(&rb, A.id).filter(|r| r["state"] == "busy")
     });
     assert_eq!(reg["pid"], c.pid, "{reg}");
@@ -1059,10 +1096,10 @@ fn ac_v2_402_a_foreground_send_that_was_stolen_returns_the_warm_workers_result()
 
     let known: BTreeSet<String> = rb.job_ids().into_iter().collect();
     let mut fg = w.spawn_send(A.handle, "two", &["--warm", "30s"]);
-    let id2 = poll_until("job 2's directory", LONG, || {
+    let id2 = poll_until("job 2's directory", scaled(LONG), || {
         rb.job_ids().into_iter().find(|i| !known.contains(i))
     });
-    rb.wait_status(&id2, "claimed", LONG, |s| s["omp_reused"] == true);
+    rb.wait_status(&id2, "claimed", scaled(LONG), |s| s["omp_reused"] == true);
     // The cold worker this send spawned is gone within a lock-poll tick or two; the send must
     // keep watching the claimant rather than report the job lost.
     let until = Instant::now() + Duration::from_millis(1500);
@@ -1097,7 +1134,7 @@ fn ac_v2_402_a_stolen_job_is_lost_when_its_claimant_dies() {
     let c = w.first("30s");
     run.close();
     let id2 = w.send_nowait(A.handle, "two", &["--warm", "30s"]);
-    rb.wait_status(&id2, "claimed and running", LONG, |s| {
+    rb.wait_status(&id2, "claimed and running", scaled(LONG), |s| {
         s["omp_reused"] == true && s["status"] == "accepted"
     });
 
@@ -1119,7 +1156,9 @@ fn ac_v2_402_jobs_queued_behind_a_running_job_are_claimed_in_id_order_right_afte
     let mut w = Wm::new(&rb);
     let run = w.gate("FAKE_OMP_RUN_RELEASE", "run-gate");
     let id1 = w.send_nowait(A.handle, "one", &["--warm", "30s"]);
-    rb.wait_status(&id1, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id1, "accepted", scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let id_b = w.send_nowait(A.handle, "bee", &["--warm", "30s"]);
     let id_c = w.send_nowait(A.handle, "sea", &["--warm", "30s"]);
     assert!(id_b < id_c, "job ids are time-ordered");
@@ -1137,14 +1176,16 @@ fn ac_v2_402_jobs_queued_behind_a_running_job_are_claimed_in_id_order_right_afte
         s["omp_reused"] == true
     });
     run.open();
-    let settled = settled.recv_timeout(LONG).expect("job 1 settled");
-    let claimed_b = claimed_b.recv_timeout(LONG).expect("job B was claimed");
+    let settled = settled.recv_timeout(scaled(LONG)).expect("job 1 settled");
+    let claimed_b = claimed_b
+        .recv_timeout(scaled(LONG))
+        .expect("job B was claimed");
     assert!(
         claimed_b >= settled || claimed_b.duration_since(settled) == Duration::ZERO,
         "a job behind a running job cannot be claimed before it settles"
     );
     assert!(
-        claimed_b.duration_since(settled) <= HALF_SECOND,
+        claimed_b.duration_since(settled) <= scaled(HALF_SECOND),
         "a queued job waits at most one claim tick behind the warm worker: {:?}\n{}",
         claimed_b.duration_since(settled),
         rb.diag()
@@ -1297,9 +1338,11 @@ fn ac_v2_402_a_new_session_goes_warm_keyed_by_its_settled_id_and_a_cwd_through_a
         .expect("session handle")
         .to_owned();
 
-    let reg = poll_until("the registry keyed by the settled session id", LONG, || {
-        registry(&rb, &sid).filter(|r| r["state"] == "idle")
-    });
+    let reg = poll_until(
+        "the registry keyed by the settled session id",
+        scaled(LONG),
+        || registry(&rb, &sid).filter(|r| r["state"] == "idle"),
+    );
     assert_eq!(reg["session_id"], sid.as_str(), "{reg}");
 
     // The fake peer writes no transcript, so stand in for omp: the session file omp would have
@@ -1324,7 +1367,7 @@ fn ac_v2_402_a_new_session_goes_warm_keyed_by_its_settled_id_and_a_cwd_through_a
         rb.diag()
     );
     let id2 = job_id(&d2);
-    poll_until("the worker to be idle again", LONG, || {
+    poll_until("the worker to be idle again", scaled(LONG), || {
         registry(&rb, &sid).filter(|r| {
             r["state"] == "idle" && (r["job_id"] == id2 || r["job_id"] == job_handle(&id2))
         })
@@ -1413,9 +1456,11 @@ fn ac_v2_403_sigterm_and_sighup_end_warmth() {
         let from = Instant::now();
         send_signal(c.pid, sig);
         assert_cooled(&rb, &c, "signal", from, FOUR_SECONDS);
-        poll_until(&format!("the worker to exit after {label}"), LONG, || {
-            (!pid_alive(c.pid)).then_some(())
-        });
+        poll_until(
+            &format!("the worker to exit after {label}"),
+            scaled(LONG),
+            || (!pid_alive(c.pid)).then_some(()),
+        );
         rb.assert_quiet();
     }
 }
@@ -1441,7 +1486,7 @@ fn ac_v2_403_a_live_endpoint_for_the_session_ends_warmth_within_one_second() {
     let from = Instant::now();
     poll_until(
         "teardown to start within a second of the endpoint appearing",
-        ONE_SECOND,
+        scaled(ONE_SECOND),
         || cooling(&lb).contains(&"endpoint".to_owned()).then_some(()),
     );
     assert_cooled(&lb, &c, "endpoint", from, FOUR_SECONDS);
@@ -1530,7 +1575,7 @@ fn ac_v2_403_a_timed_out_or_cancelled_job_never_stays_warm() {
         ];
         let out = w.run(&a).env("GLEN_JOB_TIMEOUT", timeout).run();
         let id = job_id(&data_of(&out, 10));
-        rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+        rb.wait_status(&id, "accepted", scaled(LONG), |s| s["status"] == "accepted");
         if label == "cancelled" {
             let worker = rb.status(&id)["worker_pid"].as_i64().expect("worker pid");
             send_signal(worker, Signal::TERM);
@@ -1882,10 +1927,10 @@ fn ac_v2_405_release_without_force_times_out_exit_7_and_force_kills_after_the_id
     assert_eq!(wk["outcome"], "forced", "{d}");
     assert_eq!(wk["state"], "stale", "{d}");
     assert_eq!(wk["pid"], c.pid, "{d}");
-    poll_until("the killed worker to be gone", LONG, || {
+    poll_until("the killed worker to be gone", scaled(LONG), || {
         (!pid_alive(c.pid)).then_some(())
     });
-    poll_until("the omp group to be gone", FOUR_SECONDS, || {
+    poll_until("the omp group to be gone", scaled(FOUR_SECONDS), || {
         omp_gone(c.omp_pid, c.omp_pgid).then_some(())
     });
     assert!(!reg_file(&rb, A.id).exists(), "the registry is removed");
@@ -1893,7 +1938,7 @@ fn ac_v2_405_release_without_force_times_out_exit_7_and_force_kills_after_the_id
         !release_file(&rb, A.id).exists(),
         "so is the release request"
     );
-    poll_until("the lock to be free", FOUR_SECONDS, || {
+    poll_until("the lock to be free", scaled(FOUR_SECONDS), || {
         rb.glen_lock_free(A.id).then_some(())
     });
     rb.assert_quiet();
@@ -1936,7 +1981,7 @@ fn ac_v2_405_a_registry_whose_identity_no_longer_matches_is_cleaned_and_never_si
             "force={force}: docs/json.md says an identity-changed registry is removed (`cleaned`)"
         );
         send_signal(c.pid, Signal::TERM);
-        poll_until("the untouched worker to end itself", LONG, || {
+        poll_until("the untouched worker to end itself", scaled(LONG), || {
             (!pid_alive(c.pid)).then_some(())
         });
         rb.assert_quiet();
@@ -1950,7 +1995,7 @@ fn ac_v2_405_a_dead_worker_is_counted_by_doctor_and_cleaned_by_release() {
     let c = w.first("120s");
     send_signal(c.pid, Signal::KILL);
     signal_group(c.omp_pgid, Signal::KILL);
-    poll_until("the worker to be gone", LONG, || {
+    poll_until("the worker to be gone", scaled(LONG), || {
         (!pid_alive(c.pid)).then_some(())
     });
     assert!(
@@ -2055,7 +2100,7 @@ fn control_case(args: &[&str]) {
         "{args:?}: {:?}",
         warm_entries(&rb)
     );
-    poll_until("the cooled worker to exit", LONG, || {
+    poll_until("the cooled worker to exit", scaled(LONG), || {
         (!pid_alive(c.pid)).then_some(())
     });
     rb.assert_quiet();
@@ -2088,7 +2133,7 @@ fn ac_v2_406_abort_on_an_idle_warm_session_says_idle_and_keeps_it_warm() {
     let c = w.first("30s");
     poll_until(
         "the lock holder to read `warm`",
-        Duration::from_secs(2),
+        scaled(Duration::from_secs(2)),
         || holder(&rb, A.id).filter(|h| h["kind"] == "warm"),
     );
     let jobs_before = rb.job_ids();
@@ -2172,10 +2217,10 @@ fn ac_v2_406_ls_shows_idle_and_busy_warmth_and_doctor_counts_it() {
     // While an adopted job runs the worker reads busy.
     run.close();
     let id2 = w.send_nowait(A.handle, "two", &["--warm", "60s"]);
-    rb.wait_status(&id2, "claimed and running", LONG, |s| {
+    rb.wait_status(&id2, "claimed and running", scaled(LONG), |s| {
         s["omp_reused"] == true && s["status"] == "accepted"
     });
-    poll_until("a busy registry", LONG, || {
+    poll_until("a busy registry", scaled(LONG), || {
         registry(&rb, A.id).filter(|r| r["state"] == "busy")
     });
     let r = row(&rb);
@@ -2220,10 +2265,10 @@ fn ac_v2_406_release_on_a_busy_worker_returns_at_once_and_it_cools_after_the_job
     let c = w.first("30s");
     run.close();
     let id2 = w.send_nowait(A.handle, "two", &["--warm", "30s"]);
-    rb.wait_status(&id2, "claimed and running", LONG, |s| {
+    rb.wait_status(&id2, "claimed and running", scaled(LONG), |s| {
         s["omp_reused"] == true && s["status"] == "accepted"
     });
-    poll_until("a busy registry", LONG, || {
+    poll_until("a busy registry", scaled(LONG), || {
         registry(&rb, A.id).filter(|r| r["state"] == "busy")
     });
 
@@ -2231,7 +2276,7 @@ fn ac_v2_406_release_on_a_busy_worker_returns_at_once_and_it_cools_after_the_job
     let out = rb.glen(["release", A.handle, "--json"]).run();
     let d = data_of(&out, 0);
     assert!(
-        started.elapsed() < Duration::from_secs(3),
+        started.elapsed() < scaled(Duration::from_secs(3)),
         "release never waits on a model turn"
     );
     assert_eq!(d["workers"][0]["outcome"], "cooling", "{d}");
@@ -2330,7 +2375,7 @@ fn ac_v2_406_release_with_a_tail_that_matches_two_warm_workers_is_ambiguous() {
     let w = Wm::new(&rb);
     for id in [x1, x2] {
         data_of(&w.send(id, "hi", &["--warm", "30s"]), 0);
-        poll_until("the worker's registry", LONG, || {
+        poll_until("the worker's registry", scaled(LONG), || {
             registry(&rb, id).filter(|r| r["state"] == "idle")
         });
     }
@@ -2410,7 +2455,7 @@ fn ac_v2_407_an_idle_glen_reply_is_a_tool_error_and_is_attributed_to_no_job() {
     idle_reply.open();
     let recs = poll_until(
         "omp's idle glen_reply to be answered",
-        Duration::from_secs(3),
+        scaled(Duration::from_secs(3)),
         || {
             let r = rb.recs();
             r.iter()
@@ -2511,7 +2556,9 @@ fn ac_v2_407_the_idle_clock_starts_only_after_settlement_and_rearms_per_adopted_
     let run = w.gate("FAKE_OMP_RUN_RELEASE", "run-gate");
     // Job 1 is held for longer than its whole warm window and still goes warm afterwards.
     let id1 = w.send_nowait(A.handle, "one", &["--warm", "2s"]);
-    rb.wait_status(&id1, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id1, "accepted", scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     std::thread::sleep(Duration::from_millis(2600));
     assert!(
         !reg_file(&rb, A.id).exists(),
@@ -2529,7 +2576,7 @@ fn ac_v2_407_the_idle_clock_starts_only_after_settlement_and_rearms_per_adopted_
     // Job 2 carries its own, longer window, held past the first one: busy, never cooled.
     run.close();
     let id2 = w.send_nowait(A.handle, "two", &["--warm", "5s"]);
-    rb.wait_status(&id2, "claimed and running", LONG, |s| {
+    rb.wait_status(&id2, "claimed and running", scaled(LONG), |s| {
         s["omp_reused"] == true && s["status"] == "accepted"
     });
     std::thread::sleep(Duration::from_millis(2600));

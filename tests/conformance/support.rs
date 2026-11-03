@@ -16,6 +16,8 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::flake::Capture;
+
 pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
@@ -248,22 +250,30 @@ impl Run {
         self
     }
 
+    /// Runs glen to its exit. Its output goes to files (`flake::Capture`), not pipes: a process
+    /// another test thread spawned meanwhile can hold a pipe's write end, and reading the pipe to
+    /// end of file would wait for that process.
     pub fn run(mut self) -> Out {
-        self.cmd
-            .stdout(self.stdout.take().unwrap_or_else(Stdio::piped))
-            .stderr(Stdio::piped());
+        let capture = Capture::new();
+        match self.stdout.take() {
+            Some(stdout) => {
+                self.cmd.stdout(stdout);
+                capture.attach_stderr(&mut self.cmd);
+            }
+            None => capture.attach(&mut self.cmd),
+        }
         let started = Instant::now();
-        let child = self
+        let mut child = self
             .cmd
             .spawn()
             .unwrap_or_else(|e| panic!("spawn glen {}: {e}", self.desc));
         let pid = child.id();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
+            let _ = tx.send(child.wait());
         });
         let output = match rx.recv_timeout(RUN_TIMEOUT) {
-            Ok(r) => r.unwrap_or_else(|e| panic!("wait glen {}: {e}", self.desc)),
+            Ok(r) => capture.output(r.unwrap_or_else(|e| panic!("wait glen {}: {e}", self.desc))),
             Err(_) => {
                 let _ = Command::new("/bin/kill")
                     .args(["-9", &pid.to_string()])

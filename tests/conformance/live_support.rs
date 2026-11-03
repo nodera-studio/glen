@@ -121,7 +121,9 @@ pub fn fake_ext_bin() -> &'static Path {
                 cmd.args(["--profile", other]);
             }
         }
-        let out = cmd.output().expect("run cargo build --example fake_ext");
+        // Through files: a build piped to end of file waits for any process that inherited the
+        // pipe from a concurrent spawn (a warm worker, for its window).
+        let out = crate::flake::output(&mut cmd);
         assert!(
             out.status.success(),
             "cargo build --example fake_ext failed:\n{}",
