@@ -129,7 +129,8 @@ allowed-tools grants apply only to the invoking turn.
 Claude Code 2.1.309 supports the scoped `--allowedTools "Skill(glen)"` grant under
 `dontAsk`; this run uses it to permit loading only glen. Every Skill call must name glen.
 Bash is deliberately NOT allowed on the command line: glen's Bash permission must come only
-from the skill's own `allowed-tools: Bash(glen *)` grant, not from the harness.
+from the skill's own `allowed-tools` grant (from v0.2.0 eight `Bash(glen <verb> *)` rules: `ls`,
+`show`, `tail`, `jobs`, `wait`, `inbox`, `doctor`, `send`), not from the harness.
 
 ```bash
 S=$($A/acc.sh setup b3)

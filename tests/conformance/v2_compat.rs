@@ -537,6 +537,13 @@ fn tv(t: (u64, u64, u64)) -> String {
     format!("{}.{}.{}", t.0, t.1, t.2)
 }
 
+/// The next minor release after `compat.json`'s `max_tested`, plus `suffix`: untested whatever
+/// the declared range is (the v0.2.0 release PR raised `max_tested` past the plan's 18.15.0).
+fn above_max_tested(suffix: &str) -> String {
+    let (major, minor, _) = triple(&compat().max_tested);
+    format!("{major}.{}.0{suffix}", minor + 1)
+}
+
 /// The same classification, generated from whatever `compat.json` declares.
 #[test]
 fn ac_v2_102_versions_follow_the_declared_range_whatever_it_is() {
@@ -726,6 +733,12 @@ fn ac_v2_102_absurd_version_numbers_are_a_warning_not_a_crash() {
 #[test]
 fn ac_v2_102_only_the_first_stdout_line_trimmed_is_the_version() {
     let sb = Sandbox::new();
+    // Untested inputs derive from compat.json, so they stay above max_tested when it rises.
+    let (major, minor, patch) = triple(&compat().max_tested);
+    let next_patch = tv((major, minor, patch + 1));
+    let no_newline_body = format!("printf 'omp/{next_patch}'");
+    let pre_release = above_max_tested("-rc.1+b1");
+    let prefixed_body = format!("echo omp/v{pre_release}");
     let cases: [(&str, &str, &str, Verdict); 9] = [
         (
             "later lines ignored",
@@ -766,14 +779,14 @@ fn ac_v2_102_only_the_first_stdout_line_trimmed_is_the_version() {
         ),
         (
             "no newline",
-            "printf 'omp/18.14.1'",
-            "18.14.1",
+            &no_newline_body,
+            &next_patch,
             Verdict::Untested,
         ),
         (
             "prefixed pre-release",
-            "echo omp/v18.15.0-rc.1+b1",
-            "18.15.0-rc.1+b1",
+            &prefixed_body,
+            &pre_release,
             Verdict::Untested,
         ),
     ];
@@ -804,8 +817,9 @@ fn ac_v2_102_a_long_unparseable_line_is_not_echoed_in_full() {
 #[test]
 fn ac_v2_102_human_mode_warns_and_exits_zero_for_each_non_ok_verdict() {
     let sb = Sandbox::new();
+    let above = above_max_tested("-rc.1");
     for (given, detail) in [
-        ("18.15.0-rc.1", "untested"),
+        (above.as_str(), "untested"),
         ("18.13.9", "unsupported"),
         ("garbage", "cannot parse omp --version output"),
     ] {
@@ -3122,9 +3136,11 @@ fn nightly_summary(version: &str, tweak: impl FnOnce(&mut Runner)) -> String {
 
 #[test]
 fn ac_v2_106_summary_names_the_version_and_flags_a_bump_candidate_only_when_it_is_one() {
-    // A newer omp, every step passed: a bump candidate.
-    let s = nightly_summary("18.15.0", |_| {});
-    assert!(s.contains("18.15.0"), "names the omp version:\n{s}");
+    // A newer omp, every step passed: a bump candidate. Newer than compat.json's max_tested,
+    // which the v0.2.0 release PR raised past the plan's 18.15.0.
+    let newer = above_max_tested("");
+    let s = nightly_summary(&newer, |_| {});
+    assert!(s.contains(&newer), "names the omp version:\n{s}");
     assert!(
         bump_line(&s),
         "a bump candidate line when every step passed and omp is newer:\n{s}"
@@ -3146,11 +3162,11 @@ fn ac_v2_106_summary_names_the_version_and_flags_a_bump_candidate_only_when_it_i
     assert!(s.contains("18.14.0"), "{s}");
     assert!(!bump_line(&s), "nothing to bump in range:\n{s}");
     // Newer, but a step failed: no bump candidate, and the failure is named.
-    let s = nightly_summary("18.15.0", |r| {
+    let s = nightly_summary(&newer, |r| {
         r.outcomes
             .insert("surface".to_owned(), "failure".to_owned());
     });
-    assert!(s.contains("18.15.0"), "{s}");
+    assert!(s.contains(&newer), "{s}");
     assert!(
         !bump_line(&s),
         "no bump candidate after a failed step:\n{s}"

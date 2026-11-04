@@ -9,7 +9,7 @@ export const site = {
  supportedOmp: compat.min === compat.max_tested ? compat.min : `${compat.min} to ${compat.max_tested}`,
  // The current release, kept equal to Cargo.toml's version (site.test.mjs): the release PR bumps both. Every release
  // since v0.1.0 publishes 9 assets, so the page shows the install script and the latest release; check-links.mjs --online verifies both before any deploy.
- version: '0.1.1', releaseAvailable: true,
+ version: '0.2.0', releaseAvailable: true,
  commands: {
   script: `curl -fsSL ${installScriptUrl} | sh`,
   cargo: `cargo install --git ${repoUrl} --locked`, doctor: 'glen doctor',

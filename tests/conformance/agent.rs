@@ -1265,7 +1265,14 @@ fn ac402_claude_variant_frontmatter_and_marker() {
     );
     assert_eq!(keys.len(), 3, "no duplicate keys: {keys:?}");
     assert_eq!(fm_get(&fm, "name"), "glen");
-    assert_eq!(fm_get(&fm, "allowed-tools"), "Bash(glen *)", "O7 rule form");
+    // v0.2 W7 owner decision: the pre-approval is narrowed to these eight verbs, in the O7
+    // space form (`Bash(glen <verb> *)`, which also matches the bare verb).
+    assert_eq!(
+        fm_get(&fm, "allowed-tools"),
+        "Bash(glen ls *) Bash(glen show *) Bash(glen tail *) Bash(glen jobs *) \
+         Bash(glen wait *) Bash(glen inbox *) Bash(glen doctor *) Bash(glen send *)",
+        "O7 rule form"
+    );
     assert_description(fm_get(&fm, "description"), "claude");
     assert_marker(text, "claude");
 }

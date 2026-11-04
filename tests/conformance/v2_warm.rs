@@ -2724,9 +2724,10 @@ fn ac_v2_406_the_w4_rows_exist_in_a9_a15_a16_and_the_changelog() {
     );
 
     let changelog = fs::read_to_string(repo_root().join("CHANGELOG.md")).expect("CHANGELOG.md");
+    // W7 renames `## Unreleased` to the `## v0.2.0 — <date>` release heading.
     let unreleased: String = changelog
         .lines()
-        .skip_while(|l| l.trim() != "## Unreleased")
+        .skip_while(|l| l.trim() != "## Unreleased" && !l.starts_with("## v0.2.0"))
         .skip(1)
         .take_while(|l| !l.starts_with("## "))
         .collect::<Vec<_>>()

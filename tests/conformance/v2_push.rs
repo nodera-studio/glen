@@ -2686,9 +2686,10 @@ fn ac_v2_205_a9_and_a20_describe_the_new_flags_and_state_codex_no_push() {
 #[test]
 fn ac_v2_205_the_changelog_announces_the_receivers_and_does_not_call_codex_push() {
     let log = read_repo("CHANGELOG.md");
+    // W7 renames `## Unreleased` to the `## v0.2.0 — <date>` release heading.
     let unreleased: String = log
         .lines()
-        .skip_while(|l| l.trim_end() != "## Unreleased")
+        .skip_while(|l| l.trim_end() != "## Unreleased" && !l.starts_with("## v0.2.0"))
         .skip(1)
         .take_while(|l| !l.starts_with("## "))
         .collect::<Vec<_>>()

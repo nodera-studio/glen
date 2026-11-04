@@ -27,8 +27,9 @@ Design and the omp surfaces it builds on: [`docs/design.md`](docs/design.md).
 
 ## omp facts that matter
 
-- Supported omp range: `src/omp/compat.json` (`min`, `max_tested`, `tested`; at v0.2 W1 all
-  **18.14.0**, `omp --version`), and the `omp-rpc` git tag pin in `Cargo.toml` matches `tested`.
+- Supported omp range: `src/omp/compat.json` (`min`, `max_tested`, `tested`; at v0.2.0 `min`
+  and `tested` **18.14.0**, `max_tested` **18.16.0**, `omp --version`), and the `omp-rpc` git tag
+  pin in `Cargo.toml` matches `tested`.
   The source is at `../metis/references/oh-my-pi` (a reference clone, MIT; read it, never edit
   or push it).
   When omp updates, re-check the surfaces in `docs/design.md` against the new source before
@@ -73,7 +74,7 @@ npm run deploy      # verify, online link check, wrangler deploy (local wrangler
 
 `lefthook install` once per clone: pre-commit checks rustfmt and, if `gitleaks` is installed
 (optional locally; CI always has it), scans for secrets; pre-push runs clippy and the tests
-through `scripts/suite-lock.sh`, which locks test runs so a concurrent `cargo test` from another
+through `.claude/scripts/suite-lock.sh`, which locks test runs so a concurrent `cargo test` from another
 clone or agent does not corrupt shared fixtures. CI (`.github/workflows/ci.yml`) runs rustfmt,
 clippy and the tests on Linux and macOS, plus `linux-sandbox` (the Codex-sandbox scenarios),
 `msrv` (`cargo check --locked --all-targets` on the pinned minimum Rust) and `site-deploy` (a

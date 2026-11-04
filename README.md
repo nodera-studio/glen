@@ -10,7 +10,7 @@ envelope for agents.
 
 ## Install
 
-macOS and Linux. glen supports omp 18.14.0 to 18.14.0 (tested against 18.14.0, declared in
+macOS and Linux. glen supports omp 18.14.0 to 18.16.0 (tested against 18.14.0, declared in
 `src/omp/compat.json`); `glen doctor` warns when your omp is outside that range.
 
 ### Script
@@ -23,7 +23,7 @@ The script picks the archive for your platform, verifies its SHA-256 and install
 `~/.local/bin`. It never uses sudo. Pass flags after `sh -s --`:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- --version 0.1.1 --prefix ~/.local
+curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- --version 0.2.0 --prefix ~/.local
 curl -fsSL https://raw.githubusercontent.com/nodera-studio/glen/main/install.sh | sh -s -- --dry-run
 ```
 
@@ -158,9 +158,11 @@ install. `glen doctor` shows whether the extension is current.
 ## Use from your coding agent (`glen install-skill`)
 
 The glen skill teaches Claude Code and Codex the loop above: find a session, read it, send, wait,
-read the inbox, what each exit code means and the sandbox rules. It also lets the agent run
-`glen` commands without asking each time. Replies need no polling: Claude Code is woken by a
-background `glen wait <job> --for reply`, while Codex blocks on that wait instead (Codex: no push).
+read the inbox, what each exit code means and the sandbox rules. It also lets Claude Code run
+`glen ls`, `show`, `tail`, `jobs`, `wait`, `inbox`, `doctor` and `send` without asking each time.
+Replies need no polling. Claude Code gets push: a background `glen wait <job> --for reply` wakes
+it when a reply arrives. Codex gets a blocking wait: it runs that same wait and blocks until it
+returns.
 
 ```sh
 glen install-skill                   # Claude Code and Codex, for your user
@@ -175,16 +177,18 @@ and `~/.agents/skills/glen/SKILL.md`. `--project` writes `.claude/skills/glen/SK
 Run `glen install-skill` again after upgrading glen. An edited or newer `SKILL.md` is skipped
 unless you pass `--force`; `--dry-run` works as it does for the extension.
 
-Because the skill's `allowed-tools: Bash(glen *)` pre-approves every `glen` command for the turn and glen starts
-omp with no approval flag of its own, a prompt-injected agent that reaches that turn can start an omp agent whose
-tools then run unattended under omp's own default (yolo) approval mode (design.md §A13).
+The skill's `allowed-tools` pre-approves those eight commands (`Bash(glen ls *)`, `Bash(glen send *)` and so on)
+for the turn; every other glen command, such as `abort`, `model`, `compact`, `release` or the installers, asks first.
+glen starts omp with no approval flag of its own, so a prompt-injected agent that reaches that turn can still use
+`glen send` to start an omp agent whose tools then run unattended under omp's own default (yolo) approval mode
+(design.md §A13).
 
 Headless Claude Code needs the skill itself allowed: `claude -p --permission-mode dontAsk` denies
 a skill that is not on the allow list, so pass `--allowedTools "Skill(glen)"`. The skill's own
-`allowed-tools: Bash(glen *)` grants the glen commands once the skill has loaded. Under `dontAsk`
-that grant did not reach a turn resumed by a background task's completion notification (observed
-on Claude Code 2.1.316), so a headless run that waits in the background may need `Bash(glen *)`
-on `--allowedTools` as well.
+`allowed-tools` grants those glen commands once the skill has loaded. Under `dontAsk` that grant
+did not reach a turn resumed by a background task's completion notification (observed on Claude
+Code 2.1.316), so a headless run that waits in the background may need the glen rules that turn
+runs, such as `Bash(glen wait *)` and `Bash(glen inbox *)`, on `--allowedTools` as well.
 <!-- W4:end -->
 
 ## Use from an MCP host (`glen mcp`)

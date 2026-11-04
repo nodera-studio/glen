@@ -563,11 +563,14 @@ test('copy: replies without polling, glen mcp, --warm and glen release, the supp
  const send = page.locator('.how-card').filter({ has: page.getByRole('heading', { name: 'Send' }) });
  await expect(send.locator('.how-cmds code')).toHaveText(['glen send', 'glen release']);
  await expect(send).toContainText('With --warm, omp stays up for the next send');
- // Claude Code is woken by a background wait; Codex has no push and blocks on it (design §A20 wording).
+ // Plan default 4 (design §A20): "push" for Claude Code only, "blocking wait" for Codex.
  await hydrate(page, '#agents');
- await expect(page.locator('#agent-panel-claude .panel-note')).toContainText('it runs glen wait <job> --for reply in the background and wakes when it returns');
+ const claudeNote = page.locator('#agent-panel-claude .panel-note');
+ await expect(claudeNote).toContainText('Replies come by push: it runs glen wait <job> --for reply in the background and wakes when it returns.');
  await page.getByRole('tab', { name: 'Codex', exact: true }).click();
- await expect(page.locator('#agent-panel-codex .panel-note')).toContainText('Codex has no push: it blocks on glen wait <job> --for reply instead.');
+ const codexNote = page.locator('#agent-panel-codex .panel-note');
+ await expect(codexNote).toContainText('Replies come through a blocking wait: Codex runs glen wait <job> --for reply and waits until it returns.');
+ await expect(codexNote).not.toContainText('push');
  await page.getByRole('tab', { name: 'MCP', exact: true }).click();
  const mcp = page.locator('#agent-panel-mcp');
  await expect(mcp.locator('pre code')).toHaveText(['claude mcp add glen -- glen mcp', 'codex mcp add glen -- glen mcp']);
@@ -582,10 +585,12 @@ test('copy: replies without polling, glen mcp, --warm and glen release, the supp
  await expect(faq.nth(4).locator('.faq-body')).toContainText(`glen supports omp ${site.supportedOmp}; glen doctor warns when yours is outside that range. A nightly CI job runs glen's omp checks against the latest omp release`);
  await expect(faq.nth(5).locator('summary')).toContainText('Sending again soon');
  await expect(faq.nth(5).locator('.faq-body')).toContainText('glen release <handle> ends it early, and glen release --all ends every warm worker.');
- // No version the release has not shipped, and no hidden command or flag. The hidden names are built
- // here, because tests/conformance/v2_mcp.rs fails when any file under site/ holds them literally.
- const text = await page.locator('main').innerText();
- for (const hidden of ['v0.2', '0.2.0', '__' + 'acp', '--' + 'chan' + 'nel']) expect(text).not.toContain(hidden);
+ // No glen version but the released one (site.version, kept equal to Cargo.toml's), and no hidden
+ // command or flag. The hidden names are built here, because tests/conformance/v2_mcp.rs fails
+ // when any file under site/ holds them literally.
+ const text = (await page.locator('main').innerText()).replaceAll(`v${site.version}`, '');
+ expect(text).not.toMatch(/\bv\d+\.\d+/);
+ for (const hidden of ['__' + 'acp', '--' + 'chan' + 'nel']) expect(text).not.toContain(hidden);
 });
 test('closing band and footer', async ({ page }) => {
  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');

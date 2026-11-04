@@ -410,8 +410,8 @@ fn omp_latest_summary_names_version_outcomes_and_bump_candidate() -> Result {
     // The bump signal is the omp_version row, whatever the JSON layout.
     let untested = r#"{
       "ok": true,
-      "data": {"checks": [{"name": "omp_version", "status": "warn", "value": "18.15.0", "detail": "untested"}]},
-      "warnings": [{"code": "omp_version_untested", "message": "omp 18.15.0 is untested"}]
+      "data": {"checks": [{"name": "omp_version", "status": "warn", "value": "18.17.0", "detail": "untested"}]},
+      "warnings": [{"code": "omp_version_untested", "message": "omp 18.17.0 is untested"}]
     }"#;
     // An unparseable version shares the warning code but is no bump candidate.
     let unparseable = r#"{"ok":true,"data":{"checks":[{"name":"omp_version","status":"warn","value":"unprobed","detail":"cannot parse omp --version output"}]},"warnings":[{"code":"omp_version_untested","message":"cannot parse omp --version output \"x\"; treating this omp as untested"}]}"#;
@@ -419,13 +419,13 @@ fn omp_latest_summary_names_version_outcomes_and_bump_candidate() -> Result {
     let ok = ["success"; 4];
     for (version, outcomes, doctor, want, absent) in [
         (
-            "18.15.0",
+            "18.17.0",
             ok,
             Some(untested),
             vec![
-                "omp version: 18.15.0",
-                "bump candidate: omp 18.15.0",
-                "max_tested 18.14.0",
+                "omp version: 18.17.0",
+                "bump candidate: omp 18.17.0",
+                "max_tested 18.16.0",
             ],
             vec!["FAILED", "no bump needed"],
         ),
@@ -444,7 +444,7 @@ fn omp_latest_summary_names_version_outcomes_and_bump_candidate() -> Result {
             vec!["FAILED", "bump candidate"],
         ),
         (
-            "18.15.0",
+            "18.17.0",
             ["success", "failure", "success", "success"],
             Some(untested),
             vec!["- surface: failure", "FAILED: surface (failure)"],
