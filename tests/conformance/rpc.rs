@@ -1385,7 +1385,14 @@ fn ac215_a_completed_but_unsettled_run_completes_at_the_deadline_with_a_warning(
     let out = rb
         .glen(["send", A.handle, "hi", "--wait", "20s", "--json"])
         .env("FAKE_OMP_SCENARIO", "never_settles")
-        .env("GLEN_JOB_TIMEOUT", "2s")
+        // Scaled: the turn has to complete inside the deadline for it to end unsettled.
+        .env(
+            "GLEN_JOB_TIMEOUT",
+            format!(
+                "{}ms",
+                crate::flake::scaled(Duration::from_secs(2)).as_millis()
+            ),
+        )
         .run();
     let env = ok_doc(&out, 0);
     let d = &env["data"];
