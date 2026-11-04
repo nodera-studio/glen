@@ -1,5 +1,6 @@
 #![cfg(unix)]
 mod common;
+use common::flake::{self, CaptureExt};
 use common::{A_ID, Holder};
 use glen::{
     error::{ErrorCode, GlenError},
@@ -88,7 +89,7 @@ fn follow(command: &mut Command) -> Result<String, GlenError> {
         Ok(all)
     });
     let result = (|| {
-        rx.recv_timeout(Duration::from_secs(10))
+        rx.recv_timeout(flake::scaled(Duration::from_secs(10)))
             .map_err(|e| invalid(format!("tail header: {e}")))?;
         let signal = Command::new("/bin/kill")
             .args(["-INT", &child.id().to_string()])
@@ -98,7 +99,7 @@ fn follow(command: &mut Command) -> Result<String, GlenError> {
         }
         let start = Instant::now();
         while child.try_wait()?.is_none() {
-            if start.elapsed() >= Duration::from_secs(10) {
+            if start.elapsed() >= flake::scaled(Duration::from_secs(10)) {
                 return Err(invalid("tail did not exit after SIGINT"));
             }
             thread::sleep(Duration::from_millis(20));
@@ -252,7 +253,7 @@ fn demo_capture_matches() -> Result<(), GlenError> {
             let stdout = if name == "tail-f" {
                 follow(&mut command)?
             } else {
-                let output = command.output()?;
+                let output = command.try_captured()?;
                 assert!(output.status.success(), "{output:?}");
                 assert!(output.stderr.is_empty(), "{output:?}");
                 String::from_utf8(output.stdout).map_err(|e| invalid(e.to_string()))?

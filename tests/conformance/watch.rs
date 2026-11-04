@@ -14,7 +14,9 @@
 //!
 //! Timing ACs are asserted at their bound plus `SLACK` for pty, debug-build and parallel-test
 //! scheduling (the plan's Step 10 allows the same); the terminal restore keeps a tighter
-//! allowance (`RESTORE_SLACK`).
+//! allowance (`RESTORE_SLACK`). Under `scripts/flake-check.sh` the upper bounds and waits are
+//! multiplied by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact otherwise); lower bounds and the
+//! `never` windows are not.
 //!
 //! Readings this suite takes where the plan leaves room:
 //! - R1 The terminal gate (AC-501) runs before session resolution: `watch nosuch1 | cat` is `usage`.
@@ -53,13 +55,14 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use rustix::process::Signal;
 use serde_json::{Value, json};
 
+use crate::flake::scaled;
 use crate::live_support::*;
 use crate::reader::*;
 use crate::rpc_support::*;
@@ -784,6 +787,8 @@ pub struct Tui {
     ctty: Ctty,
     out: Arc<Mutex<Vec<u8>>>,
     stop: Arc<AtomicBool>,
+    /// The reader's passes that found nothing to read (`Tui::drain`).
+    idle: Arc<AtomicU64>,
     vt: Vt,
     fed: usize,
     pub desc: String,
@@ -857,8 +862,9 @@ impl Tui {
         let pid = child.id();
         let out = Arc::new(Mutex::new(Vec::new()));
         let stop = Arc::new(AtomicBool::new(false));
+        let idle = Arc::new(AtomicU64::new(0));
         let mut reader = pty.master.try_clone().expect("dup master");
-        let (sink, st) = (Arc::clone(&out), Arc::clone(&stop));
+        let (sink, st, passes) = (Arc::clone(&out), Arc::clone(&stop), Arc::clone(&idle));
         std::thread::spawn(move || {
             let mut buf = [0u8; 65536];
             while !st.load(Ordering::Relaxed) {
@@ -868,16 +874,20 @@ impl Tui {
                     revents: 0,
                 };
                 let r = unsafe { libc::poll(&mut pfd, 1, 50) };
-                if r <= 0 {
+                if r < 0 {
                     continue;
                 }
-                if pfd.revents & libc::POLLIN == 0 {
+                if r > 0
+                    && pfd.revents & libc::POLLIN != 0
+                    && let Ok(n @ 1..) = reader.read(&mut buf)
+                {
+                    sink.lock().unwrap().extend_from_slice(&buf[..n]);
+                    continue;
+                }
+                // A timed-out poll, no POLLIN, or end of file: nothing was left to read.
+                passes.fetch_add(1, Ordering::Release);
+                if r > 0 {
                     std::thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-                match reader.read(&mut buf) {
-                    Ok(0) | Err(_) => std::thread::sleep(Duration::from_millis(20)),
-                    Ok(n) => sink.lock().unwrap().extend_from_slice(&buf[..n]),
                 }
             }
         });
@@ -889,6 +899,7 @@ impl Tui {
             ctty,
             out,
             stop,
+            idle,
             fed: 0,
             desc,
             status: None,
@@ -961,7 +972,7 @@ impl Tui {
             }
             let _ = tx.send(());
         });
-        rx.recv_timeout(Duration::from_secs(60))
+        rx.recv_timeout(scaled(Duration::from_secs(60)))
             .expect("the paste was not consumed within 60 s");
         std::thread::sleep(Duration::from_millis(60));
     }
@@ -1004,12 +1015,24 @@ impl Tui {
         self.try_status().is_none()
     }
 
+    /// Block until the reader has taken every byte glen wrote before this call: until a reader
+    /// pass that began after the call found nothing left to read (the second such pass from now).
+    /// Bounded, in case something outside glen keeps writing to the pty.
+    fn drain(&self) {
+        let seen = self.idle.load(Ordering::Acquire);
+        let deadline = Instant::now() + scaled(UI);
+        while self.idle.load(Ordering::Acquire) < seen + 2 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// Wait for exit; returns the exit code (panics on a signal death).
     pub fn wait_exit(&mut self, timeout: Duration) -> i32 {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         loop {
             if let Some(st) = self.try_status() {
-                std::thread::sleep(Duration::from_millis(150));
+                self.drain();
                 self.screen();
                 return st.code().unwrap_or_else(|| {
                     let ctx = self.ctx();
@@ -1026,6 +1049,7 @@ impl Tui {
 
     /// Poll the screen until `pred` holds.
     pub fn wait_for(&mut self, what: &str, timeout: Duration, pred: impl Fn(&Vt) -> bool) {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         loop {
             if pred(self.screen()) {
@@ -1036,7 +1060,7 @@ impl Tui {
                 panic!("timed out after {timeout:?} waiting for {what}\n{ctx}");
             }
             if self.status.is_none() && self.try_status().is_some() {
-                std::thread::sleep(Duration::from_millis(150));
+                self.drain();
                 if pred(self.screen()) {
                     return;
                 }
@@ -1091,7 +1115,7 @@ impl Tui {
                 })
                 .collect()
         };
-        let deadline = Instant::now() + UI;
+        let deadline = Instant::now() + scaled(UI);
         let mut last = norm(self.screen());
         let mut since = Instant::now();
         while Instant::now() < deadline {
@@ -1726,6 +1750,7 @@ fn short_item(i: usize) -> String {
 
 /// Time from now until the alternate screen has been left after its last entry.
 fn time_to_restore(t: &Tui, t0: Instant, timeout: Duration) -> Option<Duration> {
+    let timeout = scaled(timeout);
     loop {
         let b = t.bytes();
         if let Some(on) = rfind(&b, ALT_ON)
@@ -1742,6 +1767,7 @@ fn time_to_restore(t: &Tui, t0: Instant, timeout: Duration) -> Option<Duration> 
 
 /// Time from now until the child has exited.
 fn time_to_exit(t: &mut Tui, t0: Instant, timeout: Duration) -> Option<Duration> {
+    let timeout = scaled(timeout);
     loop {
         if t.try_status().is_some() {
             return Some(t0.elapsed());
@@ -1792,7 +1818,7 @@ fn palette_tokens(v: &Vt, depth: Depth, theme: Theme, ctx: &str) -> BTreeSet<&'s
 
 /// `job.json` once it is readable (the job directory appears first).
 fn job_of(rb: &RpcBox, id: &str) -> Value {
-    rb.wait_file(&rb.job_dir(id).join("job.json"), LONG)
+    rb.wait_file(&rb.job_dir(id).join("job.json"), scaled(LONG))
 }
 
 fn job_ids_now(rb: &RpcBox) -> Vec<String> {
@@ -1801,13 +1827,13 @@ fn job_ids_now(rb: &RpcBox) -> Vec<String> {
 
 /// Wait for a job id not in `before`.
 fn new_job(rb: &RpcBox, before: &[String]) -> String {
-    poll_until("a new job directory", LONG, || {
+    poll_until("a new job directory", scaled(LONG), || {
         rb.job_ids().into_iter().find(|i| !before.contains(i))
     })
 }
 
 fn wait_file_exists(p: &Path, timeout: Duration) {
-    poll_until(&format!("{}", p.display()), timeout, || {
+    poll_until(&format!("{}", p.display()), scaled(timeout), || {
         p.exists().then_some(())
     });
 }
@@ -2302,7 +2328,13 @@ fn ac504_items_appended_while_following_render_like_tail_f_human() {
             "toolUse",
         ),
     );
-    std::thread::sleep(Duration::from_millis(700));
+    // Both followers have read the call before the result is written (no sleep-ordered write).
+    st.wait_for_text("Running the suite.", T);
+    t.wait_for("the tool call", UI, |v| {
+        pane_lines(v)
+            .iter()
+            .any(|l| l.contains("Running the suite."))
+    });
     append_line(
         &a,
         &tool_result(
@@ -2925,7 +2957,7 @@ fn ac511_routing_shows_sending_locks_editing_and_keeps_keys_live() {
     let took = t0.elapsed();
     eprintln!("Tab while routing: {took:?}");
     assert!(
-        took <= Duration::from_millis(50) + RESTORE_SLACK,
+        took <= scaled(Duration::from_millis(50) + RESTORE_SLACK),
         "key handling blocked: {took:?}"
     );
     fs::write(&gate, "").unwrap();
@@ -3165,7 +3197,7 @@ fn ac513_a_running_job_shows_spinner_progress_and_elapsed_then_completed() {
     fs::write(&release, "").unwrap();
     // Status → strip within 500 ms.
     let done = format!("✓ completed · {jh}");
-    let deadline = Instant::now() + LONG;
+    let deadline = Instant::now() + scaled(LONG);
     let mut t_status = None;
     loop {
         if t_status.is_none()
@@ -3184,7 +3216,7 @@ fn ac513_a_running_job_shows_spinner_progress_and_elapsed_then_completed() {
     let lag = t_status.map(|s| s.elapsed()).unwrap_or_default();
     eprintln!("status.json → strip: {lag:?}");
     assert!(
-        lag <= Duration::from_millis(500) + SLACK,
+        lag <= scaled(Duration::from_millis(500) + SLACK),
         "strip lagged {lag:?}"
     );
     rb.wait_terminal(&id);
@@ -4071,7 +4103,7 @@ fn ac517_below_40x10_only_the_size_message_shows() {
 fn resize_and_settle(t: &mut Tui, w: u16, h: u16) {
     let clears = t.screen().clears;
     t.resize(w, h);
-    let deadline = Instant::now() + Duration::from_secs(3);
+    let deadline = Instant::now() + scaled(Duration::from_secs(3));
     while Instant::now() < deadline && t.screen().clears == clears {
         std::thread::sleep(Duration::from_millis(10));
     }
@@ -4495,7 +4527,7 @@ type Check<'a> = (&'a str, &'a dyn Fn(&Vt) -> bool);
 
 /// Evaluate every expectation and report all misses at once.
 fn expect_all(t: &mut Tui, checks: &[Check<'_>]) {
-    let deadline = Instant::now() + UI;
+    let deadline = Instant::now() + scaled(UI);
     loop {
         let v = t.screen().clone();
         let missed: Vec<&str> = checks
@@ -5103,11 +5135,11 @@ fn ac522_q_restores_within_250ms_and_exits_0() {
         let exit = time_to_exit(&mut t, t0, UI).unwrap_or_else(|| panic!("no exit\n{}", t.ctx()));
         eprintln!("{ctty:?}: q → restore {restore:?}, exit {exit:?}");
         assert!(
-            restore <= Duration::from_millis(250) + RESTORE_SLACK,
+            restore <= scaled(Duration::from_millis(250) + RESTORE_SLACK),
             "restore took {restore:?}"
         );
         assert!(
-            exit <= Duration::from_millis(300) + RESTORE_SLACK,
+            exit <= scaled(Duration::from_millis(300) + RESTORE_SLACK),
             "exit took {exit:?}"
         );
         assert_eq!(t.wait_exit(UI), 0, "{}", t.ctx());
@@ -5143,7 +5175,7 @@ fn ac522_quit_waits_for_an_in_flight_submit() {
     let restore = time_to_restore(&t, t0, UI).unwrap_or_else(|| panic!("no restore\n{}", t.ctx()));
     eprintln!("q with a submit in flight → restore {restore:?}");
     assert!(
-        restore <= Duration::from_millis(250) + RESTORE_SLACK,
+        restore <= scaled(Duration::from_millis(250) + RESTORE_SLACK),
         "restore waited for the submit: {restore:?}"
     );
     std::thread::sleep(Duration::from_millis(700));
@@ -5172,7 +5204,7 @@ fn ac523_signals_restore_and_exit_128_plus_n() {
             .unwrap_or_else(|| panic!("no restore on {sig:?}\n{}", t.ctx()));
         eprintln!("{sig:?} → restore {restore:?}");
         assert!(
-            restore <= Duration::from_millis(250) + RESTORE_SLACK,
+            restore <= scaled(Duration::from_millis(250) + RESTORE_SLACK),
             "{sig:?}: restore took {restore:?}"
         );
         assert_eq!(t.wait_exit(UI), code, "{sig:?}\n{}", t.ctx());
@@ -5230,7 +5262,7 @@ fn frame_write_failure(stderr_on_tty: bool) -> FrameFailure {
             }
         }
     });
-    poll_until("the first frame", UI, || {
+    poll_until("the first frame", scaled(UI), || {
         let b = seen.lock().unwrap().clone();
         let mut vt = Vt::new(120, 40);
         vt.feed(&b);
@@ -5254,7 +5286,7 @@ fn frame_write_failure(stderr_on_tty: bool) -> FrameFailure {
         if let Some(st) = child.try_wait().unwrap() {
             break st;
         }
-        if t0.elapsed() > UI {
+        if t0.elapsed() > scaled(UI) {
             let _ = child.kill();
             panic!("glen kept running after its terminal went away");
         }
@@ -5350,7 +5382,7 @@ fn orchestrator_decision_2_a_second_signal_while_waiting_exits_at_once() {
         .unwrap_or_else(|| panic!("no exit 10 s after the second SIGINT\n{}", t.ctx()));
     eprintln!("second SIGINT → exit {exit:?}");
     assert!(
-        exit <= Duration::from_millis(500) + RESTORE_SLACK,
+        exit <= scaled(Duration::from_millis(500) + RESTORE_SLACK),
         "the second SIGINT exited only after {exit:?} (the submit was still held)"
     );
     assert_eq!(t.wait_exit(UI), 130);

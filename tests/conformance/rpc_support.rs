@@ -16,11 +16,11 @@
 
 use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -28,6 +28,7 @@ use rustix::io::Errno;
 use rustix::process::{Pid, Signal};
 use serde_json::{Map, Value, json};
 
+use crate::flake::{Captured, scaled};
 use crate::reader::*;
 use crate::support::*;
 
@@ -73,53 +74,13 @@ pub const TERMINAL: [&str; 4] = ["completed", "aborted", "failed", "lost"];
 // The fake peer.
 // ---------------------------------------------------------------------------------------------
 
-/// The `fake_omp` example next to the glen binary under test, (re)built once per test process so
-/// a filtered `cargo test --test conformance` never runs a stale or missing peer.
+/// The `fake_omp` example for the glen binary under test, (re)built once per test process so a
+/// filtered `cargo test --test conformance` never runs a stale or missing peer, at the path no
+/// concurrent cargo run removes (`flake::example`).
 pub fn fake_omp_bin() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let exe = Path::new(BIN_PATH);
-        let profile_dir = exe.parent().expect("glen binary has a parent dir");
-        let target_dir = profile_dir.parent().expect("target dir");
-        let profile = profile_dir
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("debug");
-        let mut cmd = Command::new(env!("CARGO"));
-        cmd.args([
-            "build",
-            "--quiet",
-            "--locked",
-            "--offline",
-            "--example",
-            "fake_omp",
-        ])
-        .arg("--manifest-path")
-        .arg(repo_root().join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(target_dir);
-        match profile {
-            "debug" => {}
-            "release" => {
-                cmd.arg("--release");
-            }
-            other => {
-                cmd.args(["--profile", other]);
-            }
-        }
-        let out = cmd.output().expect("run cargo build --example fake_omp");
-        assert!(
-            out.status.success(),
-            "cargo build --example fake_omp failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let bin = profile_dir.join("examples/fake_omp");
-        assert!(bin.is_file(), "no fake peer at {}", bin.display());
-        bin
-    })
+    BIN.get_or_init(|| crate::flake::example("fake_omp"))
 }
-
-const BIN_PATH: &str = env!("CARGO_BIN_EXE_glen");
 
 // ---------------------------------------------------------------------------------------------
 // Ids, handles, timestamps.
@@ -258,31 +219,20 @@ pub fn fd_target(pid: i64, fd: u32) -> Option<String> {
     } else {
         "lsof"
     };
-    let out = Command::new(lsof)
-        .args(["-a", "-p", &pid.to_string(), "-d", &fd.to_string(), "-Fn"])
-        .output()
-        .ok()?;
+    let mut cmd = Command::new(lsof);
+    cmd.args(["-a", "-p", &pid.to_string(), "-d", &fd.to_string(), "-Fn"]);
+    let out = crate::flake::try_output(&mut cmd).ok()?;
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .find_map(|l| l.strip_prefix('n'))
         .map(str::to_owned)
 }
 
-/// Collect a spawned child's output with a bound, as an `Out`.
-pub fn finish(mut child: Child, desc: &str, timeout: Duration) -> Out {
+/// Collect a spawned child's output with a bound, as an `Out`. The output is in files
+/// (`flake::Captured`), so this returns at the child's exit: a pipe read to end of file would also
+/// wait for any process that inherited its write end from a concurrent spawn.
+pub fn finish(mut child: Captured, desc: &str, timeout: Duration) -> Out {
     let started = Instant::now();
-    let mut so = child.stdout.take().expect("piped stdout");
-    let mut se = child.stderr.take().expect("piped stderr");
-    let to = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b);
-        b
-    });
-    let te = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b);
-        b
-    });
     let status = loop {
         if let Some(st) = child.try_wait().unwrap() {
             break st;
@@ -294,12 +244,14 @@ pub fn finish(mut child: Child, desc: &str, timeout: Duration) -> Out {
         }
         std::thread::sleep(Duration::from_millis(10));
     };
+    let elapsed = started.elapsed();
+    let output = child.output(status);
     Out {
         desc: format!("glen {desc}"),
         status,
-        stdout: to.join().unwrap(),
-        stderr: te.join().unwrap(),
-        elapsed: started.elapsed(),
+        stdout: output.stdout,
+        stderr: output.stderr,
+        elapsed,
     }
 }
 
@@ -640,7 +592,7 @@ impl RpcBox {
 
     /// A `glen` command with the box environment, from `cwd`, stdin `/dev/null`.
     pub fn command_in(&self, cwd: &Path, args: &[OsString]) -> Command {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(glen_bin());
         cmd.env_clear()
             .args(args)
             .env("HOME", &self.bx.home)
@@ -692,29 +644,25 @@ impl RpcBox {
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd.spawn().expect("spawn glen");
+        cmd.stdin(Stdio::piped());
+        let mut child = Captured::spawn(&mut cmd).expect("spawn glen");
         let mut stdin = child.stdin.take().unwrap();
         let bytes = input.to_vec();
         std::thread::spawn(move || {
             let _ = stdin.write_all(&bytes);
         });
-        finish(child, &args.join(" "), Duration::from_secs(60))
+        finish(child, &args.join(" "), scaled(Duration::from_secs(60)))
     }
 
     /// Spawn `glen` as the leader of its own process group (a terminal's foreground job), with
-    /// piped stdout and stderr.
-    pub fn spawn_group(&self, args: &[&str], env: &[(&str, &str)]) -> Child {
+    /// its stdout and stderr captured in files.
+    pub fn spawn_group(&self, args: &[&str], env: &[(&str, &str)]) -> Captured {
         let mut cmd = self.command(args);
         for (k, v) in env {
             cmd.env(k, v);
         }
-        cmd.process_group(0)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        cmd.spawn().expect("spawn glen")
+        cmd.process_group(0);
+        Captured::spawn(&mut cmd).expect("spawn glen")
     }
 
     // -- jobs on disk -------------------------------------------------------------------------
@@ -786,12 +734,12 @@ impl RpcBox {
     }
 
     pub fn wait_terminal(&self, id: &str) -> Value {
-        self.wait_status(id, "terminal", LONG, is_terminal)
+        self.wait_status(id, "terminal", scaled(LONG), is_terminal)
     }
 
     /// The only job directory, once it exists.
     pub fn wait_one_job(&self) -> String {
-        poll_until("a job directory", LONG, || {
+        poll_until("a job directory", scaled(LONG), || {
             let ids = self.job_ids();
             (ids.len() == 1).then(|| ids[0].clone())
         })
@@ -816,7 +764,7 @@ impl RpcBox {
     }
 
     pub fn wait_log(&self, what: &str, pred: impl Fn(&[Value]) -> bool) -> Vec<Value> {
-        poll_until(what, LONG, || {
+        poll_until(what, scaled(LONG), || {
             let r = self.recs();
             pred(&r).then_some(r)
         })
@@ -964,16 +912,20 @@ impl RpcBox {
         v
     }
 
-    /// Every worker and fake omp process has exited (bounded at 20 s).
+    /// Every worker and fake omp process has exited (bounded at 20 s, scaled).
     pub fn assert_quiet(&self) {
-        let deadline = Instant::now() + LONG;
+        let deadline = Instant::now() + scaled(LONG);
         loop {
             let live = self.live_processes();
             if live.is_empty() {
                 return;
             }
             if Instant::now() >= deadline {
-                panic!("still running {LONG:?} later: {live:?}\n{}", self.diag());
+                panic!(
+                    "still running {:?} later: {live:?}\n{}",
+                    scaled(LONG),
+                    self.diag()
+                );
             }
             std::thread::sleep(Duration::from_millis(50));
         }

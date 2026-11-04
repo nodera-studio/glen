@@ -1,4 +1,5 @@
 mod common;
+use common::flake::CaptureExt;
 use common::{OmpBox, data};
 use serde_json::{Value, json};
 use std::fs;
@@ -105,8 +106,7 @@ fn show_and_ls_bound_compaction_and_preview_to_the_same_head() {
         let shown = data(
             &sb.command(&["show", path.to_str().unwrap(), "--json"], &sb.alpha())
                 .env("GLEN_MAX_OUTPUT", "0")
-                .output()
-                .unwrap(),
+                .captured(),
         );
         assert_eq!(row["title"], expected_title);
         assert_eq!(shown["session"]["title"], expected_title);
@@ -193,16 +193,14 @@ fn listing_footer_pluralizes_one_and_many() {
     let out = sb
         .command(&["ls", "--all", "--human"], &sb.alpha())
         .env("PI_CODING_AGENT_DIR", &isolated)
-        .output()
-        .unwrap();
+        .captured();
     assert!(out.status.success());
     let human = String::from_utf8(out.stdout).unwrap();
     assert!(human.contains("1 session · 0 live"), "{human}");
     let empty = sb
         .command(&["ls", "--human"], &sb.alpha())
         .env("PI_CODING_AGENT_DIR", &isolated)
-        .output()
-        .unwrap();
+        .captured();
     assert!(empty.status.success());
     let human = String::from_utf8(empty.stdout).unwrap();
     assert!(
@@ -217,8 +215,7 @@ fn listing_footer_pluralizes_one_and_many() {
     let out = sb
         .command(&["ls", "--all", "--human"], &sb.alpha())
         .env("PI_CODING_AGENT_DIR", &isolated)
-        .output()
-        .unwrap();
+        .captured();
     assert!(
         String::from_utf8(out.stdout)
             .unwrap()
@@ -227,8 +224,7 @@ fn listing_footer_pluralizes_one_and_many() {
     let empty = sb
         .command(&["ls", "--human"], &sb.alpha())
         .env("PI_CODING_AGENT_DIR", &isolated)
-        .output()
-        .unwrap();
+        .captured();
     assert!(empty.status.success());
     let human = String::from_utf8(empty.stdout).unwrap();
     assert!(

@@ -1,4 +1,5 @@
 mod common;
+use common::flake::{self, CaptureExt};
 #[path = "support/fake_ext.rs"]
 mod fake_ext_peer;
 use common::{A_ID, LiveBox, data, json, poll, write_control};
@@ -29,8 +30,11 @@ fn send(b: &LiveBox, args: &[&str]) -> std::process::Output {
     b.rpc
         .glen(&a)
         .env("GLEN_OMP_BIN", "/nonexistent")
-        .output()
-        .unwrap()
+        .captured()
+}
+/// A `--timeout` or `--wait` value: `d` scaled.
+fn ms(d: Duration) -> String {
+    format!("{}ms", flake::scaled(d).as_millis())
 }
 fn job_id(v: &Value) -> &str {
     v["job"]["id"].as_str().unwrap()
@@ -57,10 +61,10 @@ fn fake_ext_answers_a_request_sent_after_a_delay() {
     };
     let mut stream = UnixStream::connect(&registry.socket).unwrap();
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(flake::scaled(Duration::from_secs(5))))
         .unwrap();
     stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
+        .set_write_timeout(Some(flake::scaled(Duration::from_secs(10))))
         .unwrap();
     std::thread::sleep(Duration::from_millis(300));
     writeln!(
@@ -91,10 +95,10 @@ fn partial_request_peer(
     std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(flake::scaled(Duration::from_secs(10))))
             .unwrap();
         stream
-            .set_write_timeout(Some(Duration::from_secs(10)))
+            .set_write_timeout(Some(flake::scaled(Duration::from_secs(10))))
             .unwrap();
         let mut prefix = [0; 4096];
         stream.read_exact(&mut prefix).unwrap();
@@ -149,7 +153,7 @@ fn live_client_drains_a_reply_after_a_partial_request_write() {
                     if reply == "response" {
                         let first = conn
                             .rx
-                            .recv_timeout(Duration::from_secs(10))
+                            .recv_timeout(flake::scaled(Duration::from_secs(10)))
                             .unwrap()
                             .unwrap();
                         assert!(
@@ -159,7 +163,7 @@ fn live_client_drains_a_reply_after_a_partial_request_write() {
                     // Also verifies draining the first line did not discard the next frame.
                     let event = conn
                         .rx
-                        .recv_timeout(Duration::from_secs(10))
+                        .recv_timeout(flake::scaled(Duration::from_secs(10)))
                         .unwrap()
                         .unwrap();
                     assert!(
@@ -167,7 +171,7 @@ fn live_client_drains_a_reply_after_a_partial_request_write() {
                     );
                     assert!(
                         conn.rx
-                            .recv_timeout(Duration::from_secs(10))
+                            .recv_timeout(flake::scaled(Duration::from_secs(10)))
                             .unwrap()
                             .is_err()
                     );
@@ -175,13 +179,13 @@ fn live_client_drains_a_reply_after_a_partial_request_write() {
             } else {
                 let op = Op::Send(args);
                 let result = if route == "unary" {
-                    client::unary(&path, &op, Duration::from_secs(10))
+                    client::unary(&path, &op, flake::scaled(Duration::from_secs(10)))
                 } else {
                     client::unary_for(
                         &path,
                         &op,
                         A_ID,
-                        Duration::from_secs(10),
+                        flake::scaled(Duration::from_secs(10)),
                         Arc::new(AtomicBool::new(false)),
                     )
                 };
@@ -236,7 +240,7 @@ fn fake_ext_protocol_table() {
         let timeout = if scenario == "hang" {
             Duration::from_millis(200)
         } else {
-            Duration::from_secs(10)
+            flake::scaled(Duration::from_secs(10))
         };
         let hello = client::hello(&r.socket, timeout);
         if scenario == "hang" {
@@ -248,8 +252,13 @@ fn fake_ext_protocol_table() {
             continue;
         }
         assert!(hello.is_ok());
-        assert!(client::state(&r.socket, Duration::from_secs(10)).is_ok());
-        let err = client::unary(&r.socket, &Op::Abort, Duration::from_secs(10)).unwrap_err();
+        assert!(client::state(&r.socket, flake::scaled(Duration::from_secs(10))).is_ok());
+        let err = client::unary(
+            &r.socket,
+            &Op::Abort,
+            flake::scaled(Duration::from_secs(10)),
+        )
+        .unwrap_err();
         match err {
             client::ClientError::Refused(e) => {
                 assert_eq!(e.code, "unsupported_op");
@@ -278,14 +287,14 @@ fn fake_ext_protocol_table() {
         }
         let first = conn
             .rx
-            .recv_timeout(Duration::from_secs(10))
+            .recv_timeout(flake::scaled(Duration::from_secs(10)))
             .unwrap()
             .unwrap();
         assert!(matches!(first, Frame::Response { .. }));
         if matches!(scenario, "no_send" | "rekey" | "never_settles" | "queued") {
             continue;
         }
-        let end = Instant::now() + Duration::from_secs(10);
+        let end = Instant::now() + flake::scaled(Duration::from_secs(10));
         loop {
             let f = conn
                 .rx
@@ -348,11 +357,7 @@ fn ac314_stale_registries_fall_through() {
                 fs::write(&socket, "").unwrap();
             }
         }
-        let o = b
-            .rpc
-            .glen(&["send", "e27c0de", "hi", "--json"])
-            .output()
-            .unwrap();
+        let o = b.rpc.glen(&["send", "e27c0de", "hi", "--json"]).captured();
         let d = data(&o);
         assert_eq!(d["job"]["route"], "rpc");
         assert!(!b.registry(A_ID).exists());
@@ -379,7 +384,7 @@ fn ac314_unhealthy_refuses_before_job_creation() {
         let start = Instant::now();
         let o = send(&b, &[]);
         assert_eq!(o.status.code(), Some(6), "{o:?}");
-        assert!(start.elapsed() < Duration::from_secs(3));
+        assert!(start.elapsed() < flake::scaled(Duration::from_secs(3)));
         assert!(!b.rpc.omp.glen_home.join("jobs").exists());
         let hint = json(&o)["error"]["hint"].as_str().unwrap().to_owned();
         assert!(hint.contains("glen install-extension"));
@@ -435,17 +440,21 @@ fn ac315_worker_refuses_late_endpoint() {
     let o = b
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(o.status.code(), Some(10));
     let d = json(&o)["data"].clone();
     b.start_ext(A_ID, "ok", &[]);
     drop(lock);
     let o = b
         .rpc
-        .glen(&["wait", job_id(&d), "--timeout", "10s", "--json"])
-        .output()
-        .unwrap();
+        .glen(&[
+            "wait",
+            job_id(&d),
+            "--timeout",
+            &ms(Duration::from_secs(10)),
+            "--json",
+        ])
+        .captured();
     assert_eq!(o.status.code(), Some(6));
     assert_eq!(error_code(&o), "no_route");
     assert!(b.rpc.fake_log().is_empty());
@@ -544,17 +553,23 @@ fn ac317_timeouts_ack_and_consumption() {
         let start = Instant::now();
         let o = b
             .rpc
-            .glen(&["send", "e27c0de", "hi", "--wait", "15s", "--json"])
+            .glen(&[
+                "send",
+                "e27c0de",
+                "hi",
+                "--wait",
+                &ms(Duration::from_secs(15)),
+                "--json",
+            ])
             .env("GLEN_JOB_TIMEOUT", timeout)
             .env("GLEN_OMP_BIN", "/nonexistent")
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(o.status.code(), Some(7), "{o:?}");
         assert_eq!(error_code(&o), expected);
         if !hint.is_empty() {
             assert!(json(&o)["error"]["hint"].as_str().unwrap().contains(hint));
         }
-        assert!(start.elapsed() < Duration::from_secs(12));
+        assert!(start.elapsed() < flake::scaled(Duration::from_secs(12)));
         wait_failed(&b, &o);
     }
 }
@@ -569,18 +584,23 @@ fn ac317_foreground_wait_control_and_cancellation() {
     let dir = b.rpc.job_dir(id).join("control");
     let start = Instant::now();
     write_control(&dir, "abort.json", r#"{"v":1,"op":"abort"}"#);
-    let result: Value = poll(Duration::from_millis(1500), || {
+    let result: Value = poll(flake::scaled(Duration::from_millis(1500)), || {
         fs::read(dir.join("abort.done.json"))
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
     });
     assert_eq!(result["error"]["code"], "unsupported_op");
-    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert!(start.elapsed() < flake::scaled(Duration::from_millis(1500)));
     let out = b
         .rpc
-        .glen(&["wait", id, "--timeout", "10s", "--json"])
-        .output()
-        .unwrap();
+        .glen(&[
+            "wait",
+            id,
+            "--timeout",
+            &ms(Duration::from_secs(10)),
+            "--json",
+        ])
+        .captured();
     assert!(out.status.success());
     b.rpc.wait_worker_gone(id);
     let mut b = LiveBox::new();
@@ -588,10 +608,10 @@ fn ac317_foreground_wait_control_and_cancellation() {
     let start = Instant::now();
     let o = send(&b, &["--no-wait"]);
     assert_eq!(o.status.code(), Some(10));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    assert!(start.elapsed() < flake::scaled(Duration::from_secs(2)));
     let v = json(&o);
     let id = job_id(&v["data"]);
-    let status = poll(Duration::from_secs(10), || {
+    let status = poll(flake::scaled(Duration::from_secs(10)), || {
         let s = b.rpc.job(id).1;
         (s["status"] == "accepted").then_some(s)
     });
@@ -599,11 +619,13 @@ fn ac317_foreground_wait_control_and_cancellation() {
         rustix::process::Pid::from_raw(status["worker_pid"].as_i64().unwrap() as i32).unwrap();
     let start = Instant::now();
     rustix::process::kill_process(pid, rustix::process::Signal::TERM).unwrap();
-    let s = b.rpc.wait_terminal(id, Duration::from_millis(1500));
+    let s = b
+        .rpc
+        .wait_terminal(id, flake::scaled(Duration::from_millis(1500)));
     assert_eq!(s["status"], "aborted");
     assert_eq!(s["error"]["code"], "cancelled");
     assert_eq!(s["warnings"][0]["code"], "live_turn_continues");
-    assert!(start.elapsed() < Duration::from_millis(1500));
+    assert!(start.elapsed() < flake::scaled(Duration::from_millis(1500)));
     b.rpc.wait_worker_gone(id);
 }
 #[test]
@@ -611,12 +633,7 @@ fn ac318_ls_extension_state_and_parallel_budget() {
     for scenario in ["ok", "busy"] {
         let mut b = LiveBox::new();
         b.start_ext(A_ID, scenario, &[]);
-        let d = data(
-            &b.rpc
-                .glen(&["ls", "--all", "--live", "--json"])
-                .output()
-                .unwrap(),
-        );
+        let d = data(&b.rpc.glen(&["ls", "--all", "--live", "--json"]).captured());
         let row = d["sessions"]
             .as_array()
             .unwrap()
@@ -632,7 +649,7 @@ fn ac318_ls_extension_state_and_parallel_budget() {
     }
     let mut b = LiveBox::new();
     let start = Instant::now();
-    b.rpc.glen(&["ls", "--all", "--json"]).output().unwrap();
+    b.rpc.glen(&["ls", "--all", "--json"]).captured();
     let baseline = start.elapsed();
     for id in [
         A_ID,
@@ -642,8 +659,8 @@ fn ac318_ls_extension_state_and_parallel_budget() {
         b.start_ext(id, "hang", &[]);
     }
     let start = Instant::now();
-    let d = data(&b.rpc.glen(&["ls", "--all", "--json"]).output().unwrap());
-    assert!(start.elapsed().saturating_sub(baseline) < Duration::from_secs(1));
+    let d = data(&b.rpc.glen(&["ls", "--all", "--json"]).captured());
+    assert!(start.elapsed().saturating_sub(baseline) < flake::scaled(Duration::from_secs(1)));
     assert!(
         d["sessions"]
             .as_array()
@@ -697,7 +714,7 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
     let mut b = LiveBox::new();
     let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";
     b.start_ext(id, "ok", &[]);
-    let d = data(&b.rpc.glen(&["ls", "--all", "--json"]).output().unwrap());
+    let d = data(&b.rpc.glen(&["ls", "--all", "--json"]).captured());
     let row = d["sessions"]
         .as_array()
         .unwrap()
@@ -710,7 +727,7 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
     let handle = row["handle"].as_str().unwrap();
     for command in ["show", "tail"] {
         for arg in [handle, id, "@latest"] {
-            let o = b.rpc.glen(&[command, arg, "--json"]).output().unwrap();
+            let o = b.rpc.glen(&[command, arg, "--json"]).captured();
             let d = data(&o);
             assert!(d["items"].as_array().unwrap().is_empty());
             assert_eq!(d["session"]["id"], id);
@@ -725,15 +742,14 @@ fn ac326_endpoint_only_catalog_show_tail_latest_and_send() {
             .rpc
             .glen(&["send", arg, "hi", "--json"])
             .env("GLEN_OMP_BIN", "/nonexistent")
-            .output()
-            .unwrap();
+            .captured();
         let d = data(&o);
         assert_eq!(d["session"]["id"], id);
         assert_eq!(d["job"]["route"], "live");
         b.rpc.wait_worker_gone(job_id(&d));
     }
     assert!(matches!(
-        live::route::find(&home(&b), id, Duration::from_secs(10)),
+        live::route::find(&home(&b), id, flake::scaled(Duration::from_secs(10))),
         Endpoint::Live { .. }
     ));
 }
@@ -748,7 +764,7 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
     fs::write(b.registry(id),serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":null,"socket":live::run_dir(&home(&b)).join("unbound.sock"),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
     for command in ["show", "tail"] {
         for arg in [id, "e212345", "@latest"] {
-            let o = b.rpc.glen(&[command, arg, "--json"]).output().unwrap();
+            let o = b.rpc.glen(&[command, arg, "--json"]).captured();
             let d = data(&o);
             assert_eq!(d["session"]["id"], id);
             assert!(d["session"]["path"].is_null());
@@ -773,11 +789,13 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
         }
     });
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(10)))
+            .unwrap()["event"],
         "session"
     );
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()["code"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(10)))
+            .unwrap()["code"],
         "not_yet_persisted"
     );
     assert!(child.try_wait().unwrap().is_none());
@@ -787,7 +805,8 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
     )
     .unwrap();
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap()["event"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(10)))
+            .unwrap()["event"],
         "end"
     );
     assert_eq!(child.wait().unwrap().code(), Some(130));
@@ -801,7 +820,9 @@ fn submit_gate(b: &LiveBox) -> std::path::PathBuf {
 /// Waits until the debug worker's submission thread has reached the gate.
 fn wait_submit_gate(gate: &std::path::Path) {
     let ready = std::path::PathBuf::from(format!("{}.ready", gate.display()));
-    poll(Duration::from_secs(10), || ready.exists().then_some(()));
+    poll(flake::scaled(Duration::from_secs(10)), || {
+        ready.exists().then_some(())
+    });
 }
 
 #[test]
@@ -812,8 +833,7 @@ fn ac315_worker_rechecks_endpoint_at_prompt_submission() {
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
         .env("FAKE_OMP_PROMPT_SUBMIT_GATE", &gate)
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(o.status.code(), Some(10));
     let value = json(&o);
     let id = job_id(&value["data"]);
@@ -822,9 +842,14 @@ fn ac315_worker_rechecks_endpoint_at_prompt_submission() {
     fs::write(&gate, b"").unwrap();
     let out = b
         .rpc
-        .glen(&["wait", id, "--timeout", "10s", "--json"])
-        .output()
-        .unwrap();
+        .glen(&[
+            "wait",
+            id,
+            "--timeout",
+            &ms(Duration::from_secs(10)),
+            "--json",
+        ])
+        .captured();
     assert_eq!(out.status.code(), Some(6));
     assert_eq!(error_code(&out), "no_route");
     assert!(b.rpc.frames_in("prompt").is_empty());
@@ -839,8 +864,7 @@ fn ac315_worker_refuses_an_unhealthy_endpoint_at_submission() {
         .rpc
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
         .env("FAKE_OMP_PROMPT_SUBMIT_GATE", &gate)
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(o.status.code(), Some(10));
     let value = json(&o);
     let id = job_id(&value["data"]);
@@ -850,9 +874,14 @@ fn ac315_worker_refuses_an_unhealthy_endpoint_at_submission() {
     fs::write(&gate, b"").unwrap();
     let out = b
         .rpc
-        .glen(&["wait", id, "--timeout", "10s", "--json"])
-        .output()
-        .unwrap();
+        .glen(&[
+            "wait",
+            id,
+            "--timeout",
+            &ms(Duration::from_secs(10)),
+            "--json",
+        ])
+        .captured();
     assert_eq!(out.status.code(), Some(6));
     assert_eq!(error_code(&out), "no_route");
     assert!(b.rpc.frames_in("prompt").is_empty());
@@ -896,12 +925,15 @@ fn endpoint_only_tail_ends_not_found_after_disappearance_grace() {
             }
         }
     });
-    let first = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let first = rx
+        .recv_timeout(flake::scaled(Duration::from_secs(2)))
+        .unwrap();
     assert_eq!(first["event"], "session");
     assert!(first["session"]["path"].is_null());
     assert_eq!(first["session"]["state_source"], "extension");
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap()["code"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(2)))
+            .unwrap()["code"],
         "not_yet_persisted"
     );
     fs::remove_file(b.registry(id)).unwrap();
@@ -910,11 +942,13 @@ fn endpoint_only_tail_ends_not_found_after_disappearance_grace() {
         child.try_wait().unwrap().is_none(),
         "disappearance grace must be observed"
     );
-    let error = rx.recv_timeout(Duration::from_secs(7)).unwrap();
+    let error = rx
+        .recv_timeout(flake::scaled(Duration::from_secs(7)))
+        .unwrap();
     assert_eq!(error["ok"], false);
     assert_eq!(error["error"]["code"], "not_found");
     assert_eq!(child.wait().unwrap().code(), Some(3));
-    reader.join().unwrap();
+    flake::join_reader(reader);
 }
 
 #[test]
@@ -923,7 +957,7 @@ fn show_and_tail_use_extension_state_for_persisted_sessions() {
         let mut b = LiveBox::new();
         b.start_ext(A_ID, scenario, &[]);
         for command in ["show", "tail"] {
-            let o = b.rpc.glen(&[command, A_ID, "--json"]).output().unwrap();
+            let o = b.rpc.glen(&[command, A_ID, "--json"]).captured();
             let row = &data(&o)["session"];
             assert_eq!(
                 row["state_source"], "extension",
@@ -953,7 +987,6 @@ fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
     use rustix::process::{Pid, Signal, kill_process};
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
-    use std::process::Stdio;
     let b = LiveBox::new();
     fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
     let socket = live::run_dir(&home(&b)).join("stall.sock");
@@ -972,17 +1005,14 @@ fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
         let mut conclusive = false;
         for attempt in 1..=10 {
             let spawned = Instant::now();
-            let child = b
-                .rpc
-                .glen(&[command, A_ID, "--json"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .unwrap();
+            let child =
+                flake::Captured::spawn(&mut b.rpc.glen(&[command, A_ID, "--json"])).unwrap();
             let pid = Pid::from_raw(child.id() as i32).unwrap();
-            let stream = connections.recv_timeout(Duration::from_secs(10)).unwrap();
+            let stream = connections
+                .recv_timeout(flake::scaled(Duration::from_secs(10)))
+                .unwrap();
             stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
+                .set_read_timeout(Some(flake::scaled(Duration::from_secs(10))))
                 .unwrap();
             let mut line = String::new();
             BufReader::new(&stream).read_line(&mut line).unwrap();
@@ -997,7 +1027,7 @@ fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
             std::thread::sleep(past_deadline.saturating_duration_since(Instant::now()));
             kill_process(pid, Signal::CONT).unwrap();
             wrote.unwrap();
-            let o = child.wait_with_output().unwrap();
+            let o = child.wait_with_output();
             let row = &data(&o)["session"];
             if row["state_source"] == "disk" && !stopped_in_time {
                 eprintln!("{command} attempt {attempt}: stopped glen too late to prove anything");
@@ -1056,12 +1086,15 @@ fn endpoint_only_tail_waits_for_persistence_then_streams_fixture_items() {
             }
         }
     });
-    let initial = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+    let initial = rx
+        .recv_timeout(flake::scaled(Duration::from_secs(2)))
+        .unwrap();
     assert_eq!(initial["event"], "session");
     assert_eq!(initial["session"]["state_source"], "extension");
     assert!(initial["session"]["path"].is_null());
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(2)).unwrap()["code"],
+        rx.recv_timeout(flake::scaled(Duration::from_secs(2)))
+            .unwrap()["code"],
         "not_yet_persisted"
     );
     assert!(child.try_wait().unwrap().is_none());
@@ -1073,7 +1106,9 @@ fn endpoint_only_tail_waits_for_persistence_then_streams_fixture_items() {
     let mut received = Vec::new();
     let mut saw_user = false;
     for _ in 0..10 {
-        let item = rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        let item = rx
+            .recv_timeout(flake::scaled(Duration::from_secs(3)))
+            .unwrap();
         assert_eq!(item["event"], "item");
         saw_user = item["item"]
             .to_string()
@@ -1090,7 +1125,7 @@ fn endpoint_only_tail_waits_for_persistence_then_streams_fixture_items() {
     .unwrap();
     let mut ended = false;
     for _ in 0..30 {
-        match rx.recv_timeout(Duration::from_secs(2)) {
+        match rx.recv_timeout(flake::scaled(Duration::from_secs(2))) {
             Ok(frame) if frame["event"] == "end" => {
                 ended = true;
                 break;
@@ -1101,7 +1136,7 @@ fn endpoint_only_tail_waits_for_persistence_then_streams_fixture_items() {
     }
     assert!(ended);
     assert_eq!(child.wait().unwrap().code(), Some(130));
-    reader.join().unwrap();
+    flake::join_reader(reader);
     assert!(
         saw_user,
         "expected fixture user message after persistence, got {received:?}"
@@ -1137,8 +1172,7 @@ fn ac410_sandbox_and_the_live_route() {
             .glen(&["send", "e27c0de", "hi", "--json"])
             .env("GLEN_OMP_BIN", "/nonexistent")
             .envs(vars.iter().copied())
-            .output()
-            .unwrap()
+            .captured()
     };
     let mut b = LiveBox::new();
     b.start_ext(A_ID, "ok", &[]);
@@ -1216,8 +1250,7 @@ fn ac410b_connect_denied_maps_to_sandboxed() {
             .glen(&["send", "e27c0de", "hi", "--json"])
             .env("GLEN_OMP_BIN", "/nonexistent")
             .envs(vars.iter().copied())
-            .output()
-            .unwrap();
+            .captured();
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         if exit == 6 {
             assert_eq!(o.status.code(), Some(6), "{o:?}");
@@ -1261,8 +1294,7 @@ fn ac410c_registry_cleanup_denied_maps_to_sandboxed() {
             .glen(&["send", "e27c0de", "hi", "--json"])
             .env("GLEN_OMP_BIN", "/nonexistent")
             .envs(vars.iter().copied())
-            .output()
-            .unwrap();
+            .captured();
         fs::set_permissions(&reg_dir, fs::Permissions::from_mode(0o700)).unwrap();
         if exit == 6 {
             assert_eq!(o.status.code(), Some(6), "{o:?}");

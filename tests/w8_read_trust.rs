@@ -3,6 +3,7 @@
 //! writes there.
 #![cfg(unix)]
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use serde_json::Value;
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Output};
@@ -42,7 +43,7 @@ fn live_route_controls_and_send_refuse_an_untrusted_home() {
         &["models", "e27c0de", "--json"],
         &["send", "e27c0de", "planted socket", "--no-wait", "--json"],
     ] {
-        refused(b.rpc.glen(args).output().unwrap());
+        refused(b.rpc.glen(args).captured());
     }
     chmod(&root, 0o700);
     let ops: Vec<_> = b

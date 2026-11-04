@@ -81,7 +81,7 @@ fn read_endpoint_row(
 /// human state gains ` (warm)`. Registries only; nothing is probed or created.
 fn annotate_warm(rows: &mut [Row], home: &crate::glen_home::GlenHome, env: &Env, now: SystemTime) {
     use crate::rpc::warm;
-    let (entries, _) = warm::index(home);
+    let entries = warm::index(home).entries;
     if entries.is_empty() {
         return;
     }

@@ -6,6 +6,7 @@
 //! is `#[ignore]` so a normal `cargo test` never needs bwrap.
 #![cfg(target_os = "linux")]
 mod common;
+use common::flake::{self, CaptureExt};
 
 use common::{A_ID, LiveBox, RpcBox};
 use std::{
@@ -59,7 +60,7 @@ fn bwrap_pid(cmd: &Command, net: bool, pid: bool, writable: &[&std::path::Path])
     if let Some(dir) = cmd.get_current_dir() {
         c.current_dir(dir);
     }
-    run_with_timeout(c, Duration::from_secs(30))
+    run_with_timeout(c, flake::scaled(Duration::from_secs(30)))
 }
 /// `bwrap --ro-bind / / --dev /dev --proc /proc --unshare-net -- <program>` (the raw shape
 /// used by scenarios that run something other than `glen`, e.g. s10's bash probe).
@@ -93,7 +94,7 @@ fn bwrap_raw(c: Command, net: bool, writable: &[&std::path::Path]) -> Output {
         }
     }
     wrapped.env("PATH", "/usr/bin:/bin");
-    run_with_timeout(wrapped, Duration::from_secs(30))
+    run_with_timeout(wrapped, flake::scaled(Duration::from_secs(30)))
 }
 fn run_with_timeout(mut c: Command, timeout: Duration) -> Output {
     let child = c
@@ -127,7 +128,7 @@ fn preflight() {
             .arg("/")
             .arg("/")
             .arg("true")
-            .output()
+            .try_captured()
             .unwrap_or_else(|e| panic!("cannot run bwrap: {e}"));
         assert!(
             out.status.success(),
@@ -389,7 +390,7 @@ fn s10_network_is_isolated() {
     let port = listener.local_addr().unwrap().port();
     let probe = format!("exec 3<>/dev/tcp/127.0.0.1/{port}");
     let reach_outside = |when: &str| {
-        let outside = Command::new("bash").arg("-c").arg(&probe).output().unwrap();
+        let outside = Command::new("bash").arg("-c").arg(&probe).captured();
         assert!(
             outside.status.success(),
             "{when}: the host can reach its own listener: {}",

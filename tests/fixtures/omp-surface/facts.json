@@ -78,6 +78,16 @@
       "contains": "arg === \"--no-extensions\""
     },
     {
+      "id": "cli.flag.no_skills",
+      "file": "packages/coding-agent/src/cli/args.ts",
+      "contains": "arg === \"--no-skills\""
+    },
+    {
+      "id": "cli.flag.no_rules",
+      "file": "packages/coding-agent/src/cli/args.ts",
+      "contains": "arg === \"--no-rules\""
+    },
+    {
       "id": "cli.flag.profile",
       "file": "packages/coding-agent/src/cli/args.ts",
       "contains": "arg === \"--profile\""

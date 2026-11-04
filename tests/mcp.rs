@@ -1,15 +1,25 @@
 //! `glen mcp` on the real binary with `fake_omp` (v0.2 W5, AC-v2-502 to AC-v2-504; design
 //! §A22): a scripted MCP client drives the server over its stdin and stdout.
 mod common;
-use common::{A_ID, RpcBox, poll};
+use common::flake::CaptureExt;
+use common::{
+    A_ID, RpcBox,
+    flake::{children_of, scaled},
+    poll,
+};
 use serde_json::{Value, json};
 use std::{
     io::{BufRead, BufReader, Write},
+    os::fd::{AsRawFd, OwnedFd},
     process::{Child, ChildStdin, ChildStdout, Command, ExitStatus, Stdio},
     sync::{Arc, Mutex},
     thread,
     time::{Duration, Instant},
 };
+
+/// How long a test waits for its own setup (a job, a child, a full pipe) before it fails. Only a
+/// broken run reaches it, so it is generous; the product's own bounds are asserted separately.
+const SETUP: Duration = Duration::from_secs(30);
 
 const CLAUDE_INIT: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{"elicitation":{}},"clientInfo":{"name":"claude-code","version":"2.1.316"}}}"#;
 const CODEX_INIT: &str = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"codex-mcp-client","title":"Codex","version":"0.166.0"}}}"#;
@@ -65,12 +75,7 @@ impl Server {
     }
     /// Bytes waiting unread in the pipe of a `start_unread` server.
     fn unread_bytes(&self) -> usize {
-        use std::os::fd::AsRawFd;
-        let fd = self.unread.as_ref().unwrap().as_raw_fd();
-        let mut n: libc::c_int = 0;
-        // SAFETY: FIONREAD writes one c_int to `n`, a live local, for an fd this struct owns.
-        assert_eq!(unsafe { libc::ioctl(fd, libc::FIONREAD, &mut n) }, 0);
-        usize::try_from(n).unwrap()
+        unread_bytes(self.unread.as_ref().unwrap())
     }
     fn pid(&self) -> u32 {
         self.child.id()
@@ -96,7 +101,7 @@ impl Server {
         poll(timeout, || self.messages().into_iter().find(|m| pred(m)))
     }
     fn answer(&self, id: &Value) -> Value {
-        self.wait_for(Duration::from_secs(30), |m| {
+        self.wait_for(scaled(Duration::from_secs(30)), |m| {
             &m["id"] == id && m.get("method").is_none()
         })
     }
@@ -125,7 +130,7 @@ impl Server {
         assert!(m.get("error").is_none(), "{m}");
         m["result"].clone()
     }
-    /// Direct children of the server, from `/bin/ps`.
+    /// The server's live direct children.
     fn children(&self) -> Vec<u32> {
         children_of(self.pid())
     }
@@ -149,19 +154,15 @@ impl Drop for Server {
     }
 }
 
-fn children_of(parent: u32) -> Vec<u32> {
-    let out = Command::new("/bin/ps")
-        .args(["-A", "-o", "pid=,ppid="])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|l| {
-            let mut it = l.split_whitespace().map(|s| s.parse::<u32>().ok());
-            let (pid, ppid) = (it.next()??, it.next()??);
-            (ppid == parent).then_some(pid)
-        })
-        .collect()
+/// Bytes waiting unread in the pipe `fd` reads.
+fn unread_bytes(fd: &impl AsRawFd) -> usize {
+    let mut n: libc::c_int = 0;
+    // SAFETY: FIONREAD writes one c_int to `n`, a live local.
+    assert_eq!(
+        unsafe { libc::ioctl(fd.as_raw_fd(), libc::FIONREAD, &mut n) },
+        0
+    );
+    usize::try_from(n).unwrap()
 }
 fn signal(pid: u32, sig: rustix::process::Signal) {
     if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
@@ -256,7 +257,7 @@ fn the_handshake_negotiates_and_lists_the_catalog() {
             .collect();
         assert_eq!(listed["result"], json!({"tools":want}));
         s.close_stdin();
-        assert!(s.exit_within(Duration::from_secs(2)).success());
+        assert!(s.exit_within(scaled(Duration::from_secs(2))).success());
         assert_eq!(
             s.stderr(),
             "",
@@ -273,9 +274,11 @@ fn the_error_table_over_the_wire() {
     s.init();
     s.raw(b"{not json");
     s.raw(br#"[{"jsonrpc":"2.0","id":1,"method":"ping"}]"#);
-    let errors = s.wait_for(Duration::from_secs(5), |m| m["id"].is_null());
+    let errors = s.wait_for(scaled(Duration::from_secs(5)), |m| m["id"].is_null());
     assert_eq!(errors["error"]["code"], -32700);
-    let batch = poll(Duration::from_secs(5), || s.messages().get(2).cloned());
+    let batch = poll(scaled(Duration::from_secs(5)), || {
+        s.messages().get(2).cloned()
+    });
     assert_eq!(
         (batch["id"].clone(), batch["error"]["code"].clone()),
         (Value::Null, json!(-32600))
@@ -389,7 +392,7 @@ fn deterministic_results_are_byte_equal_to_a_direct_run() {
     .enumerate()
     {
         let result = s.call(json!(10 + i), name, arguments);
-        let direct = rb.glen(&argv).output().unwrap();
+        let direct = rb.glen(&argv).captured();
         let direct = String::from_utf8(direct.stdout).unwrap();
         assert!(
             text(&result) == direct,
@@ -482,8 +485,8 @@ fn interrupted_wait(s: &mut Server, job: &str) -> Value {
     for attempt in 1..=5u32 {
         let id = json!(format!("wait-{attempt}"));
         s.start_call(id.clone(), "glen_wait", json!({"job":job,"timeout":"60s"}));
-        let observer = poll(Duration::from_secs(10), || s.children().first().copied());
-        await_sigint_handler(observer, Duration::from_millis(300) * attempt);
+        let observer = poll(scaled(SETUP), || s.children().first().copied());
+        await_sigint_handler(observer, scaled(Duration::from_millis(300)) * attempt);
         signal(observer, rustix::process::Signal::INT);
         let result = s.answer(&id)["result"].clone();
         if envelope(&result)["error"]["details"]["reason"] != "mcp_exec" {
@@ -494,7 +497,7 @@ fn interrupted_wait(s: &mut Server, job: &str) -> Value {
 }
 #[cfg(target_os = "linux")]
 fn await_sigint_handler(pid: u32, _: Duration) {
-    poll(Duration::from_secs(10), || {
+    poll(scaled(SETUP), || {
         let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
         let mask = status.lines().find_map(|l| l.strip_prefix("SigCgt:"))?;
         let mask = u64::from_str_radix(mask.trim(), 16).ok()?;
@@ -649,7 +652,7 @@ fn the_profile_and_cwd_of_the_server_reach_every_child() {
     s.init();
     let listed = envelope(&s.call(json!(1), "glen_ls", json!({})));
     let direct: Value =
-        serde_json::from_slice(&rb.glen(&["--json", "ls"]).output().unwrap().stdout).unwrap();
+        serde_json::from_slice(&rb.glen(&["--json", "ls"]).captured().stdout).unwrap();
     let ids = |doc: &Value| -> Vec<Value> {
         doc["data"]["sessions"]
             .as_array()
@@ -673,7 +676,7 @@ fn the_profile_and_cwd_of_the_server_reach_every_child() {
 
 /// The one job directory under the box's glen home, once it exists.
 fn the_job(rb: &RpcBox) -> String {
-    poll(Duration::from_secs(10), || {
+    poll(scaled(SETUP), || {
         let dir = std::fs::read_dir(rb.omp.glen_home.join("jobs")).ok()?;
         let ids: Vec<String> = dir
             .filter_map(|e| e.ok())
@@ -683,7 +686,9 @@ fn the_job(rb: &RpcBox) -> String {
         (ids.len() == 1).then(|| ids[0].clone())
     })
 }
-/// Starts a `glen_send` that `fake_omp` holds, and returns its job id and observer pid.
+/// Starts a `glen_send` that `fake_omp` holds, and returns its job id and observer pid once the
+/// worker has accepted the job. Before that, a server that stops SIGKILLs an observer that has not
+/// started the worker yet, and the job never runs.
 fn held_send(rb: &RpcBox, s: &mut Server, id: Value) -> (String, u32) {
     s.start_call(
         id,
@@ -691,8 +696,10 @@ fn held_send(rb: &RpcBox, s: &mut Server, id: Value) -> (String, u32) {
         json!({"session":"e27c0de","message":"held"}),
     );
     let job = the_job(rb);
-    rb.job(&job);
-    let observer = poll(Duration::from_secs(10), || {
+    poll(scaled(SETUP), || {
+        (rb.job(&job).1["status"] == "accepted").then_some(())
+    });
+    let observer = poll(scaled(SETUP), || {
         let c = s.children();
         (c.len() == 1).then(|| c[0])
     });
@@ -712,24 +719,22 @@ fn a_cancel_kills_the_observer_and_the_job_keeps_running() {
         s.request(json!("p"), "ping", json!({}))["result"],
         json!({})
     );
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert!(start.elapsed() < scaled(Duration::from_secs(1)));
     let start = Instant::now();
     s.cancel(json!(1));
-    poll(Duration::from_secs(1), || gone(observer).then_some(()));
+    poll(scaled(Duration::from_secs(1)), || {
+        gone(observer).then_some(())
+    });
     let took = start.elapsed();
-    assert!(took < Duration::from_secs(1), "{took:?}");
+    assert!(took < scaled(Duration::from_secs(1)), "{took:?}");
     thread::sleep(Duration::from_millis(1500));
     assert!(
         s.messages().iter().all(|m| m["id"] != 1),
         "a cancelled call is never answered"
     );
-    let active: Value = serde_json::from_slice(
-        &rb.glen(&["--json", "jobs", "--active"])
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
+    let active: Value =
+        serde_json::from_slice(&rb.glen(&["--json", "jobs", "--active"]).captured().stdout)
+            .unwrap();
     let listed = &active["data"]["jobs"];
     assert_eq!(listed.as_array().unwrap().len(), 1, "{active}");
     assert_eq!(listed[0]["id"], job.as_str());
@@ -746,7 +751,7 @@ fn a_cancel_kills_the_observer_and_the_job_keeps_running() {
     );
     std::fs::write(&hold, b"go").unwrap();
     assert_eq!(
-        rb.wait_terminal(&job, Duration::from_secs(25))["status"],
+        rb.wait_terminal(&job, scaled(Duration::from_secs(25)))["status"],
         "completed"
     );
     rb.wait_worker_gone(&job);
@@ -773,14 +778,14 @@ fn eof_and_signals_stop_every_child_within_two_seconds() {
             None => s.close_stdin(),
             Some(sig) => signal(s.pid(), sig),
         }
-        let status = s.exit_within(Duration::from_secs(2));
-        assert!(start.elapsed() < Duration::from_secs(2), "{how:?}");
+        let status = s.exit_within(scaled(Duration::from_secs(2)));
+        assert!(start.elapsed() < scaled(Duration::from_secs(2)), "{how:?}");
         assert_eq!(status.code(), Some(code), "{how:?}");
         assert!(gone(observer), "{how:?}");
         assert!(s.messages().iter().all(|m| m["id"] != 1));
         std::fs::write(&hold, b"go").unwrap();
         assert_eq!(
-            rb.wait_terminal(&job, Duration::from_secs(25))["status"],
+            rb.wait_terminal(&job, scaled(Duration::from_secs(25)))["status"],
             "completed",
             "{how:?}: the job outlived the server"
         );
@@ -817,27 +822,31 @@ fn a_host_that_stops_reading_stdout_can_still_cancel_and_stop_the_server() {
     for i in 0..64 {
         s.send(&json!({"jsonrpc":"2.0","id":100 + i,"method":"tools/list"}));
     }
-    // Readiness: the pipe is full (its unread byte count holds still).
-    let full = poll(Duration::from_secs(10), || {
+    // Readiness: the pipe is full (its unread byte count holds still). The server reads the
+    // cancel only after the 64 requests, whose answers no pipe holds, so a server that wrote on
+    // its main loop would be stuck by then even if this saw a pause in the filling.
+    let full = poll(scaled(SETUP), || {
         let before = s.unread_bytes();
-        thread::sleep(Duration::from_millis(200));
+        thread::sleep(scaled(Duration::from_millis(200)));
         (before >= 8 * 1024 && s.unread_bytes() == before).then_some(before)
     });
     let start = Instant::now();
     s.cancel(json!(1));
-    poll(Duration::from_secs(1), || gone(observer).then_some(()));
+    poll(scaled(Duration::from_secs(1)), || {
+        gone(observer).then_some(())
+    });
     assert!(
-        start.elapsed() < Duration::from_secs(1),
+        start.elapsed() < scaled(Duration::from_secs(1)),
         "{full} bytes unread"
     );
     let start = Instant::now();
     signal(s.pid(), rustix::process::Signal::TERM);
-    let status = s.exit_within(Duration::from_secs(2));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    let status = s.exit_within(scaled(Duration::from_secs(2)));
+    assert!(start.elapsed() < scaled(Duration::from_secs(2)));
     assert_eq!(status.code(), Some(143));
     std::fs::write(&hold, b"go").unwrap();
     assert_eq!(
-        rb.wait_terminal(&job, Duration::from_secs(25))["status"],
+        rb.wait_terminal(&job, scaled(Duration::from_secs(25)))["status"],
         "completed"
     );
     rb.wait_worker_gone(&job);
@@ -851,18 +860,39 @@ fn a_host_that_closes_stdout_mid_call_leaves_no_child_behind() {
     let _release = Release(hold.clone());
     let mut s = unread_server(&rb, &[("FAKE_OMP_RUN_RELEASE", &hold)]);
     let (job, observer) = held_send(&rb, &mut s, json!(1));
-    drop(s.unread.take());
-    // The next answer meets EPIPE, which counts as the end of input.
+    // The host closes stdout while a copy of the read end lives on, as one does in a child that
+    // another test thread is spawning, until its exec: an answer written meanwhile succeeds.
+    let host = OwnedFd::from(s.unread.take().unwrap());
+    let copy = host.try_clone().unwrap();
+    drop(host);
+    let before = unread_bytes(&copy);
+    s.send(&json!({"jsonrpc":"2.0","id":"p0","method":"ping"}));
+    poll(scaled(SETUP), || {
+        (unread_bytes(&copy) > before).then_some(())
+    });
+    assert!(
+        s.child.try_wait().unwrap().is_none(),
+        "an answer the pipe took is no end of input"
+    );
+    // Once no reader is left, the next answer meets EPIPE, which counts as the end of input. The
+    // host asks until then: any spawn of the test process may hold a copy for a moment.
+    drop(copy);
     let start = Instant::now();
-    s.send(&json!({"jsonrpc":"2.0","id":"p","method":"ping"}));
-    let status = s.exit_within(Duration::from_secs(2));
-    assert!(start.elapsed() < Duration::from_secs(2));
+    let status = poll(scaled(Duration::from_secs(2)), || {
+        let stdin = s.stdin.as_mut().unwrap();
+        // Once the server is gone, its stdin refuses the write.
+        let _ = stdin
+            .write_all(b"{\"jsonrpc\":\"2.0\",\"id\":\"p\",\"method\":\"ping\"}\n")
+            .and_then(|()| stdin.flush());
+        s.child.try_wait().unwrap()
+    });
+    assert!(start.elapsed() < scaled(Duration::from_secs(2)));
     assert_eq!(status.code(), Some(0));
     assert!(gone(observer));
     assert!(s.children().is_empty());
     std::fs::write(&hold, b"go").unwrap();
     assert_eq!(
-        rb.wait_terminal(&job, Duration::from_secs(25))["status"],
+        rb.wait_terminal(&job, scaled(Duration::from_secs(25)))["status"],
         "completed",
         "the job outlived the server"
     );
@@ -884,7 +914,7 @@ fn startup_failures_stay_off_stdout_whatever_the_output_flags() {
         if relative_home {
             cmd.env("GLEN_HOME", "relative/home");
         }
-        let out = cmd.stdin(Stdio::null()).output().unwrap();
+        let out = cmd.captured();
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.stdout, b"", "{args:?}: stdout is the protocol's alone");
         assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
@@ -979,11 +1009,11 @@ fn the_channel_emits_each_new_reply_of_this_project_once_and_marks_nothing_read(
     append(&rb, &reply(A_ID, "r-new", "done </channel> <b>"));
     append(&rb, &reply(beta, "r-beta", "another project"));
     append(&rb, &reply(A_ID, "r-long", &long));
-    let notes = poll(Duration::from_secs(5), || {
+    let notes = poll(scaled(Duration::from_secs(5)), || {
         let n = channel_notes(&s);
         (n.len() >= 2).then_some(n)
     });
-    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(start.elapsed() < scaled(Duration::from_secs(5)));
     thread::sleep(Duration::from_millis(2500));
     let notes_after = channel_notes(&s);
     assert_eq!(
@@ -1014,7 +1044,7 @@ fn the_channel_emits_each_new_reply_of_this_project_once_and_marks_nothing_read(
     );
     // `glen inbox` afterwards still lists the replies unread.
     let unread: Value =
-        serde_json::from_slice(&rb.glen(&["--json", "inbox"]).output().unwrap().stdout).unwrap();
+        serde_json::from_slice(&rb.glen(&["--json", "inbox"]).captured().stdout).unwrap();
     let unread: Vec<&Value> = unread["data"]["messages"]
         .as_array()
         .unwrap()
@@ -1025,7 +1055,7 @@ fn the_channel_emits_each_new_reply_of_this_project_once_and_marks_nothing_read(
         assert!(unread.contains(&&json!(id)), "{id} {unread:?}");
     }
     s.close_stdin();
-    assert!(s.exit_within(Duration::from_secs(2)).success());
+    assert!(s.exit_within(scaled(Duration::from_secs(2))).success());
 }
 
 #[test]

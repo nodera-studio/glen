@@ -20,6 +20,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
+use crate::flake::scaled;
 use crate::support::*;
 
 pub const ALPHA: &str = "-work-alpha";
@@ -412,7 +413,7 @@ impl OmpBox {
     }
 
     fn command(&self, cwd: &Path, args: &[OsString]) -> (Command, String) {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(glen_bin());
         cmd.env_clear()
             .args(args)
             .env("HOME", &self.home)
@@ -683,11 +684,10 @@ pub fn display_width(line: &str) -> usize {
     unicode_width::UnicodeWidthStr::width(strip_ansi(line).as_str())
 }
 
-/// A pipe whose read end is already closed: every write gets EPIPE.
+/// A stdout whose writes fail with EPIPE (`flake::closed_stdout`: a FIFO with no reader, which
+/// unlike a dropped pipe reader no concurrently spawned process can hold).
 pub fn closed_stdout() -> Stdio {
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    drop(reader);
-    Stdio::from(writer)
+    Stdio::from(crate::flake::closed_stdout())
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -699,6 +699,8 @@ pub struct Stream {
     child: Child,
     rx: mpsc::Receiver<String>,
     stderr: Arc<Mutex<Vec<u8>>>,
+    /// Disconnects once the stderr reader is done (end of file).
+    stderr_done: mpsc::Receiver<()>,
     /// Every stdout line received so far, newline included.
     pub lines: Vec<String>,
     desc: String,
@@ -730,7 +732,9 @@ impl Stream {
         });
         let stderr = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&stderr);
+        let (done, stderr_done) = mpsc::channel::<()>();
         std::thread::spawn(move || {
+            let _done = done;
             let mut chunk = [0u8; 4096];
             while let Ok(n) = err_pipe.read(&mut chunk) {
                 if n == 0 {
@@ -743,6 +747,7 @@ impl Stream {
             child,
             rx,
             stderr,
+            stderr_done,
             lines: Vec::new(),
             desc,
             status: None,
@@ -780,6 +785,7 @@ impl Stream {
 
     /// The next line as one complete, compact, ANSI-free JSON object with `v:1` (AC-117).
     pub fn next_json(&mut self, timeout: Duration) -> Value {
+        let timeout = scaled(timeout);
         let line = self
             .next_line(timeout)
             .unwrap_or_else(|| panic!("no stream line within {timeout:?}\n{}", self.ctx()));
@@ -815,6 +821,7 @@ impl Stream {
 
     /// Read human lines until one contains `needle`.
     pub fn wait_for_text(&mut self, needle: &str, timeout: Duration) {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -838,8 +845,10 @@ impl Stream {
         assert!(ok, "kill -INT failed");
     }
 
-    /// Wait for the process to exit, then collect the rest of stdout.
+    /// Wait for the process to exit, then collect the rest of stdout and stderr: an exit seen
+    /// before a reader thread has run leaves output it wrote still unread.
     pub fn wait(&mut self, timeout: Duration) -> ExitStatus {
+        let timeout = scaled(timeout);
         let deadline = Instant::now() + timeout;
         let status = loop {
             if let Some(st) = self.child.try_wait().unwrap() {
@@ -851,9 +860,14 @@ impl Stream {
             std::thread::sleep(Duration::from_millis(20));
         };
         self.status = Some(status);
-        while let Ok(l) = self.rx.recv_timeout(Duration::from_secs(5)) {
+        while let Ok(l) = self.rx.recv_timeout(scaled(Duration::from_secs(5))) {
             self.lines.push(l);
         }
+        // End of file, or a writer outside glen still holds the pipe (a child another test thread
+        // is spawning, between its fork and exec): either way the reader has had its turn.
+        let _ = self
+            .stderr_done
+            .recv_timeout(scaled(Duration::from_secs(5)));
         status
     }
 

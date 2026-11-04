@@ -1,10 +1,11 @@
 mod common;
+use common::flake::CaptureExt;
 use common::*;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{BufRead, BufReader, Read, Write},
+    io::{BufRead, BufReader, Write},
     process::Stdio,
     sync::mpsc,
     time::Duration,
@@ -230,12 +231,11 @@ fn terminal_stream(lines: &[Value]) {
     assert_eq!(terminal[0].0, lines.len() - 1);
 }
 fn follow(b: &OmpBox, args: &[&str], first: &str) -> Vec<Value> {
-    let mut child = b
-        .command(args, &b.alpha())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
+    // stdout is streamed; stderr comes back from a file, so it is read at glen's exit.
+    let stderr = flake::Capture::new();
+    let mut cmd = b.command(args, &b.alpha());
+    stderr.attach_stderr(cmd.stdout(Stdio::piped()));
+    let mut child = cmd.spawn().unwrap();
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
@@ -247,7 +247,9 @@ fn follow(b: &OmpBox, args: &[&str], first: &str) -> Vec<Value> {
     });
     let mut values = Vec::new();
     loop {
-        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let line = rx
+            .recv_timeout(flake::scaled(Duration::from_secs(5)))
+            .unwrap();
         let v: Value = serde_json::from_str(&line).unwrap();
         let item = v["event"] == first;
         values.push(v);
@@ -261,7 +263,9 @@ fn follow(b: &OmpBox, args: &[&str], first: &str) -> Vec<Value> {
     )
     .unwrap();
     loop {
-        let line = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let line = rx
+            .recv_timeout(flake::scaled(Duration::from_secs(5)))
+            .unwrap();
         let v: Value = serde_json::from_str(&line).unwrap();
         let end = v["event"] == "end" || v["ok"] == false;
         values.push(v);
@@ -269,17 +273,12 @@ fn follow(b: &OmpBox, args: &[&str], first: &str) -> Vec<Value> {
             break;
         }
     }
-    let status = poll(Duration::from_secs(5), || child.try_wait().unwrap());
+    let status = poll(flake::scaled(Duration::from_secs(5)), || {
+        child.try_wait().unwrap()
+    });
     assert_eq!(status.code(), Some(130));
-    reader.join().unwrap();
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    assert!(stderr.is_empty());
+    flake::join_reader(reader);
+    assert!(stderr.output(status).stderr.is_empty());
     terminal_stream(&values);
     values
 }
@@ -309,8 +308,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     let out = b
         .command(&["doctor"], &b.alpha())
         .env("GLEN_OMP_BIN", fixture("bin/fake-omp"))
-        .output()
-        .unwrap();
+        .captured();
     assert!(out.status.success());
     all.insert("doctor".into(), vec![json(&out)]);
     all.insert(
@@ -345,8 +343,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     let out = b
         .command(&["show", "e27c0de"], &b.alpha())
         .env("GLEN_MAX_OUTPUT", "200")
-        .output()
-        .unwrap();
+        .captured();
     let stub = json(&out);
     let path = std::path::Path::new(stub["spilled"]["path"].as_str().unwrap());
     let bytes = fs::read(path).unwrap();
@@ -372,8 +369,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         let out = r
             .glen(&["send", "e27c0de", "hi"])
             .env("FAKE_OMP_SCENARIO", scenario)
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(out.status.code(), Some(exit), "{out:?}");
         assert!(out.stderr.is_empty());
         let v = json(&out);
@@ -384,7 +380,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         };
         r.wait_worker_gone(job);
         if id == "send.completed" {
-            let out = r.glen(&["jobs"]).output().unwrap();
+            let out = r.glen(&["jobs"]).captured();
             let rows = json(&out);
             assert_eq!(rows["data"]["total"], 1);
             assert_eq!(rows["data"]["jobs"].as_array().unwrap().len(), 1);
@@ -397,15 +393,12 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     let out = r
         .glen(&["send", "e27c0de", "hi", "--wait", "100ms"])
         .env("FAKE_OMP_DELAY_MS", "600")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(10));
     let v = json(&out);
     let handle = v["data"]["job"]["handle"].as_str().unwrap();
-    let out = r
-        .glen(&["wait", handle, "--timeout", "10s"])
-        .output()
-        .unwrap();
+    let timeout = format!("{}ms", flake::scaled(Duration::from_secs(10)).as_millis());
+    let out = r.glen(&["wait", handle, "--timeout", &timeout]).captured();
     assert_eq!(out.status.code(), Some(0));
     all.insert("wait".into(), vec![json(&out)]);
     r.wait_worker_gone(v["data"]["job"]["id"].as_str().unwrap());
@@ -415,22 +408,21 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     let out = r
         .glen(&["send", "e27c0de", "hi", "--warm", "30s"])
         .env("FAKE_OMP_MULTI", "1")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     let job = json(&out)["data"]["job"]["id"].as_str().unwrap().to_owned();
     let home = glen::glen_home::GlenHome {
         root: r.omp.glen_home.clone(),
     };
-    poll(std::time::Duration::from_secs(10), || {
+    poll(flake::scaled(std::time::Duration::from_secs(10)), || {
         glen::rpc::warm::read(&home, A_ID).map(drop)
     });
-    let out = r.glen(&["release", "e27c0de"]).output().unwrap();
+    let out = r.glen(&["release", "e27c0de"]).captured();
     assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
     all.insert("release".into(), vec![json(&out)]);
     r.wait_worker_gone(&job);
     let r = RpcBox::new();
-    let out = r.glen(&["release", "--all"]).output().unwrap();
+    let out = r.glen(&["release", "--all"]).captured();
     assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
     all.insert("release.all.empty".into(), vec![json(&out)]);
     for (id, args, scenario, exit) in [
@@ -478,8 +470,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
             .glen(&args)
             .env("FAKE_OMP_SERIAL", "1")
             .env("FAKE_OMP_SCENARIO", scenario)
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(out.status.code(), Some(exit), "{id}: {out:?}");
         assert!(out.stderr.is_empty(), "{id}: {out:?}");
         let v = json(&out);
@@ -500,19 +491,18 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         .glen(&["send", "e27c0de", "hold", "--no-wait", "--json"])
         .env("FAKE_OMP_SERIAL", "1")
         .env("FAKE_OMP_RUN_RELEASE", r.omp.tmp.path().join("release"))
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(10), "{out:?}");
     assert!(out.stderr.is_empty());
     let launched = json(&out);
     let job = launched["data"]["job"]["id"].as_str().unwrap();
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         (r.job(job).1["status"] == "accepted").then_some(())
     });
+    let timeout = format!("{}ms", flake::scaled(Duration::from_secs(15)).as_millis());
     let out = r
-        .glen(&["abort", "e27c0de", "--timeout", "15s", "--json"])
-        .output()
-        .unwrap();
+        .glen(&["abort", "e27c0de", "--timeout", &timeout, "--json"])
+        .captured();
     assert_eq!(out.status.code(), Some(0), "{out:?}");
     assert!(out.stderr.is_empty());
     let v = json(&out);
@@ -528,24 +518,22 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
         .env("FAKE_OMP_SCENARIO", "progress")
         .env("FAKE_OMP_RESULT_RELEASE", &release)
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(10), "{out:?}");
     let launched = json(&out);
     let job = launched["data"]["job"]["id"].as_str().unwrap();
     let handle = launched["data"]["job"]["handle"].as_str().unwrap();
     let replies = r.job_dir(job).join("replies.ndjson");
-    poll(Duration::from_secs(10), || {
+    poll(flake::scaled(Duration::from_secs(10)), || {
         let text = fs::read_to_string(&replies).unwrap_or_default();
         (text.ends_with('\n') && text.lines().count() == 2).then_some(())
     });
-    poll(Duration::from_secs(5), || {
+    poll(flake::scaled(Duration::from_secs(5)), || {
         (r.job(job).1["status"] == "accepted").then_some(())
     });
     let out = r
         .glen(&["wait", handle, "--for", "reply", "--json"])
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(10), "{out:?}");
     assert!(out.stderr.is_empty());
     let woke = json(&out);
@@ -567,8 +555,7 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
             "300ms",
             "--json",
         ])
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(10), "{out:?}");
     assert!(out.stderr.is_empty());
     let expired = json(&out);
@@ -580,17 +567,18 @@ fn runners() -> BTreeMap<String, Vec<Value>> {
     all.insert("wait.reply.expired".into(), vec![expired]);
     let r = RpcBox::new();
     let mut lease = r.hold_lease(A_ID);
-    let out = r.glen(&["send", "e27c0de", "hi"]).output().unwrap();
+    let out = r.glen(&["send", "e27c0de", "hi"]).captured();
     assert_eq!(out.status.code(), Some(6));
     all.insert("error.no_route".into(), vec![json(&out)]);
     drop(lease.stdin.take());
-    poll(Duration::from_secs(5), || lease.try_wait().unwrap());
+    poll(flake::scaled(Duration::from_secs(5)), || {
+        lease.try_wait().unwrap()
+    });
     let out = r
         .glen(&["send", "e27c0de", "hi"])
         .env("CODEX_SANDBOX", "seatbelt")
         .env("CODEX_SANDBOX_NETWORK_DISABLED", "1")
-        .output()
-        .unwrap();
+        .captured();
     assert_eq!(out.status.code(), Some(6));
     let mut sandboxed = json(&out);
     // W10 fixes2 decision 1 + cycle-3 Codex P2 (design.md:449): on Linux the refusal adds

@@ -8,11 +8,11 @@ use std::{
 
 use crate::support::*;
 
-/// A pipe whose read end is already closed: every write gets EPIPE.
+/// A stdout every write to which gets EPIPE: a FIFO no process holds a reader of
+/// (`flake::closed_stdout`; a dropped `std::io::pipe()` reader can survive in a process another
+/// test thread spawned, on macOS).
 fn closed_stdout() -> Stdio {
-    let (reader, writer) = std::io::pipe().expect("pipe");
-    drop(reader);
-    Stdio::from(writer)
+    Stdio::from(crate::flake::closed_stdout())
 }
 
 fn assert_silent_exit(out: &Out, expected: i32) {
@@ -111,7 +111,8 @@ fn ac1002_human_usage_with_both_pipes_closed_exits_one() {
     // then exec glen, retaining the harness's bounded wait and isolated environment.
     let mut command = Command::new("/bin/sh");
     command
-        .args(["-c", "exec \"$1\" bogus --human 2>&1", "closed-stderr", BIN])
+        .args(["-c", "exec \"$1\" bogus --human 2>&1", "closed-stderr"])
+        .arg(glen_bin())
         .env_clear()
         .env("HOME", &sb.home)
         .env("GLEN_HOME", &sb.glen_home)

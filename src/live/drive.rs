@@ -24,6 +24,82 @@ struct Observation {
     prompt_status: Option<String>,
     assistant: Option<String>,
     stop: Option<String>,
+    /// Ids of the replies kept, so a replayed frame is never stored twice (S-07).
+    seen: std::collections::HashSet<String>,
+    /// Text bytes of the replies kept (S-17).
+    reply_bytes: usize,
+    /// Replies refused or past the caps, so the worker log stays bounded too.
+    skipped: usize,
+}
+/// glen_reply's own text limit (the extension's `LIMITS.maxReply`, `rpc::reply`'s check).
+const MAX_REPLY_TEXT: usize = 65_536;
+/// A live job keeps at most this many replies and reply text bytes (S-07, S-17); past either,
+/// later replies are not kept for the job (the extension still writes them to `glen inbox`).
+const MAX_LIVE_REPLIES: usize = 256;
+const MAX_LIVE_REPLY_BYTES: usize = 8 * 1024 * 1024;
+/// The first refused replies are logged; later ones only counted.
+const LOGGED_SKIPS: usize = 16;
+/// The warning a live job carries once it stopped keeping replies at a cap.
+pub(crate) const REPLIES_TRUNCATED: &str = "replies_truncated";
+/// Why a live `reply` frame is not this job's, or `None` when it is: its job is null (a shared
+/// batch) or this job, its session is the job's target or the one the job moved to, its text
+/// is within glen_reply's limit, and its id is new.
+fn refused(w: &Worker, s: &Observation, r: &Reply) -> Option<String> {
+    if r.job_id.as_deref().is_some_and(|job| job != w.job.id) {
+        return Some("it names another job".into());
+    }
+    if ![
+        w.job.session_id.as_deref(),
+        w.status.actual_session_id.as_deref(),
+    ]
+    .contains(&Some(r.session_id.as_str()))
+    {
+        return Some("it names another session".into());
+    }
+    if r.text.len() > MAX_REPLY_TEXT {
+        return Some(format!("its text is longer than {MAX_REPLY_TEXT} bytes"));
+    }
+    s.seen
+        .contains(&r.id)
+        .then(|| "its id was already received".into())
+}
+fn on_reply(w: &mut Worker, s: &mut Observation, r: Reply) {
+    let refusal = refused(w, s, &r);
+    let capped = refusal.is_none()
+        && (s.replies.len() >= MAX_LIVE_REPLIES
+            || s.reply_bytes + r.text.len() > MAX_LIVE_REPLY_BYTES);
+    if refusal.is_none() && !capped {
+        s.seen.insert(r.id.clone());
+        s.reply_bytes += r.text.len();
+        if let Err(e) = w.store.append_reply(&w.id, &r) {
+            w.log("reply", &e.to_string());
+        }
+        s.replies.push(r);
+        return;
+    }
+    if capped
+        && !w
+            .status
+            .warnings
+            .iter()
+            .any(|x| x.code == REPLIES_TRUNCATED)
+    {
+        w.status.warnings.push(Warning {
+            code: REPLIES_TRUNCATED.into(),
+            message: format!(
+                "the live session sent more than {MAX_LIVE_REPLIES} replies or {} MiB of reply text for this job; later replies are only in `glen inbox`",
+                MAX_LIVE_REPLY_BYTES / (1024 * 1024)
+            ),
+        });
+    }
+    s.skipped += 1;
+    if s.skipped <= LOGGED_SKIPS {
+        let why = refusal.unwrap_or_else(|| "the job's reply cap is reached".into());
+        w.log(
+            "reply",
+            &crate::render::text::single_line(&format!("skipping reply {}: {why}", r.id)),
+        );
+    }
 }
 fn protocol(message: impl Into<String>) -> Failure {
     Failure::new("protocol", message)
@@ -96,13 +172,13 @@ fn on_frame(
             match kind.as_str() {
                 "consumed" => s.consumed = true,
                 "reply" => match serde_json::from_value::<Reply>(body["reply"].clone()) {
-                    Ok(r) => {
-                        if let Err(e) = w.store.append_reply(&w.id, &r) {
-                            w.log("reply", &e.to_string());
+                    Ok(r) => on_reply(w, s, r),
+                    Err(e) => {
+                        s.skipped += 1;
+                        if s.skipped <= LOGGED_SKIPS {
+                            w.log("reply", &format!("skipping malformed reply: {e}"));
                         }
-                        s.replies.push(r);
                     }
-                    Err(e) => w.log("reply", &format!("skipping malformed reply: {e}")),
                 },
                 "session_changed" => {
                     let to = body["to"]
@@ -481,6 +557,104 @@ mod tests {
             if wire == "session_mismatch" {
                 assert_eq!(f.details.unwrap()["to"], "new");
             }
+        }
+    }
+    fn reply_frame(id: &str, session: &str, job: Option<&str>, text: &str) -> Frame {
+        frame(
+            json!({"v":1,"id":"r","event":"reply","reply":{"v":1,"id":id,"session_id":session,"job_id":job,"text":text,"final":false,"at":"2026-11-03T00:00:00Z"}}),
+        )
+    }
+    /// S-07, the audit's reproduction: a duplicate id, another session's and another job's
+    /// replies and an oversized text are refused; a shared (null-job) reply and the job's own,
+    /// on its target or moved-to session, are kept once, in memory and on disk.
+    #[test]
+    fn s07_only_this_jobs_new_bounded_replies_are_kept() {
+        let (_t, mut w) = worker();
+        let mut s = Observation::default();
+        on_frame(&mut w, &mut s, ack()).unwrap();
+        let session = w.job.session_id.clone().unwrap();
+        let job = w.job.id.clone();
+        for f in [
+            reply_frame("dup", &session, Some(&job), "first"),
+            reply_frame("dup", &session, Some(&job), "replayed"),
+            reply_frame(
+                "foreign",
+                "00000000-aaaa-7000-8000-000000000000",
+                Some(&job),
+                "x",
+            ),
+            reply_frame("other-job", &session, Some("jFOREIGNJOB"), "x"),
+            reply_frame("big", &session, Some(&job), &"a".repeat(MAX_REPLY_TEXT + 1)),
+            reply_frame("shared", &session, None, "for everyone"),
+            reply_frame("limit", &session, Some(&job), &"b".repeat(MAX_REPLY_TEXT)),
+        ] {
+            assert!(on_frame(&mut w, &mut s, f).unwrap().is_none());
+        }
+        // After the session moved, replies on the new session are the job's too.
+        on_frame(
+            &mut w,
+            &mut s,
+            frame(json!({"v":1,"id":"r","event":"session_changed","to":"moved"})),
+        )
+        .unwrap();
+        on_frame(
+            &mut w,
+            &mut s,
+            reply_frame("moved", "moved", Some(&job), "after"),
+        )
+        .unwrap();
+        let ids: Vec<&str> = s.replies.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(ids, ["dup", "shared", "limit", "moved"]);
+        assert_eq!(s.replies[0].text, "first");
+        let stored: Vec<String> = w
+            .store
+            .read_replies_complete(&w.id)
+            .unwrap()
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        assert_eq!(stored, ids);
+        assert!(
+            w.status.warnings.is_empty(),
+            "refusals are logged, not warned"
+        );
+    }
+    /// S-17, the audit's reproduction (50 x 4 MiB frames): a live job keeps at most
+    /// MAX_LIVE_REPLIES replies and MAX_LIVE_REPLY_BYTES of text, then one warning, never more.
+    #[test]
+    fn s17_reply_count_and_bytes_are_capped_with_one_warning() {
+        let (_t, mut w) = worker();
+        let mut s = Observation::default();
+        on_frame(&mut w, &mut s, ack()).unwrap();
+        let session = w.job.session_id.clone().unwrap();
+        let full = "c".repeat(MAX_REPLY_TEXT);
+        let fits = MAX_LIVE_REPLY_BYTES / MAX_REPLY_TEXT;
+        for n in 0..fits + 50 {
+            on_frame(
+                &mut w,
+                &mut s,
+                reply_frame(&format!("b{n}"), &session, None, &full),
+            )
+            .unwrap();
+        }
+        assert_eq!(s.replies.len(), fits);
+        assert_eq!(s.reply_bytes, MAX_LIVE_REPLY_BYTES);
+        let (_t, mut w2) = worker();
+        let mut s2 = Observation::default();
+        on_frame(&mut w2, &mut s2, ack()).unwrap();
+        for n in 0..MAX_LIVE_REPLIES + 50 {
+            on_frame(
+                &mut w2,
+                &mut s2,
+                reply_frame(&format!("c{n}"), &session, None, "x"),
+            )
+            .unwrap();
+        }
+        assert_eq!(s2.replies.len(), MAX_LIVE_REPLIES);
+        for (w, s) in [(&w, &s), (&w2, &s2)] {
+            let codes: Vec<&str> = w.status.warnings.iter().map(|x| x.code.as_str()).collect();
+            assert_eq!(codes, [REPLIES_TRUNCATED]);
+            assert_eq!(s.skipped, 50);
         }
     }
     #[test]

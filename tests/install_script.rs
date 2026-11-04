@@ -1,4 +1,7 @@
 #![cfg(unix)]
+#[path = "common/flake.rs"]
+mod flake;
+use flake::CaptureExt;
 use glen::error::GlenError;
 use std::{
     fs,
@@ -114,7 +117,11 @@ impl Installer {
         c
     }
     fn install(&self, args: &[&str]) -> Result<Output> {
-        Ok(self.command("sh").arg("install.sh").args(args).output()?)
+        Ok(self
+            .command("sh")
+            .arg("install.sh")
+            .args(args)
+            .try_captured()?)
     }
     fn package(&self, out: &Path) -> Result<Output> {
         Ok(self
@@ -124,7 +131,7 @@ impl Installer {
             .arg(&self.binary)
             .arg(&self.notices)
             .arg(out)
-            .output()?)
+            .try_captured()?)
     }
     fn release(&self) -> Result {
         let latest = self.rel.join("latest/download");
@@ -155,7 +162,7 @@ impl Installer {
             .join(format!("glen-{}.tar.gz", target()))
     }
     fn checksum(&self) -> Result {
-        let hash = self.command("sh").args(["-c", "if command -v sha256sum >/dev/null; then sha256sum \"$1\"; elif command -v shasum >/dev/null; then shasum -a 256 \"$1\"; else openssl dgst -sha256 -r \"$1\"; fi", "hash"]).arg(self.asset()).output()?;
+        let hash = self.command("sh").args(["-c", "if command -v sha256sum >/dev/null; then sha256sum \"$1\"; elif command -v shasum >/dev/null; then shasum -a 256 \"$1\"; else openssl dgst -sha256 -r \"$1\"; fi", "hash"]).arg(self.asset()).try_captured()?;
         check(&hash, 0);
         fs::write(self.asset().with_extension("gz.sha256"), &hash.stdout)?;
         Ok(())
@@ -181,7 +188,7 @@ impl Installer {
         archive.extend_from_slice(&[0; 1024]);
         let raw = self.root.join("attack.tar");
         fs::write(&raw, archive)?;
-        let gzip = self.command("gzip").arg("-c").arg(raw).output()?;
+        let gzip = self.command("gzip").arg("-c").arg(raw).try_captured()?;
         check(&gzip, 0);
         fs::write(self.asset(), &gzip.stdout)?;
         self.checksum()
@@ -214,7 +221,7 @@ impl Installer {
         let version = self
             .command(bin.to_string_lossy().as_ref())
             .arg("--version")
-            .output()?;
+            .try_captured()?;
         check(&version, 0);
         assert_eq!(stdout(&version), "glen 9.9.9\n");
         assert!(
@@ -262,7 +269,7 @@ fn prefix_creates_bin() -> Result {
         .command("sh")
         .args(["install.sh", "--prefix"])
         .arg(&prefix)
-        .output()?;
+        .try_captured()?;
     b.installed(&prefix.join("bin/glen"), &o)
 }
 
@@ -467,7 +474,7 @@ fn staging_file_is_reserved_before_copying() -> Result {
         .command("sh")
         .arg("install.sh")
         .env("VICTIM", &victim)
-        .output()?;
+        .try_captured()?;
     b.installed(&b.home.join(".local/bin/glen"), &o)?;
     assert_eq!(fs::read_to_string(victim)?, "do not overwrite");
     b.cleaned()
@@ -482,7 +489,7 @@ fn paths_with_spaces() -> Result {
         .command("sh")
         .args(["install.sh", "--prefix"])
         .arg(&prefix)
-        .output()?;
+        .try_captured()?;
     b.installed(&prefix.join("bin/glen"), &o)?;
     b.home = b.root.join("my home");
     fs::create_dir(&b.home)?;
@@ -513,6 +520,68 @@ fn missing_archive_and_checksum_name_url_and_source_fallback() -> Result {
         assert!(!b.home.join(".local").exists());
     }
     Ok(())
+}
+
+#[test]
+fn network_mirrors_must_use_https() -> Result {
+    // v0.2 W6 (S-24): over plain http a network attacker replaces the archive and its
+    // checksum together. Only https mirrors and file:// directories (every other
+    // test here) are accepted; anything else is refused before any download or write.
+    let b = Installer::new()?;
+    b.release()?;
+    let log = b.root.join("curl.log");
+    executable(
+        &b.shim.join("curl"),
+        "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$CURL_LOG\"\nexit 22\n",
+    )?;
+    for base in [
+        "http://127.0.0.1:9/glen",
+        "HTTP://mirror.invalid/glen",
+        "ftp://mirror.invalid/glen",
+        "mirror.invalid/glen",
+        "//mirror.invalid/glen",
+    ] {
+        for args in [&[][..], &["--dry-run"]] {
+            let o = b
+                .command("sh")
+                .arg("install.sh")
+                .args(args)
+                .env("GLEN_INSTALL_BASE_URL", base)
+                .env("CURL_LOG", &log)
+                .try_captured()?;
+            check(&o, 2);
+            let err = stderr(&o);
+            assert!(
+                err.contains(&format!(
+                    "GLEN_INSTALL_BASE_URL must start with https:// (a mirror) or file:// (a local directory): {base}"
+                )),
+                "{o:?}"
+            );
+            assert!(!err.contains("downloading"), "{o:?}");
+            assert!(o.stdout.is_empty(), "{o:?}");
+            assert!(!log.exists(), "{base}: curl ran");
+            assert!(!b.home.join(".local").exists());
+        }
+    }
+    // An https mirror still takes the TLS-only branch (no network: curl is a shim).
+    let o = b
+        .command("sh")
+        .arg("install.sh")
+        .env("GLEN_INSTALL_BASE_URL", "https://mirror.invalid/glen/")
+        .env("CURL_LOG", &log)
+        .try_captured()?;
+    check(&o, 1);
+    let calls = fs::read_to_string(&log)?;
+    let url = format!(
+        "https://mirror.invalid/glen/latest/download/glen-{}.tar.gz -o ",
+        target()
+    );
+    assert!(
+        calls.contains(&url) && calls.trim_end().ends_with(" --proto =https --tlsv1.2"),
+        "{calls}"
+    );
+    assert!(!b.home.join(".local").exists());
+    b.cleaned()
 }
 
 #[test]
@@ -575,7 +644,7 @@ fn unwritable_directory_suggests_prefix() -> Result {
         .command("sh")
         .args(["install.sh", "--prefix"])
         .arg(&prefix)
-        .output();
+        .try_captured();
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755))?;
     let o = o?;
     check(&o, 1);
@@ -607,7 +676,7 @@ fn architecture_aliases() -> Result {
 fn package_layout_checksum_and_executable_mode() -> Result {
     let b = Installer::new()?;
     b.release()?;
-    let o = b.command("tar").arg("-tzf").arg(b.asset()).output()?;
+    let o = b.command("tar").arg("-tzf").arg(b.asset()).try_captured()?;
     check(&o, 0);
     let name = format!("glen-{}", target());
     let mut entries = stdout(&o).lines().map(str::to_owned).collect::<Vec<_>>();
@@ -626,7 +695,7 @@ fn package_layout_checksum_and_executable_mode() -> Result {
         .arg("-xOzf")
         .arg(b.asset())
         .arg(format!("{name}/THIRD-PARTY-LICENSES"))
-        .output()?;
+        .try_captured()?;
     check(&o, 0);
     assert_eq!(stdout(&o), fs::read_to_string(&b.notices)?);
     let sum = fs::read_to_string(b.asset().with_extension("gz.sha256"))?;
@@ -675,7 +744,7 @@ fn argument_errors_help_and_home_override() -> Result {
             .command("sh")
             .arg("scripts/package-release.sh")
             .args(&args)
-            .output()?;
+            .try_captured()?;
         check(&o, code);
         if code == 1 && args[1] == binary {
             assert!(stderr(&o).contains("third-party licenses"), "{o:?}");
@@ -696,7 +765,7 @@ fn argument_errors_help_and_home_override() -> Result {
         .command("sh")
         .args(["install.sh", "--dry-run"])
         .env_remove("HOME")
-        .output()?;
+        .try_captured()?;
     check(&o, 1);
     assert!(stderr(&o).contains("HOME"));
     let prefix = b.root.join("p");
@@ -705,7 +774,7 @@ fn argument_errors_help_and_home_override() -> Result {
         .args(["install.sh", "--dry-run"])
         .arg(format!("--prefix={}", prefix.display()))
         .env_remove("HOME")
-        .output()?;
+        .try_captured()?;
     check(&o, 0);
     assert!(!prefix.exists());
     Ok(())

@@ -16,7 +16,11 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
+use crate::flake::{Capture, scaled};
+
+/// The glen binary under test, run from where no concurrent cargo run removes it: `v2_compat`
+/// builds other tests' executables while the suite runs.
+pub use crate::flake::glen as glen_bin;
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
@@ -181,7 +185,7 @@ impl Sandbox {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(glen_bin());
         cmd.env_clear()
             .args(&args)
             .env("HOME", &self.home)
@@ -248,27 +252,39 @@ impl Run {
         self
     }
 
+    /// Runs glen to its exit. Its output goes to files (`flake::Capture`), not pipes: a process
+    /// another test thread spawned meanwhile can hold a pipe's write end, and reading the pipe to
+    /// end of file would wait for that process.
     pub fn run(mut self) -> Out {
-        self.cmd
-            .stdout(self.stdout.take().unwrap_or_else(Stdio::piped))
-            .stderr(Stdio::piped());
+        let capture = Capture::new();
+        match self.stdout.take() {
+            Some(stdout) => {
+                self.cmd.stdout(stdout);
+                capture.attach_stderr(&mut self.cmd);
+            }
+            None => capture.attach(&mut self.cmd),
+        }
         let started = Instant::now();
-        let child = self
+        let mut child = self
             .cmd
             .spawn()
             .unwrap_or_else(|e| panic!("spawn glen {}: {e}", self.desc));
         let pid = child.id();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(child.wait_with_output());
+            let _ = tx.send(child.wait());
         });
-        let output = match rx.recv_timeout(RUN_TIMEOUT) {
-            Ok(r) => r.unwrap_or_else(|e| panic!("wait glen {}: {e}", self.desc)),
+        let output = match rx.recv_timeout(scaled(RUN_TIMEOUT)) {
+            Ok(r) => capture.output(r.unwrap_or_else(|e| panic!("wait glen {}: {e}", self.desc))),
             Err(_) => {
                 let _ = Command::new("/bin/kill")
                     .args(["-9", &pid.to_string()])
                     .status();
-                panic!("`glen {}` did not finish within {RUN_TIMEOUT:?}", self.desc);
+                panic!(
+                    "`glen {}` did not finish within {:?}",
+                    self.desc,
+                    scaled(RUN_TIMEOUT)
+                );
             }
         };
         Out {

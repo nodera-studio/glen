@@ -14,6 +14,10 @@
 .claude/tech-debt/
 .claude/testing/
 .claude/auto-mode/
+# Security-audit working material names exploit paths for unfixed findings and
+# the repo is public: keep it local until the findings are fixed or accepted.
+.claude/reviews/security-*
+.wrangler/
 .claude/settings.local.json
 .claude/.orchestrator-mode
 .claude/*.local.*

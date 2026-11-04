@@ -79,8 +79,8 @@ impl Process {
         let end = Instant::now() + grace;
         loop {
             if self.child.try_wait()?.is_some() {
-                let group = rustix::process::Pid::from_raw(pid as i32)
-                    .ok_or_else(|| io::Error::other("invalid omp pid"))?;
+                let group =
+                    rpc::signal_pid(pid).ok_or_else(|| io::Error::other("invalid omp pid"))?;
                 if group_gone(probe(group))? {
                     self.reaped = true;
                     return Ok(());
@@ -100,8 +100,8 @@ impl Process {
             let end = Instant::now() + Duration::from_secs(1);
             loop {
                 let exited = self.child.try_wait()?.is_some();
-                let group = rustix::process::Pid::from_raw(pid as i32)
-                    .ok_or_else(|| io::Error::other("invalid omp pid"))?;
+                let group =
+                    rpc::signal_pid(pid).ok_or_else(|| io::Error::other("invalid omp pid"))?;
                 if group_gone(probe(group))? && exited {
                     self.reaped = true;
                     return Ok(());
@@ -218,6 +218,8 @@ pub struct Ephemeral {
     stop: Arc<AtomicBool>,
     warnings: Vec<Warning>,
     applied_session: Option<String>,
+    /// A listing child's private cwd (S-02), removed after `terminate` reaps omp.
+    _cwd: Option<rpc::PrivateCwd>,
 }
 pub(crate) fn stopped(deadline: Instant, stop: &AtomicBool) -> Result<(), OpError> {
     if stop.load(Ordering::SeqCst) {
@@ -306,16 +308,20 @@ impl Ephemeral {
         }
         Ok(opened)
     }
+    /// A throwaway listing child (`rpc::listing_command`) in a private empty cwd (S-02).
     pub(crate) fn open_listing(
         profile: Option<&str>,
         bin: &Path,
-        cwd: &Path,
+        env: &crate::env::Env,
         deadline: Instant,
         stop: Arc<AtomicBool>,
     ) -> Result<Self, OpenError> {
-        let mut command = rpc::base_command(bin, profile, cwd);
-        command.arg("--no-session");
-        Self::spawn(command, None, deadline, stop)
+        let cwd = rpc::PrivateCwd::new(env)
+            .map_err(|e| OpenError::Failed(GlenError::new(ErrorCode::Io, e.to_string())))?;
+        let command = rpc::listing_command(bin, profile, &cwd);
+        let mut opened = Self::spawn(command, None, deadline, stop)?;
+        opened._cwd = Some(cwd);
+        Ok(opened)
     }
     fn spawn(
         mut command: std::process::Command,
@@ -388,6 +394,7 @@ impl Ephemeral {
                         stop,
                         warnings: vec![],
                         applied_session: None,
+                        _cwd: None,
                     });
                 }
                 Ok(Err(error)) => {

@@ -17,7 +17,8 @@ Product direction (owner, 2026-10-30; details in the Glen project's Ideas in Mne
 
 - **Standalone and agent-callable, the `playwright-cli` way.** One binary with short verb-first
   subcommands, short session handles, human output on a TTY and `--json` for agents, and a
-  shipped agent skill (`SKILL.md`) for Claude Code and Codex. No MCP server needed to use it.
+  shipped agent skill (`SKILL.md`) for Claude Code and Codex. No MCP server needed to use it
+  (an optional one, `glen mcp`, shipped in v0.2 W5 for hosts that prefer tools over Bash).
 - **It has to look good.** Polished terminal output and a live full-screen session view.
 - **An Astro landing page** (`site/`) in the Nodex redesign's look (`apps/mockup-nodex`;
   Mnemosyne decision `f6a568ef`), with morphin.dev motion components.
@@ -70,9 +71,14 @@ npm run demo:refresh  # regenerate the demo capture from real glen output (cargo
 npm run deploy      # verify, online link check, wrangler deploy (local wrangler login)
 ```
 
-`lefthook install` once per clone: pre-commit checks rustfmt and scans for secrets, pre-push runs
-clippy and the tests. CI (`.github/workflows/ci.yml`) runs the same on Linux and macOS (the
-`site` job runs on Linux only).
+`lefthook install` once per clone: pre-commit checks rustfmt and, if `gitleaks` is installed
+(optional locally; CI always has it), scans for secrets; pre-push runs clippy and the tests
+through `scripts/suite-lock.sh`, which locks test runs so a concurrent `cargo test` from another
+clone or agent does not corrupt shared fixtures. CI (`.github/workflows/ci.yml`) runs rustfmt,
+clippy and the tests on Linux and macOS, plus `linux-sandbox` (the Codex-sandbox scenarios),
+`msrv` (`cargo check --locked --all-targets` on the pinned minimum Rust) and `site-deploy` (a
+dry-run `wrangler deploy`, and a real one on `main` when the deploy secret is set); the `site`
+job itself runs on Linux only.
 
 ## Conventions
 

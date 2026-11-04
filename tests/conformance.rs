@@ -38,6 +38,9 @@
 //! `tests/fixtures/`. TTY-only behaviour (pretty JSON, TTY spinner, terminal width) is not
 //! covered here because the suite has no pseudo-terminal.
 
+/// Process and timing helpers shared with the other suites (`scripts/flake-check.sh` load).
+#[path = "common/flake.rs"]
+mod flake;
 #[path = "conformance/live_support.rs"]
 mod live_support;
 #[path = "conformance/reader.rs"]

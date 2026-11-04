@@ -116,6 +116,13 @@ pub fn map_socket_failure(env: &Env, action: &str, err: &io::Error) -> Option<Gl
 fn marked(env: &Env) -> bool {
     detect(env).is_some() || env.get("CODEX_SANDBOX_NETWORK_DISABLED") == Some("1")
 }
+/// S-04: the same Linux sandbox may also unshare the pid namespace (`bwrap --unshare-pid`),
+/// where a live host process (a TUI, a warm worker, a job's worker) is simply absent from
+/// `/proc`. So under any Codex marker on Linux a pid gone from `/proc` proves nothing: liveness
+/// reads it as unknown, never dead (`jobs::liveness::observe`). `linux` is the unit seam.
+pub fn pids_hidden(env: &Env, linux: bool) -> bool {
+    linux && marked(env)
+}
 /// On Linux omp's session lease is an abstract socket, which is scoped to a network namespace,
 /// and a Codex sandbox may run glen in its own (`--unshare-net`, with `--unshare-pid` making
 /// PID 1 the sandbox's own bwrap). No in-process signal tells such a namespace from the host's
@@ -477,6 +484,9 @@ mod tests {
             let e = Env::for_test(None, Path::new("/"), &vars);
             assert_eq!(lease_hidden(&e, true), marked, "{vars:?} linux");
             assert!(!lease_hidden(&e, false), "{vars:?} not linux");
+            // S-04: the same markers hide other processes' pids on Linux only.
+            assert_eq!(pids_hidden(&e, true), marked, "{vars:?} linux pids");
+            assert!(!pids_hidden(&e, false), "{vars:?} not linux pids");
         }
     }
     #[test]

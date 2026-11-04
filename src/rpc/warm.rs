@@ -211,7 +211,7 @@ impl Entry {
     pub fn class(&self, mtime: SystemTime, now: SystemTime, stale: Duration) -> Class {
         let dead = match &self.start {
             Some(start) => liveness::check(self.pid, start) == Liveness::Dead,
-            None => matches!(liveness::start_token(self.pid), liveness::Probe::Gone),
+            None => matches!(liveness::observe(self.pid), liveness::Probe::Gone),
         };
         if dead {
             Class::Dead
@@ -445,11 +445,23 @@ fn parse(bytes: &[u8], session_id: &str) -> Option<Entry> {
         .ok()
         .filter(|e| e.v == 1 && e.pid > 0 && e.session_id == session_id)
 }
-/// Every readable registry, plus the count of files that are not (torn, foreign, a symlink).
-/// Release requests, metadata lock files and atomic-write temporaries are not registries.
-pub fn index(home: &GlenHome) -> (Vec<Indexed>, usize) {
-    let mut entries = vec![];
-    let mut unreadable = 0;
+/// What [`index`] found in `run/warm`.
+#[derive(Debug, Default)]
+pub struct Index {
+    /// Registries named for their own session (`<lock_key(session_id)>.json`), by session id.
+    pub entries: Vec<Indexed>,
+    /// Registry files that cannot be read or parsed (torn, foreign, a symlink): a worker may
+    /// still run behind one, so callers surface them and never treat them as absent.
+    pub unreadable: Vec<PathBuf>,
+    /// Parsable registries under another session's name (S-09): never a release or kill
+    /// target, never deleted; `doctor` reports them.
+    pub misnamed: Vec<PathBuf>,
+}
+/// Every registry in `run/warm`, sorted out. Release requests, metadata lock files and
+/// atomic-write temporaries are not registries. A forged file can name any pid, so only one
+/// at its session's own path counts (the path every glen writer uses).
+pub fn index(home: &GlenHome) -> Index {
+    let mut index = Index::default();
     for e in fs::read_dir(dir(home)).into_iter().flatten().flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
@@ -462,12 +474,19 @@ pub fn index(home: &GlenHome) -> (Vec<Indexed>, usize) {
                 .filter(|entry| entry.v == 1 && entry.pid > 0)
                 .map(|entry| Indexed { entry, mtime })
         }) {
-            Some(i) => entries.push(i),
-            None => unreadable += 1,
+            Some(i) if name == format!("{}.json", lock_key(&i.entry.session_id)) => {
+                index.entries.push(i)
+            }
+            Some(_) => index.misnamed.push(e.path()),
+            None => index.unreadable.push(e.path()),
         }
     }
-    entries.sort_by(|a, b| a.entry.session_id.cmp(&b.entry.session_id));
-    (entries, unreadable)
+    index
+        .entries
+        .sort_by(|a, b| a.entry.session_id.cmp(&b.entry.session_id));
+    index.unreadable.sort();
+    index.misnamed.sort();
+    index
 }
 /// Asks the worker named by `ident` (see [`ident`]) to cool, under the metadata lock; true once
 /// the request is written. Rewriting refreshes the request. A lock still busy after
@@ -537,7 +556,7 @@ pub fn kill_identity(entry: &Entry) -> KillIdentity {
 fn proven(pid: u32, start: Option<&str>) -> Liveness {
     match start {
         Some(start) => liveness::check(pid, start),
-        None if matches!(liveness::start_token(pid), liveness::Probe::Gone) => Liveness::Dead,
+        None if matches!(liveness::observe(pid), liveness::Probe::Gone) => Liveness::Dead,
         None => Liveness::Unknown,
     }
 }
@@ -674,7 +693,8 @@ fn append_log(store: &JobStore, id: &JobId, handle: &str, line: &str) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.mode(0o600);
+        // S-12: never append through a planted symlink.
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     if let Err(e) = opts
         .open(&path)
@@ -1369,14 +1389,14 @@ mod registry_tests {
         let t = tempfile::tempdir().unwrap();
         let h = home(&t);
         assert!(read(&h, ID).is_none());
-        assert_eq!(index(&h).0.len(), 0);
+        assert_eq!(index(&h).entries.len(), 0);
         assert!(!h.root.exists(), "readers create nothing");
         let e = me(EntryState::Idle);
         publish(&h, &e).unwrap();
         assert_eq!(read(&h, ID).unwrap().entry, e);
-        let (all, unreadable) = index(&h);
-        assert_eq!((all.len(), unreadable), (1, 0));
-        assert_eq!(all[0].entry, e);
+        let found = index(&h);
+        assert_eq!((found.entries.len(), found.unreadable.len()), (1, 0));
+        assert_eq!(found.entries[0].entry, e);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path(&h, ID)), 0o600);
         assert_eq!(mode(&h.root.join("run/warm")), 0o700);
@@ -1387,11 +1407,33 @@ mod registry_tests {
         assert_eq!(mode(&release_path(&h, ID)), 0o600);
         fs::write(dir(&h).join("torn.json"), b"{\"v\":1,").unwrap();
         fs::write(dir(&h).join(".x.json.1.0.tmp"), b"{}").unwrap();
-        let (all, unreadable) = index(&h);
-        assert_eq!((all.len(), unreadable), (1, 1));
+        let found = index(&h);
+        assert_eq!((found.entries.len(), found.unreadable.len()), (1, 1));
+        assert_eq!(found.unreadable, [dir(&h).join("torn.json")]);
         remove(&h, ID).unwrap();
         remove(&h, ID).unwrap();
         assert!(read(&h, ID).is_none());
+    }
+    /// S-09: only a registry at its session's own path is indexed; a parsable one under another
+    /// name (another session's key, or any name) is reported as misnamed and left in place.
+    #[test]
+    fn s09_index_takes_only_registries_named_for_their_session() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let e = me(EntryState::Idle);
+        publish(&h, &e).unwrap();
+        let bytes = serde_json::to_vec(&e).unwrap();
+        let other = path(&h, "01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de");
+        let forged = dir(&h).join("forged.json");
+        for p in [&other, &forged] {
+            fs::write(p, &bytes).unwrap();
+        }
+        let found = index(&h);
+        assert_eq!(found.entries.len(), 1);
+        assert_eq!(found.entries[0].entry, e);
+        assert_eq!(found.misnamed, [other.clone(), forged.clone()]);
+        assert!(found.unreadable.is_empty());
+        assert!(other.exists() && forged.exists(), "never deleted");
     }
     #[test]
     fn symlinks_are_never_read_or_touched() {
@@ -1409,8 +1451,8 @@ mod registry_tests {
             .unwrap();
         std::os::unix::fs::symlink(&victim, path(&h, ID)).unwrap();
         assert!(read(&h, ID).is_none());
-        let (all, unreadable) = index(&h);
-        assert_eq!((all.len(), unreadable), (0, 1));
+        let found = index(&h);
+        assert_eq!((found.entries.len(), found.unreadable.len()), (0, 1));
         touch(&h, ID);
         assert_eq!(fs::metadata(&victim).unwrap().modified().unwrap(), old);
         std::os::unix::fs::symlink(&victim, release_path(&h, ID)).unwrap();
@@ -1863,6 +1905,7 @@ mod claim_tests {
 #[cfg(test)]
 mod idle_tests {
     use super::*;
+    use crate::mcp::test_support::scaled;
     const ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
     #[test]
     fn decide_checks_in_the_documented_order() {
@@ -1967,7 +2010,7 @@ mod idle_tests {
             &|l: &str| lines.lock().unwrap().push(l.to_owned()),
         );
         assert!(
-            started.elapsed() < Duration::from_secs(4),
+            started.elapsed() < scaled(Duration::from_secs(4)),
             "{:?}",
             started.elapsed()
         );
@@ -2046,7 +2089,7 @@ mod idle_tests {
         );
         let took = started.elapsed();
         assert!(
-            took >= META_BOUND && took < META_BOUND + META_BOUND / 2,
+            took >= META_BOUND && took < scaled(META_BOUND + META_BOUND / 2),
             "one wait of the metadata bound: {took:?}"
         );
         assert!(!crate::jobs::lock::is_held(&home, ID));
@@ -2077,7 +2120,7 @@ mod idle_tests {
         );
         let took = started.elapsed();
         assert!(
-            took >= TEARDOWN_BOUND && took < TEARDOWN_DEADLINE + Duration::from_millis(250),
+            took >= TEARDOWN_BOUND && took < scaled(TEARDOWN_DEADLINE + Duration::from_millis(250)),
             "teardown keeps its deadline: {took:?}"
         );
         assert!(!crate::jobs::lock::is_held(&home, ID));

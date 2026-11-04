@@ -1,4 +1,5 @@
 mod common;
+use common::flake::CaptureExt;
 use common::{OmpBox, data, json};
 use std::{
     fs,
@@ -11,7 +12,7 @@ fn mode(p: &Path) -> u32 {
 fn install(b: &OmpBox, flags: &[&str]) -> std::process::Output {
     let mut args = vec!["install-extension", "--json"];
     args.extend_from_slice(flags);
-    b.command(&args, &b.alpha()).output().unwrap()
+    b.command(&args, &b.alpha()).captured()
 }
 fn target(b: &OmpBox) -> std::path::PathBuf {
     b.agent.join("extensions/glen/index.ts")
@@ -23,8 +24,7 @@ fn ac302_install_targets_and_lazy_home() {
         &default
             .command(&["install-extension", "--json"], &default.alpha())
             .env_remove("PI_CODING_AGENT_DIR")
-            .output()
-            .unwrap(),
+            .captured(),
     );
     assert_eq!(
         d["path"],
@@ -57,7 +57,7 @@ fn ac302_install_targets_and_lazy_home() {
         let b = OmpBox::new();
         let mut args = vec!["install-extension", "--json"];
         args.extend(flags);
-        let o = b.command(&args, &b.alpha()).envs(vars).output().unwrap();
+        let o = b.command(&args, &b.alpha()).envs(vars).captured();
         let d = data(&o);
         assert_eq!(d["action"], "installed");
         let p = std::path::PathBuf::from(d["path"].as_str().unwrap());
@@ -176,8 +176,7 @@ fn ac304_doctor_checks_and_ac321_warning() {
         data(
             &b.command(&["doctor", "--json"], &b.alpha())
                 .env("GLEN_OMP_BIN", common::fixture("bin/fake-omp"))
-                .output()
-                .unwrap(),
+                .captured(),
         )
     };
     assert_eq!(doctor()["extension"]["state"], "not_installed");
@@ -192,8 +191,7 @@ fn ac304_doctor_checks_and_ac321_warning() {
     let o = b
         .command(&["install-extension", "--json"], &b.alpha())
         .env("GLEN_HOME", &home)
-        .output()
-        .unwrap();
+        .captured();
     assert!(
         json(&o)["warnings"]
             .as_array()
@@ -217,8 +215,7 @@ fn installer_rejects_non_utf8_baked_home_without_writing() {
             .command(&["install-extension", mode], &b.alpha())
             .env_remove("GLEN_HOME")
             .env("HOME", &home)
-            .output()
-            .unwrap();
+            .captured();
         assert_eq!(o.status.code(), Some(2), "{o:?}");
         assert!(!b.agent.join("extensions").exists());
         if mode == "--json" {
@@ -239,8 +236,7 @@ fn human_install_output_explains_the_tool_and_fits_both_themes() {
             )
             .env("GLEN_THEME", theme)
             .env("COLUMNS", "60")
-            .output()
-            .unwrap();
+            .captured();
         assert!(o.status.success(), "{o:?}");
         assert!(o.stderr.is_empty());
         assert!(o.stdout.contains(&27));
@@ -312,7 +308,7 @@ fn human_dry_run_and_action_specific_tool_explanation() {
     ] {
         let mut args = vec!["install-extension", "--human"];
         args.extend(&flags);
-        let o = b.command(&args, &b.alpha()).output().unwrap();
+        let o = b.command(&args, &b.alpha()).captured();
         assert!(o.status.success(), "{o:?}");
         let text = String::from_utf8(o.stdout).unwrap();
         assert_eq!(
@@ -332,8 +328,7 @@ fn doctor_only_suggests_install_when_needed_and_reports_inspection_errors() {
         data(
             &b.command(&["doctor", "--json"], &b.alpha())
                 .env("GLEN_OMP_BIN", common::fixture("bin/fake-omp"))
-                .output()
-                .unwrap(),
+                .captured(),
         )
     };
     assert!(
@@ -372,16 +367,14 @@ fn default_profile_is_null_and_named_profile_matches_doctor() {
     let doctor = data(
         &b.command(&["doctor", "--json"], &b.alpha())
             .env("GLEN_OMP_BIN", common::fixture("bin/fake-omp"))
-            .output()
-            .unwrap(),
+            .captured(),
     );
     assert_eq!(installed["profile"], doctor["paths"]["profile"]);
     let installed = data(&install(&b, &["--profile", "work", "--dry-run"]));
     let doctor = data(
         &b.command(&["doctor", "--profile", "work", "--json"], &b.alpha())
             .env("GLEN_OMP_BIN", common::fixture("bin/fake-omp"))
-            .output()
-            .unwrap(),
+            .captured(),
     );
     assert_eq!(installed["profile"], "work");
     assert_eq!(installed["profile"], doctor["paths"]["profile"]);
@@ -397,8 +390,7 @@ fn doctor_current_is_always_a_boolean() {
         let doctor = data(
             &b.command(&["doctor", "--json"], &b.alpha())
                 .env("GLEN_OMP_BIN", common::fixture("bin/fake-omp"))
-                .output()
-                .unwrap(),
+                .captured(),
         );
         assert!(doctor["extension"]["current"].is_boolean());
         assert_eq!(doctor["extension"]["current"], present);

@@ -1,9 +1,17 @@
 //! v0.2 W4 warm worker (AC-v2-401…AC-v2-407, design §A21): the Implementer's own tests, on the
 //! real binary with `fake_omp` (never a live omp). Every test ends warmth (release, expiry, a
 //! signal) and a drop guard kills any survivor, so no worker outlives its box.
+//!
+//! Under `scripts/flake-check.sh` the waits, the upper bounds on the product's timing and the
+//! `--warm` windows a later send must land in (`window`) are multiplied by `GLEN_TEST_TIME_SCALE`
+//! (`flake::scaled`, exact in a plain run); lower bounds and absence windows are not. glen's
+//! output is captured in files (`flake::output`), never read from a pipe to end of file.
 #![cfg(unix)]
 mod common;
-use common::*;
+use common::{
+    flake::{self, scaled},
+    *,
+};
 use glen::{
     glen_home::GlenHome,
     jobs::{
@@ -31,8 +39,7 @@ impl std::ops::Deref for WarmBox {
 }
 impl Drop for WarmBox {
     fn drop(&mut self) {
-        let (entries, _) = warm::index(&self.home());
-        for e in entries {
+        for e in warm::index(&self.home()).entries {
             for pid in [Some(e.entry.pid), e.entry.omp_pid].into_iter().flatten() {
                 if let Some(pid) = rustix::process::Pid::from_raw(pid as i32) {
                     let _ = rustix::process::kill_process(pid, rustix::process::Signal::CONT);
@@ -77,7 +84,7 @@ impl WarmBox {
         c
     }
     fn run(&self, args: &[&str]) -> Output {
-        self.cmd(args).output().unwrap()
+        flake::output(&mut self.cmd(args))
     }
     fn send(&self, extra: &[&str]) -> Value {
         let mut args = vec!["send", "e27c0de", "hi", "--json"];
@@ -95,10 +102,10 @@ impl WarmBox {
     }
     /// The box's one warm registry, whatever its session.
     fn registry(&self) -> Option<warm::Indexed> {
-        warm::index(&self.home()).0.into_iter().next()
+        warm::index(&self.home()).entries.into_iter().next()
     }
     fn wait_registry(&self) -> warm::Indexed {
-        poll(Duration::from_secs(10), || {
+        poll(scaled(Duration::from_secs(10)), || {
             self.registry()
                 .filter(|r| r.entry.state == warm::EntryState::Idle)
         })
@@ -119,10 +126,11 @@ impl WarmBox {
             .filter(|v| v["event"] == "start")
             .count()
     }
-    /// Waits until warmth is over: registry gone, lock free, worker and omp group gone.
+    /// Waits until warmth is over: registry gone, lock free, worker and omp group gone, within
+    /// `within` (scaled).
     fn wait_cold(&self, entry: &warm::Entry, within: Duration) -> Duration {
         let started = Instant::now();
-        poll(within, || {
+        poll(scaled(within), || {
             (self.registry().is_none()
                 && !lock::is_held(&self.home(), &entry.session_id)
                 && gone(entry.pid)
@@ -137,11 +145,16 @@ impl WarmBox {
         let s = self.job(id).1;
         let pid = s["worker_pid"].as_u64().unwrap() as u32;
         let omp = s["omp_pid"].as_u64().map(|p| p as u32);
-        poll(within, || {
+        poll(scaled(within), || {
             (self.registry().is_none() && !self.held() && gone(pid) && omp.is_none_or(group_gone))
                 .then_some(())
         });
     }
+}
+/// A `--warm` value for a window the test's own steps must outlast (a later send has to land in
+/// it): `secs` in a plain run, scaled under `scripts/flake-check.sh`.
+fn window(secs: u64) -> String {
+    format!("{}s", scaled(Duration::from_secs(secs)).as_secs())
 }
 fn gone(pid: u32) -> bool {
     matches!(liveness::start_token(pid), Probe::Gone)
@@ -181,7 +194,7 @@ fn ac_v2_403_a_warm_worker_holds_the_session_then_expires() {
     assert_eq!(reg.entry.job_id, id);
     assert!(b.held());
     // The registry is published just before the holder flips to `warm`.
-    let holder = poll(Duration::from_secs(2), || {
+    let holder = poll(scaled(Duration::from_secs(2)), || {
         b.holder().filter(|h| h.kind == lock::HolderKind::Warm)
     });
     assert_eq!(holder.pid, reg.entry.pid);
@@ -199,7 +212,7 @@ fn ac_v2_403_a_warm_worker_holds_the_session_then_expires() {
     let second = b.send(&["--warm", "1s"]);
     assert_eq!(second["job"]["status"], "completed", "{second}");
     let two = job_id(&second);
-    poll(Duration::from_secs(10), || {
+    poll(scaled(Duration::from_secs(10)), || {
         b.log(&two)
             .contains("warm: cooling (expired)")
             .then_some(())
@@ -219,12 +232,12 @@ fn ac_v2_402_a_second_send_is_stolen_and_runs_on_the_same_omp() {
     let queued = b.no_wait(&["again", "--warm", "30s"]);
     let sent = Instant::now();
     let two = job_id(&queued);
-    let claimed = poll(Duration::from_secs(5), || {
+    let claimed = poll(scaled(Duration::from_secs(5)), || {
         let s = b.job(&two).1;
         (s["omp_reused"] == true).then_some(s)
     });
     assert!(
-        sent.elapsed() < Duration::from_millis(500),
+        sent.elapsed() < scaled(Duration::from_millis(500)),
         "{:?}",
         sent.elapsed()
     );
@@ -335,7 +348,7 @@ fn ac_v2_406_controls_cool_an_idle_warm_session_then_run_as_today() {
 
 /// `pred` once it holds, or `None` once `child` exited without it.
 fn until_or_exit<T>(child: &mut std::process::Child, pred: impl Fn() -> Option<T>) -> Option<T> {
-    poll(Duration::from_secs(10), || match pred() {
+    poll(scaled(Duration::from_secs(10)), || match pred() {
         Some(v) => Some(Some(v)),
         None => child.try_wait().unwrap().map(|_| None),
     })
@@ -357,12 +370,10 @@ fn ac_v2_406_models_asks_the_job_a_cooling_warm_worker_adopted() {
         start: Some(me.start.clone()),
     };
     lock::mark(&held, &warm_holder).unwrap();
-    let mut models = b
-        .cmd(&["models", "e27c0de", "--timeout", "10s", "--json"])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
+    let capture = flake::Capture::new();
+    let mut models = b.cmd(&["models", "e27c0de", "--timeout", "10s", "--json"]);
+    capture.attach(&mut models);
+    let mut models = models.spawn().unwrap();
     let ident = warm::ident(me.pid, Some(&me.start));
     let asked = until_or_exit(&mut models, || {
         warm::release_requested(&home, A_ID, &ident).then_some(())
@@ -445,7 +456,7 @@ fn ac_v2_406_models_asks_the_job_a_cooling_warm_worker_adopted() {
             answer.to_string(),
         );
     }
-    let doc = data(&models.wait_with_output().unwrap());
+    let doc = data(&capture.output(models.wait().unwrap()));
     assert_eq!(doc["route"], "job", "{doc}");
     assert_eq!(doc["current_source"], "session", "{doc}");
     assert_eq!(doc["current"]["id"], "adopted", "{doc}");
@@ -514,6 +525,200 @@ fn ac_v2_405_a_mismatched_registry_is_cleaned_and_never_signalled() {
     );
     sleeper.kill().unwrap();
     sleeper.wait().unwrap();
+}
+
+/// A stale idle registry for session A naming `pid` with its real start token, as a forger
+/// reads both from `ps`.
+fn forged_entry(pid: u32) -> warm::Entry {
+    let Probe::Running(start) = liveness::start_token(pid) else {
+        panic!("no start token for {pid}")
+    };
+    warm::Entry {
+        v: 1,
+        pid,
+        start: Some(start),
+        session_id: A_ID.into(),
+        session_handle: None,
+        job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+        omp_pid: None,
+        omp_start: None,
+        warm_ms: 1000,
+        expires_at: "2099-01-01T00:00:00Z".into(),
+        state: warm::EntryState::Idle,
+        started_at: "2020-01-01T00:00:00Z".into(),
+    }
+}
+fn age(path: &std::path::Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000))
+        .unwrap();
+}
+
+/// S-09, the audit's reproduction: a registry forged under a name that is not its session's
+/// key (`forged.json`), naming a live process by its real pid and start token, is never a
+/// release target. `release --all --force` signals nothing and deletes nothing; doctor names
+/// the file in a warning.
+#[test]
+fn s09_a_misnamed_registry_is_never_signalled_or_removed() {
+    let b = WarmBox::new();
+    let mut sleeper = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let dir = b.home().ensure_dir("run/warm").unwrap();
+    let forged = dir.join("forged.json");
+    std::fs::write(
+        &forged,
+        serde_json::to_vec(&forged_entry(sleeper.id())).unwrap(),
+    )
+    .unwrap();
+    age(&forged);
+    let out = data(&b.run(&["release", "--all", "--force", "--json"]));
+    assert_eq!(out["total"], 0, "{out}");
+    assert!(sleeper.try_wait().unwrap().is_none(), "never signalled");
+    assert!(forged.exists(), "never deleted");
+    let doctor = data(&b.run(&["doctor", "--json"]));
+    let row = check(&doctor, "warm_workers");
+    assert_eq!(row["status"], "warn", "{row}");
+    assert_eq!(row["value"], "0 warm, 0 stale, 0 dead");
+    let detail = row["detail"].as_str().unwrap();
+    assert!(
+        detail.contains("forged.json") && detail.contains("ignored"),
+        "{detail}"
+    );
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+}
+
+/// Tech-debt F4: a torn registry may still name a running worker, so `release --all` releases
+/// the readable ones and then fails (exit 1, `io`) naming the torn file; it never says "no warm
+/// workers" with exit 0, and it removes nothing it cannot read.
+#[test]
+fn f4_release_all_never_succeeds_past_an_unreadable_registry() {
+    let b = WarmBox::new();
+    let dir = b.home().ensure_dir("run/warm").unwrap();
+    let torn = dir.join("01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de.json");
+    std::fs::write(&torn, b"{\"v\":1,\"pid\":").unwrap();
+    // A dead registry next to it is still cleaned and reported (never this test process: the
+    // box's drop kills every pid left in a registry).
+    let mut stand_in = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut dead = forged_entry(stand_in.id());
+    dead.start = Some("reused".into());
+    warm::publish(&b.home(), &dead).unwrap();
+    let out = b.run(&["release", "--all", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let e = &json(&out)["error"];
+    assert_eq!(e["code"], "io", "{e}");
+    assert!(e["message"].as_str().unwrap().contains("unreadable"), "{e}");
+    assert_eq!(e["details"]["unreadable"][0], torn.to_str().unwrap());
+    assert_eq!(e["details"]["workers"][0]["outcome"], "cleaned", "{e}");
+    assert!(torn.exists());
+    assert!(b.registry().is_none());
+    let human = b.run(&["release", "--all", "--human"]);
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    assert!(!String::from_utf8_lossy(&human.stdout).contains("no warm workers"));
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
+}
+
+/// Tech-debt F3: one worker's I/O error never drops the other rows. The first worker (by
+/// session id) cannot be cleaned (its metadata lock path is a directory); the second still is,
+/// and the error carries both rows.
+#[test]
+fn f3_release_all_keeps_every_row_past_one_workers_io_error() {
+    let b = WarmBox::new();
+    // Never this test process: the box's drop kills every pid left in a registry.
+    let mut stand_in = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let first = "01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de";
+    for id in [first, A_ID] {
+        let mut dead = forged_entry(stand_in.id());
+        dead.session_id = id.into();
+        dead.start = Some("reused".into());
+        warm::publish(&b.home(), &dead).unwrap();
+    }
+    let lock = b.home().root.join("run/warm").join(format!("{first}.lock"));
+    std::fs::remove_file(&lock).unwrap();
+    std::fs::create_dir(&lock).unwrap();
+    let out = b.run(&["release", "--all", "--json"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let e = &json(&out)["error"];
+    assert_eq!(e["code"], "io", "{e}");
+    let message = e["message"].as_str().unwrap();
+    assert!(
+        message.contains(".lock") && message.ends_with("(1 of 2 warm workers released)"),
+        "{message}"
+    );
+    let rows = e["details"]["workers"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{e}");
+    assert_eq!(
+        (&rows[0]["session"]["id"], &rows[0]["outcome"]),
+        (&Value::from(first), &Value::from("failed"))
+    );
+    assert_eq!(
+        (&rows[1]["session"]["id"], &rows[1]["outcome"]),
+        (&Value::from(A_ID), &Value::from("cleaned"))
+    );
+    assert!(warm::read(&b.home(), A_ID).is_none());
+    assert!(warm::read(&b.home(), first).is_some());
+    assert!(stand_in.try_wait().unwrap().is_none(), "never signalled");
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
+}
+
+/// Tech-debt F5: when `--force` itself could not prove the process, the hint never suggests
+/// `--force` again; without it, it does.
+#[test]
+fn f5_the_release_timeout_hint_names_force_only_without_it() {
+    let b = WarmBox::new();
+    // A live process with no start token: unprovable, so never signalled.
+    let mut stand_in = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+    let mut unproven = forged_entry(stand_in.id());
+    unproven.start = None;
+    warm::publish(&b.home(), &unproven).unwrap();
+    for (force, names_force) in [(true, false), (false, true)] {
+        let mut args = vec!["release", "e27c0de", "--timeout", "100ms", "--json"];
+        if force {
+            args.push("--force");
+        }
+        let out = b.run(&args);
+        assert_eq!(out.status.code(), Some(7), "{out:?}");
+        let e = &json(&out)["error"];
+        assert_eq!(e["details"]["reason"], "release_timeout");
+        let hint = e["hint"].as_str().unwrap();
+        assert_eq!(
+            hint.contains("--force"),
+            names_force,
+            "force {force}: {hint}"
+        );
+    }
+    assert_eq!(warm::read(&b.home(), A_ID).unwrap().entry, unproven);
+    assert!(stand_in.try_wait().unwrap().is_none(), "never signalled");
+    stand_in.kill().unwrap();
+    stand_in.wait().unwrap();
+}
+
+/// S-27: a job whose final session identity omp never confirmed (every get_state from the
+/// third on answers after 4 s, past its 1 s budget, so the retry fails too) completes with the
+/// `session_identity_unverified` warning and does not stay warm.
+#[test]
+fn s27_an_unverified_identity_never_stays_warm() {
+    let b = WarmBox::with(&[
+        ("FAKE_OMP_STATE_DELAY_AT", "3+"),
+        ("FAKE_OMP_PREFLIGHT_DELAY_MS", "4000"),
+    ]);
+    let out = b.run(&["send", "e27c0de", "hi", "--warm", "30s", "--json"]);
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let v = json(&out);
+    let codes: Vec<&str> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|w| w["code"].as_str())
+        .collect();
+    assert_eq!(codes, ["session_identity_unverified"], "{v}");
+    b.wait_worker_gone(&job_id(&v["data"]));
+    assert!(b.registry().is_none(), "no warm registry");
+    assert!(!b.held(), "the session lock is free");
 }
 
 /// A flock on session A's metadata lock file from this process, as a holder stopped inside its
@@ -638,7 +843,7 @@ fn ac_v2_401_off_by_default_flag_beats_env_and_zero_is_off() {
         args.extend(flag.map(|f| ["--warm", f]).into_iter().flatten());
         let mut c = b.cmd(&args);
         c.envs(var.map(|v| ("GLEN_WARM", v)));
-        let doc = data(&c.output().unwrap());
+        let doc = data(&flake::output(&mut c));
         assert_eq!(
             warm_ms_of(&b, &doc),
             want.map_or(Value::Null, Value::from),
@@ -648,7 +853,7 @@ fn ac_v2_401_off_by_default_flag_beats_env_and_zero_is_off() {
             // Warm, or already cooled on its own (the 1s row): end it either way, never by
             // catching a window that may have closed.
             let id = job_id(&doc);
-            poll(Duration::from_secs(10), || {
+            poll(scaled(Duration::from_secs(10)), || {
                 (b.registry().is_some() || b.log(&id).contains("warm: cooling")).then_some(())
             });
             release_all(&b);
@@ -673,7 +878,7 @@ fn ac_v2_401_bad_values_fail_before_any_job_exists() {
         args.extend(flag.map(|f| ["--warm", f]).into_iter().flatten());
         let mut c = b.cmd(&args);
         c.envs(var.map(|v| ("GLEN_WARM", v)));
-        let out = c.output().unwrap();
+        let out = flake::output(&mut c);
         assert_eq!(out.status.code(), Some(2), "{flag:?} {var:?}: {out:?}");
         if code == "invalid_env" {
             let e = json(&out);
@@ -690,7 +895,7 @@ fn ac_v2_401_bad_values_fail_before_any_job_exists() {
     // GLEN_WARM is read only by send.
     let mut c = b.cmd(&["jobs", "--json"]);
     c.env("GLEN_WARM", "abc");
-    assert!(c.output().unwrap().status.success());
+    assert!(flake::output(&mut c).status.success());
 }
 
 #[test]
@@ -698,6 +903,7 @@ fn ac_v2_401_new_session_stays_warm_and_a_send_through_a_symlinked_cwd_is_stolen
     let b = WarmBox::new();
     let link = b.omp.tmp.path().join("alpha-link");
     std::os::unix::fs::symlink(b.omp.alpha(), &link).unwrap();
+    let warm = window(5);
     let first = b.run(&[
         "send",
         "@new",
@@ -705,7 +911,7 @@ fn ac_v2_401_new_session_stays_warm_and_a_send_through_a_symlinked_cwd_is_stolen
         "--cwd",
         link.to_str().unwrap(),
         "--warm",
-        "5s",
+        &warm,
         "--json",
     ]);
     let first = data(&first);
@@ -727,7 +933,7 @@ fn ac_v2_401_new_session_stays_warm_and_a_send_through_a_symlinked_cwd_is_stolen
     )
     .unwrap();
     let handle = glen::rpc::session_handle(&id);
-    let second = data(&b.run(&["send", &handle, "again", "--warm", "5s", "--json"]));
+    let second = data(&b.run(&["send", &handle, "again", "--warm", &warm, "--json"]));
     assert_eq!(second["job"]["omp_reused"], true, "{second}");
     assert_eq!(b.starts(), 1);
     release_all(&b);
@@ -737,11 +943,11 @@ fn ac_v2_401_new_session_stays_warm_and_a_send_through_a_symlinked_cwd_is_stolen
 fn ac_v2_401_live_route_ignores_warm_with_a_warning() {
     let mut lb = LiveBox::new();
     lb.start_ext(A_ID, "ok", &[]);
-    let out = lb
-        .rpc
-        .glen(&["send", "e27c0de", "hi", "--warm", "5s", "--json"])
-        .output()
-        .unwrap();
+    let out = flake::output(
+        &mut lb
+            .rpc
+            .glen(&["send", "e27c0de", "hi", "--warm", "5s", "--json"]),
+    );
     let v = json(&out);
     let id = v["data"]["job"]["id"].as_str().unwrap();
     assert_eq!(v["data"]["job"]["route"], "live", "{v}");
@@ -773,18 +979,19 @@ fn ac_v2_402_a_stolen_job_is_the_claimants_never_lost_while_it_lives() {
     let (_dir, run) = gate_path();
     let b = WarmBox::with(&[("FAKE_OMP_RUN_RELEASE", run.to_str().unwrap())]);
     std::fs::write(&run, b"go").unwrap();
-    b.send(&["--warm", "5s"]);
+    let warm = window(5);
+    b.send(&["--warm", &warm]);
     let reg = b.wait_registry();
     // Hold job 2 in omp by deleting the knob's file (never by changing an env value).
     std::fs::remove_file(&run).unwrap();
-    let two = job_id(&b.no_wait(&["held", "--warm", "5s"]));
-    let claimed = poll(Duration::from_secs(5), || {
+    let two = job_id(&b.no_wait(&["held", "--warm", &warm]));
+    let claimed = poll(scaled(Duration::from_secs(5)), || {
         let s = status_of(&b, &two);
         (s["omp_reused"] == true).then_some(s)
     });
     assert_eq!(claimed["worker_pid"], reg.entry.pid);
     // The blocked cold worker exits on the steal without writing the status.
-    poll(Duration::from_secs(5), || {
+    poll(scaled(Duration::from_secs(5)), || {
         b.log(&two)
             .contains("claimed by another worker, exiting")
             .then_some(())
@@ -809,8 +1016,8 @@ fn ac_v2_402_a_stolen_job_is_the_claimants_never_lost_while_it_lives() {
     // A claimant that dies mid-job: its job is lost through liveness.
     let reg = b.wait_registry();
     std::fs::remove_file(&run).unwrap();
-    let three = job_id(&b.no_wait(&["doomed", "--warm", "5s"]));
-    poll(Duration::from_secs(5), || {
+    let three = job_id(&b.no_wait(&["doomed", "--warm", &warm]));
+    poll(scaled(Duration::from_secs(5)), || {
         (status_of(&b, &three)["status"] == "accepted").then_some(())
     });
     let pid = rustix::process::Pid::from_raw(reg.entry.pid as i32).unwrap();
@@ -829,7 +1036,9 @@ fn ac_v2_402_a_stolen_job_is_the_claimants_never_lost_while_it_lives() {
         Ok(()) | Err(rustix::io::Errno::SRCH) => (),
         Err(e) => panic!("cannot kill omp group {omp}: {e}"),
     }
-    poll(Duration::from_secs(5), || group_gone(omp).then_some(()));
+    poll(scaled(Duration::from_secs(5)), || {
+        group_gone(omp).then_some(())
+    });
     warm::remove(&b.home(), A_ID).unwrap();
 }
 fn gate_path() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -843,28 +1052,33 @@ fn ac_v2_402_a_job_queued_behind_the_first_is_claimed_once_it_settles() {
     let (_dir, result) = gate_path();
     let b = WarmBox::with(&[("FAKE_OMP_RESULT_RELEASE", result.to_str().unwrap())]);
     let one = job_id(&b.no_wait(&["first", "--warm", "5s"]));
-    poll(Duration::from_secs(5), || {
+    poll(scaled(Duration::from_secs(5)), || {
         (status_of(&b, &one)["status"] == "accepted").then_some(())
     });
-    // Queued while job 1 runs: no warm duration, so warmth ends after it.
+    // Queued while job 1 runs: no warm duration, so warmth ends after it. Its own worker waits
+    // for the session lock before job 1 settles.
     let two = job_id(&b.no_wait(&["second"]));
-    std::thread::sleep(Duration::from_millis(300));
+    poll(scaled(Duration::from_secs(5)), || {
+        b.log(&two)
+            .contains("lock: waiting for glen session lock")
+            .then_some(())
+    });
     std::fs::write(&result, b"go").unwrap();
-    let settled = poll(Duration::from_secs(10), || {
+    let settled = poll(scaled(Duration::from_secs(10)), || {
         let s = status_of(&b, &one);
         (s["status"] == "completed").then(Instant::now)
     });
-    poll(Duration::from_secs(5), || {
+    poll(scaled(Duration::from_secs(5)), || {
         (status_of(&b, &two)["omp_reused"] == true).then_some(())
     });
     assert!(
-        settled.elapsed() < Duration::from_millis(500),
+        settled.elapsed() < scaled(Duration::from_millis(500)),
         "{:?}",
         settled.elapsed()
     );
     let done = data(&b.run(&["wait", &two, "--json"]));
     assert_eq!(done["job"]["omp_reused"], true);
-    poll(Duration::from_secs(6), || {
+    poll(scaled(Duration::from_secs(6)), || {
         (b.registry().is_none() && !b.held()).then_some(())
     });
     assert!(
@@ -886,19 +1100,20 @@ fn ac_v2_407_an_idle_glen_reply_is_rejected_and_attributed_nowhere() {
         ("FAKE_OMP_IDLE_REPLY_RELEASE", idle.to_str().unwrap()),
         ("FAKE_OMP_SCENARIO", "progress"),
     ]);
-    let first = b.send(&["--warm", "5s"]);
+    let warm = window(5);
+    let first = b.send(&["--warm", &warm]);
     let one = job_id(&first);
     let reg = b.wait_registry();
     let replies_one = std::fs::read(b.job_dir(&one).join("replies.ndjson")).unwrap();
     std::fs::write(&idle, b"go").unwrap();
-    let result = poll(Duration::from_secs(5), || {
+    let result = poll(scaled(Duration::from_secs(5)), || {
         b.frames_in("host_tool_result")
             .into_iter()
             .find(|f| f["id"] == "htc_idle")
     });
     assert_eq!(result["isError"], true, "{result}");
     // The next job's replies are its own; the first job's file is unchanged.
-    let second = b.send(&["--warm", "5s"]);
+    let second = b.send(&["--warm", &warm]);
     let two = job_id(&second);
     assert_eq!(second["job"]["omp_reused"], true);
     let texts: Vec<_> = second["replies"]
@@ -942,14 +1157,14 @@ fn ac_v2_407_the_window_opens_after_settlement_and_a_long_job_stays_busy() {
     // Job 1 is held before its result, and job 2 queues behind it: the worker adopts job 2 on
     // its first idle tick after job 1 settles, so no process start-up races job 1's window.
     let one = job_id(&b.no_wait(&["first", "--warm", "2s"]));
-    poll(Duration::from_secs(10), || {
+    poll(scaled(Duration::from_secs(10)), || {
         contains(&b.job_dir(&one).join("replies.ndjson"), "reply: first").then_some(())
     });
     let two = job_id(&b.no_wait(&["long", "--warm", "30s"]));
     // Job 1 is past the run gate (its reply is in): closing it holds only job 2.
     std::fs::remove_file(&run).unwrap();
     std::fs::write(&result, b"go").unwrap();
-    let busy = poll(Duration::from_secs(10), || {
+    let busy = poll(scaled(Duration::from_secs(10)), || {
         b.registry()
             .filter(|r| r.entry.state == warm::EntryState::Busy && r.entry.job_id == two)
     });
@@ -1024,7 +1239,7 @@ fn ac_v2_403_every_ending_goes_through_one_teardown() {
             }
         };
         let took = b.wait_cold(&reg.entry, Duration::from_secs(4));
-        assert!(took < Duration::from_secs(4), "{ending}: {took:?}");
+        assert!(took < scaled(Duration::from_secs(4)), "{ending}: {took:?}");
         assert!(!warm::release_path(&b.home(), A_ID).exists(), "{ending}");
         assert!(
             b.log(&one).contains(&format!("warm: cooling ({reason})")),
@@ -1036,30 +1251,32 @@ fn ac_v2_403_every_ending_goes_through_one_teardown() {
 
 #[test]
 fn ac_v2_403_a_live_endpoint_for_the_session_ends_warmth_within_a_second() {
+    // The box has built fake_ext already: the endpoint starts within the window, not after it.
     let mut lb = LiveBox::new();
     let owners = lb.rpc.owners();
-    let send = lb
-        .rpc
-        .glen(&["send", "e27c0de", "hi", "--warm", "60s", "--json"])
-        .env("FAKE_OMP_MULTI", "1")
-        .env("FAKE_OMP_OWNERS_DIR", &owners)
-        .output()
-        .unwrap();
+    let send = flake::output(
+        lb.rpc
+            .glen(&["send", "e27c0de", "hi", "--warm", "60s", "--json"])
+            .env("FAKE_OMP_MULTI", "1")
+            .env("FAKE_OMP_OWNERS_DIR", &owners),
+    );
     let one = data(&send)["job"]["id"].as_str().unwrap().to_owned();
     let home = GlenHome {
         root: lb.rpc.omp.glen_home.clone(),
     };
-    let reg = poll(Duration::from_secs(10), || warm::read(&home, A_ID));
+    let reg = poll(scaled(Duration::from_secs(10)), || warm::read(&home, A_ID));
     lb.start_ext(A_ID, "ok", &[]);
     let appeared = Instant::now();
     let omp = reg.entry.omp_pid.unwrap();
-    poll(Duration::from_secs(1), || group_gone(omp).then_some(()));
+    poll(scaled(Duration::from_secs(1)), || {
+        group_gone(omp).then_some(())
+    });
     assert!(
-        appeared.elapsed() < Duration::from_secs(1),
+        appeared.elapsed() < scaled(Duration::from_secs(1)),
         "{:?}",
         appeared.elapsed()
     );
-    poll(Duration::from_secs(4), || {
+    poll(scaled(Duration::from_secs(4)), || {
         (warm::read(&home, A_ID).is_none() && !lock::is_held(&home, A_ID) && gone(reg.entry.pid))
             .then_some(())
     });
@@ -1091,7 +1308,7 @@ fn ac_v2_403_a_stray_control_for_the_last_job_is_answered_job_ended() {
     b.wait_registry();
     let dir = b.job_dir(&one).join("control");
     write_control(&dir, "1.json", br#"{"v":1,"op":"list_models"}"#);
-    let done = poll(Duration::from_secs(3), || {
+    let done = poll(scaled(Duration::from_secs(3)), || {
         std::fs::read(dir.join("1.done.json"))
             .ok()
             .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap())
@@ -1130,7 +1347,7 @@ fn ac_v2_404_a_job_with_another_key_cools_the_worker_and_runs_cold() {
         args.extend(&extra);
         let mut c = b.cmd(&args);
         c.envs(vars.iter().copied());
-        let two = data(&c.output().unwrap());
+        let two = data(&flake::output(&mut c));
         assert_eq!(two["job"]["status"], "completed", "{name}");
         assert_eq!(two["job"]["omp_reused"], false, "{name}");
         assert_eq!(b.starts(), starts + 2, "{name}: job 2 started its own omp");
@@ -1150,4 +1367,23 @@ fn ac_v2_404_a_job_with_another_key_cools_the_worker_and_runs_cold() {
         b.wait_worker_gone(&job_id(&two));
         assert!(b.registry().is_none(), "{name}");
     }
+}
+
+/// The harness's `flake::output` returns at the child's exit while another process still holds
+/// its stdout and stderr, as a warm worker holds a pipe it inherited from a concurrent spawn (on
+/// macOS std sets a pipe's `FD_CLOEXEC` after creating it). `Command::output()` reads to end of
+/// file, so it waits for that process: on CI the fake_ext build sat in it for a warm worker's
+/// 60 s window, and the AC-v2-403 live case behind it started its endpoint after the expiry.
+#[test]
+fn harness_output_returns_at_exit_while_another_process_holds_the_output() {
+    let started = Instant::now();
+    let out = flake::output(
+        Command::new("/bin/sh").args(["-c", "/bin/sleep 30 & echo $!; echo done >&2"]),
+    );
+    let took = started.elapsed();
+    let holder: u32 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+    signal(holder, rustix::process::Signal::KILL);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stderr, b"done\n");
+    assert!(took < scaled(Duration::from_secs(10)), "{took:?}");
 }

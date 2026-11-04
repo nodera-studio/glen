@@ -234,7 +234,7 @@ fn ac314_an_endpoint_that_never_answers_hello_refuses_within_two_seconds() {
     let err = refused_before_a_job(&lb, &out);
     assert_install_hint(&err);
     assert!(
-        out.elapsed < Duration::from_secs(3),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(3)),
         "AC-314: hello is bounded at 2 s, took {:?}",
         out.elapsed
     );
@@ -690,7 +690,8 @@ fn ac316_no_ack_within_ten_seconds_is_failed_protocol() {
     let err = failed(&out, "job_failed");
     assert_job_failed(&err, "failed", "protocol");
     assert!(
-        out.elapsed >= Duration::from_secs(9) && out.elapsed < Duration::from_secs(15),
+        out.elapsed >= Duration::from_secs(9)
+            && out.elapsed < crate::flake::scaled(Duration::from_secs(15)),
         "AC-316: the ack bound is 10 s, took {:?}",
         out.elapsed
     );
@@ -719,7 +720,7 @@ fn ac317_bounded_waits_exit_10_and_glen_wait_collects_the_result() {
     let out = lb.send(A.handle, "again", &["--no-wait"]).run();
     let d = data_of(&out, 10);
     assert!(
-        out.elapsed < Duration::from_secs(2),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(2)),
         "--no-wait took {:?}",
         out.elapsed
     );
@@ -801,7 +802,7 @@ fn ac317_a_deadline_before_the_ack_is_failed_timeout() {
     let err = failed(&out, "job_failed");
     assert_job_failed(&err, "failed", "timeout");
     assert!(
-        out.elapsed < Duration::from_secs(8),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(8)),
         "the 2 s deadline, not the 10 s ack bound, decides: {:?}",
         out.elapsed
     );
@@ -813,12 +814,12 @@ fn live_signal_cancels(sig: Signal) {
     let mut ext = lb.start_ext(A.id, "never_settles", &[], &[]);
     let d = data_of(&lb.send(A.handle, "hi", &["--no-wait"]).run(), 10);
     let id = job_id(&d);
-    let st = lb.wait_status(&id, "accepted", LONG, |s| {
+    let st = lb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
         s["status"] == "accepted" && s["worker_pid"].is_u64()
     });
     let t = Instant::now();
     signal(st["worker_pid"].as_i64().unwrap(), sig);
-    let fin = lb.wait_status(&id, "terminal", LONG, is_terminal);
+    let fin = lb.wait_status(&id, "terminal", crate::flake::scaled(LONG), is_terminal);
     let took = t.elapsed();
     assert_eq!(fin["status"], "aborted", "{fin}");
     assert_eq!(fin["error"]["code"], "cancelled", "{fin}");
@@ -860,7 +861,9 @@ fn ac317_ac307_control_ops_on_a_live_job_are_unsupported_and_the_job_continues()
     let _ext = lb.start_ext(A.id, "slow", &[("FAKE_EXT_DELAY_MS", "4000")], &[]);
     let d = data_of(&lb.send(A.handle, "hi", &["--no-wait"]).run(), 10);
     let id = job_id(&d);
-    lb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let control = lb.job_dir(&id).join("control");
     let t = Instant::now();
     for op in RESERVED_OPS {
@@ -877,7 +880,10 @@ fn ac317_ac307_control_ops_on_a_live_job_are_unsupported_and_the_job_continues()
         );
     }
     for op in RESERVED_OPS {
-        let done = lb.wait_file(&control.join(format!("{op}.done.json")), LONG);
+        let done = lb.wait_file(
+            &control.join(format!("{op}.done.json")),
+            crate::flake::scaled(LONG),
+        );
         assert!(
             t.elapsed() <= ABORT_BOUND,
             "AC-317: {op} answered within 1 s, took {:?}",
@@ -1239,7 +1245,7 @@ fn ac326_tail_follow_ends_not_found_when_the_tui_quits_without_writing() {
     assert_eq!(last["ok"], false, "{last}");
     assert_eq!(last["error"]["code"], "not_found", "{last}");
     assert!(
-        took >= Duration::from_secs(4) && took < Duration::from_secs(12),
+        took >= Duration::from_secs(4) && took < crate::flake::scaled(Duration::from_secs(12)),
         "after the five-second disappearance grace: {took:?}"
     );
 }

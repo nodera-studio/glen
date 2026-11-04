@@ -110,7 +110,9 @@ FLAGS
   --profile=<value>        Use an isolated profile for auth, sessions, settings, and caches
   --thinking=<value>       Set thinking level
   -e, --extension=<value>  Load an extension file (can be used multiple times)
-  --no-extensions          Disable extension discovery (explicit -e paths still work)"
+  --no-extensions          Disable extension discovery (explicit -e paths still work)
+  --no-skills              Disable skills discovery and loading
+  --no-rules               Disable rules discovery and loading"
         );
         return Ok(0);
     }
@@ -133,7 +135,8 @@ FLAGS
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "--mode" if iter.next().map(String::as_str) == Some("rpc") => mode = true,
-            "--no-ui" => (),
+            // Discovery switches: logged in argv, nothing to discover here.
+            "--no-ui" | "--no-extensions" | "--no-skills" | "--no-rules" => (),
             "--no-session" => no_session = true,
             "--profile" => {
                 if iter.next().is_none() {
@@ -302,10 +305,14 @@ FLAGS
                         if stage != 0 {
                             running_queries += 1;
                         }
-                        let delay = if knob("FAKE_OMP_STATE_DELAY_AT")
-                            .and_then(|v| v.parse::<usize>().ok())
-                            == Some(state_queries)
-                        {
+                        // `N` delays the Nth get_state; `N+` delays it and every later one.
+                        let delayed_at = knob("FAKE_OMP_STATE_DELAY_AT").and_then(|v| {
+                            match v.strip_suffix('+') {
+                                Some(n) => n.parse::<usize>().ok().map(|n| state_queries >= n),
+                                None => v.parse::<usize>().ok().map(|n| state_queries == n),
+                            }
+                        });
+                        let delay = if delayed_at == Some(true) {
                             ms("FAKE_OMP_PREFLIGHT_DELAY_MS", 0)
                         } else if scenario == "stale_state" && running_queries == 1 {
                             id = format!("{}f0f0", &id[..id.len().saturating_sub(4)]);

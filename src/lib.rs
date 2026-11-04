@@ -19,6 +19,7 @@ use clap::Parser;
 use std::{ffi::OsString, process::ExitCode};
 pub fn run() -> ExitCode {
     let env = env::Env::from_process();
+    jobs::liveness::init(&env);
     let term = output::Terminal::detect();
     let argv: Vec<OsString> = std::env::args_os().collect();
     let cli = match cli::Cli::try_parse_from(&argv) {

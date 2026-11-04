@@ -1,7 +1,7 @@
 #![cfg(unix)]
 mod common;
 
-use common::{A_ID, Holder, LiveBox, OmpBox, RpcBox, json, poll};
+use common::{A_ID, Holder, LiveBox, OmpBox, RpcBox, flake::scaled, json, poll};
 use rustix::{
     fs::{Mode, OFlags},
     process::{Pid, Signal},
@@ -26,6 +26,8 @@ use std::{
     time::{Duration, Instant},
 };
 
+// The bounds and waits below are multiplied by GLEN_TEST_TIME_SCALE (`scaled`, exact in a plain
+// run) where they are used; lower bounds and absence windows are not.
 const START: Duration = Duration::from_secs(5);
 const DATA: Duration = Duration::from_secs(2);
 const EXIT: Duration = Duration::from_secs(1);
@@ -155,7 +157,7 @@ fn cursor_updates_reconstruct_visible_spaces_and_unchanged_letters() {
 struct Process(Child);
 impl Process {
     fn wait(&mut self, timeout: Duration) -> ExitStatus {
-        poll(timeout, || self.0.try_wait().unwrap())
+        poll(scaled(timeout), || self.0.try_wait().unwrap())
     }
 }
 impl Drop for Process {
@@ -164,7 +166,7 @@ impl Drop for Process {
             return;
         }
         let killed = self.0.kill();
-        let until = Instant::now() + Duration::from_secs(3);
+        let until = Instant::now() + scaled(Duration::from_secs(3));
         while Instant::now() < until {
             if matches!(self.0.try_wait(), Ok(Some(_))) {
                 return;
@@ -229,13 +231,16 @@ impl Pty {
         let reader = thread::spawn(move || {
             let mut buf = [0; 8192];
             loop {
+                // Sampled before the read: only a read that began after the stop may end the
+                // drain on WouldBlock, so the bytes glen wrote before it exited are never unread.
+                let stopping = stopped.load(Ordering::Acquire);
                 match read.read(&mut buf) {
                     Ok(0) => return Ok(()),
                     Ok(n) => bytes.lock().unwrap().extend_from_slice(&buf[..n]),
                     Err(e) if e.raw_os_error() == Some(libc::EIO) => return Ok(()),
                     Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        if stopped.load(Ordering::Acquire) {
+                        if stopping {
                             return Ok(());
                         }
                         thread::sleep(Duration::from_millis(5));
@@ -295,7 +300,7 @@ impl Pty {
         screen(&bytes, self.size, offset)
     }
     fn wait_from(&self, offset: usize, needle: &str, timeout: Duration) {
-        let end = Instant::now() + timeout;
+        let end = Instant::now() + scaled(timeout);
         loop {
             let text = self.text_from(offset);
             if text.contains(needle) {
@@ -321,7 +326,7 @@ impl Pty {
         // Record evidence for this exact fd, not merely that watch drew a frame. Every
         // restoration assertion requires this witness, including callers that skip ready().
         self.raw_observed = None;
-        let end = Instant::now() + START;
+        let end = Instant::now() + scaled(START);
         loop {
             let child = &mut self.child.as_mut().expect("watch must be spawned").0;
             assert!(
@@ -348,7 +353,7 @@ impl Pty {
         }
     }
     fn send(&mut self, mut bytes: &[u8]) {
-        let end = Instant::now() + Duration::from_secs(1);
+        let end = Instant::now() + scaled(Duration::from_secs(1));
         while !bytes.is_empty() {
             match self.master.write(bytes) {
                 Ok(0) => panic!("pty write returned EOF"),
@@ -395,7 +400,7 @@ impl Pty {
         // Drain the final teardown bytes without relying on EOF: the parent keeps a slave open.
         self.stop.store(true, Ordering::Release);
         let reader = self.reader.take().unwrap();
-        poll(Duration::from_secs(1), || {
+        poll(scaled(Duration::from_secs(1)), || {
             reader.is_finished().then_some(())
         });
         reader.join().unwrap().unwrap();
@@ -455,7 +460,7 @@ impl Drop for Pty {
         drop(self.child.take());
         self.stop.store(true, Ordering::Release);
         if let Some(reader) = self.reader.take() {
-            let end = Instant::now() + Duration::from_secs(1);
+            let end = Instant::now() + scaled(Duration::from_secs(1));
             while !reader.is_finished() && Instant::now() < end {
                 thread::sleep(Duration::from_millis(5));
             }
@@ -607,7 +612,7 @@ fn separate_placeholder_row_keeps_the_draft_empty_for_ctrl_d() {
         pty.assert_raw_while_running();
         pty.send(b"\t");
         let wait_empty_prompt = |pty: &Pty| {
-            poll(DATA, || {
+            poll(scaled(DATA), || {
                 let shown = pty.text_from(0);
                 let lines = shown.lines().map(str::trim_end).collect::<Vec<_>>();
                 lines
@@ -688,7 +693,7 @@ fn resizing_switches_narrow_wide_and_too_small_layouts() {
     pty.wait_from(offset, "pending", DATA);
     let offset = pty.bytes().len();
     pty.resize(30, 8);
-    poll(DATA, || {
+    poll(scaled(DATA), || {
         let shown = pty
             .text_from(offset)
             .split_whitespace()
@@ -785,7 +790,7 @@ fn pending_tools_headers_and_same_batch_pairing_match_show_tail_and_watch() {
     append(&path, format!("{call}\n").as_bytes());
     pty.wait_for("read pending.rs · no result", DATA);
     pty.wait_for("glen_reply \"awaiting reply\" · no result", DATA);
-    poll(DATA, || {
+    poll(scaled(DATA), || {
         pty.text_from(0)
             .lines()
             .nth(1)
@@ -837,7 +842,7 @@ fn pending_tools_headers_and_same_batch_pairing_match_show_tail_and_watch() {
     )
     .unwrap();
     pty.send(b"r");
-    poll(START, || {
+    poll(scaled(START), || {
         pty.text_from(0)
             .lines()
             .nth(1)
@@ -936,7 +941,7 @@ fn v1_rewrite_rebases_watch_occurrences_so_the_next_duplicate_is_visible() {
     pty.wait_for("── session file rewritten ──", DATA);
     assert_eq!(pty.text_from(0).matches("old prompt").count(), 2);
     append(&path, a.as_bytes());
-    poll(DATA, || {
+    poll(scaled(DATA), || {
         (pty.text_from(0).matches("old prompt").count() == 3).then_some(())
     });
     assert_eq!(pty.text_from(0).matches("another prompt").count(), 1);
@@ -987,7 +992,7 @@ fn v1_migration_rewrite_shows_only_the_new_turn_in_watch() {
     let mut pty = Pty::start(command(&b, &["watch", "e27c0de"]), 120, 80);
     pty.wait_for("pre-migration hook note", START);
     pty.assert_raw_while_running();
-    poll(START, || {
+    poll(scaled(START), || {
         (pty.text_from(0).matches("migrate me").count() == 2).then_some(())
     });
     let staged = path.with_extension("staged");
@@ -1099,7 +1104,7 @@ impl Workers<'_> {
 impl Drop for Workers<'_> {
     fn drop(&mut self) {
         // Test commands use a 5s job deadline, including failure paths during assertions.
-        let end = Instant::now() + Duration::from_secs(10);
+        let end = Instant::now() + scaled(Duration::from_secs(10));
         while !self.gone() && Instant::now() < end {
             thread::sleep(Duration::from_millis(20));
         }
@@ -1136,7 +1141,7 @@ impl Drop for Workers<'_> {
                     }
                 }
             }
-            let end = Instant::now() + Duration::from_secs(3);
+            let end = Instant::now() + scaled(Duration::from_secs(3));
             while !self.gone() && Instant::now() < end {
                 thread::sleep(Duration::from_millis(20));
             }
@@ -1151,7 +1156,7 @@ impl Drop for Workers<'_> {
     }
 }
 fn completed_job(b: &RpcBox, text: &str) -> Value {
-    poll(Duration::from_secs(10), || {
+    poll(scaled(Duration::from_secs(10)), || {
         for entry in fs::read_dir(b.omp.glen_home.join("jobs")).ok()? {
             let dir = entry.unwrap().path();
             let job: Value = serde_json::from_slice(&fs::read(dir.join("job.json")).ok()?).unwrap();
@@ -1300,9 +1305,9 @@ fn second_signal_interrupts_the_wait_for_an_in_flight_submit() {
     let mut pty = Pty::start(cmd, 120, 40);
     pty.ready();
     pty.send(b"\tin flight\r");
-    poll(START, || ready.exists().then_some(()));
+    poll(scaled(START), || ready.exists().then_some(()));
     pty.signal(Signal::TERM);
-    poll(DATA, || {
+    poll(scaled(DATA), || {
         (pty.bytes().windows(8).any(|b| b == b"\x1b[?1049l")
             && termios::tcgetattr(&pty.slave)
                 .unwrap()
@@ -1318,7 +1323,7 @@ fn second_signal_interrupts_the_wait_for_an_in_flight_submit() {
     pty.signal_process(Signal::INT); // The first signal already restored cooked mode.
     assert_eq!(pty.wait_exit(EXIT), 130);
     assert!(
-        second.elapsed() < EXIT,
+        second.elapsed() < scaled(EXIT),
         "second signal did not exit within 1s"
     );
     pty.assert_restored();
@@ -1343,25 +1348,70 @@ fn back_to_back_signals_exit_within_one_second_and_finish_teardown() {
             pty.spawn(cmd);
             pty.ready();
             pty.send(b"\tin flight\r");
-            poll(START, || ready.exists().then_some(()));
+            poll(scaled(START), || ready.exists().then_some(()));
             let signalled = Instant::now();
             pty.signal_process(Signal::TERM);
             pty.signal_process(Signal::INT);
             let code = pty.wait_exit(EXIT);
-            assert!(signalled.elapsed() < EXIT, "rapid signals took at least 1s");
+            assert!(
+                signalled.elapsed() < scaled(EXIT),
+                "rapid signals took at least 1s"
+            );
             // Distinct pending signals can be yielded in either order by the OS/iterator.
             assert!([130, 143].contains(&code), "unexpected signal exit: {code}");
             pty.assert_teardown();
-            let bytes = pty.bytes();
-            let leave = b"\x1b[?2004l\x1b[?1049l\x1b[?25h";
-            assert_eq!(
-                bytes
-                    .windows(leave.len())
-                    .filter(|bytes| *bytes == leave)
-                    .count(),
-                1,
-                "teardown must be one complete, uninterrupted escape sequence: {bytes:?}"
-            );
+            assert_final_teardown(&pty.bytes());
+            assert!(!gate.exists());
+            b.omp.clean();
+        }
+    }
+}
+
+/// Teardown ran once, as one uninterrupted sequence, and nothing followed it: a frame written
+/// after it lands on the restored main screen and can hide the shell's cursor again.
+fn assert_final_teardown(bytes: &[u8]) {
+    let leave = b"\x1b[?2004l\x1b[?1049l\x1b[?25h";
+    let tail = bytes[bytes.len().saturating_sub(512)..].escape_ascii();
+    assert_eq!(
+        bytes
+            .windows(leave.len())
+            .filter(|run| *run == leave)
+            .count(),
+        1,
+        "teardown must be one complete, uninterrupted escape sequence; output ends: {tail}"
+    );
+    assert!(
+        bytes.ends_with(leave),
+        "nothing may be written after teardown; output ends: {tail}"
+    );
+}
+
+#[test]
+#[cfg(debug_assertions)]
+fn frames_drawn_while_a_signal_teardown_runs_neither_split_nor_follow_it() {
+    for controlling in terminal_modes() {
+        for _ in 0..2 {
+            let b = RpcBox::new();
+            let gate = b.omp.tmp.path().join("teardown-probe");
+            let ready = gate.with_file_name("teardown-probe.ready");
+            let mut cmd = b.glen(&["watch", "e27c0de"]);
+            // The held submit animates every 80 ms, so the UI keeps drawing while teardown is
+            // held after its first step, as on a slow terminal.
+            cmd.env("TERM", "xterm-256color")
+                .env("FAKE_OMP_LEASE_PROBE_GATE", &gate)
+                .env("GLEN_WATCH_TEST_TEARDOWN_PAUSE_MS", "300");
+            let mut pty = Pty::open(120, 40);
+            pty.controlling = controlling;
+            pty.spawn(cmd);
+            pty.ready();
+            pty.send(b"\tin flight\r");
+            poll(scaled(START), || ready.exists().then_some(()));
+            pty.signal_process(Signal::TERM);
+            pty.signal_process(Signal::INT);
+            let code = pty.wait_exit(START);
+            assert!([130, 143].contains(&code), "unexpected signal exit: {code}");
+            pty.assert_teardown();
+            assert_final_teardown(&pty.bytes());
             assert!(!gate.exists());
             b.omp.clean();
         }
@@ -1384,13 +1434,13 @@ fn repeated_sigint_interrupts_an_in_flight_submit_after_observed_delivery() {
             pty.spawn(cmd);
             pty.ready();
             pty.send(b"\tin flight\r");
-            poll(START, || ready.exists().then_some(()));
+            poll(scaled(START), || ready.exists().then_some(()));
             let signalled = Instant::now();
             pty.signal_process(Signal::INT);
             // Standard signals may coalesce in the kernel before any handler runs.
             // Observe the first delivery before sending the same number again; the
             // unit counter test covers two deliveries before the watcher can poll.
-            poll(EXIT, || {
+            poll(scaled(EXIT), || {
                 (pty.bytes().windows(8).any(|b| b == b"\x1b[?1049l")
                     && termios::tcgetattr(&pty.slave)
                         .unwrap()
@@ -1405,7 +1455,7 @@ fn repeated_sigint_interrupts_an_in_flight_submit_after_observed_delivery() {
             pty.signal_process(Signal::INT);
             assert_eq!(pty.wait_exit(EXIT), 130);
             assert!(
-                signalled.elapsed() < EXIT,
+                signalled.elapsed() < scaled(EXIT),
                 "identical signals took at least 1s"
             );
             pty.assert_teardown();
@@ -1436,12 +1486,15 @@ fn hung_endpoint_keeps_focus_responsive_refuses_and_bounds_quit() {
     let submitted = Instant::now();
     pty.send(b"\thung route\r\t");
     pty.wait_for("▍sessions", EXIT);
-    assert!(submitted.elapsed() < EXIT, "Tab waited for the endpoint");
+    assert!(
+        submitted.elapsed() < scaled(EXIT),
+        "Tab waited for the endpoint"
+    );
     pty.wait_for(
         "cannot take messages",
         Duration::from_secs(3).saturating_sub(submitted.elapsed()),
     );
-    assert!(submitted.elapsed() < Duration::from_secs(3));
+    assert!(submitted.elapsed() < scaled(Duration::from_secs(3)));
     let hellos = || {
         b.ext_log()
             .iter()
@@ -1450,13 +1503,13 @@ fn hung_endpoint_keeps_focus_responsive_refuses_and_bounds_quit() {
     };
     let before = hellos();
     pty.send(b"\t\t\r"); // Retry the retained draft, then quit with routing still in flight.
-    poll(EXIT, || (hellos() > before).then_some(()));
+    poll(scaled(EXIT), || (hellos() > before).then_some(()));
     pty.wait_for("sending", EXIT);
     pty.assert_raw_while_running();
     let quitting = Instant::now();
     pty.send(b"\x1b[Zq");
     assert_eq!(pty.wait_exit(Duration::from_secs(7)), 0);
-    assert!(quitting.elapsed() < Duration::from_secs(7));
+    assert!(quitting.elapsed() < scaled(Duration::from_secs(7)));
     pty.assert_restored();
     assert!(!b.rpc.omp.glen_home.join("jobs").exists());
 }

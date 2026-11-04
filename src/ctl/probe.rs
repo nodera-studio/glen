@@ -1,6 +1,7 @@
-//! `glen doctor --probe`: a foreground, lockless RPC capability check. It starts omp with
-//! `--no-session`, performs the handshake and two capability calls inside one budget, sends
-//! no prompt, writes nothing under GLEN_HOME, and always tears the process group down.
+//! `glen doctor --probe`: a foreground, lockless RPC capability check. It starts omp as a
+//! listing child (`rpc::listing_command`: `--no-session`, discovery off, a private empty cwd),
+//! performs the handshake and two capability calls inside one budget, sends no prompt, writes
+//! nothing under GLEN_HOME, and always tears the process group down.
 use super::ephemeral::{Process, drain_stderr};
 use crate::rpc::{self, reply};
 use omp_rpc::{Client, ClientOptions, SetEventFilterCommand};
@@ -95,20 +96,25 @@ impl Probe {
         self.detail.push_str(&reason);
     }
 }
-/// Starts `bin --mode rpc --no-ui --no-session` in `cwd` and checks its capabilities. The
+/// Starts `bin --mode rpc --no-ui --no-session --no-extensions --no-skills --no-rules` in a
+/// fresh private directory (S-02: never the caller's cwd) and checks its capabilities. The
 /// result is final at `budget`; teardown after it is bounded by [`Process::finish`]. Once
 /// `stop` is set (the caller's interrupt flag) it tears omp down and returns `interrupted`:
 /// omp runs in its own process group, so a terminal's Ctrl-C reaches only glen.
 pub fn run(
     bin: &Path,
     profile: Option<&str>,
-    cwd: &Path,
+    env: &crate::env::Env,
     budget: Duration,
     stop: &AtomicBool,
 ) -> Probe {
     let deadline = Instant::now() + budget;
-    let mut command = rpc::base_command(bin, profile, cwd);
-    command.arg("--no-session");
+    // Dropped (removed) only when run returns, after the teardown.
+    let cwd = match rpc::PrivateCwd::new(env) {
+        Ok(cwd) => cwd,
+        Err(e) => return Probe::unknown(one_line(&e.to_string())),
+    };
+    let mut command = rpc::listing_command(bin, profile, &cwd);
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut command, 0);
     let child = match command

@@ -116,7 +116,7 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
             let result = probe::run(
                 bin,
                 cli.global.profile.as_deref(),
-                env.cwd(),
+                env,
                 probe_budget(env),
                 &stop,
             );
@@ -512,14 +512,16 @@ fn warm_row(
     now: std::time::SystemTime,
 ) -> (&'static str, String, String) {
     use crate::rpc::warm::{self, Class};
-    let (entries, unreadable) = warm::index(home);
+    let index = warm::index(home);
     let bound = warm::stale_bound(env);
     let (mut fresh, mut dead, mut stale) = (0, 0, vec![]);
-    for i in &entries {
+    for i in &index.entries {
         match i.entry.class(i.mtime, now, bound) {
             Class::Fresh => fresh += 1,
             Class::Dead => dead += 1,
-            Class::Stale => stale.push(crate::rpc::session_handle(&i.entry.session_id)),
+            Class::Stale => stale.push(crate::render::text::single_line(
+                &crate::rpc::session_handle(&i.entry.session_id),
+            )),
         }
     }
     let value = format!("{fresh} warm, {} stale, {dead} dead", stale.len());
@@ -527,8 +529,16 @@ fn warm_row(
         .iter()
         .map(|h| format!("warm worker {h} has no heartbeat; run `glen release {h} --force`"))
         .collect::<Vec<_>>();
-    if unreadable > 0 {
+    if !index.unreadable.is_empty() {
         detail.push("a warm worker registry is unreadable".into());
+    }
+    // S-09: a registry under another session's name is never released or killed; it is left
+    // in place for the owner to inspect.
+    for path in &index.misnamed {
+        detail.push(format!(
+            "ignored {}: a warm registry not named for its session",
+            crate::render::text::single_line(&path.to_string_lossy())
+        ));
     }
     if detail.is_empty() {
         let detail = if dead > 0 {

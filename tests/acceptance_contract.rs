@@ -1,4 +1,7 @@
 //! Offline harness regressions; no actual omp or coding agent is launched.
+#[path = "common/flake.rs"]
+mod flake;
+use flake::CaptureExt;
 use std::{fs, process::Command};
 #[test]
 fn person_checks_command_output_without_accepting_echoed_nonces() {
@@ -41,7 +44,7 @@ expect eof
     let out = match Command::new("expect")
         .arg(&script)
         .env("TERM", "dumb")
-        .output()
+        .try_captured()
     {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -232,7 +235,7 @@ fn mcp_mode_runs_no_omp_and_its_launcher_closes_the_environment() {
             acc_path,
             dir,
         ])
-        .output()
+        .try_captured()
     {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -241,7 +244,7 @@ fn mcp_mode_runs_no_omp_and_its_launcher_closes_the_environment() {
         }
         Err(e) => panic!("cannot run bash: {e}"),
     };
-    if !out.status.success() && Command::new("jq").arg("--version").output().is_err() {
+    if !out.status.success() && Command::new("jq").arg("--version").try_captured().is_err() {
         eprintln!("launcher generation not run: optional harness dependency jq is absent");
         return;
     }

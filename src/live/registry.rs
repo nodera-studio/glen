@@ -76,8 +76,9 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
         .filter(|r| r.v == 1 && r.pid > 0)
         .collect()
 }
+/// Only a pid proven gone (`liveness::observe`: never under S-04's hidden pids) is dead.
 pub fn pid_dead(pid: u32) -> bool {
-    matches!(liveness::start_token(pid), Probe::Gone)
+    matches!(liveness::observe(pid), Probe::Gone)
 }
 /// A failed stale-registry cleanup, carrying the raw I/O error alongside the
 /// formatted message so callers can tell a sandbox permission denial from any

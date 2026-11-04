@@ -428,15 +428,17 @@ pub(crate) fn route(
                             lock::lock_key(id),
                             std::process::id()
                         ));
-                        crate::glen_home::write_private_atomic(&gate, b"waiting").map_err(|e| {
-                            GlenError::new(
-                                ErrorCode::Io,
-                                format!(
-                                    "cannot publish control lock-wait gate {}: {e}",
-                                    gate.display()
-                                ),
-                            )
-                        })?;
+                        crate::glen_home::write_private_atomic_unnamed(&gate, b"waiting").map_err(
+                            |e| {
+                                GlenError::new(
+                                    ErrorCode::Io,
+                                    format!(
+                                        "cannot publish control lock-wait gate {}: {e}",
+                                        gate.display()
+                                    ),
+                                )
+                            },
+                        )?;
                     }
                     while lock::is_held(&home, id) {
                         stopped(deadline, &stop, opened)?;
@@ -576,12 +578,8 @@ pub(crate) fn route_models(
     let bin = bin::find_omp(env).map_err(|e| {
         GlenError::new(ErrorCode::OmpUnavailable, e).with_hint("install omp or set GLEN_OMP_BIN")
     })?;
-    let cwd = opened
-        .and_then(|o| o.session.header.cwd.as_deref())
-        .map(std::path::Path::new)
-        .filter(|p| p.is_dir())
-        .unwrap_or(env.cwd());
-    let client = Ephemeral::open_listing(cli.global.profile.as_deref(), &bin, cwd, deadline, stop)
+    // A listing never resumes the target, so it never needs the session's cwd (S-02).
+    let client = Ephemeral::open_listing(cli.global.profile.as_deref(), &bin, env, deadline, stop)
         .map_err(|e| open_error(e, opened))?;
     let source = match opened {
         None => ModelsSource::Profile,

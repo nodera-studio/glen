@@ -66,6 +66,44 @@ pub fn start_token(pid: u32) -> Probe {
 pub fn start_token(_pid: u32) -> Probe {
     Probe::Unknown("unsupported platform".into())
 }
+/// Whether a pid gone from this process's view may still run elsewhere (S-04,
+/// [`crate::sandbox::pids_hidden`]): set once per process by [`init`].
+static PIDS_HIDDEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Records, from the process's own environment, whether pids may be hidden from it. glen's
+/// entry point calls this before any command, the hidden worker included.
+pub fn init(env: &crate::env::Env) {
+    PIDS_HIDDEN.store(
+        crate::sandbox::pids_hidden(env, cfg!(target_os = "linux")),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+#[cfg(test)]
+thread_local! { static FORCE_PIDS_HIDDEN: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) }; }
+/// Test-only seam: forces [`init`]'s answer for the current thread, so a unit test can act as a
+/// process under a Codex marker on Linux on any host. Call with `None` before the test ends.
+#[cfg(test)]
+pub(crate) fn force_pids_hidden_for_test(value: Option<bool>) {
+    FORCE_PIDS_HIDDEN.with(|f| f.set(value));
+}
+fn pids_hidden() -> bool {
+    #[cfg(test)]
+    if let Some(forced) = FORCE_PIDS_HIDDEN.with(|f| f.get()) {
+        return forced;
+    }
+    PIDS_HIDDEN.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// [`start_token`] as evidence for a liveness decision. Where pids may be hidden (S-04: a Codex
+/// sandbox on Linux, possibly in its own pid namespace) a gone pid is `Unknown`, so no live
+/// registry or socket is removed, no warm registry is cleaned and no job is persisted `lost`
+/// on that alone.
+pub fn observe(pid: u32) -> Probe {
+    match start_token(pid) {
+        Probe::Gone if pids_hidden() => {
+            Probe::Unknown("the pid may run in another pid namespace (Codex sandbox)".into())
+        }
+        probe => probe,
+    }
+}
 pub struct Identity {
     pub pid: u32,
     pub start: String,
@@ -85,7 +123,7 @@ pub enum Liveness {
     Unknown,
 }
 pub fn check(pid: u32, start: &str) -> Liveness {
-    match start_token(pid) {
+    match observe(pid) {
         Probe::Running(t) if t == start => Liveness::Alive,
         Probe::Running(_) | Probe::Gone => Liveness::Dead,
         Probe::Unknown(_) => Liveness::Unknown,
@@ -430,5 +468,52 @@ mod w8_err2_tests {
         // Feeding the in-memory result back in does not stack a second warning.
         let again = mark_lost(&store, &id, s);
         assert_eq!(again.warnings.len(), 1);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod s04_tests {
+    use super::*;
+    /// Resets the seam even when an assertion fails.
+    struct Hidden;
+    impl Hidden {
+        fn on() -> Self {
+            force_pids_hidden_for_test(Some(true));
+            Hidden
+        }
+    }
+    impl Drop for Hidden {
+        fn drop(&mut self) {
+            force_pids_hidden_for_test(None);
+        }
+    }
+    /// S-04: where pids may be hidden, a gone pid is unknown: never dead, never lost on disk.
+    /// A reused pid (a live process with another start token) is still dead.
+    #[test]
+    fn a_gone_pid_is_unknown_where_pids_may_be_hidden() {
+        let gone = tests_dead_pid();
+        force_pids_hidden_for_test(Some(false));
+        assert!(matches!(observe(gone), Probe::Gone));
+        assert_eq!(check(gone, "linux:1"), Liveness::Dead);
+        let _hidden = Hidden::on();
+        assert!(matches!(observe(gone), Probe::Unknown(_)));
+        assert_eq!(check(gone, "linux:1"), Liveness::Unknown);
+        let me = current().unwrap();
+        assert_eq!(check(me.pid, &me.start), Liveness::Alive);
+        assert_eq!(check(me.pid, "reused"), Liveness::Dead);
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let j = crate::jobs::tests::job();
+        let id = JobId::parse(&j.id).unwrap();
+        store.create(&j).unwrap();
+        let mut s = store.read_status(&id).unwrap();
+        s.status = State::Accepted;
+        s.updated_at = "2000-01-01T00:00:00Z".into();
+        s.worker_pid = Some(gone);
+        s.worker_start = Some("linux:1".into());
+        store.write_status(&id, &s).unwrap();
+        assert!(!is_lost(&s, jiff::Timestamp::now()));
+        assert_eq!(refresh(&store, &id, s.clone()).status, State::Accepted);
+        assert_eq!(store.read_status(&id).unwrap().status, State::Accepted);
     }
 }

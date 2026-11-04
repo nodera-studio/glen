@@ -10,6 +10,7 @@
 //! Needs Node ≥ 22.6 on PATH. Without it the tests print a note and pass locally; with `CI` set
 //! they fail, as `tests/extension_ts.rs` does.
 
+use crate::flake::CaptureExt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileTypeExt;
@@ -190,7 +191,7 @@ fn node_env() -> Option<&'static NodeEnv> {
         let node = std::env::split_paths(&path)
             .map(|d| d.join("node"))
             .find(|p| p.is_file())?;
-        let v = Command::new(&node).arg("--version").output().ok()?;
+        let v = Command::new(&node).arg("--version").try_captured().ok()?;
         let text = String::from_utf8_lossy(&v.stdout);
         let nums: Vec<u32> = text
             .trim()
@@ -311,7 +312,7 @@ impl Host {
     }
 
     fn expect_line(&mut self, want: &str) {
-        let deadline = Instant::now() + LONG;
+        let deadline = Instant::now() + crate::flake::scaled(LONG);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
@@ -370,7 +371,8 @@ impl Drop for Host {
 /// One request on a fresh connection; every frame until the server closes (8 s bound).
 fn exchange(sock: &Path, bytes: &[u8]) -> Vec<Value> {
     let mut s = UnixStream::connect(sock).unwrap_or_else(|e| panic!("connect {sock:?}: {e}"));
-    s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    s.set_read_timeout(Some(crate::flake::scaled(Duration::from_secs(8))))
+        .unwrap();
     let _ = s.write_all(bytes);
     let mut buf = Vec::new();
     let r = s.read_to_end(&mut buf);
@@ -530,7 +532,8 @@ fn node_ac307_protocol_errors_and_reserved_ops() {
 
     // A connection with no complete line is closed after about 5 s.
     let mut s = UnixStream::connect(&sock).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(9))).unwrap();
+    s.set_read_timeout(Some(crate::flake::scaled(Duration::from_secs(9))))
+        .unwrap();
     s.write_all(b"{\"v\":1,").unwrap();
     let t = Instant::now();
     let mut buf = Vec::new();
@@ -539,7 +542,8 @@ fn node_ac307_protocol_errors_and_reserved_ops() {
         "AC-307: idle connection closed"
     );
     assert!(
-        t.elapsed() >= Duration::from_secs(4) && t.elapsed() < Duration::from_secs(8),
+        t.elapsed() >= Duration::from_secs(4)
+            && t.elapsed() < crate::flake::scaled(Duration::from_secs(8)),
         "closed after {:?}",
         t.elapsed()
     );
@@ -595,7 +599,9 @@ fn node_ac313_bind_sweeps_dead_leftovers_and_shutdown_or_exit_removes_the_files(
     let (sock, reg) = (socket_of(&lb, &h), lb.registry_path(B.id));
     assert!(sock.exists() && reg.exists());
     h.cmd("exit");
-    poll_until("the host to exit", LONG, || h.child.try_wait().unwrap());
+    poll_until("the host to exit", crate::flake::scaled(LONG), || {
+        h.child.try_wait().unwrap()
+    });
     assert!(
         !sock.exists() && !reg.exists(),
         "AC-313: the exit handler unlinks too"
@@ -804,7 +810,9 @@ fn accepted(lb: &LiveBox, text: &str, flags: &[&str], env: &[(&str, &str)]) -> S
         run = run.env(k, v);
     }
     let j = job_id(&data_of(&run.run(), 10));
-    lb.wait_status(&j, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&j, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     j
 }
 
@@ -921,7 +929,12 @@ fn node_o6_interleaved_prompt_follow_up_prompt_steer_each_answer_from_its_own_sp
     h.cmd("end");
     // B's user message is the next boundary: A settles no later than this, B is still open.
     h.cmd("user bravo");
-    lb.wait_status(&ja, "A terminal", Duration::from_secs(5), is_terminal);
+    lb.wait_status(
+        &ja,
+        "A terminal",
+        crate::flake::scaled(Duration::from_secs(5)),
+        is_terminal,
+    );
     assert!(!is_terminal(&lb.status(&jb)), "B's span is still open");
     for c in ["assistant second", "end", "idle"] {
         h.cmd(c);
@@ -1013,9 +1026,14 @@ fn node_o6_a_queued_message_removed_before_delivery_fails_not_delivered_at_quies
         h.cmd(c);
     }
     let t = Instant::now();
-    let st = lb.wait_status(&j, "terminal", Duration::from_secs(10), is_terminal);
+    let st = lb.wait_status(
+        &j,
+        "terminal",
+        crate::flake::scaled(Duration::from_secs(10)),
+        is_terminal,
+    );
     assert!(
-        t.elapsed() < Duration::from_secs(10),
+        t.elapsed() < crate::flake::scaled(Duration::from_secs(10)),
         "at quiescence, not at a 30 s deadline: {st}"
     );
     let err = assert_not_delivered(&lb, &j);
@@ -1071,10 +1089,15 @@ fn node_o6_an_undelivered_prompt_fails_not_delivered_after_the_delivery_deadline
     let h = Host::start(&lb, nd, &dir, A.id, None, &[("HOST_SCRIPT", "1")]);
     let t = Instant::now();
     let j = accepted(&lb, "into the void", &[], &[("GLEN_JOB_TIMEOUT", "90s")]);
-    let st = lb.wait_status(&j, "terminal", Duration::from_secs(45), is_terminal);
+    let st = lb.wait_status(
+        &j,
+        "terminal",
+        crate::flake::scaled(Duration::from_secs(45)),
+        is_terminal,
+    );
     let took = t.elapsed();
     assert!(
-        took >= Duration::from_secs(28) && took < Duration::from_secs(40),
+        took >= Duration::from_secs(28) && took < crate::flake::scaled(Duration::from_secs(40)),
         "the 30 s delivery deadline: {took:?} {st}"
     );
     assert_not_delivered(&lb, &j);
@@ -1128,7 +1151,9 @@ fn node_ac313_ac316_shutdown_fails_the_active_job_omp_exited() {
     let dir = install(&lb);
     let mut h = Host::start(&lb, nd, &dir, A.id, None, &[("HOST_HOLD", "1")]);
     let j = job_id(&data_of(&lb.send(A.handle, "hi", &["--no-wait"]).run(), 10));
-    lb.wait_status(&j, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&j, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     h.cmd("shutdown");
     let st = lb.wait_terminal(&j);
     assert_eq!(st["status"], "failed", "{st}");
@@ -1145,7 +1170,9 @@ fn node_ac312_a_new_session_rekeys_the_registry_and_ends_the_request() {
     let dir = install(&lb);
     let mut h = Host::start(&lb, nd, &dir, A.id, None, &[("HOST_HOLD", "1")]);
     let j = job_id(&data_of(&lb.send(A.handle, "hi", &["--no-wait"]).run(), 10));
-    lb.wait_status(&j, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&j, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let new_id = "01a2ffff-0312-7000-8000-0000000a3120";
     h.cmd(&format!("switch {new_id} new"));
     let st = lb.wait_terminal(&j);
@@ -1174,7 +1201,8 @@ fn node_ac312_a_new_session_rekeys_the_registry_and_ends_the_request() {
 /// Write one request and read only the first frame (a `send` connection stays open for events).
 fn first_frame(sock: &Path, req: &Value) -> (Value, UnixStream) {
     let mut s = UnixStream::connect(sock).unwrap();
-    s.set_read_timeout(Some(Duration::from_secs(8))).unwrap();
+    s.set_read_timeout(Some(crate::flake::scaled(Duration::from_secs(8))))
+        .unwrap();
     s.write_all(format!("{req}\n").as_bytes()).unwrap();
     let mut line = String::new();
     BufReader::new(s.try_clone().unwrap())

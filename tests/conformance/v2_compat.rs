@@ -18,11 +18,16 @@
 //! - AC-v2-105 `omp_surface` and `omp_source_facts` as gates: `ac_v2_105_*`.
 //! - AC-v2-106 the nightly workflow, read statically and run step by step against stub
 //!   `curl`/`cargo` and a wrapper omp: `ac_v2_106_*`.
+//!
+//! Under `scripts/flake-check.sh` the waits and the upper bounds on the product's timing (the
+//! probe budget plus teardown, the omp teardown polls, the `--version` deadline's ceiling) are
+//! multiplied by `GLEN_TEST_TIME_SCALE` (`flake::scaled`, exact in a plain run); lower bounds are
+//! not. Child output is captured in files (`flake::Captured`), never read from a pipe to end of
+//! file, which a process that inherited the pipe from a concurrent spawn could hold back.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs;
-use std::io::Read;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -32,6 +37,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
+use crate::flake::{Captured, scaled, try_output};
 use crate::reader::*;
 use crate::rpc_support::*;
 use crate::support::*;
@@ -913,7 +919,7 @@ fn ac_v2_102_a_hanging_version_times_out_as_omp_unavailable() {
         out.ctx()
     );
     assert!(
-        out.elapsed >= Duration::from_secs(8) && out.elapsed < Duration::from_secs(25),
+        out.elapsed >= Duration::from_secs(8) && out.elapsed < scaled(Duration::from_secs(25)),
         "--version has its own 10 s deadline, took {:?}",
         out.elapsed
     );
@@ -1304,8 +1310,8 @@ fn ac_v2_103_an_omp_that_exits_before_ready_is_warn_with_everything_unknown() {
     }
 }
 
-/// The probe's wire behaviour: one omp, RPC mode without a session, glen's cwd, `GLEN_MANAGED=1`,
-/// the real `glen_reply` tool and no prompt.
+/// The probe's wire behaviour: one omp, RPC mode without a session and with discovery off, in a
+/// private empty cwd (S-02), `GLEN_MANAGED=1`, the real `glen_reply` tool and no prompt.
 #[test]
 fn ac_v2_103_probe_starts_one_sessionless_rpc_omp_and_sends_no_prompt() {
     let rb = RpcBox::new();
@@ -1319,18 +1325,31 @@ fn ac_v2_103_probe_starts_one_sessionless_rpc_omp_and_sends_no_prompt() {
     let argv: BTreeSet<String> = strings(&start["argv"]).into_iter().collect();
     assert_eq!(
         argv,
-        ["--mode", "rpc", "--no-ui", "--no-session"]
-            .map(str::to_owned)
-            .into_iter()
-            .collect(),
-        "§A19 probe process: omp --mode rpc --no-ui --no-session, no --resume\n{start}"
+        [
+            "--mode",
+            "rpc",
+            "--no-ui",
+            "--no-session",
+            "--no-extensions",
+            "--no-skills",
+            "--no-rules"
+        ]
+        .map(str::to_owned)
+        .into_iter()
+        .collect(),
+        "§A19 probe process: omp --mode rpc --no-ui --no-session with discovery off, no --resume\n{start}"
     );
-    assert_eq!(strings(&start["argv"]).len(), 4, "{start}");
+    assert_eq!(strings(&start["argv"]).len(), 7, "{start}");
     assert_eq!(start["env"]["GLEN_MANAGED"], "1", "{start}");
+    // S-02: never glen's cwd, which may hold a planted `.omp`; a fresh directory, gone after.
+    let cwd = Path::new(start["cwd"].as_str().unwrap());
+    assert!(!same_file(cwd, &rb.bx.alpha), "{start}");
     assert!(
-        same_file(Path::new(start["cwd"].as_str().unwrap()), &rb.bx.alpha),
-        "the probe omp runs in glen's cwd: {start}"
+        cwd.file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("glen-omp-")),
+        "{start}"
     );
+    assert!(!cwd.exists(), "the private cwd is removed: {start}");
     let inbound: BTreeSet<String> = recs
         .iter()
         .filter(|r| r["event"] == "in")
@@ -1415,7 +1434,8 @@ fn ac_v2_103_probe_passes_the_profile_on() {
         .position(|a| a == "--profile")
         .expect("--profile passed");
     assert_eq!(argv[at + 1], "ci", "{argv:?}");
-    assert_eq!(argv.len(), 6, "{argv:?}");
+    // `--mode rpc --no-ui --profile ci --no-session --no-extensions --no-skills --no-rules`.
+    assert_eq!(argv.len(), 9, "{argv:?}");
 }
 
 fn tree_with_contents(root: &Path) -> Vec<(String, Option<Vec<u8>>)> {
@@ -1480,7 +1500,7 @@ const TEARDOWN: Duration = Duration::from_millis(2100);
 const SLACK: Duration = Duration::from_millis(2500);
 
 fn assert_returns_within(out: &Out, budget_ms: u64) {
-    let bound = Duration::from_millis(budget_ms) + TEARDOWN + SLACK;
+    let bound = scaled(Duration::from_millis(budget_ms) + TEARDOWN + SLACK);
     assert!(
         out.elapsed < bound,
         "§A19: the result is final at the budget ({budget_ms} ms) and teardown takes at most \
@@ -1491,9 +1511,11 @@ fn assert_returns_within(out: &Out, budget_ms: u64) {
 }
 
 fn assert_no_omp_left(rb: &RpcBox) {
-    poll_until("the probe's omp to be gone", Duration::from_secs(2), || {
-        rb.live_processes().is_empty().then_some(())
-    });
+    poll_until(
+        "the probe's omp to be gone",
+        scaled(Duration::from_secs(2)),
+        || rb.live_processes().is_empty().then_some(()),
+    );
 }
 
 #[test]
@@ -1660,7 +1682,7 @@ fn ac_v2_103_a_stubborn_omp_and_its_children_are_killed_within_the_bounded_teard
     );
     poll_until(
         "the stubborn omp and its child to be gone",
-        Duration::from_millis(1500),
+        scaled(Duration::from_millis(1500)),
         || (!group_alive(ids[0]) && !pid_alive(ids[1])).then_some(()),
     );
 }
@@ -1870,24 +1892,11 @@ fn ac_v2_104_an_unowned_control_records_no_job_status() {
 // AC-v2-105: `omp_surface` and `omp_source_facts` gate omp, with fakes and with a real tree.
 // ---------------------------------------------------------------------------------------------
 
-/// Run `cmd` to the end, killing it at `limit`. Returns (success, stdout + stderr).
+/// Run `cmd` to its exit, killing it at `limit` (scaled). Returns (success, stdout + stderr).
 fn run_capture(mut cmd: Command, limit: Duration) -> (bool, String) {
-    cmd.stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().expect("spawn");
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
-    let t1 = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = so.read_to_end(&mut b);
-        b
-    });
-    let t2 = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b);
-        b
-    });
+    let limit = scaled(limit);
+    cmd.stdin(Stdio::null());
+    let mut child = Captured::spawn(&mut cmd).expect("spawn");
     let started = Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().unwrap() {
@@ -1900,43 +1909,22 @@ fn run_capture(mut cmd: Command, limit: Duration) -> (bool, String) {
         }
         std::thread::sleep(Duration::from_millis(20));
     };
-    let mut text = String::from_utf8_lossy(&t1.join().unwrap()).into_owned();
-    text.push_str(&String::from_utf8_lossy(&t2.join().unwrap()));
+    let out = child.output(status);
+    let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&out.stderr));
     (status.success(), text)
 }
 
 /// The built test executable of an integration test, built once through cargo (the same way CI
-/// builds it), so it can be run with a controlled environment.
+/// builds it), so it can be run with a controlled environment. The build puts the glen binary in
+/// `target/<profile>` again, so the suite runs glen from `flake::glen()`.
 fn test_binary(name: &str) -> PathBuf {
     static CACHE: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     if let Some(p) = cache.get(name) {
         return p.clone();
     }
-    let target_dir = fake_omp_bin()
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("target dir")
-        .to_path_buf();
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.args([
-        "test",
-        "--locked",
-        "--offline",
-        "--no-run",
-        "--message-format=json",
-        "--test",
-        name,
-    ])
-    .arg("--manifest-path")
-    .arg(repo_root().join("Cargo.toml"))
-    .arg("--target-dir")
-    .arg(&target_dir);
-    if !cfg!(debug_assertions) {
-        cmd.arg("--release");
-    }
-    let out = cmd.output().expect("run cargo test --no-run");
+    let out = crate::flake::cargo(&["test", "--no-run", "--message-format=json", "--test", name]);
     assert!(
         out.status.success(),
         "cargo test --no-run --test {name} failed:\n{}",
@@ -2196,20 +2184,16 @@ fn ac_v2_105_omp_source_facts_pass_against_the_reference_clone_read_only() {
             .collect()
     };
     let before = snapshot(&clone);
-    let status_before = Command::new("git")
-        .args(["-C", &s(&clone), "status", "--porcelain"])
-        .output()
-        .ok();
+    let status_before =
+        try_output(Command::new("git").args(["-C", &s(&clone), "status", "--porcelain"])).ok();
     let (ok, text) = run_test_binary("omp_source_facts", &[]);
     assert_ran_and_passed("omp_source_facts", ok, &text);
     assert!(
         before == snapshot(&clone),
         "omp_source_facts changed the omp reference clone"
     );
-    let status_after = Command::new("git")
-        .args(["-C", &s(&clone), "status", "--porcelain"])
-        .output()
-        .ok();
+    let status_after =
+        try_output(Command::new("git").args(["-C", &s(&clone), "status", "--porcelain"])).ok();
     assert_eq!(
         status_before.map(|o| o.stdout),
         status_after.map(|o| o.stdout),
@@ -2679,7 +2663,7 @@ impl Runner {
             )
             .unwrap();
         }
-        symlink(BIN, ws.join("target/debug/glen")).unwrap();
+        symlink(glen_bin(), ws.join("target/debug/glen")).unwrap();
         let (omp_log, curl_log, cargo_log, version_file) = (
             root.join("omp.log"),
             root.join("curl.log"),
@@ -2802,19 +2786,15 @@ impl Runner {
         for (k, v) in &step.env {
             cmd.env(k, self.expand(v));
         }
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+        cmd.stdin(Stdio::null());
         let (tx, rx) = mpsc::channel();
-        let child = child.spawn().expect("spawn bash");
+        let child = Captured::spawn(&mut cmd).expect("spawn bash");
         std::thread::spawn(move || {
             let _ = tx.send(child.wait_with_output());
         });
         let output = rx
-            .recv_timeout(Duration::from_secs(120))
-            .expect("a workflow step did not finish")
-            .unwrap();
+            .recv_timeout(scaled(Duration::from_secs(120)))
+            .expect("a workflow step did not finish");
         let text = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
@@ -2843,13 +2823,14 @@ impl Runner {
 
     /// The directory a plain `mktemp -d` creates in under this runner's environment.
     fn mktemp_parent(&self) -> PathBuf {
-        let out = Command::new("/usr/bin/mktemp")
-            .arg("-d")
-            .env_clear()
-            .env("TMPDIR", &self.tmp)
-            .env("PATH", "/usr/bin:/bin")
-            .output()
-            .expect("run mktemp -d");
+        let out = try_output(
+            Command::new("/usr/bin/mktemp")
+                .arg("-d")
+                .env_clear()
+                .env("TMPDIR", &self.tmp)
+                .env("PATH", "/usr/bin:/bin"),
+        )
+        .expect("run mktemp -d");
         let dir = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
         let parent = fs::canonicalize(dir.parent().unwrap()).unwrap();
         let _ = fs::remove_dir(&dir);
@@ -2924,7 +2905,13 @@ fn run_nightly(r: &mut Runner, all: bool) {
         assert_eq!(code, 0, "the facts step failed:\n{text}");
     }
     let (code, text) = r.run(step_with(&steps, "doctor --probe"));
-    assert_eq!(code, 0, "the doctor step failed:\n{text}");
+    // The step sends glen's report to doctor.json, so a failure shows that file too.
+    assert_eq!(
+        code,
+        0,
+        "the doctor step failed:\n{text}\ndoctor.json: {}",
+        fs::read_to_string(r.ws.join("doctor.json")).unwrap_or_default()
+    );
 }
 
 fn is_secretish(name: &str) -> bool {
@@ -3024,16 +3011,20 @@ fn ac_v2_106_every_omp_command_runs_in_a_scratch_home_with_no_secrets() {
             }
         }
     }
-    // The probe runs from the scratch directory (§A19), so omp finds no project configuration.
+    // The probe omp runs in glen's own private empty directory (S-02), never the workspace, so
+    // it finds no project configuration; the directory is gone once the probe ends.
     for (head, vars) in calls
         .iter()
         .filter(|(h, _)| h.starts_with("omp --mode rpc"))
     {
-        assert_eq!(
-            fs::canonicalize(&vars["PWD"]).unwrap(),
-            scratch,
-            "`{head}` ran outside the scratch directory"
+        let pwd = Path::new(&vars["PWD"]);
+        assert!(
+            pwd.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("glen-omp-")),
+            "`{head}` ran outside a private directory: {pwd:?}"
         );
+        assert!(!pwd.starts_with(&r.ws), "`{head}` ran in the workspace");
+        assert!(!pwd.exists(), "`{head}`'s directory was left behind");
     }
     // The stub provider lives in the scratch home only.
     assert_eq!(

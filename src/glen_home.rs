@@ -166,7 +166,17 @@ pub fn take_refusal(err: io::Error) -> Result<GlenError, io::Error> {
 pub fn write_private_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
     write_atomic(path, bytes, 0o600)
 }
+/// Writes `bytes` to `path` through a synced temp file and a rename. An error names `path`
+/// (`cannot write <path>: <cause>`) and keeps the cause's kind.
 pub fn write_atomic(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_unnamed(path, bytes, mode)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot write {}: {e}", path.display())))
+}
+/// [`write_private_atomic`] for a caller whose own error message already names `path`.
+pub(crate) fn write_private_atomic_unnamed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    write_atomic_unnamed(path, bytes, 0o600)
+}
+fn write_atomic_unnamed(path: &Path, bytes: &[u8], mode: u32) -> io::Result<()> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file name required"))?
@@ -235,6 +245,23 @@ mod tests {
             &[("GLEN_HOME", "rel")],
         );
         assert_eq!(resolve(&env).unwrap_err().code, ErrorCode::InvalidEnv);
+    }
+    /// Tech-debt F1: a failed atomic write names its target and keeps the cause's kind, so a
+    /// warm registry or inbox cursor failure is never a bare "Permission denied".
+    #[test]
+    fn a_failed_atomic_write_names_its_path() {
+        let t = tempfile::tempdir().unwrap();
+        let file = t.path().join("missing/registry.json");
+        let e = write_private_atomic(&file, b"x").unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::NotFound);
+        assert!(
+            e.to_string()
+                .starts_with(&format!("cannot write {}: ", file.display())),
+            "{e}"
+        );
+        // A caller that names the path itself gets the bare cause.
+        let e = write_private_atomic_unnamed(&file, b"x").unwrap_err();
+        assert!(!e.to_string().contains("registry.json"), "{e}");
     }
     #[test]
     fn private_directories_and_atomic_files() {

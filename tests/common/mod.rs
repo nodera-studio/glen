@@ -1,4 +1,6 @@
 #![allow(dead_code)]
+pub mod flake;
+use flake::scaled;
 use std::{
     path::{Path, PathBuf},
     process::{Command, Output},
@@ -26,21 +28,23 @@ pub fn write_control(dir: &Path, name: &str, body: impl AsRef<[u8]>) {
     drop(file);
     std::fs::rename(staging, dir.join(name)).unwrap();
 }
+/// `glen <args>` in a fresh scratch HOME, to its exit; its output is captured in files
+/// (`flake::output`), never read from a pipe to end of file.
 pub fn glen(args: &[&str], vars: &[(&str, &str)]) -> Output {
     let tmp = tempfile::tempdir().unwrap();
     let home = tmp.path().join("home");
     let path = tmp.path().join("bin");
     std::fs::create_dir(&home).unwrap();
     std::fs::create_dir(&path).unwrap();
-    Command::new(env!("CARGO_BIN_EXE_glen"))
-        .args(args)
-        .env_clear()
-        .env("HOME", &home)
-        .env("GLEN_HOME", tmp.path().join("glen"))
-        .env("PATH", path)
-        .envs(vars.iter().copied())
-        .output()
-        .unwrap()
+    flake::output(
+        Command::new(env!("CARGO_BIN_EXE_glen"))
+            .args(args)
+            .env_clear()
+            .env("HOME", &home)
+            .env("GLEN_HOME", tmp.path().join("glen"))
+            .env("PATH", path)
+            .envs(vars.iter().copied()),
+    )
 }
 pub fn fixture(path: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -148,8 +152,11 @@ impl OmpBox {
             .current_dir(cwd);
         c
     }
+    /// `glen <args>` from `cwd`, to its exit; its output is captured in files (`flake::output`):
+    /// a pipe read to end of file would also wait for any process that inherited its write end
+    /// from a concurrent spawn.
     pub fn glen(&self, args: &[&str], cwd: &std::path::Path) -> Output {
-        self.command(args, cwd).output().unwrap()
+        flake::output(&mut self.command(args, cwd))
     }
     pub fn clean(&self) {
         assert!(!self.home.join(".omp").exists());
@@ -177,34 +184,11 @@ pub fn data(out: &Output) -> serde_json::Value {
     v["data"].clone()
 }
 
+/// The `fake_omp` example, rebuilt once per integration-test process so fake-peer knobs match this
+/// source, at the path no concurrent cargo run removes (`flake::example`).
 pub fn fake_omp_bin() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BUILT
-        .get_or_init(|| {
-            let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
-            let dir = bin.parent().unwrap();
-            let fake = dir.join("examples/fake_omp");
-            // Rebuild once per integration-test process so fake-peer knobs match this source.
-            let mut cmd = Command::new(env!("CARGO"));
-            cmd.current_dir(env!("CARGO_MANIFEST_DIR")).args([
-                "build",
-                "--example",
-                "fake_omp",
-                "--offline",
-                "--locked",
-            ]);
-            if dir.file_name().unwrap() == "release" {
-                cmd.arg("--release");
-            }
-            let out = cmd.output().unwrap();
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            fake
-        })
-        .clone()
+    BUILT.get_or_init(|| flake::example("fake_omp")).clone()
 }
 pub struct RpcBox {
     pub omp: OmpBox,
@@ -245,7 +229,7 @@ impl RpcBox {
     pub fn job(&self, id: &str) -> (serde_json::Value, serde_json::Value) {
         let dir = self.job_dir(id);
         // The directory becomes visible before create() has atomically published both files.
-        poll(std::time::Duration::from_secs(3), || {
+        poll(scaled(std::time::Duration::from_secs(3)), || {
             let read = |name| match std::fs::read(dir.join(name)) {
                 Ok(bytes) => Some(serde_json::from_slice(&bytes).unwrap()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
@@ -265,8 +249,8 @@ impl RpcBox {
         })
     }
     pub fn wait_worker_gone(&self, id: &str) {
-        let s = self.wait_terminal(id, std::time::Duration::from_secs(25));
-        poll(std::time::Duration::from_secs(10), || {
+        let s = self.wait_terminal(id, scaled(std::time::Duration::from_secs(25)));
+        poll(scaled(std::time::Duration::from_secs(10)), || {
             let dead = s["worker_pid"].as_u64().is_none_or(|pid| {
                 matches!(
                     glen::jobs::liveness::start_token(pid as u32),
@@ -327,31 +311,10 @@ pub fn poll<T>(timeout: std::time::Duration, mut f: impl FnMut() -> Option<T>) -
 }
 pub const A_ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
 
+/// The `fake_ext` example, rebuilt once per integration-test process (see [`fake_omp_bin`]).
 pub fn fake_ext_bin() -> PathBuf {
     static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BIN.get_or_init(|| {
-        let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
-        let dir = bin.parent().unwrap();
-        let mut c = Command::new(env!("CARGO"));
-        c.current_dir(env!("CARGO_MANIFEST_DIR")).args([
-            "build",
-            "--example",
-            "fake_ext",
-            "--offline",
-            "--locked",
-        ]);
-        if dir.file_name().unwrap() == "release" {
-            c.arg("--release");
-        }
-        let out = c.output().unwrap();
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        dir.join("examples/fake_ext")
-    })
-    .clone()
+    BIN.get_or_init(|| flake::example("fake_ext")).clone()
 }
 pub struct LiveBox {
     pub rpc: RpcBox,
@@ -361,6 +324,8 @@ pub struct LiveBox {
 }
 impl LiveBox {
     pub fn new() -> Self {
+        // Built before the test starts anything with a window (a warm worker's), never inside it.
+        fake_ext_bin();
         let mut rpc = RpcBox::new();
         let short = tempfile::Builder::new()
             .prefix("gle-")
@@ -389,8 +354,10 @@ impl LiveBox {
         .env("FAKE_EXT_LOG", &self.log)
         .env("FAKE_EXT_CWD", self.rpc.omp.alpha())
         .envs(vars.iter().copied())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
+        .stdout(std::process::Stdio::piped());
+        // Its stderr goes to a file, so a failed start is read at its exit, not at end of file.
+        let stderr = flake::Capture::new();
+        stderr.attach_stderr(&mut c);
         if id == A_ID {
             c.arg("--session-file").arg(self.rpc.omp.session('A'));
         }
@@ -404,10 +371,10 @@ impl LiveBox {
                 .map(|_| line);
             let _ = tx.send(result);
         });
-        let ready = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let ready = rx.recv_timeout(scaled(std::time::Duration::from_secs(10)));
         if !matches!(&ready,Ok(Ok(line)) if line=="ready\n") {
             let _ = child.kill();
-            let out = child.wait_with_output().unwrap();
+            let out = stderr.output(child.wait().unwrap());
             panic!(
                 "fake_ext not ready: {ready:?}: {}",
                 String::from_utf8_lossy(&out.stderr)
@@ -571,7 +538,7 @@ impl Holder {
             }
         });
         let holder = Self(c);
-        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        rx.recv_timeout(scaled(Duration::from_secs(10))).unwrap();
         holder
     }
     pub fn release(&mut self) {
@@ -586,7 +553,7 @@ impl Holder {
                 assert!(s.success());
                 return;
             }
-            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(start.elapsed() < scaled(Duration::from_secs(3)));
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -602,7 +569,7 @@ impl Drop for Holder {
             self.0.kill().unwrap();
             let start = Instant::now();
             while self.0.try_wait().unwrap().is_none() {
-                assert!(start.elapsed() < Duration::from_secs(3));
+                assert!(start.elapsed() < scaled(Duration::from_secs(3)));
                 thread::sleep(Duration::from_millis(20));
             }
         }

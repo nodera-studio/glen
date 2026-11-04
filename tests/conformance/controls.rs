@@ -32,6 +32,7 @@
 //!
 //! Run: `cargo test --locked --test conformance controls`
 
+use crate::flake::CaptureExt;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::FileExt;
@@ -192,8 +193,8 @@ fn ctl(lb: &LiveBox, args: &[&str]) -> Run {
     lb.glen(a).env("FAKE_OMP_SERIAL", "1")
 }
 
-/// `glen <args> --json` started in the background (piped stdout/stderr).
-fn spawn_ctl(lb: &LiveBox, args: &[&str], env: &[(&str, &str)]) -> Child {
+/// `glen <args> --json` started in the background, its stdout and stderr captured in files.
+fn spawn_ctl(lb: &LiveBox, args: &[&str], env: &[(&str, &str)]) -> crate::flake::Captured {
     let mut a: Vec<&str> = args.to_vec();
     a.push("--json");
     let mut cmd = lb.command(&a);
@@ -201,8 +202,7 @@ fn spawn_ctl(lb: &LiveBox, args: &[&str], env: &[(&str, &str)]) -> Child {
     for (k, v) in env {
         cmd.env(k, v);
     }
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-    cmd.spawn().expect("spawn glen")
+    crate::flake::Captured::spawn(&mut cmd).expect("spawn glen")
 }
 
 fn has_keys(v: &Value, keys: &[&str], what: &str) {
@@ -487,7 +487,9 @@ fn held_job(lb: &LiveBox, release: &Path, env: &[(&str, &str)]) -> String {
         run = run.env(k, v);
     }
     let id = job_id(&data_of(&run.run(), 10));
-    lb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     id
 }
 
@@ -533,10 +535,15 @@ fn done_files(dir: &Path) -> Vec<PathBuf> {
 fn ask(lb: &LiveBox, job: &str, name: &str, body: &Value) -> Value {
     write_control(lb, job, &format!("{name}.json"), &body.to_string());
     let dir = control_dir(lb, job);
-    let done = lb.wait_file(&dir.join(format!("{name}.done.json")), LONG);
-    poll_until("the answered request to be removed", LONG, || {
-        (!dir.join(format!("{name}.json")).exists()).then_some(())
-    });
+    let done = lb.wait_file(
+        &dir.join(format!("{name}.done.json")),
+        crate::flake::scaled(LONG),
+    );
+    poll_until(
+        "the answered request to be removed",
+        crate::flake::scaled(LONG),
+        || (!dir.join(format!("{name}.json")).exists()).then_some(()),
+    );
     assert_eq!(done["v"], 1, "{name}: {done}");
     done
 }
@@ -1622,9 +1629,11 @@ fn ac354_ac365_the_short_lived_client_holds_the_glen_lock_with_a_control_record(
         &[("FAKE_OMP_COMPACT_DELAY_MS", "3000")],
     );
     let pid = child.id();
-    let rec = poll_until("a control holder record", LONG, || {
-        read_json(&lb.lock_path(&id)).filter(|r| r["kind"] == "control")
-    });
+    let rec = poll_until(
+        "a control holder record",
+        crate::flake::scaled(LONG),
+        || read_json(&lb.lock_path(&id)).filter(|r| r["kind"] == "control"),
+    );
     assert_eq!(rec["v"], 1, "{rec}");
     assert!(rec["job_id"].is_null(), "{rec}");
     assert_eq!(rec["pid"], pid, "the holder is this glen process: {rec}");
@@ -1636,7 +1645,11 @@ fn ac354_ac365_the_short_lived_client_holds_the_glen_lock_with_a_control_record(
         !lb.glen_lock_free(&id),
         "AC-354: the glen lock is held during the run"
     );
-    let out = finish(child, "compact", Duration::from_secs(30));
+    let out = finish(
+        child,
+        "compact",
+        crate::flake::scaled(Duration::from_secs(30)),
+    );
     assert_eq!(data_of(&out, 0)["compacted"], true);
     assert!(lb.glen_lock_free(&id), "released after omp closed");
     assert_omp_gone(&lb.starts()[0]);
@@ -1647,11 +1660,34 @@ fn ac354_ac365_the_short_lived_client_holds_the_glen_lock_with_a_control_record(
 fn ac354_r5_an_endpoint_that_appears_while_waiting_for_the_lock_is_honoured() {
     let lb = LiveBox::new();
     let lock = lb.hold_glen_lock(A.id);
-    let child = spawn_ctl(&lb, &["model", A.handle, "fake/fake-2"], &[]);
+    let child = spawn_ctl(
+        &lb,
+        &["model", A.handle, "fake/fake-2"],
+        &[("FAKE_CTL_LOCK_WAIT_GATE", "1")],
+    );
+    // A debug glen publishes this gate once it waits for the lock; a release build sleeps.
+    #[cfg(debug_assertions)]
+    {
+        let gate = lb.bx.glen_home.join("run/locks").join(format!(
+            ".{}.{}.control-waiting",
+            glen::jobs::lock::lock_key(A.id),
+            child.id()
+        ));
+        poll_until(
+            "the control's lock-wait gate",
+            crate::flake::scaled(LONG),
+            || gate.exists().then_some(()),
+        );
+    }
+    #[cfg(not(debug_assertions))]
     std::thread::sleep(Duration::from_millis(1500));
     let ext = start_ext_for_a(&lb, "ok", &[]);
     drop(lock);
-    let out = finish(child, "model", Duration::from_secs(30));
+    let out = finish(
+        child,
+        "model",
+        crate::flake::scaled(Duration::from_secs(30)),
+    );
     let d = data_of(&out, 0);
     assert_eq!(d["route"], "live", "{d}");
     lb.assert_no_omp();
@@ -1742,7 +1778,7 @@ fn ac352_an_unhealthy_endpoint_refuses_quickly_and_models_still_lists() {
             let out = ctl(&lb, args).run();
             failed(&out, "no_route");
             assert!(
-                out.elapsed < Duration::from_secs(3),
+                out.elapsed < crate::flake::scaled(Duration::from_secs(3)),
                 "{scenario} {args:?}: hello is bounded at 2 s, took {:?}",
                 out.elapsed
             );
@@ -1943,12 +1979,14 @@ fn ac356_aborting_a_busy_live_session_stops_the_run_and_its_glen_job_ends_aborte
         &lb.send(A.handle, "hold", &["--no-wait"]).run(),
         10,
     ));
-    lb.wait_status(&j, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&j, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let out = ctl(&lb, &["abort", A.handle])
         .env("GLEN_OMP_BIN", NO_OMP)
         .run();
     assert!(
-        out.elapsed < Duration::from_secs(7),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(7)),
         "AC-356: within 7 s, took {:?}",
         out.elapsed
     );
@@ -1980,7 +2018,7 @@ fn ac356_an_abort_that_does_not_settle_warns_abort_pending() {
         .env("GLEN_OMP_BIN", NO_OMP)
         .run();
     assert!(
-        out.elapsed < Duration::from_secs(7),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(7)),
         "took {:?}",
         out.elapsed
     );
@@ -2000,19 +2038,21 @@ fn ac356_ac364_aborting_a_session_driven_by_a_glen_job_cancels_it_and_reports_th
             .run(),
         10,
     ));
-    lb.wait_status(&j1, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&j1, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let j2 = job_id(&data_of(
         &lb.glen(["send", A.handle, "second", "--no-wait", "--json"])
             .run(),
         10,
     ));
-    lb.wait_status(&j2, "queued behind j1", LONG, |s| {
+    lb.wait_status(&j2, "queued behind j1", crate::flake::scaled(LONG), |s| {
         s["status"] == "queued" && s["worker_pid"].is_u64()
     });
 
     let out = ctl(&lb, &["abort", A.handle]).run();
     assert!(
-        out.elapsed < Duration::from_secs(3),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(3)),
         "AC-356: the job acknowledgement within 3 s, took {:?}",
         out.elapsed
     );
@@ -2071,7 +2111,7 @@ fn ac363_an_rpc_deadline_stops_the_omp_group_without_an_abort_frame() {
         .run();
     control_failed(&out, "timeout");
     assert!(
-        out.elapsed < Duration::from_secs(6),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(6)),
         "AC-363: exit within 5 s of the 1 s deadline, took {:?}",
         out.elapsed
     );
@@ -2098,9 +2138,13 @@ fn ac363_sigint_on_the_rpc_route_exits_130_with_an_interrupted_document() {
     });
     let t = Instant::now();
     signal(pid as i64, Signal::INT);
-    let out = finish(child, "compact (SIGINT)", Duration::from_secs(20));
+    let out = finish(
+        child,
+        "compact (SIGINT)",
+        crate::flake::scaled(Duration::from_secs(20)),
+    );
     assert!(
-        t.elapsed() < Duration::from_secs(5),
+        t.elapsed() < crate::flake::scaled(Duration::from_secs(5)),
         "AC-363: exit within 5 s of SIGINT, took {:?}",
         t.elapsed()
     );
@@ -2125,7 +2169,7 @@ fn ac363_an_omp_that_never_becomes_ready_is_bounded_by_the_deadline() {
         .run();
     control_failed(&out, "timeout");
     assert!(
-        out.elapsed < Duration::from_secs(7),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(7)),
         "AC-363: within 5 s of the deadline, took {:?}",
         out.elapsed
     );
@@ -2148,7 +2192,7 @@ fn ac363_a_live_deadline_closes_the_socket_with_a_hint() {
         "AC-363: a hint that the op may still finish: {err}"
     );
     assert!(
-        out.elapsed < Duration::from_secs(4),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(4)),
         "the live deadline bounds the command, took {:?}",
         out.elapsed
     );
@@ -2175,10 +2219,11 @@ fn ac363_ac364_a_job_route_deadline_leaves_an_unknown_outcome_and_the_request_ne
             signal(self.0, Signal::CONT);
         }
     }
-    let worker =
-        lb.wait_status(&j, "the worker pid", LONG, |s| s["worker_pid"].is_u64())["worker_pid"]
-            .as_i64()
-            .unwrap();
+    let worker = lb.wait_status(&j, "the worker pid", crate::flake::scaled(LONG), |s| {
+        s["worker_pid"].is_u64()
+    })["worker_pid"]
+        .as_i64()
+        .unwrap();
     signal(worker, Signal::STOP);
     let frozen = Frozen(worker);
 
@@ -2191,7 +2236,7 @@ fn ac363_ac364_a_job_route_deadline_leaves_an_unknown_outcome_and_the_request_ne
         "AC-363: the hint names the job: {err}"
     );
     assert!(
-        out.elapsed < Duration::from_secs(4),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(4)),
         "took {:?}",
         out.elapsed
     );
@@ -2216,9 +2261,11 @@ fn ac363_ac364_a_job_route_deadline_leaves_an_unknown_outcome_and_the_request_ne
 
     drop(frozen);
     release(&ready);
-    let done = poll_until("the worker's answer to the expired request", LONG, || {
-        done_files(&dir).into_iter().find_map(|p| read_json(&p))
-    });
+    let done = poll_until(
+        "the worker's answer to the expired request",
+        crate::flake::scaled(LONG),
+        || done_files(&dir).into_iter().find_map(|p| read_json(&p)),
+    );
     assert_eq!(done["ok"], false, "{done}");
     assert_eq!(
         done["error"]["code"], "timeout",
@@ -2323,11 +2370,14 @@ fn ac364_a_running_job_executes_control_files_on_its_own_omp() {
     let st = lb.wait_terminal(&j);
     assert_eq!(st["status"], "aborted", "{st}");
     assert!(
-        t.elapsed() <= Duration::from_millis(1500),
+        t.elapsed() <= crate::flake::scaled(Duration::from_millis(1500)),
         "AC-364: W2's 1 s abort bound with no control in flight, took {:?}",
         t.elapsed()
     );
-    let done = lb.wait_file(&control_dir(&lb, &j).join("z.done.json"), LONG);
+    let done = lb.wait_file(
+        &control_dir(&lb, &j).join("z.done.json"),
+        crate::flake::scaled(LONG),
+    );
     assert_eq!(done["ok"], true, "{done}");
     assert_eq!(done["data"]["job_status"], "aborted", "{done}");
     assert_eq!(lb.starts().len(), 1);
@@ -2364,7 +2414,7 @@ fn ac364_ops_written_while_omp_starts_wait_for_the_client_and_are_answered_befor
     assert!(dir.join("a.json").exists(), "the request stays in place");
 
     release(&ready);
-    let done = lb.wait_file(&dir.join("a.done.json"), LONG);
+    let done = lb.wait_file(&dir.join("a.done.json"), crate::flake::scaled(LONG));
     assert_eq!(done["ok"], true, "{done}");
     assert!(
         !is_terminal(&lb.status(&j)),
@@ -2386,7 +2436,9 @@ fn ac364_after_an_abort_no_further_control_op_is_dispatched() {
             .run(),
         10,
     ));
-    lb.wait_status(&j, "accepted", LONG, |s| s["status"] == "accepted");
+    lb.wait_status(&j, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let far = now_ms() + 60_000;
     write_control(
         &lb,
@@ -2410,21 +2462,21 @@ fn ac364_after_an_abort_no_further_control_op_is_dispatched() {
     let st = lb.wait_terminal(&j);
     assert_eq!(st["status"], "aborted", "{st}");
     assert!(
-        t.elapsed() <= Duration::from_secs(13),
+        t.elapsed() <= crate::flake::scaled(Duration::from_secs(13)),
         "AC-364: the 13 s escalation bound, took {:?}",
         t.elapsed()
     );
     let dir = control_dir(&lb, &j);
-    let c = lb.wait_file(&dir.join("c.done.json"), LONG);
+    let c = lb.wait_file(&dir.join("c.done.json"), crate::flake::scaled(LONG));
     assert_eq!(c["ok"], false, "{c}");
     assert_eq!(
         c["error"]["code"], "job_ended",
         "AC-364: unanswered at the end: {c}"
     );
     assert_no_frames(&lb, &["set_model"]);
-    let a = lb.wait_file(&dir.join("a.done.json"), LONG);
+    let a = lb.wait_file(&dir.join("a.done.json"), crate::flake::scaled(LONG));
     assert!(a["ok"].is_boolean(), "the in-flight op is answered: {a}");
-    let b = lb.wait_file(&dir.join("b.done.json"), LONG);
+    let b = lb.wait_file(&dir.join("b.done.json"), crate::flake::scaled(LONG));
     assert_eq!(b["data"]["job_status"], "aborted", "{b}");
     lb.assert_quiet();
 }
@@ -2443,11 +2495,17 @@ fn ac364_a_control_deferred_in_startup_is_answered_job_ended_and_the_cli_reroute
     lb.wait_log("the job's omp start", |r| !starts(r).is_empty());
     let child = spawn_ctl(&lb, &["model", A.handle, "fake/fake-2"], &[]);
     let dir = control_dir(&lb, &j);
-    poll_until("the CLI's control request", LONG, || {
-        (!request_files(&dir).is_empty()).then_some(())
-    });
+    poll_until(
+        "the CLI's control request",
+        crate::flake::scaled(LONG),
+        || (!request_files(&dir).is_empty()).then_some(()),
+    );
     write_control(&lb, &j, "0-abort.json", r#"{"v":1,"op":"abort"}"#);
-    let out = finish(child, "model (job_ended)", Duration::from_secs(40));
+    let out = finish(
+        child,
+        "model (job_ended)",
+        crate::flake::scaled(Duration::from_secs(40)),
+    );
     let d = data_of(&out, 0);
     assert_eq!(
         d["route"], "rpc",
@@ -2521,7 +2579,8 @@ fn ac365_a_lock_held_by_nobody_known_makes_controls_wait_for_their_deadline() {
     let out = ctl(&lb, &["model", A.handle, "fake/fake-2", "--timeout", "2s"]).run();
     control_failed(&out, "timeout");
     assert!(
-        out.elapsed >= Duration::from_millis(1500) && out.elapsed < Duration::from_secs(5),
+        out.elapsed >= Duration::from_millis(1500)
+            && out.elapsed < crate::flake::scaled(Duration::from_secs(5)),
         "waited for the lock until the deadline: {:?}",
         out.elapsed
     );
@@ -2597,8 +2656,10 @@ fn ac368_on_the_rpc_route_only_omp_writes_the_session_and_glen_writes_only_its_h
     let outside = |lb: &LiveBox| -> Vec<(String, u64, SystemTime)> {
         snapshot(&lb.bx.root)
             .into_iter()
+            // `models` lists through a private cwd made and removed under TMPDIR (S-02): that
+            // touches only the directory's own mtime, and anything left inside it still shows.
             .filter(|(p, _, _)| {
-                !p.starts_with("logs") && !p.starts_with("extlogs") && *p != rel_file
+                !p.starts_with("logs") && !p.starts_with("extlogs") && *p != rel_file && *p != "tmp"
             })
             .collect()
     };
@@ -2817,7 +2878,7 @@ fn node_env() -> Option<&'static NodeEnv> {
         let node = std::env::split_paths(&path)
             .map(|d| d.join("node"))
             .find(|p| p.is_file())?;
-        let v = Command::new(&node).arg("--version").output().ok()?;
+        let v = Command::new(&node).arg("--version").try_captured().ok()?;
         let text = String::from_utf8_lossy(&v.stdout);
         let nums: Vec<u32> = text
             .trim()
@@ -2932,7 +2993,7 @@ impl CtlHost {
     }
 
     fn expect_line(&mut self, want: &str) {
-        let deadline = Instant::now() + LONG;
+        let deadline = Instant::now() + crate::flake::scaled(LONG);
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match self.rx.recv_timeout(left) {
@@ -2997,7 +3058,8 @@ impl Drop for CtlHost {
 /// to EOF is what proves "exactly one response frame" (AC-366).
 fn exchange(sock: &Path, req: &Value) -> Vec<Value> {
     let mut s = UnixStream::connect(sock).unwrap_or_else(|e| panic!("connect {sock:?}: {e}"));
-    s.set_read_timeout(Some(Duration::from_secs(12))).unwrap();
+    s.set_read_timeout(Some(crate::flake::scaled(Duration::from_secs(12))))
+        .unwrap();
     let _ = s.write_all(format!("{req}\n").as_bytes());
     let mut buf = Vec::new();
     let r = s.read_to_end(&mut buf);
@@ -3269,7 +3331,11 @@ fn node_ac356_ac366_abort_idle_busy_and_a_run_that_never_stops() {
     let notes = h.count("notify");
     let t = Instant::now();
     let d = op_ok(&h.socket(&lb), "a2", "abort", json!({}));
-    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert!(
+        t.elapsed() < crate::flake::scaled(Duration::from_secs(3)),
+        "{:?}",
+        t.elapsed()
+    );
     assert_eq!(d["was"], "busy", "{d}");
     assert_eq!(d["aborted"], true, "{d}");
     assert_eq!(d["idle_after"], true, "{d}");
@@ -3294,7 +3360,7 @@ fn node_ac356_ac366_abort_idle_busy_and_a_run_that_never_stops() {
     let d = op_ok(&h.socket(&lb), "a3", "abort", json!({}));
     let took = t.elapsed();
     assert!(
-        took >= Duration::from_millis(2500) && took < Duration::from_secs(5),
+        took >= Duration::from_millis(2500) && took < crate::flake::scaled(Duration::from_secs(5)),
         "AC-356: answers after the 3 s settle wait, took {took:?}"
     );
     assert_eq!(d["aborted"], true, "{d}");
@@ -3354,9 +3420,11 @@ fn node_ac362_ac366_compact_refuses_busy_and_runs_one_at_a_time() {
         let sock = sock.clone();
         std::thread::spawn(move || op(&sock, "c4", "compact", json!({})))
     };
-    poll_until("the first ctx.compact call", LONG, || {
-        (h.count("compact") == 1).then_some(())
-    });
+    poll_until(
+        "the first ctx.compact call",
+        crate::flake::scaled(LONG),
+        || (h.count("compact") == 1).then_some(()),
+    );
     op_err(&sock, "c5", "compact", json!({}), "busy");
     assert_eq!(h.count("compact"), 1, "one compaction at a time");
     let d = op_ok(&sock, "c6", "abort", json!({}));

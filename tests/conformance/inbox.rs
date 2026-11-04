@@ -76,7 +76,7 @@ fn assert_message(m: &Value, rec: &Value) {
 
 /// `glen inbox <args>` from the sandbox, for streams and raw pipes.
 fn command(sb: &Sandbox, args: &[&str]) -> Command {
-    let mut cmd = Command::new(BIN);
+    let mut cmd = Command::new(glen_bin());
     cmd.env_clear()
         .args(args)
         .env("HOME", &sb.home)
@@ -436,22 +436,30 @@ fn ac320_a_broken_pipe_stops_following_and_marks_nothing_further() {
         &inbox_record(A.id, None, "seen", "2026-10-30T10:00:00Z"),
     );
     let mut cmd = command(&sb, &["inbox", "-f", "--json"]);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // stdout is a FIFO no other process can keep a reader of; stderr comes back from a file.
+    let (stdout, writer) = crate::flake::fifo();
+    let probe = writer.try_clone().unwrap();
+    cmd.stdout(writer);
+    let stderr = crate::flake::Capture::new();
+    stderr.attach_stderr(&mut cmd);
     let mut child = cmd.spawn().unwrap();
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut reader = BufReader::new(stdout);
     let mut first = String::new();
     reader.read_line(&mut first).unwrap();
     assert!(first.contains("\"seen\""), "{first}");
     drop(reader);
+    // Glen's next write fails only once no process holds a reader.
+    crate::flake::await_no_reader(&probe);
     append_record(
         &f,
         &inbox_record(A.id, None, "unseen", "2026-10-30T10:00:01Z"),
     );
-    let status = poll_until("inbox -f to stop after the broken pipe", LONG, || {
-        child.try_wait().unwrap()
-    });
-    let mut err = String::new();
-    let _ = std::io::Read::read_to_string(&mut child.stderr.take().unwrap(), &mut err);
+    let status = poll_until(
+        "inbox -f to stop after the broken pipe",
+        crate::flake::scaled(LONG),
+        || child.try_wait().unwrap(),
+    );
+    let err = String::from_utf8_lossy(&stderr.output(status).stderr).into_owned();
     assert!(!err.contains("panicked"), "{err}");
     assert_eq!(
         status.code(),

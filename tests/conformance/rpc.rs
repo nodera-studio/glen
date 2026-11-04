@@ -139,7 +139,8 @@ fn abort_job_finishing_before_control_arrives_preserves_json_and_reports_finishe
                 .run();
             let id = job_id(&data_of(&sent, 10));
             let dir = rb.job_dir(&id);
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            let deadline =
+                std::time::Instant::now() + crate::flake::scaled(Duration::from_secs(10));
             let mut state = loop {
                 let state: Value =
                     serde_json::from_slice(&std::fs::read(dir.join("status.json")).unwrap())
@@ -156,9 +157,15 @@ fn abort_job_finishing_before_control_arrives_preserves_json_and_reports_finishe
 
             // Freeze the fixture worker so the test can deliver a terminal job
             // acknowledgement after the CLI has selected the active job route.
+            let timeout = format!(
+                "{}ms",
+                crate::flake::scaled(Duration::from_secs(5)).as_millis()
+            );
             let out = std::thread::scope(|scope| {
-                let client =
-                    scope.spawn(|| rb.glen(["abort", A.handle, mode, "--timeout", "5s"]).run());
+                let client = scope.spawn(|| {
+                    rb.glen(["abort", A.handle, mode, "--timeout", timeout.as_str()])
+                        .run()
+                });
                 let request = loop {
                     let request = std::fs::read_dir(dir.join("control"))
                         .ok()
@@ -348,9 +355,12 @@ fn ac202_the_worker_leads_its_own_session_with_null_stdin_and_a_private_log() {
         .env("FAKE_OMP_DELAY_MS", "3000")
         .run();
     let id = job_id(&data_of(&out, 10));
-    let st = rb.wait_status(&id, "accepted with a worker identity", LONG, |s| {
-        s["status"] == "accepted" && s["worker_pid"].is_u64()
-    });
+    let st = rb.wait_status(
+        &id,
+        "accepted with a worker identity",
+        crate::flake::scaled(LONG),
+        |s| s["status"] == "accepted" && s["worker_pid"].is_u64(),
+    );
     assert!(
         st["worker_start"].as_str().is_some_and(|t| !t.is_empty()),
         "AC-214: worker_start recorded: {st}"
@@ -478,7 +488,7 @@ fn ac203_an_unsettled_result_completes_only_after_session_settled() {
         .run();
     let id = job_id(&data_of(&out, 10));
     let mut saw_window = false;
-    poll_until("the job to finish", LONG, || {
+    poll_until("the job to finish", crate::flake::scaled(LONG), || {
         // Read the status first, then the log: the fake logs a frame before writing it, so a
         // terminal status seen before `session_settled` is in the log was written too early.
         let st = rb.try_status(&id);
@@ -559,7 +569,7 @@ fn ac204_no_wait_and_wait_0_return_within_two_seconds() {
         let out = rb.glen(&args).env("FAKE_OMP_DELAY_MS", "1500").run();
         let d = data_of(&out, 10);
         assert!(
-            out.elapsed < Duration::from_secs(2),
+            out.elapsed < crate::flake::scaled(Duration::from_secs(2)),
             "{flags:?} took {:?}",
             out.elapsed
         );
@@ -595,7 +605,7 @@ fn ac205_wait_on_a_terminal_job_reports_at_once_with_the_send_mapping() {
         .run();
     let w = data_of(&out, 0);
     assert!(
-        out.elapsed < Duration::from_secs(5),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(5)),
         "took {:?}",
         out.elapsed
     );
@@ -619,7 +629,7 @@ fn ac205_wait_on_a_terminal_job_reports_at_once_with_the_send_mapping() {
         .run();
     let err = failed(&out, "job_failed");
     assert!(
-        out.elapsed < Duration::from_secs(5),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(5)),
         "took {:?}",
         out.elapsed
     );
@@ -703,10 +713,8 @@ fn ac207_a_live_owner_is_refused_before_any_job_or_omp_exists() {
 fn ac207_send_reprobes_the_owner_lease_after_reading_stdin() {
     let rb = RpcBox::new();
     let mut cmd = rb.command(&["send", A.handle, "-", "--json"]);
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = cmd.spawn().unwrap();
+    cmd.stdin(Stdio::piped());
+    let mut child = crate::flake::Captured::spawn(&mut cmd).unwrap();
     let mut stdin = child.stdin.take().unwrap();
     // `send` resolves (and probes) the target before it blocks on stdin; give it time to get
     // there. A slower start only makes this row less discriminating, never wrongly red.
@@ -714,7 +722,11 @@ fn ac207_send_reprobes_the_owner_lease_after_reading_stdin() {
     let _lease = hold_lease(&rb.bx.owners(), A.id);
     stdin.write_all(b"hi").unwrap();
     drop(stdin);
-    let out = finish(child, "send - (owner appears while stdin is read)", LONG);
+    let out = finish(
+        child,
+        "send - (owner appears while stdin is read)",
+        crate::flake::scaled(LONG),
+    );
     failed(&out, "no_route");
     assert!(!rb.bx.glen_home.exists(), "GLEN_HOME was created");
     assert!(rb.starts().is_empty(), "omp was started\n{}", rb.diag());
@@ -798,7 +810,7 @@ fn a7_a_queued_job_publishes_waiting_for_lock_until_it_gets_the_lock() {
             .run(),
         10,
     ));
-    let st = rb.wait_status(&id, "waiting_for_lock", LONG, |s| {
+    let st = rb.wait_status(&id, "waiting_for_lock", crate::flake::scaled(LONG), |s| {
         s["waiting_for_lock"] == true
     });
     assert_eq!(st["status"], "queued", "{st}");
@@ -833,7 +845,9 @@ fn ac208_a_send_behind_a_running_glen_job_queues_and_runs_after_it() {
             .run()
     };
     let first = job_id(&data_of(&run("one"), 10));
-    rb.wait_status(&first, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&first, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     // The first omp child holds the owner lease from its prompt on, like omp does.
     rb.wait_log("the first prompt", |r| {
         r.iter().any(|x| is_frame(x, "in", "prompt"))
@@ -1215,7 +1229,7 @@ fn ac212_a_locally_handled_prompt_completes_without_result_or_settlement() {
         .run();
     let d = data_of(&out, 0);
     assert!(
-        out.elapsed < Duration::from_secs(10),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(10)),
         "took {:?}",
         out.elapsed
     );
@@ -1278,7 +1292,7 @@ fn ac214_a_killed_worker_is_reported_lost_and_a_live_one_never_is() {
         10,
     );
     let id = job_id(&d);
-    let st = rb.wait_status(&id, "accepted", LONG, |s| {
+    let st = rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
         s["status"] == "accepted" && s["worker_pid"].is_u64()
     });
     assert!(
@@ -1301,9 +1315,11 @@ fn ac214_a_killed_worker_is_reported_lost_and_a_live_one_never_is() {
     }
     let pid = st["worker_pid"].as_i64().unwrap();
     signal(pid, Signal::KILL);
-    poll_until("the killed worker to disappear", LONG, || {
-        (!pid_alive(pid)).then_some(())
-    });
+    poll_until(
+        "the killed worker to disappear",
+        crate::flake::scaled(LONG),
+        || (!pid_alive(pid)).then_some(()),
+    );
     let out = rb
         .glen(["wait", &job_handle(&id), "--timeout", "20s", "--json"])
         .run();
@@ -1369,7 +1385,14 @@ fn ac215_a_completed_but_unsettled_run_completes_at_the_deadline_with_a_warning(
     let out = rb
         .glen(["send", A.handle, "hi", "--wait", "20s", "--json"])
         .env("FAKE_OMP_SCENARIO", "never_settles")
-        .env("GLEN_JOB_TIMEOUT", "2s")
+        // Scaled: the turn has to complete inside the deadline for it to end unsettled.
+        .env(
+            "GLEN_JOB_TIMEOUT",
+            format!(
+                "{}ms",
+                crate::flake::scaled(Duration::from_secs(2)).as_millis()
+            ),
+        )
         .run();
     let env = ok_doc(&out, 0);
     let d = &env["data"];
@@ -1480,9 +1503,11 @@ fn ac217_ctrl_c_on_send_prints_the_running_document_and_the_job_completes() {
     );
     let pid = child.id() as i64;
     let id = rb.wait_one_job();
-    rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     signal_group(pid, Signal::INT);
-    let out = finish(child, "send (SIGINT)", LONG);
+    let out = finish(child, "send (SIGINT)", crate::flake::scaled(LONG));
     let d = data_of(&out, 130);
     assert_eq!(d["interrupted"], true, "{d}");
     assert_eq!(d["status"], "running", "{d}");
@@ -1512,12 +1537,14 @@ fn ac217_ctrl_c_on_wait_keeps_the_job_running() {
     );
     let id = job_id(&d);
     let h = job_handle(&id);
-    rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let child = rb.spawn_group(&["wait", &h, "--timeout", "30s", "--json"], &[]);
     // Let `wait` start observing (it has no readiness signal of its own).
     std::thread::sleep(Duration::from_millis(1000));
     signal_group(child.id() as i64, Signal::INT);
-    let out = finish(child, "wait (SIGINT)", LONG);
+    let out = finish(child, "wait (SIGINT)", crate::flake::scaled(LONG));
     let w = data_of(&out, 130);
     assert_eq!(w["interrupted"], true, "{w}");
     assert_eq!(w["status"], "running", "{w}");
@@ -1543,7 +1570,7 @@ fn worker_signal_cancels(sig: Signal) {
         10,
     );
     let id = job_id(&d);
-    let st = rb.wait_status(&id, "accepted", LONG, |s| {
+    let st = rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
         s["status"] == "accepted" && s["worker_pid"].is_u64()
     });
     rb.wait_log("the prompt", |r| {
@@ -1551,7 +1578,7 @@ fn worker_signal_cancels(sig: Signal) {
     });
     let t = Instant::now();
     signal(st["worker_pid"].as_i64().unwrap(), sig);
-    let fin = rb.wait_status(&id, "terminal", LONG, is_terminal);
+    let fin = rb.wait_status(&id, "terminal", crate::flake::scaled(LONG), is_terminal);
     let took = t.elapsed();
     assert_eq!(fin["status"], "aborted", "{fin}");
     assert!(
@@ -1594,12 +1621,15 @@ const ABORT: &str = r#"{"v":1,"op":"abort"}"#;
 const ABORT_BOUND: Duration = Duration::from_millis(1500);
 
 fn assert_cancelled_quickly(rb: &RpcBox, id: &str, since: Instant) {
-    let st = rb.wait_status(id, "terminal", LONG, is_terminal);
+    let st = rb.wait_status(id, "terminal", crate::flake::scaled(LONG), is_terminal);
     let took = since.elapsed();
     assert_eq!(st["status"], "aborted", "{st}");
     assert_eq!(st["error"]["code"], "cancelled", "{st}");
     assert!(took <= ABORT_BOUND, "abort took {took:?}");
-    let done = rb.wait_file(&rb.job_dir(id).join("control/a.done.json"), LONG);
+    let done = rb.wait_file(
+        &rb.job_dir(id).join("control/a.done.json"),
+        crate::flake::scaled(LONG),
+    );
     // W3b AC-356: the acknowledgement reports the terminal job status.
     assert_eq!(
         done,
@@ -1619,13 +1649,17 @@ fn ac218_an_abort_request_cancels_a_running_job_within_a_second() {
     rb.wait_log("the prompt", |r| {
         r.iter().any(|x| is_frame(x, "in", "prompt"))
     });
-    rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let t = Instant::now();
     write_control(&rb, &id, "a.json", ABORT);
     assert_cancelled_quickly(&rb, &id, t);
-    poll_until("the request file to be removed", LONG, || {
-        (!rb.job_dir(&id).join("control/a.json").exists()).then_some(())
-    });
+    poll_until(
+        "the request file to be removed",
+        crate::flake::scaled(LONG),
+        || (!rb.job_dir(&id).join("control/a.json").exists()).then_some(()),
+    );
     let err = failed(
         &rb.glen(["wait", &job_handle(&id), "--json"]).run(),
         "job_failed",
@@ -1646,7 +1680,9 @@ fn ac218_unknown_malformed_and_ignored_control_files_leave_the_job_running() {
     rb.wait_log("the prompt", |r| {
         r.iter().any(|x| is_frame(x, "in", "prompt"))
     });
-    rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let control = rb.job_dir(&id).join("control");
     // §A7: dotfiles and `.done.json` files are never requests.
     write_control(&rb, &id, ".d.json", ABORT);
@@ -1654,7 +1690,10 @@ fn ac218_unknown_malformed_and_ignored_control_files_leave_the_job_running() {
     write_control(&rb, &id, "b.json", r#"{"v":1,"op":"set_model"}"#);
     write_control(&rb, &id, "c.json", "not json");
     for name in ["b", "c"] {
-        let done = rb.wait_file(&control.join(format!("{name}.done.json")), LONG);
+        let done = rb.wait_file(
+            &control.join(format!("{name}.done.json")),
+            crate::flake::scaled(LONG),
+        );
         assert_eq!(done["v"], 1, "{name}: {done}");
         assert_eq!(done["ok"], false, "{name}: {done}");
         assert_eq!(done["error"]["code"], "bad_request", "{name}: {done}");
@@ -1683,9 +1722,12 @@ fn ac218_an_abort_while_queued_is_honoured_without_starting_omp() {
     );
     assert_eq!(d["job"]["status"], "queued", "{d}");
     let id = job_id(&d);
-    rb.wait_status(&id, "claimed by its worker", LONG, |s| {
-        s["worker_pid"].is_u64()
-    });
+    rb.wait_status(
+        &id,
+        "claimed by its worker",
+        crate::flake::scaled(LONG),
+        |s| s["worker_pid"].is_u64(),
+    );
     let t = Instant::now();
     write_control(&rb, &id, "a.json", ABORT);
     assert_cancelled_quickly(&rb, &id, t);
@@ -1749,10 +1791,10 @@ fn ac219_send_pipes_reach_eof_within_a_second_of_its_exit() {
     };
     let exited = Instant::now();
     let (stdout, t_out) = out_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(crate::flake::scaled(Duration::from_secs(10)))
         .expect("stdout EOF");
     let (stderr, t_err) = err_rx
-        .recv_timeout(Duration::from_secs(10))
+        .recv_timeout(crate::flake::scaled(Duration::from_secs(10)))
         .expect("stderr EOF");
     let one = Duration::from_secs(1);
     assert!(

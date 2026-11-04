@@ -17,6 +17,25 @@ All notable changes to glen are listed here, newest first.
 - `glen release [<target>] [--all] [--force] [--timeout DUR]` ends warm workers: a target is a session id, a hex tail or a job handle, and `--all` ends every one. `--force` kills a worker that does not release in time, only after proving its pid and start time (and omp's own, when recorded) are unchanged.
 - `glen mcp` serves glen's commands to an MCP host such as Claude Code or Codex over stdio (`claude mcp add glen -- glen mcp`, `codex mcp add glen -- glen mcp`): 14 tools (`glen_ls`, `glen_send`, `glen_wait`, and the rest), each a byte-for-byte copy of the matching command's `--json` envelope. `isError` mirrors `ok:false`, so a still-running, forked or SIGINT-interrupted result (exits 10, 11, 130) is not an error. Cancelling a tool call (`notifications/cancelled`) stops the exec-self child but never aborts the job, which keeps running. Codex's default `tool_timeout_sec` (60 s) is shorter than `send`'s and `wait`'s 90 s defaults; set it higher (120 in the `[mcp_servers.glen]` example) or pass a shorter `wait`/`timeout`.
 - `src/mcp/tools.json`, the generated MCP tool catalog, is checked in and generated from `docs/json.md`'s `<!-- mcp: … -->` annotations plus clap; `cargo test --locked --test mcp_contract` fails on any drift between the catalog and either source, naming the regenerate command.
+- Warnings `session_identity_unverified` (send, wait: omp did not confirm the session id after the turn, so a fork may be unreported; the worker does not stay warm) and `replies_truncated` (send, wait: a live job kept only its first 256 replies or 8 MiB of reply text; later replies are still in `glen inbox`).
+
+### Fixed
+
+- `glen watch`'s terminal teardown no longer races the last frame: on SIGINT, SIGTERM, SIGHUP and a panic, the terminal is restored before any further draw, so a stray frame can no longer be written after the terminal has already been handed back.
+- `glen release --all` no longer stops at the first warm worker it fails to release: every target is still attempted, and a failure's message and `details.workers` report every worker's outcome, ending with `(k of n warm workers released)`.
+- An unreadable warm-worker registry file no longer lets `glen release --all` report `total:0` or succeed silently; it now exits 1 `io` with `details.unreadable`, after every readable worker has still been processed.
+- `doctor --probe` and `glen models`'s throwaway omp process now run in a private, empty directory with `--no-extensions --no-skills --no-rules`, instead of the caller's own directory with whatever extensions, skills and rules it carries; a side effect is that `glen models` can no longer list a provider that only an extension had registered.
+- A job's final identity check (`get_state`) failing silently no longer lets a fork go unreported as if the session were confirmed: a failed check is now retried once within the job's deadline and warned on.
+- Live `glen_reply` frames are now validated and capped by count and byte size before they are persisted, instead of trusting whatever the omp extension sent.
+- On Linux, a live TUI's registry and socket are no longer deleted just because its pid is invisible from glen's own process view (for example inside a pid namespace); under a detected Codex sandbox marker the lease now reports as unknown instead.
+- Warm-worker registry file names must now equal the session's own lock key, closing a path where `glen release --force` could be pointed at a forged identity.
+
+### Security
+
+- Every workflow in `.github/workflows/` pins its actions, including GitHub's own `actions/*`, to full commit SHAs and declares a read-only top-level `permissions:`, both enforced by a workflow-contract test.
+- CI's `site-deploy` job now runs `npm ci --ignore-scripts`.
+- `install.sh`'s `GLEN_INSTALL_BASE_URL` now accepts only an `https://` mirror or a `file://` directory (for fixtures); any other scheme is a usage error (exit 2) before any download is attempted.
+- Untrusted text passed through `render::sanitize` and the JSON escaper now also escapes tag characters, zero-width characters and U+2028; session-id-derived strings reaching human output (`release`, `jobs`, `doctor`) are sanitized the same way as everywhere else.
 
 ### Changed
 
@@ -30,7 +49,7 @@ All notable changes to glen are listed here, newest first.
 
 ### Documentation
 
-- `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). The CLI is unchanged.
+- `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). (This described the v0.2 W0 foundation wave, which added only docs and tests; the CLI itself changed substantially across the waves below.)
 - §A20 describes push to the calling agent as shipped in v0.2 W2: the two receivers, the unseen-reply rule, why `wait` leaves the inbox marker alone, the two exit-10 documents and the per-caller delivery table. A background wait also wakes a headless `claude -p` run: verified on Claude Code 2.1.316 in stream-json mode, where the completion notification resumed the run after its first result. The skill's allowed-tools may not apply to that resumed turn under `--permission-mode dontAsk`.
 - §A21 describes the warm worker as shipped in v0.2 W4: the stay-warm rule, the on-disk registry and release request, the match key and the compare-and-claim protocol, the idle loop and its bounds, the one teardown and its reasons, `glen release`'s outcomes, controls and `ls`/doctor wording on a warm session, the queued-job liveness decision, the lease cost and two residual races.
 - §A22 describes the MCP layer as shipped in v0.2 W5: the supported protocol revisions and why (`initialize`-era only, no batching), the annotation grammar and the generated catalog, naming and schema rules, the exec-self argv and result-mapping rules, cancellation and shutdown, the limits, Codex's and Claude Code's host-specific quirks, and the security notes. It also records the hidden, unsupported `glen mcp --channel` notifier, tested at the protocol level only.

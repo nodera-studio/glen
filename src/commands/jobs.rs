@@ -55,7 +55,7 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                         State::Accepted => "◐ running".into(),
                         State::Completed => {
                             if let Some(f) = &s.forked {
-                                format!("✓ forked → {}", session_handle(&f.to))
+                                format!("✓ forked → {}", text::single_line(&session_handle(&f.to)))
                             } else {
                                 "✓ completed".into()
                             }
@@ -65,7 +65,8 @@ pub fn run(_cli: &Cli, args: &JobsArgs, env: &Env, ctx: &OutputCtx) -> Result<Ou
                         State::Lost => "✗ lost".into(),
                     },
                     j.session_handle
-                        .clone()
+                        .as_deref()
+                        .map(text::single_line)
                         .map(|h| {
                             if j.route == crate::jobs::Route::Live {
                                 format!("● {h}")

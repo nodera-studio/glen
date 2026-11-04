@@ -1,3 +1,6 @@
+#[path = "common/flake.rs"]
+mod flake;
+use flake::CaptureExt;
 use std::{path::PathBuf, process::Command};
 #[test]
 fn extension_unit_tests_under_node() {
@@ -33,7 +36,7 @@ fn extension_unit_tests_under_node() {
         if flag {
             c.arg("--experimental-strip-types");
         }
-        c.arg("--test").args(&tests).output().unwrap()
+        c.arg("--test").args(&tests).captured()
     };
     let mut o = run(true);
     if String::from_utf8_lossy(&o.stderr).contains("bad option") {

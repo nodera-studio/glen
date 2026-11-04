@@ -44,6 +44,10 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
    - `git switch -c chore/release-v<version>`.
    - Set `version = "<version>"` in `Cargo.toml`, then run `cargo build` (without `--locked`)
      so `Cargo.lock` records the new version. Commit both files.
+   - If the site's copy for this version is still held out of `main` (as the v0.2.0 copy was,
+     commit `39aff85`), cherry-pick that commit onto the release branch. Either way, bump the
+     `version` field in `site/src/data/site.ts` to match `Cargo.toml` in the same PR:
+     `site/src/data/site.test.mjs` fails when the two versions disagree.
    - If a `CHANGELOG.md` exists, add a `## v<version> — <YYYY-MM-DD>` section from the log in
      step 1. If none exists, put the summary in the PR body instead; don't create one unasked.
    - Pre-push: `cargo fmt --all -- --check && cargo clippy --all-targets --locked -- -D warnings
@@ -58,7 +62,10 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
    `capture-before-merge` hook blocks `gh pr merge` until such a call exists.
 5. **Merge.** `gh pr merge <n> --squash` (prompt-gated). Then `git switch main && git pull
    --ff-only`, and confirm `HEAD` is the squash commit: `git log -1 --oneline` shows the
-   `chore: release v<version>` subject and `Cargo.toml` has the new version.
+   `chore: release v<version>` subject and `Cargo.toml` has the new version. CI's `site-deploy`
+   job redeploys the site on every push to `main` once the `CLOUDFLARE_API_TOKEN` secret is set,
+   so this merge is the site's deploy for the new copy and version — there is no separate deploy
+   step to run for it.
 6. **Tag.** On that exact commit:
    `git tag -a v<version> -m "glen v<version>"` then `git push origin v<version>`. Pushing a tag
    is a mutator and stays prompt-gated. Never tag a commit that is not on `main`, never move or
@@ -70,7 +77,8 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
      --limit 1` / `gh run watch <id>` and confirm it is green.
    - Confirm the 9 assets (4 `glen-<target>.tar.gz`, 4 `.sha256`, `SHA256SUMS`):
      `gh release view v<version> --json assets --jq '.assets[].name'`.
-   - Install smoke: download this machine's asset, check its checksum and run it.
+   - Install smoke: this only works once the step above finishes publishing the assets, not right
+     after the merge in Step 5. Download this machine's asset, check its checksum and run it.
 
      ```bash
      case "$(uname -sm)" in
@@ -89,9 +97,11 @@ nothing to drift; the two things that go wrong are tagging the wrong commit and 
      (`release.yml:131`); the `steer-bash` hook blocks `curl`, so do not run `curl … | sh` here.
    - Fallback only if the workflow cannot run: `gh release create v<version> --verify-tag
      --notes-file <file>` with the same notes as the PR body, then upload the assets by hand.
-   - After the first release (v0.1.0): set `releaseAvailable: true` in `site/src/data/site.ts` in a
-     PR, so the site offers the install script and the latest release, and redeploy the site
-     (`npm --prefix site run deploy`; its online link check verifies the script and the assets).
+   - `releaseAvailable: true` in `site/src/data/site.ts` was set once, after v0.1.0, so the site
+     already offers the install script and the latest release; only the `version` bump in Step 2
+     is needed per release, and Step 5's merge already redeployed it. Running
+     `npm --prefix site run deploy` by hand (its online link check verifies the script and the
+     assets) is a verification option, not a required step.
    - Tag every board issue shipped in this release with `released:v<version>`
      (`document_tags_update`, `mode: "add"`, on the Mnemosyne board of project Glen; read the
      issue with `document_get` first for its `revision`). Keep their `shipped:main` tag.

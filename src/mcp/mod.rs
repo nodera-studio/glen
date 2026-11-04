@@ -233,8 +233,24 @@ impl Writer {
 pub(crate) mod test_support {
     use std::{
         io::{self, Write},
-        sync::{Arc, Mutex, PoisonError},
+        sync::{Arc, Mutex, OnceLock, PoisonError},
+        time::Duration,
     };
+    /// A test's wait, or its upper bound on how long the server takes, times
+    /// `GLEN_TEST_TIME_SCALE` (a whole number from 1, exported by `scripts/flake-check.sh` for
+    /// its loaded runs; 1 when unset): exactly `d` in a normal run. A lower bound is never scaled.
+    pub(crate) fn scaled(d: Duration) -> Duration {
+        static SCALE: OnceLock<u32> = OnceLock::new();
+        d * *SCALE.get_or_init(|| {
+            let env = crate::env::Env::from_process();
+            let value = env.get("GLEN_TEST_TIME_SCALE");
+            value
+                .map_or(Some(1), |v| v.parse().ok().filter(|n| *n >= 1))
+                .unwrap_or_else(|| {
+                    panic!("GLEN_TEST_TIME_SCALE must be a whole number from 1: {value:?}")
+                })
+        })
+    }
     /// A `Write` the test can read while the server runs.
     #[derive(Clone, Default)]
     pub(crate) struct Shared(pub Arc<Mutex<Vec<u8>>>);
@@ -367,7 +383,10 @@ mod tests {
             writer.post(&big);
         }
         assert!(!writer.gone());
-        assert!(start.elapsed() < Duration::from_secs(2), "post waited");
+        assert!(
+            start.elapsed() < test_support::scaled(Duration::from_secs(2)),
+            "post waited"
+        );
         // Shutdown takes `send` out of its wait for room, and the drain is bounded.
         let huge = serde_json::json!({"pad":"y".repeat(OUTPUT_QUEUE)});
         let blocked = {
@@ -382,7 +401,8 @@ mod tests {
         writer.finish(Instant::now() + Duration::from_millis(200));
         let took = start.elapsed();
         assert!(
-            took >= Duration::from_millis(200) && took < Duration::from_secs(2),
+            took >= Duration::from_millis(200)
+                && took < test_support::scaled(Duration::from_secs(2)),
             "{took:?}"
         );
         assert!(!writer.gone());

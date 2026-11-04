@@ -62,8 +62,11 @@ const LEAVE: [TerminalStep; 4] = [
     TerminalStep::Show,
     TerminalStep::NoRaw,
 ];
+/// Test knob: hold teardown after its first step, as a slow terminal would (debug builds only).
+#[cfg(debug_assertions)]
+static TEARDOWN_PAUSE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 fn terminal_step(step: TerminalStep) -> io::Result<()> {
-    match step {
+    let result = match step {
         TerminalStep::Raw => terminal::enable_raw_mode(),
         TerminalStep::Alternate => execute!(io::stdout(), EnterAlternateScreen),
         TerminalStep::Paste => execute!(io::stdout(), EnableBracketedPaste),
@@ -72,7 +75,14 @@ fn terminal_step(step: TerminalStep) -> io::Result<()> {
         TerminalStep::Leave => execute!(io::stdout(), LeaveAlternateScreen),
         TerminalStep::Show => execute!(io::stdout(), Show),
         TerminalStep::NoRaw => terminal::disable_raw_mode(),
+    };
+    #[cfg(debug_assertions)]
+    if step == TerminalStep::NoPaste {
+        thread::sleep(Duration::from_millis(
+            TEARDOWN_PAUSE_MS.load(Ordering::Relaxed),
+        ));
     }
+    result
 }
 fn restore_with(
     active: &AtomicBool,
@@ -149,6 +159,39 @@ impl Drop for TerminalGuard {
         // Normal exits collect the error explicitly; Drop and panic paths must never panic.
         if let Err(_error) = self.restore() {}
     }
+}
+/// ratatui's output. crossterm writes every escape sequence in several pieces, so a frame
+/// written straight to stdout can be split by a second-signal teardown on the signal thread,
+/// and its rest then lands on the restored main screen. Frames go out on flush instead: whole,
+/// under the teardown lock, and only while the terminal is still entered.
+#[derive(Default)]
+struct FrameWriter(Vec<u8>);
+impl io::Write for FrameWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        let written = write_frame(&ACTIVE, &RESTORING, &mut io::stdout(), &self.0);
+        self.0.clear();
+        written
+    }
+}
+fn write_frame(
+    active: &AtomicBool,
+    restoring: &Mutex<()>,
+    out: &mut impl io::Write,
+    frame: &[u8],
+) -> io::Result<()> {
+    if frame.is_empty() {
+        return Ok(());
+    }
+    let _restoring = restoring.lock().unwrap_or_else(|error| error.into_inner());
+    if !active.load(Ordering::Acquire) {
+        return Ok(()); // Torn down: the main screen is the user's again.
+    }
+    out.write_all(frame)?;
+    out.flush()
 }
 type Hook = dyn Fn(&panic::PanicHookInfo<'_>) + Send + Sync + 'static;
 struct PanicHook(Arc<Hook>);
@@ -705,6 +748,14 @@ pub(crate) fn run(
         stop: Arc::new(AtomicBool::new(false)),
         tx,
     };
+    #[cfg(debug_assertions)]
+    if let Some(ms) = ctx
+        .env
+        .get("GLEN_WATCH_TEST_TEARDOWN_PAUSE_MS")
+        .and_then(|v| v.parse().ok())
+    {
+        TEARDOWN_PAUSE_MS.store(ms, Ordering::Relaxed);
+    }
     let hup = Arc::new(AtomicBool::new(false));
     let quitting = Arc::new(AtomicBool::new(false));
     #[cfg(unix)]
@@ -731,7 +782,7 @@ pub(crate) fn run(
     };
     let mut effects = Effects::start(ctx.clone(), &app, opened);
     let result = (|| {
-        let backend = CrosstermBackend::new(Box::new(io::stdout()) as Box<dyn io::Write>);
+        let backend = CrosstermBackend::new(Box::new(FrameWriter::default()) as Box<dyn io::Write>);
         let mut terminal =
             Terminal::new(backend).map_err(|e| io_error("initialise terminal", e))?;
         let result = (|| {
@@ -1043,6 +1094,68 @@ mod tests {
         let (bytes, raw) = completed.recv_timeout(Duration::from_secs(2)).unwrap();
         assert_eq!(bytes, b"\x1b[?2004l\x1b[?1049l\x1b[?25h");
         assert!(!raw, "exit preceded disabling raw mode");
+    }
+    #[test]
+    fn a_frame_drawn_during_teardown_waits_for_it_and_is_then_dropped() {
+        // One shared byte stream standing in for the terminal, as stdout is for both threads.
+        struct Out(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Out {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let active = Arc::new(AtomicBool::new(true));
+        let restoring = Arc::new(Mutex::new(()));
+        let output = Arc::new(Mutex::new(Vec::new()));
+        write_frame(&active, &restoring, &mut Out(output.clone()), b"<frame 1>").unwrap();
+        let (started, in_teardown) = mpsc::channel();
+        let (resume, paused) = mpsc::channel();
+        let teardown = {
+            let (active, restoring, output) = (active.clone(), restoring.clone(), output.clone());
+            thread::spawn(move || {
+                restore_with(&active, &restoring, |step| {
+                    let bytes: &[u8] = match step {
+                        TerminalStep::NoPaste => b"\x1b[?2004l",
+                        TerminalStep::Leave => b"\x1b[?1049l",
+                        TerminalStep::Show => b"\x1b[?25h",
+                        TerminalStep::NoRaw => b"",
+                        _ => panic!("unexpected enter step"),
+                    };
+                    io::Write::write_all(&mut Out(output.clone()), bytes)?;
+                    if step == TerminalStep::NoPaste {
+                        started.send(()).unwrap();
+                        paused.recv_timeout(Duration::from_secs(2)).unwrap();
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        in_teardown.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done, drawn) = mpsc::channel();
+        let draw = {
+            let output = output.clone();
+            thread::spawn(move || {
+                write_frame(&active, &restoring, &mut Out(output), b"<frame 2>").unwrap();
+                done.send(()).unwrap();
+            })
+        };
+        let early = drawn.recv_timeout(Duration::from_millis(50));
+        resume.send(()).unwrap();
+        teardown.join().unwrap();
+        draw.join().unwrap();
+        assert!(
+            matches!(early, Err(RecvTimeoutError::Timeout)),
+            "a frame was written inside teardown"
+        );
+        assert_eq!(
+            output.lock().unwrap().as_slice(),
+            b"<frame 1>\x1b[?2004l\x1b[?1049l\x1b[?25h"
+        );
     }
     #[test]
     fn input_adapter_forwards_only_keys_paste_and_resize() {
