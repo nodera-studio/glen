@@ -349,6 +349,32 @@ test('header: sticky glass with the morphing hover fill and a focus ring', async
  await expect(item.locator('.nav-fill')).toHaveCSS('transform', 'none');
 });
 
+// Reads the built CSS: Lightning CSS once folded animation-timeline into the animation shorthand, which browsers drop.
+test('header: the hairline stays hidden until the page scrolls under the glass', async ({ page }) => {
+ await page.setViewportSize({ width: 1280, height: 800 });
+ const header = page.locator('.header-glass'), scrollTo = (y: number) => page.evaluate(y => window.scrollTo({ top: y, behavior: 'instant' }), y);
+ for (const [colorScheme, line] of [['light', 'rgb(51, 51, 51)'], ['dark', 'rgb(194, 194, 194)']] as const) {
+  await page.emulateMedia({ colorScheme }); await page.goto('/');
+  await expect(header).toHaveCSS('animation-name', 'header-edge');
+  await expect(header).toHaveCSS('border-bottom-color', 'rgba(0, 0, 0, 0)');
+  await scrollTo(48); await expect(header).toHaveCSS('border-bottom-color', line);
+  await scrollTo(600); await expect(header).toHaveCSS('border-bottom-color', line);
+  await scrollTo(0); await expect(header).toHaveCSS('border-bottom-color', 'rgba(0, 0, 0, 0)');
+ }
+ // Forced colours and more contrast keep the hairline at the top as well.
+ await page.emulateMedia({ colorScheme: 'light', forcedColors: 'active' }); await page.goto('/');
+ await expect(header).toHaveCSS('animation-name', 'none'); await expect(header).toHaveCSS('border-bottom-style', 'solid');
+ await page.emulateMedia({ forcedColors: 'none', contrast: 'more' }); await page.goto('/');
+ await expect(header).toHaveCSS('animation-name', 'none'); await expect(header).toHaveCSS('border-bottom-color', 'rgb(219, 219, 219)');
+});
+
+test('exit codes: the badge icons keep their scroll-driven pop in the built CSS', async ({ page }) => {
+ await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
+ const icon = page.locator('.exit-badge svg').first();
+ await expect(icon).toHaveCSS('animation-name', 'icon-pop');
+ await expect(icon).toHaveCSS('animation-fill-mode', 'both');
+});
+
 test('header: hover and keyboard focus swap the nav labels; reduced motion keeps one', async ({ page }) => {
  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
  const item = page.locator('.desktop-nav .nav-item').first();

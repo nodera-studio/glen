@@ -156,9 +156,11 @@ section[id] { scroll-margin-top: 88px }
 
 /* ---------- Header (MK .header-glass, morphin nav hover) ---------- */
 .header-glass { position: sticky; top: 0; z-index: 50; padding-top: env(safe-area-inset-top); color: var(--frame-fg); background: color-mix(in oklch, var(--frame) 80%, transparent); -webkit-backdrop-filter: blur(20px) saturate(160%); backdrop-filter: blur(20px) saturate(160%); border-bottom: 1px solid var(--frame-border) }
-/* The hairline only shows once the page scrolls under the glass. */
+/* The hairline only shows once the page scrolls under the glass. Longhands, not the animation
+   shorthand: Astro builds with target esnext, so Vite's Lightning CSS minify has no browser targets
+   and folds animation-timeline into the shorthand, which browsers reject as a whole. */
 @supports (animation-timeline: scroll()) {
- .header-glass { animation: header-edge linear both; animation-timeline: scroll(root); animation-range: 0 48px }
+ .header-glass { animation-name: header-edge; animation-timing-function: linear; animation-fill-mode: both; animation-timeline: scroll(root); animation-range: 0 48px }
  @keyframes header-edge { from { border-bottom-color: transparent } }
 }
 .header-bar { display: flex; align-items: center; gap: 12px; max-width: 1344px; height: 64px; margin: auto; padding-inline: var(--gutter) }
@@ -187,8 +189,8 @@ section[id] { scroll-margin-top: 88px }
 .mobile-nav { display: none }
 @supports not ((backdrop-filter: blur(1px)) or (-webkit-backdrop-filter: blur(1px))) { .header-glass { background: var(--frame) } }
 @media (prefers-reduced-transparency: reduce) { .header-glass { background: var(--frame); -webkit-backdrop-filter: none; backdrop-filter: none } }
-@media (forced-colors: active) { .header-glass { background: Canvas; color: CanvasText; border-bottom: 1px solid CanvasText; -webkit-backdrop-filter: none; backdrop-filter: none } }
-@media (prefers-contrast: more) { .header-glass { background: var(--frame); border-bottom: 1px solid var(--frame-fg) } }
+@media (forced-colors: active) { .header-glass { background: Canvas; color: CanvasText; border-bottom: 1px solid CanvasText; -webkit-backdrop-filter: none; backdrop-filter: none; animation: none } }
+@media (prefers-contrast: more) { .header-glass { background: var(--frame); border-bottom: 1px solid var(--frame-fg); animation: none } }
 @media print { .header-glass { position: static; background: white; color: black; -webkit-backdrop-filter: none; backdrop-filter: none } }
 
 /* ---------- Hero (MK composition) ---------- */
@@ -350,7 +352,8 @@ section[id] { scroll-margin-top: 88px }
 /* ---------- Scroll reveal (MK y14, reveal easing) ---------- */
 @supports (animation-timeline: view()) {
  .reveal { animation: section-reveal both var(--ease-reveal); animation-timeline: view(); animation-range: entry 0% entry 35% }
- .exit-badge svg { animation: icon-pop both cubic-bezier(.175, .885, .32, 1.275); animation-timeline: view(); animation-range: entry 10% entry 45% }
+ /* Longhands, as for .header-glass: the shorthand plus animation-timeline gets folded into one declaration browsers drop. */
+ .exit-badge svg { animation-name: icon-pop; animation-timing-function: cubic-bezier(.175, .885, .32, 1.275); animation-fill-mode: both; animation-timeline: view(); animation-range: entry 10% entry 45% }
 }
 @keyframes section-reveal { from { opacity: 0; transform: translateY(14px) } }
 @keyframes icon-pop { from { transform: scale(.35) } }
