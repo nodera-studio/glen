@@ -582,7 +582,7 @@ impl Holder {
             }
         });
         let holder = Self(c);
-        rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        rx.recv_timeout(scaled(Duration::from_secs(10))).unwrap();
         holder
     }
     pub fn release(&mut self) {
@@ -597,7 +597,7 @@ impl Holder {
                 assert!(s.success());
                 return;
             }
-            assert!(start.elapsed() < Duration::from_secs(3));
+            assert!(start.elapsed() < scaled(Duration::from_secs(3)));
             thread::sleep(Duration::from_millis(20));
         }
     }
@@ -613,7 +613,7 @@ impl Drop for Holder {
             self.0.kill().unwrap();
             let start = Instant::now();
             while self.0.try_wait().unwrap().is_none() {
-                assert!(start.elapsed() < Duration::from_secs(3));
+                assert!(start.elapsed() < scaled(Duration::from_secs(3)));
                 thread::sleep(Duration::from_millis(20));
             }
         }
