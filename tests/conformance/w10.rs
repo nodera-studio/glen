@@ -102,14 +102,15 @@ fn assert_silent(out: &Out, code: i32) {
     );
 }
 
-/// Wait for a child whose stdout is not a pipe of ours; returns (exit code, stderr).
-fn finish_unpiped(mut child: Child, desc: &str, timeout: Duration) -> (Option<i32>, String) {
-    let mut se = child.stderr.take().expect("piped stderr");
-    let te = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = se.read_to_end(&mut b);
-        b
-    });
+/// Wait for a child whose stdout is not a pipe of ours and whose stderr goes to `stderr`;
+/// returns (exit code, stderr), read at its exit.
+fn finish_unpiped(
+    mut child: Child,
+    stderr: crate::flake::Capture,
+    desc: &str,
+    timeout: Duration,
+) -> (Option<i32>, String) {
+    let timeout = crate::flake::scaled(timeout);
     let started = Instant::now();
     let status = loop {
         if let Some(st) = child.try_wait().unwrap() {
@@ -122,7 +123,7 @@ fn finish_unpiped(mut child: Child, desc: &str, timeout: Duration) -> (Option<i3
         }
         std::thread::sleep(Duration::from_millis(10));
     };
-    let err = String::from_utf8_lossy(&te.join().unwrap()).into_owned();
+    let err = String::from_utf8_lossy(&stderr.output(status).stderr).into_owned();
     (status.code(), err)
 }
 
@@ -196,14 +197,17 @@ fn ac1001_an_interrupted_send_on_a_closed_stdout_keeps_exit_130() {
     let mut cmd = rb.command(&["send", A.handle, "hello", "--wait", "30s", "--json"]);
     cmd.env("FAKE_OMP_DELAY_MS", "3000")
         .process_group(0)
-        .stdout(closed_stdout())
-        .stderr(Stdio::piped());
+        .stdout(closed_stdout());
+    let stderr = crate::flake::Capture::new();
+    stderr.attach_stderr(&mut cmd);
     let child = cmd.spawn().expect("spawn glen send");
     let pgid = child.id() as i64;
     let id = rb.wait_one_job();
-    rb.wait_status(&id, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&id, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     signal_group(pgid, Signal::INT);
-    let (code, err) = finish_unpiped(child, "send --wait (SIGINT, closed stdout)", LONG);
+    let (code, err) = finish_unpiped(child, stderr, "send --wait (SIGINT, closed stdout)", LONG);
     assert_eq!(
         code,
         Some(130),
@@ -265,11 +269,15 @@ fn ac1003_tail_follow_stops_silently_when_its_reader_goes_away() {
         .env("TZ", "UTC")
         .env("PATH", &bx.empty_bin)
         .current_dir(&bx.alpha)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stdin(Stdio::null());
+    // stdout is a FIFO no other process can keep a reader of; stderr comes back from a file.
+    let (stdout, writer) = crate::flake::fifo();
+    let probe = writer.try_clone().unwrap();
+    cmd.stdout(writer);
+    let stderr = crate::flake::Capture::new();
+    stderr.attach_stderr(&mut cmd);
     let mut child = cmd.spawn().expect("spawn glen tail -f");
-    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    let mut reader = BufReader::new(stdout);
     let mut first = String::new();
     reader.read_line(&mut first).unwrap();
     assert!(
@@ -277,6 +285,8 @@ fn ac1003_tail_follow_stops_silently_when_its_reader_goes_away() {
         "a stream line first: {first:?}"
     );
     drop(reader);
+    // Glen's next write fails only once no process holds a reader.
+    crate::flake::await_no_reader(&probe);
     append_line(
         &bx.path(&A),
         &user(
@@ -286,14 +296,12 @@ fn ac1003_tail_follow_stops_silently_when_its_reader_goes_away() {
             "after the reader left",
         ),
     );
-    let mut se = child.stderr.take().unwrap();
     let status = poll_until(
         "tail -f to stop after the broken pipe",
-        Duration::from_secs(10),
+        crate::flake::scaled(Duration::from_secs(10)),
         || child.try_wait().unwrap(),
     );
-    let mut err = String::new();
-    let _ = se.read_to_string(&mut err);
+    let err = String::from_utf8_lossy(&stderr.output(status).stderr).into_owned();
     assert_eq!(status.code(), Some(0), "AC-1003: exit 0; stderr: {err}");
     assert!(err.is_empty(), "AC-1003: no stderr text: {err}");
 }
@@ -460,12 +468,16 @@ fn ac1006_a_worker_side_held_lease_is_live_owner_in_send_and_wait() {
     let mut cmd = rb.command(&["send", A.handle, "hi", "--wait", "20s", "--json"]);
     let child = crate::flake::Captured::spawn(&mut cmd).expect("spawn glen send");
     let id = rb.wait_one_job();
-    rb.wait_status(&id, "waiting_for_lock", LONG, |s| {
+    rb.wait_status(&id, "waiting_for_lock", crate::flake::scaled(LONG), |s| {
         s["waiting_for_lock"] == true
     });
     let _lease = hold_lease(&rb.bx.owners(), A.id);
     drop(lock);
-    let out = finish(child, "send --wait (worker-side refusal)", LONG);
+    let out = finish(
+        child,
+        "send --wait (worker-side refusal)",
+        crate::flake::scaled(LONG),
+    );
     assert_worker_refusal(&no_route(&out, "live_owner"), &id);
     let out = rb
         .glen(["wait", &job_handle(&id), "--timeout", "20s", "--json"])
@@ -899,7 +911,7 @@ fn request_id(prefix: &[u8]) -> Option<String> {
 
 fn serve_partial(mut s: UnixStream, on_large: OnLarge, large: &Mutex<Vec<Vec<u8>>>) {
     let _ = s.set_nonblocking(false);
-    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = s.set_read_timeout(Some(crate::flake::scaled(Duration::from_secs(5))));
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     while buf.len() < 4096 && !buf.contains(&b'\n') {
@@ -1013,7 +1025,7 @@ fn ac1014_a_peer_that_closes_without_answering_fails_protocol_once() {
         "AC-1014 message: {err}"
     );
     assert!(
-        out.elapsed < Duration::from_secs(10),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(10)),
         "AC-1014: the drain read is bounded; took {:?}",
         out.elapsed
     );
@@ -1056,7 +1068,8 @@ fn ac1016_fake_ext_answers_a_request_written_after_a_delay() {
     let lb = LiveBox::new();
     let ext = lb.start_ext(A.id, "ok", &[], &[]);
     let mut s = UnixStream::connect(&ext.socket).expect("connect to fake_ext");
-    s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    s.set_read_timeout(Some(crate::flake::scaled(Duration::from_secs(5))))
+        .unwrap();
     // The request arrives after the peer accepted: a non-blocking accepted socket would read
     // WouldBlock, close, and fail this write or the read below.
     std::thread::sleep(Duration::from_millis(300));

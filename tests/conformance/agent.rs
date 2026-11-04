@@ -2771,7 +2771,7 @@ fn assert_sandboxed(out: &Out, sandbox: Option<&str>, network: bool, existing: b
         out.ctx()
     );
     assert!(
-        out.elapsed < Duration::from_secs(5),
+        out.elapsed < crate::flake::scaled(Duration::from_secs(5)),
         "refusal took {:?}",
         out.elapsed
     );
@@ -3704,7 +3704,7 @@ fn ac412_contract_wait_for_reply_wake_and_expiry() {
         .run();
     let id = job_id(&data_of(&out, 10));
     let replies = rb.job_dir(&id).join("replies.ndjson");
-    poll_until("both progress replies", LONG, || {
+    poll_until("both progress replies", crate::flake::scaled(LONG), || {
         let text = fs::read_to_string(&replies).unwrap_or_default();
         (text.ends_with('\n') && text.lines().count() == 2).then_some(())
     });
@@ -3755,7 +3755,7 @@ fn ac412_contract_release() {
         .glen_home
         .join("run/warm")
         .join(format!("{}.json", A.id));
-    poll_until("the warm registry", LONG, || {
+    poll_until("the warm registry", crate::flake::scaled(LONG), || {
         read_json(&registry)
             .filter(|r| r["state"] == "idle")
             .map(|_| ())

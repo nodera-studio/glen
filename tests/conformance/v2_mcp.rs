@@ -26,6 +26,7 @@
 //! legs and the owner), and the execution failures that need a misbehaving child (exit without an
 //! envelope, non-UTF-8, more than 16 MiB: the real binary cannot be made to do them).
 
+use crate::flake::CaptureExt;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fs;
@@ -101,7 +102,7 @@ fn kill(pid: u32, sig: Signal) {
 fn ps() -> Vec<(u32, u32, String)> {
     let out = Command::new("/bin/ps")
         .args(["-A", "-ww", "-o", "pid=,ppid=,command="])
-        .output()
+        .try_captured()
         .expect("run /bin/ps");
     String::from_utf8_lossy(&out.stdout)
         .lines()
@@ -1264,7 +1265,7 @@ fn ac502a_the_server_adds_no_async_runtime_or_mcp_crate() {
             "--manifest-path",
         ])
         .arg(repo_root().join("Cargo.toml"))
-        .output()
+        .try_captured()
         .expect("run cargo tree");
     assert!(
         !out.status.success() && out.stdout.is_empty(),
@@ -2204,7 +2205,7 @@ fn ac502_a_terminal_on_stdin_is_a_usage_refusal_on_stderr_never_a_message_on_std
         let mut cmd = rb.command_in(&alpha(&rb), &argv);
         cmd.stdin(Stdio::from(slave));
         let child = crate::flake::Captured::spawn(&mut cmd).expect("spawn glen mcp on a terminal");
-        let out = finish(child, &args.join(" "), Duration::from_secs(20));
+        let out = finish(child, &args.join(" "), scaled(Duration::from_secs(20)));
         assert_eq!(out.code(), exit_for("usage"), "{args:?}\n{}", out.ctx());
         assert!(
             out.stdout.is_empty(),

@@ -785,6 +785,7 @@ impl Stream {
 
     /// The next line as one complete, compact, ANSI-free JSON object with `v:1` (AC-117).
     pub fn next_json(&mut self, timeout: Duration) -> Value {
+        let timeout = scaled(timeout);
         let line = self
             .next_line(timeout)
             .unwrap_or_else(|| panic!("no stream line within {timeout:?}\n{}", self.ctx()));

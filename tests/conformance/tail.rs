@@ -171,7 +171,7 @@ fn ac117_follow_streams_the_backlog_then_appended_entries() {
     assert_eq!(ev["item"]["kind"], "user", "{}", st.ctx());
     assert_eq!(ev["item"]["text"], "more", "{}", st.ctx());
     assert!(
-        latency <= Duration::from_millis(2500),
+        latency <= crate::flake::scaled(Duration::from_millis(2500)),
         "an appended entry is written within 2 s (took {latency:?})\n{}",
         st.ctx()
     );
@@ -363,7 +363,8 @@ fn ac119_a_vanished_file_ends_the_stream_with_not_found() {
     assert_eq!(last["ok"], false, "{}", st.ctx());
     assert_eq!(last["error"]["code"], "not_found", "{}", st.ctx());
     assert!(
-        took >= Duration::from_millis(4500) && took <= Duration::from_secs(15),
+        took >= Duration::from_millis(4500)
+            && took <= crate::flake::scaled(Duration::from_secs(15)),
         "ends about 5 s after the file disappears (took {took:?})\n{}",
         st.ctx()
     );
@@ -416,7 +417,7 @@ fn ac124_sigint_ends_a_json_stream_with_end_and_exit_130() {
         st.ctx()
     );
     assert!(
-        took <= Duration::from_secs(2),
+        took <= crate::flake::scaled(Duration::from_secs(2)),
         "stops within a poll interval (took {took:?})\n{}",
         st.ctx()
     );

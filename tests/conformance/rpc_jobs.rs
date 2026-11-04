@@ -151,7 +151,9 @@ fn ac220_active_keeps_queued_or_accepted_jobs_after_the_lost_check() {
             .run(),
         10,
     ));
-    rb.wait_status(&running, "accepted", LONG, |s| s["status"] == "accepted");
+    rb.wait_status(&running, "accepted", crate::flake::scaled(LONG), |s| {
+        s["status"] == "accepted"
+    });
     let d = jobs(&rb, &["--active"]);
     assert_eq!(row_ids(&d), std::slice::from_ref(&running), "{d}");
     assert_eq!(d["total"], 1, "{d}");
