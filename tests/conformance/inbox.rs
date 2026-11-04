@@ -76,7 +76,7 @@ fn assert_message(m: &Value, rec: &Value) {
 
 /// `glen inbox <args>` from the sandbox, for streams and raw pipes.
 fn command(sb: &Sandbox, args: &[&str]) -> Command {
-    let mut cmd = Command::new(BIN);
+    let mut cmd = Command::new(glen_bin());
     cmd.env_clear()
         .args(args)
         .env("HOME", &sb.home)

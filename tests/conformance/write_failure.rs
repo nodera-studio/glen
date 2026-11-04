@@ -111,7 +111,8 @@ fn ac1002_human_usage_with_both_pipes_closed_exits_one() {
     // then exec glen, retaining the harness's bounded wait and isolated environment.
     let mut command = Command::new("/bin/sh");
     command
-        .args(["-c", "exec \"$1\" bogus --human 2>&1", "closed-stderr", BIN])
+        .args(["-c", "exec \"$1\" bogus --human 2>&1", "closed-stderr"])
+        .arg(glen_bin())
         .env_clear()
         .env("HOME", &sb.home)
         .env("GLEN_HOME", &sb.glen_home)

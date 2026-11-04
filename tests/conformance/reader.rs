@@ -413,7 +413,7 @@ impl OmpBox {
     }
 
     fn command(&self, cwd: &Path, args: &[OsString]) -> (Command, String) {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(glen_bin());
         cmd.env_clear()
             .args(args)
             .env("HOME", &self.home)

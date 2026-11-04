@@ -15,7 +15,7 @@
 //! and are not run here.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::os::unix::fs::{MetadataExt, symlink};
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ impl Ws {
         }
     }
 
-    fn command(&self, program: &str, cwd: &Path, args: &[OsString]) -> Command {
+    fn command(&self, program: impl AsRef<OsStr>, cwd: &Path, args: &[OsString]) -> Command {
         let mut cmd = Command::new(program);
         cmd.env_clear()
             .args(args)
@@ -169,7 +169,7 @@ impl Ws {
             .map(|a| a.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
             .join(" ");
-        Run::from_command(self.command(BIN, cwd, &args), desc)
+        Run::from_command(self.command(glen_bin(), cwd, &args), desc)
     }
 
     fn glen<I, S>(&self, args: I) -> Run
@@ -185,7 +185,7 @@ impl Ws {
         let mut all: Vec<OsString> = vec![
             "-c".into(),
             "umask \"$1\" && shift && exec \"$0\" \"$@\"".into(),
-            BIN.into(),
+            glen_bin().into(),
             mask.into(),
         ];
         all.extend(args.iter().map(OsString::from));

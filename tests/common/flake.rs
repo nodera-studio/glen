@@ -4,6 +4,7 @@
 use std::{
     fs::File,
     io::{Read, Seek},
+    path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Output, Stdio},
     sync::OnceLock,
     time::Duration,
@@ -90,6 +91,115 @@ pub fn try_output(cmd: &mut Command) -> std::io::Result<Output> {
     capture.attach(cmd.stdin(Stdio::null()));
     let status = cmd.status()?;
     Ok(capture.output(status))
+}
+
+/// Where tests run the binaries cargo builds: `target/<profile>/glen-test-bin/`. Each cargo run
+/// that builds a binary, or finds it fresh, puts it in `target/<profile>` again, and on macOS it
+/// does so by removing the file there and copying the new one in (it never hard-links there,
+/// rust-lang/cargo#10060). A test that runs cargo (to build a fake peer, or another test's
+/// executable) so makes that path vanish for a moment, and a concurrent exec of it fails with
+/// ENOENT or is killed (flake-proof run 41761493795). Cargo never touches this directory:
+/// [`publish`] puts a binary here by an atomic rename, and every cargo run a test makes and every
+/// publish hold [`locked`]'s lock, so no publish reads a binary that cargo is replacing.
+fn bin_dir() -> PathBuf {
+    profile_dir().join("glen-test-bin")
+}
+
+/// `target/<profile>`, the directory of the glen binary under test.
+fn profile_dir() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_glen")).parent().unwrap()
+}
+
+/// Runs `f` holding the lock of [`bin_dir`], across processes.
+fn locked<T>(f: impl FnOnce() -> T) -> T {
+    let dir = bin_dir();
+    std::fs::create_dir_all(&dir).unwrap();
+    let lock = File::options()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))
+        .unwrap();
+    lock.lock().unwrap();
+    let result = f();
+    lock.unlock().unwrap();
+    result
+}
+
+/// `cargo <args> --locked --offline` on this package, for the target dir and profile of the glen
+/// binary under test.
+fn cargo_command(args: &[&str]) -> Command {
+    let profile = profile_dir();
+    let mut cmd = Command::new(env!("CARGO"));
+    cmd.args(args)
+        .args(["--locked", "--offline", "--manifest-path"])
+        .arg(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
+        .arg("--target-dir")
+        .arg(profile.parent().unwrap());
+    match profile.file_name().unwrap().to_str().unwrap() {
+        "debug" => {}
+        "release" => {
+            cmd.arg("--release");
+        }
+        other => {
+            cmd.args(["--profile", other]);
+        }
+    }
+    cmd
+}
+
+/// [`cargo_command`] run to its exit under [`locked`]'s lock (see [`bin_dir`]); output as
+/// [`output`] gives it.
+pub fn cargo(args: &[&str]) -> Output {
+    locked(|| output(&mut cargo_command(args)))
+}
+
+/// `cargo build --example <name>`, then the example [`publish`]ed: the path a test runs it from.
+/// Called once per test process, so the fake peers match this source.
+pub fn example(name: &str) -> PathBuf {
+    locked(|| {
+        let out = output(&mut cargo_command(&["build", "--quiet", "--example", name]));
+        assert!(
+            out.status.success(),
+            "cargo build --example {name} failed:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        publish(&profile_dir().join("examples").join(name))
+    })
+}
+
+/// The glen binary under test, [`publish`]ed once per process, for a suite that runs [`cargo`]
+/// while it runs glen.
+pub fn glen() -> &'static Path {
+    static GLEN: OnceLock<PathBuf> = OnceLock::new();
+    GLEN.get_or_init(|| locked(|| publish(Path::new(env!("CARGO_BIN_EXE_glen")))))
+}
+
+/// `built` at `<bin_dir>/<its name>`, by a hard link renamed into place, so the path always
+/// holds a whole binary. No copy is written, so no exec finds one open for writing (ETXTBSY on
+/// Linux); on macOS the link is to cargo's copy, not to the linker's output that
+/// rust-lang/cargo#10060 is about. A path that already holds `built` is left alone, so on Linux
+/// (where cargo hard-links) a running binary's own path does not turn `(deleted)`. Called under
+/// [`locked`]'s lock.
+fn publish(built: &Path) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+    let name = built.file_name().unwrap().to_str().unwrap();
+    let dst = bin_dir().join(name);
+    let id = |p: &Path| std::fs::metadata(p).map(|m| (m.dev(), m.ino())).ok();
+    let built_id = id(built);
+    if built_id.is_some() && built_id == id(&dst) {
+        return dst;
+    }
+    let tmp = bin_dir().join(format!(".{name}.tmp"));
+    match std::fs::remove_file(&tmp) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => panic!("remove {tmp:?}: {e}"),
+        _ => {}
+    }
+    std::fs::hard_link(built, &tmp)
+        .or_else(|_| std::fs::copy(built, &tmp).map(drop))
+        .unwrap_or_else(|e| panic!("publish {built:?}: {e}"));
+    std::fs::rename(&tmp, &dst).unwrap();
+    dst
 }
 
 /// [`output`] and [`try_output`] as methods, for a `Command` built in a chain: `cmd.captured()`

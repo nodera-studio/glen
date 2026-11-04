@@ -184,34 +184,11 @@ pub fn data(out: &Output) -> serde_json::Value {
     v["data"].clone()
 }
 
+/// The `fake_omp` example, rebuilt once per integration-test process so fake-peer knobs match this
+/// source, at the path no concurrent cargo run removes (`flake::example`).
 pub fn fake_omp_bin() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BUILT
-        .get_or_init(|| {
-            let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
-            let dir = bin.parent().unwrap();
-            let fake = dir.join("examples/fake_omp");
-            // Rebuild once per integration-test process so fake-peer knobs match this source.
-            let mut cmd = Command::new(env!("CARGO"));
-            cmd.current_dir(env!("CARGO_MANIFEST_DIR")).args([
-                "build",
-                "--example",
-                "fake_omp",
-                "--offline",
-                "--locked",
-            ]);
-            if dir.file_name().unwrap() == "release" {
-                cmd.arg("--release");
-            }
-            let out = flake::output(&mut cmd);
-            assert!(
-                out.status.success(),
-                "{}",
-                String::from_utf8_lossy(&out.stderr)
-            );
-            fake
-        })
-        .clone()
+    BUILT.get_or_init(|| flake::example("fake_omp")).clone()
 }
 pub struct RpcBox {
     pub omp: OmpBox,
@@ -334,31 +311,10 @@ pub fn poll<T>(timeout: std::time::Duration, mut f: impl FnMut() -> Option<T>) -
 }
 pub const A_ID: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
 
+/// The `fake_ext` example, rebuilt once per integration-test process (see [`fake_omp_bin`]).
 pub fn fake_ext_bin() -> PathBuf {
     static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    BIN.get_or_init(|| {
-        let bin = PathBuf::from(env!("CARGO_BIN_EXE_glen"));
-        let dir = bin.parent().unwrap();
-        let mut c = Command::new(env!("CARGO"));
-        c.current_dir(env!("CARGO_MANIFEST_DIR")).args([
-            "build",
-            "--example",
-            "fake_ext",
-            "--offline",
-            "--locked",
-        ]);
-        if dir.file_name().unwrap() == "release" {
-            c.arg("--release");
-        }
-        let out = flake::output(&mut c);
-        assert!(
-            out.status.success(),
-            "{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        dir.join("examples/fake_ext")
-    })
-    .clone()
+    BIN.get_or_init(|| flake::example("fake_ext")).clone()
 }
 pub struct LiveBox {
     pub rpc: RpcBox,

@@ -1916,37 +1916,15 @@ fn run_capture(mut cmd: Command, limit: Duration) -> (bool, String) {
 }
 
 /// The built test executable of an integration test, built once through cargo (the same way CI
-/// builds it), so it can be run with a controlled environment.
+/// builds it), so it can be run with a controlled environment. The build puts the glen binary in
+/// `target/<profile>` again, so the suite runs glen from `flake::glen()`.
 fn test_binary(name: &str) -> PathBuf {
     static CACHE: OnceLock<Mutex<BTreeMap<String, PathBuf>>> = OnceLock::new();
     let mut cache = CACHE.get_or_init(Default::default).lock().unwrap();
     if let Some(p) = cache.get(name) {
         return p.clone();
     }
-    let target_dir = fake_omp_bin()
-        .parent()
-        .and_then(Path::parent)
-        .and_then(Path::parent)
-        .expect("target dir")
-        .to_path_buf();
-    let mut cmd = Command::new(env!("CARGO"));
-    cmd.args([
-        "test",
-        "--locked",
-        "--offline",
-        "--no-run",
-        "--message-format=json",
-        "--test",
-        name,
-    ])
-    .arg("--manifest-path")
-    .arg(repo_root().join("Cargo.toml"))
-    .arg("--target-dir")
-    .arg(&target_dir);
-    if !cfg!(debug_assertions) {
-        cmd.arg("--release");
-    }
-    let out = try_output(&mut cmd).expect("run cargo test --no-run");
+    let out = crate::flake::cargo(&["test", "--no-run", "--message-format=json", "--test", name]);
     assert!(
         out.status.success(),
         "cargo test --no-run --test {name} failed:\n{}",
@@ -2685,7 +2663,7 @@ impl Runner {
             )
             .unwrap();
         }
-        symlink(BIN, ws.join("target/debug/glen")).unwrap();
+        symlink(glen_bin(), ws.join("target/debug/glen")).unwrap();
         let (omp_log, curl_log, cargo_log, version_file) = (
             root.join("omp.log"),
             root.join("curl.log"),

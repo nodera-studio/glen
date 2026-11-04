@@ -15,7 +15,6 @@
 
 #![allow(dead_code)]
 
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::ops::Deref;
@@ -89,51 +88,11 @@ pub fn codes_of(warnings: &Value) -> Vec<String> {
 // The fake extension peer.
 // ---------------------------------------------------------------------------------------------
 
-/// The `fake_ext` example next to the glen binary under test, (re)built once per test process.
+/// The `fake_ext` example for the glen binary under test, (re)built once per test process, at
+/// the path no concurrent cargo run removes (`flake::example`).
 pub fn fake_ext_bin() -> &'static Path {
     static EXT: OnceLock<PathBuf> = OnceLock::new();
-    EXT.get_or_init(|| {
-        let exe = Path::new(BIN);
-        let profile_dir = exe.parent().expect("glen binary has a parent dir");
-        let target_dir = profile_dir.parent().expect("target dir");
-        let profile = profile_dir
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("debug");
-        let mut cmd = Command::new(env!("CARGO"));
-        cmd.args([
-            "build",
-            "--quiet",
-            "--locked",
-            "--offline",
-            "--example",
-            "fake_ext",
-        ])
-        .arg("--manifest-path")
-        .arg(repo_root().join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(target_dir);
-        match profile {
-            "debug" => {}
-            "release" => {
-                cmd.arg("--release");
-            }
-            other => {
-                cmd.args(["--profile", other]);
-            }
-        }
-        // Through files: a build piped to end of file waits for any process that inherited the
-        // pipe from a concurrent spawn (a warm worker, for its window).
-        let out = crate::flake::output(&mut cmd);
-        assert!(
-            out.status.success(),
-            "cargo build --example fake_ext failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let bin = profile_dir.join("examples/fake_ext");
-        assert!(bin.is_file(), "no fake extension at {}", bin.display());
-        bin
-    })
+    EXT.get_or_init(|| crate::flake::example("fake_ext"))
 }
 
 /// A running `fake_ext` process (killed on drop).

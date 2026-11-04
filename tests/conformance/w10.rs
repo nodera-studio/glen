@@ -259,7 +259,7 @@ fn ac1003_tail_follow_stops_silently_when_its_reader_goes_away() {
         assert_silent(&out, 0);
     }
 
-    let mut cmd = Command::new(BIN);
+    let mut cmd = Command::new(glen_bin());
     cmd.env_clear()
         .args(["tail", A.handle, "-n", "1", "-f", "--json"])
         .env("HOME", &bx.home)

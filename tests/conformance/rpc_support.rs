@@ -74,55 +74,13 @@ pub const TERMINAL: [&str; 4] = ["completed", "aborted", "failed", "lost"];
 // The fake peer.
 // ---------------------------------------------------------------------------------------------
 
-/// The `fake_omp` example next to the glen binary under test, (re)built once per test process so
-/// a filtered `cargo test --test conformance` never runs a stale or missing peer.
+/// The `fake_omp` example for the glen binary under test, (re)built once per test process so a
+/// filtered `cargo test --test conformance` never runs a stale or missing peer, at the path no
+/// concurrent cargo run removes (`flake::example`).
 pub fn fake_omp_bin() -> &'static Path {
     static BIN: OnceLock<PathBuf> = OnceLock::new();
-    BIN.get_or_init(|| {
-        let exe = Path::new(BIN_PATH);
-        let profile_dir = exe.parent().expect("glen binary has a parent dir");
-        let target_dir = profile_dir.parent().expect("target dir");
-        let profile = profile_dir
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or("debug");
-        let mut cmd = Command::new(env!("CARGO"));
-        cmd.args([
-            "build",
-            "--quiet",
-            "--locked",
-            "--offline",
-            "--example",
-            "fake_omp",
-        ])
-        .arg("--manifest-path")
-        .arg(repo_root().join("Cargo.toml"))
-        .arg("--target-dir")
-        .arg(target_dir);
-        match profile {
-            "debug" => {}
-            "release" => {
-                cmd.arg("--release");
-            }
-            other => {
-                cmd.args(["--profile", other]);
-            }
-        }
-        // Through files: a build piped to end of file waits for any process that inherited the
-        // pipe from a concurrent spawn (a warm worker, for its window).
-        let out = crate::flake::output(&mut cmd);
-        assert!(
-            out.status.success(),
-            "cargo build --example fake_omp failed:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        let bin = profile_dir.join("examples/fake_omp");
-        assert!(bin.is_file(), "no fake peer at {}", bin.display());
-        bin
-    })
+    BIN.get_or_init(|| crate::flake::example("fake_omp"))
 }
-
-const BIN_PATH: &str = env!("CARGO_BIN_EXE_glen");
 
 // ---------------------------------------------------------------------------------------------
 // Ids, handles, timestamps.
@@ -634,7 +592,7 @@ impl RpcBox {
 
     /// A `glen` command with the box environment, from `cwd`, stdin `/dev/null`.
     pub fn command_in(&self, cwd: &Path, args: &[OsString]) -> Command {
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(glen_bin());
         cmd.env_clear()
             .args(args)
             .env("HOME", &self.bx.home)

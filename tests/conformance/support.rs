@@ -18,7 +18,9 @@ use serde_json::Value;
 
 use crate::flake::{Capture, scaled};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_glen");
+/// The glen binary under test, run from where no concurrent cargo run removes it: `v2_compat`
+/// builds other tests' executables while the suite runs.
+pub use crate::flake::glen as glen_bin;
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const TESTED_OMP: &str = "18.14.0";
 
@@ -183,7 +185,7 @@ impl Sandbox {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let mut cmd = Command::new(BIN);
+        let mut cmd = Command::new(glen_bin());
         cmd.env_clear()
             .args(&args)
             .env("HOME", &self.home)
