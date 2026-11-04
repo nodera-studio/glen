@@ -1213,9 +1213,10 @@ fn review1_abort_in_prompt_submission_gap_never_sends_prompt() {
     let b = RpcBox::new();
     let o = b
         .glen(&["send", "e27c0de", "hi", "--no-wait", "--json"])
+        // Scaled, within the worker's 20 s cap on its test delays (a larger value means none).
         .env(
             "FAKE_OMP_PROMPT_SUBMIT_DELAY_MS",
-            millis(flake::scaled(Duration::from_secs(5))),
+            millis(flake::scaled(Duration::from_secs(5)).min(Duration::from_secs(20))),
         )
         .captured();
     let v = envelope(&o, 10);
