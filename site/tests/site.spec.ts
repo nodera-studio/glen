@@ -368,6 +368,13 @@ test('header: the hairline stays hidden until the page scrolls under the glass',
  await expect(header).toHaveCSS('animation-name', 'none'); await expect(header).toHaveCSS('border-bottom-color', 'rgb(219, 219, 219)');
 });
 
+test('exit codes: the badge icons keep their scroll-driven pop in the built CSS', async ({ page }) => {
+ await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
+ const icon = page.locator('.exit-badge svg').first();
+ await expect(icon).toHaveCSS('animation-name', 'icon-pop');
+ await expect(icon).toHaveCSS('animation-fill-mode', 'both');
+});
+
 test('header: hover and keyboard focus swap the nav labels; reduced motion keeps one', async ({ page }) => {
  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
  const item = page.locator('.desktop-nav .nav-item').first();

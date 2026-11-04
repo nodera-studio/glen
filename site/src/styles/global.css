@@ -352,7 +352,8 @@ section[id] { scroll-margin-top: 88px }
 /* ---------- Scroll reveal (MK y14, reveal easing) ---------- */
 @supports (animation-timeline: view()) {
  .reveal { animation: section-reveal both var(--ease-reveal); animation-timeline: view(); animation-range: entry 0% entry 35% }
- .exit-badge svg { animation: icon-pop both cubic-bezier(.175, .885, .32, 1.275); animation-timeline: view(); animation-range: entry 10% entry 45% }
+ /* Longhands, as for .header-glass: the shorthand plus animation-timeline gets folded into one declaration browsers drop. */
+ .exit-badge svg { animation-name: icon-pop; animation-timing-function: cubic-bezier(.175, .885, .32, 1.275); animation-fill-mode: both; animation-timeline: view(); animation-range: entry 10% entry 45% }
 }
 @keyframes section-reveal { from { opacity: 0; transform: translateY(14px) } }
 @keyframes icon-pop { from { transform: scale(.35) } }
