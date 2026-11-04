@@ -72,21 +72,32 @@ fn doctor_classifies_the_omp_version_against_the_declared_range() {
             json!("18.14.0+b1"),
         ),
         ("v18.14.0", "ok", "18.14.0", "", None, json!("18.14.0")),
+        // v0.2.0 raised max_tested to 18.16.0: everything up to it is in range.
+        ("18.14.1", "ok", "18.14.1", "", None, json!("18.14.1")),
         (
-            "18.14.1",
+            "18.15.0-rc.1",
+            "ok",
+            "18.15.0-rc.1",
+            "",
+            None,
+            json!("18.15.0-rc.1"),
+        ),
+        ("18.16.0", "ok", "18.16.0", "", None, json!("18.16.0")),
+        (
+            "18.16.1",
             "warn",
-            "18.14.1",
+            "18.16.1",
             "untested",
             Some("omp_version_untested"),
-            json!("18.14.1"),
+            json!("18.16.1"),
         ),
         (
-            "18.15.0-rc.1",
+            "18.17.0-rc.1",
             "warn",
-            "18.15.0-rc.1",
+            "18.17.0-rc.1",
             "untested",
             Some("omp_version_untested"),
-            json!("18.15.0-rc.1"),
+            json!("18.17.0-rc.1"),
         ),
         (
             "19.0.0",
@@ -180,7 +191,7 @@ fn doctor_classifies_the_omp_version_against_the_declared_range() {
         assert_eq!(r["omp"]["version"], *normalized, "{version:?}");
         assert_eq!(
             r["omp"]["supported"],
-            json!({"min":"18.14.0","max_tested":"18.14.0"})
+            json!({"min":"18.14.0","max_tested":"18.16.0"})
         );
         assert_eq!(r["omp"]["tested_version"], "18.14.0");
         assert_eq!(r["omp"]["capabilities"], Value::Null);
@@ -202,7 +213,7 @@ fn unparseable_version_never_echoes_escape_bytes_in_human_mode() {
     let stdout = String::from_utf8_lossy(&o.stdout);
     assert!(stdout.contains("unprobed"), "{stdout}");
     assert!(
-        stdout.contains("tested against omp 18.14.0 · supported 18.14.0 to 18.14.0"),
+        stdout.contains("tested against omp 18.14.0 · supported 18.14.0 to 18.16.0"),
         "{stdout}"
     );
 }

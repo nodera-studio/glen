@@ -143,13 +143,17 @@ mod tests {
         ] {
             assert_eq!(classify_in(&min, &max, &v(version)), want, "{version}");
         }
-        // The real file: min = max_tested = 18.14.0 at v0.2 W1.
+        // The real file: min 18.14.0, max_tested 18.16.0 from v0.2.0 (18.14.0 to 18.14.0 at W1).
         for (version, want) in [
             ("18.14.0", Supported),
             ("18.14.0+b1", Supported),
             ("v18.14.0", Supported),
-            ("18.14.1", Untested),
-            ("18.15.0-rc.1", Untested),
+            ("18.14.1", Supported),
+            ("18.15.0-rc.1", Supported),
+            ("18.16.0", Supported),
+            ("18.16.0+b1", Supported),
+            ("18.16.1", Untested),
+            ("18.17.0-rc.1", Untested),
             ("19.0.0", Untested),
             ("18.14.0-rc.1", Unsupported),
             ("18.13.9", Unsupported),

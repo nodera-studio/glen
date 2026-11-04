@@ -1030,13 +1030,13 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
     "glen": {
       "home": "/tmp/glen-example/glen",
       "home_exists": false,
-      "version": "0.1.1"
+      "version": "0.2.0"
     },
     "omp": {
       "bin": "/work/glen/tests/fixtures/bin/fake-omp",
       "capabilities": null,
       "supported": {
-        "max_tested": "18.14.0",
+        "max_tested": "18.16.0",
         "min": "18.14.0"
       },
       "tested_version": "18.14.0",
@@ -1158,7 +1158,7 @@ Install the bundled omp extension into the effective agent dir and profile. Dry 
     "previous_version": null,
     "profile": null,
     "restart_required": false,
-    "version": "0.1.1"
+    "version": "0.2.0"
   },
   "ok": true,
   "v": 1
@@ -1194,7 +1194,7 @@ Install for both agents unless selected; --project means cwd. Dry runs make no c
         "state": "not_installed"
       }
     ],
-    "version": "0.1.1"
+    "version": "0.2.0"
   },
   "ok": true,
   "v": 1
@@ -1467,13 +1467,13 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
         "glen": {
           "home": "/tmp/glen-example/glen",
           "home_exists": false,
-          "version": "0.1.1"
+          "version": "0.2.0"
         },
         "omp": {
           "bin": null,
           "capabilities": null,
           "supported": {
-            "max_tested": "18.14.0",
+            "max_tested": "18.16.0",
             "min": "18.14.0"
           },
           "tested_version": "18.14.0",

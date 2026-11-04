@@ -1,7 +1,7 @@
 ---
 name: glen
 description: "Talk to omp (oh-my-pi) coding-agent sessions with the glen CLI: list them, read their transcripts, send a prompt, steer a running turn or queue a follow-up, wait for the answer, and read what omp sends back. Use when the user mentions omp, oh-my-pi, an omp session or TUI, or asks you to ask, tell, check on, hand work to, or read the output of an agent running in omp. Not for Claude Code or Codex sessions."
-allowed-tools: Bash(glen *)
+allowed-tools: Bash(glen ls *) Bash(glen show *) Bash(glen tail *) Bash(glen jobs *) Bash(glen wait *) Bash(glen inbox *) Bash(glen doctor *) Bash(glen send *) <!-- glen:if ls show tail jobs wait inbox doctor send -->
 ---
 
 # glen: talk to omp sessions

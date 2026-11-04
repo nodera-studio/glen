@@ -2,7 +2,7 @@
 
 All notable changes to glen are listed here, newest first.
 
-## Unreleased
+## v0.2.0 — 2026-11-04
 
 ### Added
 
@@ -12,7 +12,6 @@ All notable changes to glen are listed here, newest first.
 - `glen inbox --wait [--timeout DUR]` waits (90 s by default, at most 24 h) for one unread message: exit 0 with the messages, or exit 10 with none and a `next` command. It honours `--session`, `--cwd` and `--peek`, and marks messages read only after printing them.
 - Job views in `send`, `wait`, `jobs` and job error details carry `task_state`, the job's state in A2A's vocabulary (`submitted`, `working`, `completed`, `canceled`, `rejected`, `failed`). `status` is unchanged and still decides the exit code.
 - The agent skill has a "Replies without polling" section: Claude Code starts `glen wait <job> --for reply` as a background command and is woken when it finishes; a subagent waits in the foreground or hands the job to its parent; Codex runs a blocking wait and peeks the inbox at the start of each turn. Codex: blocking wait, not push.
-- A hidden, unsupported `glen __acp <session|@new> <message>` talks to `omp acp` (ACP v1) for the v0.2 spike. It is not in `--help`, completions, the skill or `docs/json.md`, creates no job and writes no session file; `docs/design.md` §A23 records the experiment results and the verdict.
 - `glen send --warm DUR` (or `GLEN_WARM`, at most 10m) keeps a settled job's omp process alive so a following send to the same session skips omp's startup; the worker holds the session, and omp's own owner lease, until the window ends or `glen release <handle>` ends it early, so the omp TUI cannot open that session meanwhile. A queued job whose binary, profile, thinking level, cwd or environment digest differs is never adopted: the worker cools and it runs cold instead.
 - `glen release [<target>] [--all] [--force] [--timeout DUR]` ends warm workers: a target is a session id, a hex tail or a job handle, and `--all` ends every one. `--force` kills a worker that does not release in time, only after proving its pid and start time (and omp's own, when recorded) are unchanged.
 - `glen mcp` serves glen's commands to an MCP host such as Claude Code or Codex over stdio (`claude mcp add glen -- glen mcp`, `codex mcp add glen -- glen mcp`): 14 tools (`glen_ls`, `glen_send`, `glen_wait`, and the rest), each a byte-for-byte copy of the matching command's `--json` envelope. `isError` mirrors `ok:false`, so a still-running, forked or SIGINT-interrupted result (exits 10, 11, 130) is not an error. Cancelling a tool call (`notifications/cancelled`) stops the exec-self child but never aborts the job, which keeps running. Codex's default `tool_timeout_sec` (60 s) is shorter than `send`'s and `wait`'s 90 s defaults; set it higher (120 in the `[mcp_servers.glen]` example) or pass a shorter `wait`/`timeout`.
@@ -36,12 +35,14 @@ All notable changes to glen are listed here, newest first.
 - CI's `site-deploy` job now runs `npm ci --ignore-scripts`.
 - `install.sh`'s `GLEN_INSTALL_BASE_URL` now accepts only an `https://` mirror or a `file://` directory (for fixtures); any other scheme is a usage error (exit 2) before any download is attempted.
 - Untrusted text passed through `render::sanitize` and the JSON escaper now also escapes tag characters, zero-width characters and U+2028; session-id-derived strings reaching human output (`release`, `jobs`, `doctor`) are sanitized the same way as everywhere else.
+- The Claude Code skill's `allowed-tools` now pre-approves only `glen ls`, `show`, `tail`, `jobs`, `wait`, `inbox`, `doctor` and `send`, not every `glen` command: the others (`abort`, `models`, `model`, `thinking`, `compact`, `release`, the installers and the rest) ask first. glen still starts omp under omp's own default approval mode, so a pre-approved `send` can start an omp agent whose tools run without asking (`docs/design.md` §A13). Run `glen install-skill` again after upgrading to get the narrower list.
 
 ### Changed
 
 - The agent skill no longer tells agents to poll `glen inbox`: every inbox instruction uses `--wait`, `--peek` or `-f`, and the loop points at the new receivers.
 - Exit 10 now has two documents under `glen wait --for reply`: a reply wake (`data.woke` is `reply`) and a bound expiry (no `woke`). Read `woke` before treating exit 10 as a timeout. Exit 10 without `--for reply` is unchanged.
 - `glen doctor` judges omp against a supported range declared in `src/omp/compat.json` and reports it in `data.omp.supported`. A version older than the minimum warns with the new code `omp_version_unsupported`; one newer than the newest tested version still warns `omp_version_untested`. `omp --version` output that cannot be parsed is now a warning (`omp_version_untested`, row value `unprobed`), not exit 5; an `omp --version` that fails or times out is still exit 5 `omp_unavailable`.
+- The supported omp range is 18.14.0 to 18.16.0. glen is still built and tested against omp 18.14.0 (the `omp-rpc` pin); 18.16.0 is the newest release the nightly `omp-latest` checks passed on.
 - Job views in `send`, `wait`, `jobs` and job error details gain `omp_reused`, true only for a job that ran on an omp process a warm worker kept from an earlier job.
 - `glen doctor` gains a `warm_workers` check, right after `live_endpoints`: how many warm-worker registries are fresh, stale (no heartbeat) or dead; it warns, never fails, naming the fix. `glen ls` shows warmth in `state_detail` and with a ` (warm)`/` (warm, stale)` suffix on the human state cell.
 - The agent skill gains one guarded bullet (shown once `glen release` is visible) telling agents to use `--warm` only when another send is coming soon, and to end it with `glen release`.
@@ -52,7 +53,14 @@ All notable changes to glen are listed here, newest first.
 - `docs/design.md` describes v0.2.0. New sections cover omp compatibility (§A19), replies without a polling loop (§A20), the warm worker (§A21), the MCP layer (§A22) and the ACP spike (§A23). Job states also get their A2A names (§A7). (This described the v0.2 W0 foundation wave, which added only docs and tests; the CLI itself changed substantially across the waves below.)
 - §A20 describes push to the calling agent as shipped in v0.2 W2: the two receivers, the unseen-reply rule, why `wait` leaves the inbox marker alone, the two exit-10 documents and the per-caller delivery table. A background wait also wakes a headless `claude -p` run: verified on Claude Code 2.1.316 in stream-json mode, where the completion notification resumed the run after its first result. The skill's allowed-tools may not apply to that resumed turn under `--permission-mode dontAsk`.
 - §A21 describes the warm worker as shipped in v0.2 W4: the stay-warm rule, the on-disk registry and release request, the match key and the compare-and-claim protocol, the idle loop and its bounds, the one teardown and its reasons, `glen release`'s outcomes, controls and `ls`/doctor wording on a warm session, the queued-job liveness decision, the lease cost and two residual races.
-- §A22 describes the MCP layer as shipped in v0.2 W5: the supported protocol revisions and why (`initialize`-era only, no batching), the annotation grammar and the generated catalog, naming and schema rules, the exec-self argv and result-mapping rules, cancellation and shutdown, the limits, Codex's and Claude Code's host-specific quirks, and the security notes. It also records the hidden, unsupported `glen mcp --channel` notifier, tested at the protocol level only.
+- §A22 describes the MCP layer as shipped in v0.2 W5: the supported protocol revisions and why (`initialize`-era only, no batching), the annotation grammar and the generated catalog, naming and schema rules, the exec-self argv and result-mapping rules, cancellation and shutdown, the limits, Codex's and Claude Code's host-specific quirks, and the security notes.
+- §A23 records the `omp acp` (ACP v1) spike, its experiment results and the verdict. The spike ran through a hidden command, `__acp`, which is not part of glen's interface and may change or go away.
+
+### Site
+
+- The landing page shows what v0.2 ships: the Hear back card shows `glen wait --for reply` and `glen inbox --wait`, the Send card `--warm` and `glen release`, the Agents section gains an MCP tab with the `claude mcp add` and `codex mcp add` commands, the exit table splits exit 10 into running and woke, and the FAQ covers replies without polling, `--warm` and the supported omp range.
+- The Agents tabs say push only for Claude Code, which a background wait wakes; Codex gets replies through a blocking wait.
+- The hero chip and the FAQ read the supported omp range from `src/omp/compat.json`, and a unit test keeps the site's version equal to `Cargo.toml`'s.
 
 ## v0.1.1 — 2026-11-01
 

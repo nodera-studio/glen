@@ -510,17 +510,20 @@ test('390px: the script and cargo commands stay on one line and fade out', async
  }));
  expect(split).toEqual([]);
 });
-test('agents: five exit codes with glowing status badges', async ({ page }) => {
+test('agents: six exit rows with glowing status badges, exit 10 split into running and woke', async ({ page }) => {
  await page.goto('/');
- await expect(page.locator('.exit-row')).toHaveCount(5);
- await expect(page.locator('.exit-badge')).toHaveCount(5);
- await expect(page.locator('.exit-badge i')).toHaveCount(15);
- await expect(page.locator('.exit-row [role=rowheader]')).toHaveText(['0', '10', '6', '7', '11']);
+ await expect(page.locator('.exit-row')).toHaveCount(6);
+ await expect(page.locator('.exit-badge')).toHaveCount(6);
+ await expect(page.locator('.exit-badge i')).toHaveCount(18);
+ await expect(page.locator('.exit-row [role=rowheader]')).toHaveText(['0', '10', '10', '6', '7', '11']);
+ await expect(page.locator('.exit-row .exit-badge')).toHaveText(['reply', 'running', 'woke', 'refused', 'failed', 'moved']);
+ // Docs audit M2: exit 10 with --for reply can mean new replies (data.woke), not only a bound that passed.
+ await expect(page.locator('.exit-row').nth(2).locator('.exit-meaning')).toHaveText('With --for reply: new replies are in data.replies. Run data.next for more.');
 });
-test('FAQ: five rows; Enter opens one and the others close', async ({ page }) => {
+test('FAQ: six rows; Enter opens one and the others close', async ({ page }) => {
  await page.goto('/');
  const rows = page.locator('#faq details');
- await expect(rows).toHaveCount(5);
+ await expect(rows).toHaveCount(6);
  await rows.nth(1).locator('summary').focus(); await page.keyboard.press('Enter');
  await expect(rows.nth(1)).toHaveAttribute('open', '');
  await rows.nth(3).locator('summary').focus(); await page.keyboard.press('Enter');
@@ -532,7 +535,7 @@ test('the header, hero and footer chips read the released version, and the hero 
  const v = `v${site.version}`;
  await page.goto('/');
  await expect(page.locator('.header-bar .version-chip')).toHaveText(v);
- await expect(page.locator('.hero .release-chip')).toHaveText(`${v} · works with omp ${site.testedOmp}`);
+ await expect(page.locator('.hero .release-chip')).toHaveText(`${v} · works with omp ${site.supportedOmp}`);
  await expect(page.locator('.footer-bottom span').last()).toHaveText(v);
  const dot = page.locator('.release-chip > span');
  await expect(page.locator('.hero .release-chip')).toHaveAttribute('data-release', 'out');
@@ -545,10 +548,49 @@ test('copy: exit 6 is a refusal, --project uses the current directory, the Linux
  const six = page.locator('.exit-row').filter({ has: page.locator('[role=rowheader]', { hasText: /^6$/ }) });
  await expect(six.locator('.exit-badge')).toHaveText('refused');
  await expect(six.locator('.exit-meaning')).toHaveText('Read error.hint and details.reason; often: install the extension and restart omp.');
- await expect(page.locator('#agents .tabs-foot')).toHaveText('Add --project to install into the current directory instead (run it from the repository root).');
+ await expect(page.locator('#agents .tabs-foot')).toHaveText('Add --project to install the skill into the current directory instead (run it from the repository root).');
  // W10 fix cycle 2 decision 1 replaced DOC-17's namespace condition: on Linux any Codex marker hides the lease.
  await expect(page.locator('#faq details').nth(3).locator('.faq-body')).toContainText("On Linux, a Codex sandbox hides omp's session locks, so under either variable glen refuses to resume a session over RPC (exit 6); the live route through the extension still works.");
- await expect(page.locator('#install .section-lead')).toHaveText('macOS and Linux. Tested with omp 18.14.0.');
+ // Docs audit M1: the omp version comes from src/omp/compat.json through site.ts, not a literal.
+ await expect(page.locator('#install .section-lead')).toHaveText(`macOS and Linux. Tested with omp ${site.testedOmp}.`);
+});
+// Docs audit M2: the page carries what v0.2 ships, with commands that exist in `glen --help`.
+test('copy: replies without polling, glen mcp, --warm and glen release, the supported omp range', async ({ page, context }) => {
+ await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+ await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');
+ const hear = page.locator('.how-card').filter({ has: page.getByRole('heading', { name: 'Hear back' }) });
+ await expect(hear.locator('.how-cmds code')).toHaveText(['glen_reply', 'glen wait --for reply', 'glen inbox --wait']);
+ const send = page.locator('.how-card').filter({ has: page.getByRole('heading', { name: 'Send' }) });
+ await expect(send.locator('.how-cmds code')).toHaveText(['glen send', 'glen release']);
+ await expect(send).toContainText('With --warm, omp stays up for the next send');
+ // Plan default 4 (design §A20): "push" for Claude Code only, "blocking wait" for Codex.
+ await hydrate(page, '#agents');
+ const claudeNote = page.locator('#agent-panel-claude .panel-note');
+ await expect(claudeNote).toContainText('Replies come by push: it runs glen wait <job> --for reply in the background and wakes when it returns.');
+ await page.getByRole('tab', { name: 'Codex', exact: true }).click();
+ const codexNote = page.locator('#agent-panel-codex .panel-note');
+ await expect(codexNote).toContainText('Replies come through a blocking wait: Codex runs glen wait <job> --for reply and waits until it returns.');
+ await expect(codexNote).not.toContainText('push');
+ await page.getByRole('tab', { name: 'MCP', exact: true }).click();
+ const mcp = page.locator('#agent-panel-mcp');
+ await expect(mcp.locator('pre code')).toHaveText(['claude mcp add glen -- glen mcp', 'codex mcp add glen -- glen mcp']);
+ await expect(mcp).toContainText('glen mcp serves 14 tools');
+ await expect(mcp).toContainText('tool_timeout_sec = 120');
+ await expect(mcp.getByRole('link', { name: 'MCP setup in the README', exact: true })).toHaveAttribute('href', 'https://github.com/nodera-studio/glen/blob/main/README.md#use-from-an-mcp-host-glen-mcp');
+ await expect(page.locator('#agents .tabs-foot')).toBeHidden();
+ await mcp.getByRole('button', { name: 'Copy Codex MCP command', exact: true }).click();
+ expect(await page.evaluate(() => navigator.clipboard.readText())).toBe('codex mcp add glen -- glen mcp');
+ const faq = page.locator('#faq details');
+ await expect(faq.nth(0).locator('.faq-body')).toContainText('glen inbox --wait waits up to 90 seconds');
+ await expect(faq.nth(4).locator('.faq-body')).toContainText(`glen supports omp ${site.supportedOmp}; glen doctor warns when yours is outside that range. A nightly CI job runs glen's omp checks against the latest omp release`);
+ await expect(faq.nth(5).locator('summary')).toContainText('Sending again soon');
+ await expect(faq.nth(5).locator('.faq-body')).toContainText('glen release <handle> ends it early, and glen release --all ends every warm worker.');
+ // No glen version but the released one (site.version, kept equal to Cargo.toml's), and no hidden
+ // command or flag. The hidden names are built here, because tests/conformance/v2_mcp.rs fails
+ // when any file under site/ holds them literally.
+ const text = (await page.locator('main').innerText()).replaceAll(`v${site.version}`, '');
+ expect(text).not.toMatch(/\bv\d+\.\d+/);
+ for (const hidden of ['__' + 'acp', '--' + 'chan' + 'nel']) expect(text).not.toContain(hidden);
 });
 test('closing band and footer', async ({ page }) => {
  await page.setViewportSize({ width: 1280, height: 800 }); await page.goto('/');

@@ -269,6 +269,7 @@ section[id] { scroll-margin-top: 88px }
 .tab-pill { position: absolute; inset: 0; border-radius: 999px; background: var(--ink); box-shadow: var(--shadow-1) }
 .tabs-list button:active, .tabs-card [role=tabpanel] button:active, .cta-command button:active { transform: scale(.985) }
 .command-row { display: flex; align-items: center; gap: 12px }
+.command-row + .command-row { margin-top: 8px }
 .command { flex: 1; min-width: 0; padding-right: 24px; overflow-x: auto; font: 13px/1.7 var(--font-mono); white-space: pre; user-select: all; scrollbar-width: none; mask-image: linear-gradient(90deg, black 85%, transparent) }
 .command::-webkit-scrollbar { display: none }
 .command::before { content: '$ '; color: var(--ink-subdued); user-select: none }
