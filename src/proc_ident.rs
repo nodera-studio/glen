@@ -957,6 +957,44 @@ pub fn ppid(pid: u32) -> Option<u32> {
     }
 }
 
+/// Whether `pid` is in the stopped state (Linux `/proc/<pid>/stat` state `T`, macOS
+/// `pbi_status == SSTOP`): a SIGSTOP submitted is not yet a process stopped.
+pub fn stopped(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .and_then(|(_, f)| f.split_whitespace().next())
+                == Some("T")
+        })
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Ok(raw) = i32::try_from(pid) else {
+            return false;
+        };
+        let mut info = std::mem::MaybeUninit::<libc::proc_bsdinfo>::zeroed();
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+        // SAFETY: info is writable and correctly sized; proc_pidinfo writes at most size bytes.
+        let n = unsafe {
+            libc::proc_pidinfo(
+                raw,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                info.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        // SAFETY: proc_pidinfo returned the full structure.
+        n == size && unsafe { info.assume_init() }.pbi_status == libc::SSTOP
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// `pid`'s process group.
 pub fn pgid(pid: u32) -> Option<u32> {
     let pid = rustix::process::Pid::from_raw(i32::try_from(pid).ok()?)?;
@@ -1263,6 +1301,27 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         assert_eq!(argv(pid), None, "a reaped process has no argv");
+    }
+
+    /// F8: a SIGSTOPped process is seen stopped, a running one is not.
+    #[test]
+    fn a_stopped_process_is_seen_stopped() {
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(!stopped(pid));
+        let raw = pid as libc::pid_t;
+        // SAFETY: signals to this test's own child.
+        unsafe { libc::kill(raw, libc::SIGSTOP) };
+        wait_until("never seen stopped", || stopped(pid));
+        // SAFETY: as above.
+        unsafe { libc::kill(raw, libc::SIGCONT) };
+        wait_until("never seen running again", || !stopped(pid));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(!stopped(pid), "a reaped process is not stopped");
     }
 
     /// F4: the image is proven by the mapped file, not by a path. A symlink named after glen's

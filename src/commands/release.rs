@@ -275,11 +275,16 @@ enum Kill {
     Resume(u32),
 }
 /// Sends `target`'s signal; a process or group that is already gone is not an error. The
-/// worker is signalled through its [`Pinned`] handle.
+/// worker is signalled through its [`Pinned`] handle, and omp's group through omp's.
 fn signal(target: Kill, pinned: Option<&Pinned>) -> std::io::Result<()> {
     use rustix::process::Signal;
     let (pid, sig) = match target {
-        Kill::Group(pid) => return rpc::kill_group(pid, Signal::KILL),
+        Kill::Group(pid) => {
+            return match pinned {
+                Some(p) => p.send_group(Signal::KILL),
+                None => rpc::kill_group(pid, Signal::KILL),
+            };
+        }
         Kill::Process(pid) => (pid, Signal::KILL),
         Kill::Stop(pid) => (pid, Signal::STOP),
         Kill::Resume(pid) => (pid, Signal::CONT),
@@ -292,12 +297,12 @@ fn signal(target: Kill, pinned: Option<&Pinned>) -> std::io::Result<()> {
             .map(drop),
     }
 }
-/// A worker held for signalling. On Linux it is a pidfd opened before the worker's identity is
-/// proven, so a signal reaches the proven process or none (AC-H103); a pidfd that cannot be
-/// opened leaves the worker unverified (F3). On macOS it is the pid, proven again right before
-/// each signal (a window of microseconds, §A14).
+/// A process held for signalling: the worker, or omp as the leader of its group. On Linux it is
+/// a pidfd opened before the process's identity is proven, so a signal reaches the proven
+/// process or none (AC-H103); a pidfd that cannot be opened leaves the process unverified (F3).
+/// On macOS it is the pid, proven again right before each signal (a window of microseconds,
+/// §A14).
 struct Pinned {
-    #[cfg(not(target_os = "linux"))]
     pid: u32,
     #[cfg(target_os = "linux")]
     fd: std::os::fd::OwnedFd,
@@ -305,11 +310,69 @@ struct Pinned {
 impl Pinned {
     fn open(pid: u32) -> Option<Self> {
         Some(Self {
-            #[cfg(not(target_os = "linux"))]
             pid,
             #[cfg(target_os = "linux")]
             fd: crate::proc_ident::pidfd(pid)?,
         })
+    }
+    /// Whether the pinned process has not exited. Linux: its pidfd is not yet readable (it
+    /// polls readable once the process exits, a zombie included); an error is an exit (fail
+    /// closed). Elsewhere there is nothing to poll, and the caller proves the pid again by its
+    /// start token.
+    fn alive(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let mut p = libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, no wait.
+            unsafe { libc::poll(&mut p, 1, 0) == 0 }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            true
+        }
+    }
+    /// Signals the process group the pinned process leads (F8). Linux 6.9+: through the pidfd
+    /// with `PIDFD_SIGNAL_PROCESS_GROUP`, so the signal reaches the group of the pinned
+    /// process, never a group that reused its number. On an older kernel (`EINVAL`) and on
+    /// macOS: by number, after the caller checked the leader alive and its parent (the worker)
+    /// still stopped (§A14 residual). A group already gone is not an error.
+    fn send_group(&self, sig: rustix::process::Signal) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            const PIDFD_SIGNAL_PROCESS_GROUP: libc::c_uint = 1 << 2;
+            // SAFETY: a pidfd we own, a signal number, no siginfo, and a flag word.
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    self.fd.as_raw_fd(),
+                    sig.as_raw(),
+                    std::ptr::null::<libc::siginfo_t>(),
+                    PIDFD_SIGNAL_PROCESS_GROUP,
+                )
+            };
+            if rc == 0 {
+                return Ok(());
+            }
+            let e = std::io::Error::last_os_error();
+            match e.raw_os_error() {
+                Some(libc::ESRCH) => return Ok(()),
+                // Before Linux 6.9 the flag is unknown.
+                Some(libc::EINVAL) => (),
+                _ => {
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("cannot signal omp process group {}: {e}", self.pid),
+                    ));
+                }
+            }
+        }
+        rpc::kill_group(self.pid, sig)
     }
     /// SIGKILL; `Ok(false)` when the process had already exited, so nothing was signalled.
     #[cfg(test)]
@@ -341,11 +404,32 @@ struct Facts<'a> {
     /// The recorded omp `(worker, omp)`: omp's parent is the worker and it leads its own
     /// process group (AC-H102).
     omp: &'a dyn Fn(u32, u32) -> bool,
+    /// The worker `pid` is in the stopped state, not merely sent SIGSTOP (F8).
+    stopped: &'a dyn Fn(u32) -> bool,
+    /// A pinned process has not exited ([`Pinned::alive`]).
+    alive: &'a dyn Fn(&Pinned) -> bool,
 }
 const KERNEL: Facts<'static> = Facts {
     worker: &is_glen_worker,
     omp: &is_workers_omp,
+    stopped: &crate::proc_ident::stopped,
+    alive: &Pinned::alive,
 };
+/// How long `--force` waits for a SIGSTOPped worker to be seen stopped (F8).
+const STOP_BOUND: Duration = Duration::from_millis(200);
+/// Whether the pinned worker is seen stopped within [`STOP_BOUND`].
+fn confirmed_stop(facts: &Facts<'_>, worker: &Pinned) -> bool {
+    let end = Instant::now() + STOP_BOUND;
+    loop {
+        if (facts.alive)(worker) && (facts.stopped)(worker.pid) {
+            return true;
+        }
+        if Instant::now() >= end {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
 fn is_glen_worker(pid: u32, origin: &str) -> bool {
     let Some(argv) = crate::proc_ident::argv(pid) else {
         return false;
@@ -405,6 +489,14 @@ fn force_with(
         (Some(pid), Some(Liveness::Alive)) => (Some(pid), Some(pid)),
         (pid, _) => (None, pid),
     };
+    // F8: omp is pinned before its proof too, so its group is signalled through it.
+    let omp = match signalled {
+        Some(pid) => match Pinned::open(pid) {
+            Some(p) => Some(p),
+            None => return Ok((UNVERIFIED, false)),
+        },
+        None => None,
+    };
     // AC-H102: before the first signal.
     if signalled.is_some_and(|pid| !(facts.omp)(e.pid, pid)) {
         return Ok((UNVERIFIED, false));
@@ -439,9 +531,24 @@ fn force_with(
             }
             Ok((outcome, false))
         };
+        // F8: SIGSTOP sent is not a worker stopped (it may be resumed by its own uid): unless it
+        // is seen stopped, omp's pid is not pinned, so nothing more is signalled.
+        if stopped && !confirmed_stop(facts, &worker) {
+            return give_up(UNVERIFIED);
+        }
+        let omp = omp.as_ref().expect("pinned with the first omp proof");
         match warm::kill_identity(e).omp {
+            // F8: an omp whose pidfd says it exited is a leader gone, so its group number is
+            // not signalled; the recorded group must still be gone below.
+            Some(Liveness::Alive) if !(facts.alive)(omp) => (),
             Some(Liveness::Alive) if (facts.omp)(e.pid, pid) => {
-                if kill(Kill::Group(pid), None).is_err() {
+                // Right before the group signal, which falls back to the group's number on
+                // macOS and before Linux 6.9: the worker must still be stopped, so omp cannot
+                // have been reaped and its number reused.
+                if stopped && !((facts.alive)(&worker) && (facts.stopped)(e.pid)) {
+                    return give_up(UNVERIFIED);
+                }
+                if kill(Kill::Group(pid), Some(omp)).is_err() {
                     return give_up("timeout");
                 }
             }
@@ -507,6 +614,8 @@ mod tests {
     const TRUSTING: Facts<'static> = Facts {
         worker: &|_, _| true,
         omp: &|_, _| true,
+        stopped: &|_| true,
+        alive: &|_| true,
     };
     const A: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
     const B: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de";
@@ -1156,6 +1265,7 @@ mod tests {
                 asked.borrow_mut().push((w, o));
                 is_workers_omp(w, o)
             },
+            ..TRUSTING
         };
         let sent = std::cell::RefCell::new(vec![]);
         assert_eq!(
@@ -1168,8 +1278,9 @@ mod tests {
         assert_eq!(warm::read(&h, A).unwrap().entry, e);
         // With both facts proven, the group then the worker are signalled.
         let trusted = Facts {
-            worker: &|_, _| true,
-            omp: &|_, _| true,
+            stopped: &crate::proc_ident::stopped,
+            alive: &Pinned::alive,
+            ..TRUSTING
         };
         // The group is gone only once its killed leader (this test's child) is reaped.
         let reaping = |k: Kill, p: Option<&Pinned>| -> std::io::Result<()> {
@@ -1246,6 +1357,8 @@ mod tests {
                 }
                 proofs.get() == 1
             },
+            stopped: &crate::proc_ident::stopped,
+            alive: &Pinned::alive,
         };
         let sent = std::cell::RefCell::new(vec![]);
         assert_eq!(
@@ -1346,6 +1459,128 @@ mod tests {
             ("forced", true)
         );
         assert_eq!(*outcomes.borrow(), [false], "the signal reached nothing");
+    }
+    /// A worker (`sleeper`) and its recorded omp: a `sleep` leading its own process group.
+    fn worker_and_omp(h: &GlenHome) -> (std::process::Child, std::process::Child, warm::Entry) {
+        use std::os::unix::process::CommandExt;
+        let omp = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let crate::jobs::liveness::Probe::Running(omp_start) =
+            crate::jobs::liveness::start_token(omp.id())
+        else {
+            panic!("no start token for omp")
+        };
+        let (worker, mut e) = sleeper();
+        e.omp_pid = Some(omp.id());
+        e.omp_start = Some(omp_start);
+        warm::publish(h, &e).unwrap();
+        (worker, omp, e)
+    }
+    /// F8: a SIGSTOP the worker is never seen to obey (it could be resumed by its own uid, so
+    /// omp's pid is not pinned) signals nothing more: the worker is resumed, omp's group is
+    /// never signalled, and the row is `unverified_process`.
+    #[test]
+    fn f8_an_unconfirmed_stop_resumes_the_worker_and_signals_nothing_more() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (mut worker, mut omp, e) = worker_and_omp(&h);
+        let _cleanup = Group(omp.id());
+        let facts = Facts {
+            stopped: &|_| false,
+            ..TRUSTING
+        };
+        let sent = std::cell::RefCell::new(vec![]);
+        assert_eq!(
+            force_with(&h, &e, &facts, &recorder(&sent), FORCE_BOUND).unwrap(),
+            (UNVERIFIED, false)
+        );
+        assert_eq!(*sent.borrow(), [Kill::Stop(e.pid), Kill::Resume(e.pid)]);
+        assert!(reaches(e.pid, false), "the worker runs again");
+        assert!(omp.try_wait().unwrap().is_none(), "omp was never signalled");
+        assert_eq!(warm::read(&h, A).unwrap().entry, e, "the registry is kept");
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+    }
+    /// F8: a worker seen stopped, then resumed (by its own uid) before omp's group is signalled,
+    /// leaves omp reapable and its group number free for reuse: the group is never signalled.
+    #[test]
+    fn f8_a_worker_resumed_before_the_group_signal_blocks_it() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (mut worker, mut omp, e) = worker_and_omp(&h);
+        let _cleanup = Group(omp.id());
+        let checks = std::cell::Cell::new(0);
+        let facts = Facts {
+            stopped: &|_| {
+                checks.set(checks.get() + 1);
+                checks.get() == 1
+            },
+            ..TRUSTING
+        };
+        let sent = std::cell::RefCell::new(vec![]);
+        assert_eq!(
+            force_with(&h, &e, &facts, &recorder(&sent), FORCE_BOUND).unwrap(),
+            (UNVERIFIED, false)
+        );
+        assert_eq!(checks.get(), 2, "seen stopped, then checked again");
+        assert_eq!(*sent.borrow(), [Kill::Stop(e.pid), Kill::Resume(e.pid)]);
+        assert!(omp.try_wait().unwrap().is_none(), "omp was never signalled");
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+    }
+    /// F8: an omp whose pin says it exited (Linux: its pidfd polls readable) is a leader gone:
+    /// its group number is never signalled, the worker still is, and the release waits for the
+    /// recorded group to be gone (here it is not: `timeout`).
+    #[test]
+    fn f8_an_omp_whose_pin_says_it_exited_is_never_group_signalled() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (mut worker, mut omp, e) = worker_and_omp(&h);
+        let omp_pid = omp.id();
+        let _cleanup = Group(omp_pid);
+        let facts = Facts {
+            stopped: &crate::proc_ident::stopped,
+            alive: &|p: &Pinned| p.pid != omp_pid,
+            ..TRUSTING
+        };
+        let sent = std::cell::RefCell::new(vec![]);
+        assert_eq!(
+            force_with(&h, &e, &facts, &recorder(&sent), Duration::from_millis(100)).unwrap(),
+            ("timeout", false)
+        );
+        assert_eq!(*sent.borrow(), [Kill::Stop(e.pid), Kill::Process(e.pid)]);
+        assert!(omp.try_wait().unwrap().is_none(), "omp was never signalled");
+        assert!(!worker.wait().unwrap().success());
+    }
+    /// F8: omp's group is signalled through omp's pin (Linux 6.9+: `PIDFD_SIGNAL_PROCESS_GROUP`;
+    /// older kernels and macOS: by number), and the pin tells a live process from an exited one
+    /// (Linux: a zombie's pidfd polls readable).
+    #[test]
+    fn f8_the_omp_pin_signals_its_group_and_sees_its_exit() {
+        use std::os::unix::process::{CommandExt, ExitStatusExt};
+        let mut leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let _cleanup = Group(leader.id());
+        let pin = Pinned::open(leader.id()).expect("pinned");
+        assert!(pin.alive());
+        pin.send_group(rustix::process::Signal::KILL).unwrap();
+        #[cfg(target_os = "linux")]
+        {
+            let end = Instant::now() + Duration::from_secs(5);
+            while pin.alive() {
+                assert!(Instant::now() < end, "the pidfd never saw the exit");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert_eq!(leader.wait().unwrap().signal(), Some(libc::SIGKILL));
+        // A group already gone is not an error.
+        pin.send_group(rustix::process::Signal::KILL).unwrap();
     }
     #[test]
     fn an_at_new_job_handle_finds_its_worker_after_a_follow_up_was_adopted() {
