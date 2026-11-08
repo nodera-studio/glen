@@ -937,7 +937,9 @@ answers); a dead or identity-changed registry is removed (`cleaned`), and only w
 With `--force`, a worker whose heartbeat is stale, or that did not release within `--timeout` (default 10s, at most
 24h), is killed with its omp process group after a pid and start-time check (`forced`, once both are gone and its
 files removed); a process glen cannot prove unchanged is never signalled, and a recorded omp it cannot prove keeps
-the worker from being signalled too (`release_timeout`, registry kept). A removal the metadata lock blocks past its
+the worker from being signalled too (`release_timeout`, registry kept). Neither is signalled unless the worker runs
+this glen executable as `__worker <origin_job_id>` and omp is its child leading its own process group; a failed
+check is `release_timeout` with that worker's row carrying `reason:"unverified_process"`. A removal the metadata lock blocks past its
 bound is `release_timeout` too, with the files kept for a later `glen release`. A
 target that matches no warm worker exits 3 `not_found` with `details:{reason:"not_warm",target}`. A worker that
 did not release in time without `--force` exits 7 `control_failed` with `details:{reason:"release_timeout",workers}`
@@ -956,7 +958,7 @@ worker has still been processed: it exits 1 `io`, with `details.unreadable` (the
 | Field | Meaning |
 |---|---|
 | `total` | warm workers processed |
-| `workers` | `{session:{id,handle},job,pid,state,outcome}`: `state` idle, busy, stale or dead as found; `outcome` released, cooling, forced or cleaned on success, or, only inside an error's `details.workers`, timeout (not yet forced) or failed (this run's own I/O error) |
+| `workers` | `{session:{id,handle},job,pid,state,outcome}`: `state` idle, busy, stale or dead as found; `outcome` released, cooling, forced or cleaned on success, or, only inside an error's `details.workers`, timeout (not yet forced) or failed (this run's own I/O error); a timeout row adds `reason:"unverified_process"` when `--force` could not prove the process is that session's glen worker or its omp |
 
 <!-- contract: release -->
 ```json
@@ -1314,7 +1316,8 @@ or project directory could not be read, the error is `io` (exit 1) naming that p
 listing every unreadable path. Ambiguous errors include `details.candidates`: session objects for sessions,
 `{provider,id,name}` for models. Job failure has `details:{status,job,error,forked}`, plus `replies` (the unseen ones) under `wait --for reply`. Every exit-6 `no_route` envelope
 includes a string `details.reason`; worker-side refusals also copy it beside `status`, `job`, `error` and `forked`.
-Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`, `endpoint_gone`, `endpoint_appeared`, `rpc_job_running`, `sandboxed`, `extension_outdated`, `unknown` (a legacy job record persisted before this list existed; wait normalises it, never a missing reason).
+Allowed `no_route` reasons: `live_owner`, `unknown_lease`, `unhealthy_endpoint`, `endpoint_gone`, `endpoint_appeared`, `rpc_job_running`, `sandboxed`, `extension_outdated`, `untrusted_endpoint`, `unknown` (a legacy job record persisted before this list existed; wait normalises it, never a missing reason).
+`untrusted_endpoint` (send, the controls, `acp`, and a worker's late endpoint check) means the session's live endpoint is not one glen will hand work to: its registry names a socket other than a private `run/live/<pid>.sock`, the process holding the socket or answering `hello` is not the registry's pid, or that process runs more confined than glen (for example under `sandbox-exec` or with no_new_privs). Nothing is written to it and its registry is kept; the hint names the cause to check.
 Sandbox refusal adds `details:{reason:"sandboxed",sandbox,network}`; a permission-denied glen-home write adds
 `glen_home_writable:false` and a hint to set GLEN_HOME to a private directory (for example `$(mktemp -d)/glen`),
 add it to writable_roots, or run glen outside the sandbox. A GLEN_HOME, or a directory glen writes under it, that

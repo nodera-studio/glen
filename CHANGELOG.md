@@ -6,6 +6,11 @@ All notable changes to glen are listed here, newest first.
 
 - `glen doctor` reports omp's tool approval mode for the profile glen uses (`tools.approvalMode` from the profile's `config.yml` and any `PI_CONFIG_FILES` overlays, parsed as YAML without starting omp) as a new `omp_approval` row and `data.omp.approval: {mode, source}`. It warns with `omp_approval_yolo` when the mode is yolo, set or omp's default, because a pre-approved `glen send` then starts an omp agent whose tools run without asking (audit S-01), and with `omp_approval_unknown` when the config cannot be read; neither fails doctor. A stricter mode makes tools that need approval fail in glen's UI-less sessions, so the warning points at per-tool `tools.approval.<tool>: deny` as well.
 
+### Security
+
+- `glen send` and the session controls now check who is on the other end of a live session's socket before sending anything. The socket must be the one the session's registry names (`run/live/<pid>.sock`, private to you), the process holding it must be that registry's omp process, and that process must not run more sandboxed than glen itself (for example under `sandbox-exec` on macOS or with no_new_privs on Linux). Otherwise glen refuses with exit 6 `no_route`, `details.reason:"untrusted_endpoint"`, sends no text, and leaves the registry in place; `glen ls` and `glen show` no longer show such a session as live (audit S-18). A sandboxed glen still delivers to your omp sessions as before. If your omp TUI itself runs sandboxed (a Flatpak or sandboxed terminal app), an unsandboxed glen now refuses to send to it.
+- `glen release --force` now kills a warm worker only after proving it is that session's glen worker (the glen executable running `__worker` for the job the worker started with) and that the omp group it kills belongs to that worker. A forged registry naming any other process, even with its correct pid and start time, makes `--force` fail with exit 7 `release_timeout` and `reason:"unverified_process"` on that worker, and nothing is signalled (audit S-09). Warm workers started by an older glen have no record of their starting job, so `--force` cannot end them; plain `glen release` still can.
+
 ## v0.2.0 — 2026-11-04
 
 ### Added
