@@ -151,6 +151,16 @@
       "id": "settings.invalid_value_uses_default",
       "file": "packages/coding-agent/src/config/registry.ts",
       "contains": "logger.warn(\"Settings: ignoring invalid value, using the default\""
+    },
+    {
+      "id": "settings.config_files_overlay",
+      "file": "packages/coding-agent/src/config/settings.ts",
+      "contains": "const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];"
+    },
+    {
+      "id": "settings.layer_order",
+      "file": "packages/coding-agent/src/config/settings.ts",
+      "contains": "let merged = this.#deepMerge(this.#deepMerge({}, layers.global), projectLayerForMerge(layers.project));\n\t\tmerged = this.#deepMerge(merged, layers.configOverlay);"
     }
   ]
 }

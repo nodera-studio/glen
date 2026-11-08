@@ -4,7 +4,7 @@ All notable changes to glen are listed here, newest first.
 
 ## Unreleased
 
-- `glen doctor` reports omp's tool approval mode for the profile glen uses (`tools.approvalMode` from the profile's `config.yml`, read without starting omp) as a new `omp_approval` row and `data.omp.approval: {mode, source}`, and warns with `omp_approval_yolo` when it is yolo, set or omp's default, because a pre-approved `glen send` then starts an omp agent whose tools run without asking (audit S-01). A malformed or unreadable config reads as `unknown` and never fails doctor.
+- `glen doctor` reports omp's tool approval mode for the profile glen uses (`tools.approvalMode` from the profile's `config.yml` and any `PI_CONFIG_FILES` overlays, parsed as YAML without starting omp) as a new `omp_approval` row and `data.omp.approval: {mode, source}`. It warns with `omp_approval_yolo` when the mode is yolo, set or omp's default, because a pre-approved `glen send` then starts an omp agent whose tools run without asking (audit S-01), and with `omp_approval_unknown` when the config cannot be read; neither fails doctor. A stricter mode makes tools that need approval fail in glen's UI-less sessions, so the warning points at per-tool `tools.approval.<tool>: deny` as well.
 
 ## v0.2.0 — 2026-11-04
 

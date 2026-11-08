@@ -23,6 +23,7 @@ unicode-segmentation = "1.13.3"
 unicode-width = "0.2.3"
 uuid = { version = "1.29.0", features = ["v7"] }
 xxhash-rust = { version = "0.8.18", features = ["xxh3", "xxh64"] }
+yaml-rust2 = { version = "0.13.0", default-features = false }
 
 [dev-dependencies]
 insta = "1.49.0"

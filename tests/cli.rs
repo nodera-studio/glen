@@ -878,7 +878,11 @@ fn doctor_reports_the_omp_approval_mode() {
         ),
         "{message}"
     );
-    assert!(message.contains("approvalMode: always-ask"), "{message}");
+    assert!(
+        message.contains("`tools.approval.<tool>: deny`"),
+        "{message}"
+    );
+    assert!(message.contains("no UI to ask"), "{message}");
     assert!(
         message.contains(default_agent.join("config.yml").to_str().unwrap()),
         "{message}"
@@ -912,7 +916,34 @@ fn doctor_reports_the_omp_approval_mode() {
         serde_json::json!({"mode":"unknown","source":"unknown"})
     );
     assert_eq!(check(&v)["value"], "unknown");
+    assert_eq!(check(&v)["status"], "warn");
     assert!(yolo_warning(&v).is_none());
+    let codes: Vec<_> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["omp_approval_unknown"]);
+    // A PI_CONFIG_FILES overlay decides over the agent dir, and a missing one is unknown.
+    fs::write(&config, "tools:\n  approvalMode: write\n").unwrap();
+    let overlay = t.path().join("overlay.yml");
+    fs::write(&overlay, "tools:\n  approvalMode: yolo\n").unwrap();
+    let v = json(&run(
+        &["doctor"],
+        &[("PI_CONFIG_FILES", overlay.to_str().unwrap())],
+    ));
+    assert_eq!(
+        v["data"]["omp"]["approval"]["source"],
+        overlay.to_str().unwrap()
+    );
+    assert!(yolo_warning(&v).is_some());
+    let missing = t.path().join("missing.yml");
+    let v = json(&run(
+        &["doctor"],
+        &[("PI_CONFIG_FILES", missing.to_str().unwrap())],
+    ));
+    assert_eq!(v["data"]["omp"]["approval"]["mode"], "unknown");
     // A named profile reads its own agent dir: --profile, OMP_PROFILE and PI_PROFILE.
     fs::write(&config, "tools:\n  approvalMode: write\n").unwrap();
     fs::create_dir_all(&work_agent).unwrap();
