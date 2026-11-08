@@ -525,7 +525,14 @@ impl Worker {
                         .map(drop)
                         .map_err(std::io::Error::other)
                 },
-                &mut || match rpc::warm::offer(&home, &id, &self.job, &mut offered) {
+                &mut || match rpc::warm::offer(
+                    &home,
+                    &id,
+                    &self.job,
+                    &mut offered,
+                    self.deadline,
+                    &|| self.stolen() || self.stop_requested(),
+                ) {
                     rpc::warm::Offered::Adopted => {
                         self.log("warm", "offered to the warm worker: adopted");
                         true

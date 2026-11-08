@@ -749,6 +749,8 @@ const OFFER_READ: Duration = Duration::from_secs(1);
 /// How long an offerer waits for the warm worker to accept and answer.
 const OFFER_CONNECT: Duration = Duration::from_secs(1);
 const OFFER_ANSWER: Duration = Duration::from_secs(5);
+/// How often an offerer waiting for an answer re-checks its own stop and deadline (H2 G5).
+const STOP_POLL: Duration = Duration::from_millis(200);
 
 /// A cold worker's offer of its own in-memory job (S-03): `{v:1,op:"adopt",job_id,job}`.
 #[derive(Serialize, Deserialize)]
@@ -776,26 +778,37 @@ struct AnswerLine {
 }
 
 /// Reads one `\n`-terminated line of at most `max` bytes from `stream` by `end`.
+/// `stop` is asked at least every 200 ms; true ends the wait (`Interrupted`).
 fn read_line(
     stream: &std::os::unix::net::UnixStream,
     max: usize,
     end: Instant,
+    stop: &dyn Fn() -> bool,
 ) -> io::Result<Vec<u8>> {
     use std::io::Read;
     let mut line = Vec::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
+        if stop() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+        }
         let left = end.saturating_duration_since(Instant::now());
         if left.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "no line in time"));
         }
-        timeout(stream.set_read_timeout(Some(left)))?;
+        timeout(stream.set_read_timeout(Some(left.min(STOP_POLL))))?;
         let n = match (&*stream).read(&mut buf) {
             Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
             Ok(n) => n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "no line in time"));
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -856,11 +869,16 @@ pub(crate) enum Offered {
 /// be `run/warm/<pid>.sock`, a 0600 socket this user owns, held by that worker generation and no
 /// more confined than this process (`proc_ident::trust_endpoint`). `offered` keeps the worker
 /// already offered to, so each warm worker is offered the job once, unless it answers `retry`.
+/// Every wait is bounded by `deadline` (the job's) as well as its own bound, and `stop` (the
+/// worker's cancel and claim checks) is asked between the phases and while the answer is
+/// awaited (H2 G5): a stop or a passed deadline makes it `Retry`, and the lock wait decides.
 pub(crate) fn offer(
     home: &GlenHome,
     session_id: &str,
     job: &Job,
     offered: &mut Option<String>,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
 ) -> Offered {
     use std::os::fd::AsFd;
     let Some(holder) = crate::jobs::lock::holder(home, session_id) else {
@@ -894,13 +912,14 @@ pub(crate) fn offer(
         let Some(start) = entry.start.as_deref() else {
             return Err("the warm registry has no start token".into());
         };
+        let within = |bound: Duration| (Instant::now() + bound).min(deadline);
         let stream = std::os::unix::net::UnixStream::connect(&path)
             .map_err(|e| format!("cannot connect to {}: {e}", path.display()))?;
         match crate::proc_ident::trust_endpoint(
             stream.as_fd(),
             &path,
             entry.pid,
-            Instant::now() + OFFER_CONNECT,
+            within(OFFER_CONNECT),
         ) {
             Ok(()) => (),
             Err(crate::proc_ident::Refusal::NotAccepted) => return Ok(Offered::Retry),
@@ -912,16 +931,20 @@ pub(crate) fn offer(
                 entry.pid
             ));
         }
+        if stop() || Instant::now() >= deadline {
+            return Ok(Offered::Retry);
+        }
         let line = OfferLine {
             v: 1,
             op: "adopt".into(),
             job_id: job.id.clone(),
             job: job.clone(),
         };
-        if write_line(&stream, &line, OFFER_ANSWER).is_err() {
+        let left = within(OFFER_ANSWER).saturating_duration_since(Instant::now());
+        if left.is_zero() || write_line(&stream, &line, left).is_err() {
             return Ok(Offered::Retry);
         }
-        let Ok(answer) = read_line(&stream, 4096, Instant::now() + OFFER_ANSWER) else {
+        let Ok(answer) = read_line(&stream, 4096, within(OFFER_ANSWER), stop) else {
             // Busy with another job, or gone: the holder tells on the next poll.
             return Ok(Offered::Retry);
         };
@@ -2782,7 +2805,13 @@ mod adopt_tests {
         stream
     }
     fn answer_of(stream: &std::os::unix::net::UnixStream) -> Answer {
-        let line = read_line(stream, 4096, Instant::now() + Duration::from_secs(2)).unwrap();
+        let line = read_line(
+            stream,
+            4096,
+            Instant::now() + Duration::from_secs(2),
+            &|| false,
+        )
+        .unwrap();
         serde_json::from_slice::<AnswerLine>(&line).unwrap().answer
     }
     fn receive(listener: &std::os::unix::net::UnixListener, within: Duration) -> Vec<Offer> {
@@ -3043,6 +3072,90 @@ mod adopt_tests {
                 .is_empty()
         );
         assert!(inbox.pending.is_empty());
+    }
+    /// H2 G5: an offer to a warm worker that never answers ends at the job's deadline, or as
+    /// soon as the worker is stopped, not after the full answer bound.
+    #[test]
+    fn an_unanswered_offer_ends_at_the_deadline_or_a_stop() {
+        let (_t, store, listener, path) = setup();
+        let home = store.home.clone();
+        let me = liveness::current().unwrap();
+        let lock = crate::jobs::lock::try_acquire(&home, SESSION)
+            .unwrap()
+            .unwrap();
+        hold(
+            &lock,
+            crate::jobs::lock::HolderKind::Warm,
+            &JobId::new(),
+            Some(&me.start),
+        )
+        .unwrap();
+        let mut entry = Entry {
+            v: 1,
+            pid: me.pid,
+            start: Some(me.start.clone()),
+            session_id: SESSION.into(),
+            session_handle: None,
+            job_id: JobId::new().as_str().into(),
+            origin_job_id: None,
+            omp_pid: None,
+            omp_start: None,
+            socket: Some(path.clone()),
+            warm_ms: 30_000,
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            state: EntryState::Idle,
+            started_at: "2026-11-08T00:00:00Z".into(),
+        };
+        publish(&home, &entry).unwrap();
+        // Accept and hold every connection, never answering.
+        listener.set_nonblocking(false).unwrap();
+        std::thread::spawn(move || {
+            let mut held = vec![];
+            while let Ok((s, _)) = listener.accept() {
+                held.push(s);
+            }
+        });
+        let job = crate::jobs::tests::job();
+        let started = Instant::now();
+        let got = offer(
+            &home,
+            SESSION,
+            &job,
+            &mut None,
+            Instant::now() + Duration::from_millis(300),
+            &|| false,
+        );
+        assert_eq!(got, Offered::Retry);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                stopped.store(true, Ordering::SeqCst);
+            });
+            offer(
+                &home,
+                SESSION,
+                &job,
+                &mut None,
+                Instant::now() + Duration::from_secs(60),
+                &|| stopped.load(Ordering::SeqCst),
+            )
+        });
+        assert_eq!(got, Offered::Retry);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        entry.state = EntryState::Busy;
+        publish(&home, &entry).unwrap();
+        drop(lock);
     }
     /// A connection that sends nothing well-formed, an id that is not its job's, or that its
     /// offerer already closed, is dropped unanswered within the read bound.
