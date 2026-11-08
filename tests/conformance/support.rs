@@ -54,7 +54,7 @@ pub const HIDDEN: [&str; 1] = ["__acp"];
 pub const NOT_IMPLEMENTED: [&str; 0] = [];
 
 /// Doctor check names, in the order docs/design.md §A10 lists them.
-pub const DOCTOR_CHECKS: [&str; 14] = [
+pub const DOCTOR_CHECKS: [&str; 15] = [
     "omp_binary",
     "omp_version",
     "omp_capabilities",
@@ -69,6 +69,7 @@ pub const DOCTOR_CHECKS: [&str; 14] = [
     "skill_claude",
     "skill_codex",
     "sandbox",
+    "omp_approval",
 ];
 
 const RUN_TIMEOUT: Duration = Duration::from_secs(60);
@@ -170,6 +171,19 @@ impl Sandbox {
             empty_bin,
             cwd,
         }
+    }
+
+    /// Gives the default profile a non-yolo `tools.approvalMode`, so doctor's `omp_approval_yolo`
+    /// warning (audit S-01) stays out of a test about other warnings.
+    pub fn approval_always_ask(&self) -> &Self {
+        let agent = self.home.join(".omp/agent");
+        fs::create_dir_all(&agent).unwrap();
+        fs::write(
+            agent.join("config.yml"),
+            "tools:\n  approvalMode: always-ask\n",
+        )
+        .unwrap();
+        self
     }
 
     /// Make a fresh directory under the sandbox root (not under HOME).

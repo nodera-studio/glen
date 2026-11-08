@@ -817,6 +817,7 @@ fn ac_v2_102_a_long_unparseable_line_is_not_echoed_in_full() {
 #[test]
 fn ac_v2_102_human_mode_warns_and_exits_zero_for_each_non_ok_verdict() {
     let sb = Sandbox::new();
+    sb.approval_always_ask();
     let above = above_max_tested("-rc.1");
     for (given, detail) in [
         (above.as_str(), "untested"),

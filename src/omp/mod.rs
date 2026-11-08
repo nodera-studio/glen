@@ -1,3 +1,4 @@
+pub mod approval;
 pub mod bin;
 pub mod paths;
 /// The omp version glen is tested against, from `compat.json` (`tested`).

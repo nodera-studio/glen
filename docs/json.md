@@ -1002,7 +1002,8 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
 | Field | Meaning |
 |---|---|
 | `glen` | version, home, home_exists |
-| `omp` | bin, version, tested_version, supported:{min,max_tested}, capabilities |
+| `omp` | bin, version, tested_version, supported:{min,max_tested}, capabilities, approval |
+| `omp.approval` | {mode,source}: omp's tool approval mode for the profile, read from its config without starting omp |
 | `paths` | resolved omp paths and their sources |
 | `extension` | path, state, version, current of the installed omp extension |
 | `checks` | ordered {name,status,value,detail}, status ok/warn/fail/info |
@@ -1033,6 +1034,10 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
       "version": "0.2.0"
     },
     "omp": {
+      "approval": {
+        "mode": "yolo",
+        "source": "default"
+      },
       "bin": "/work/glen/tests/fixtures/bin/fake-omp",
       "capabilities": null,
       "supported": {
@@ -1071,7 +1076,13 @@ Read-only diagnostic. W4 rows are advisory and cannot turn success into failure.
     }
   },
   "ok": true,
-  "v": 1
+  "v": 1,
+  "warnings": [
+    {
+      "code": "omp_approval_yolo",
+      "message": "omp approval mode is yolo for profile default (tools.approvalMode is unset, so omp's default): a pre-approved `glen send` starts an omp agent whose tools run without asking; to change it, add `approvalMode: always-ask` (or `write`) under `tools:` in /tmp/glen-example/agent/config.yml"
+    }
+  ]
 }
 ```
 
@@ -1091,7 +1102,8 @@ object (not a contract block):
 ```
 
 Check order: omp_binary, omp_version, omp_capabilities, profile, agent_dir, sessions_dir,
-glen_home, extension, live_endpoints, warm_workers, omp_env_files, skill_claude, skill_codex, sandbox.
+glen_home, extension, live_endpoints, warm_workers, omp_env_files, skill_claude, skill_codex, sandbox,
+omp_approval.
 `omp_version` is `ok` inside the supported range, `warn` with detail `untested` above
 `max_tested` or `unsupported` below `min`, and `warn` with value `unprobed` when the output cannot
 be parsed; it is `fail` only when `omp --version` cannot run. `omp_capabilities` is `info`
@@ -1105,6 +1117,15 @@ current/not_installed/outdated/newer/different_home/modified/foreign; `live_endp
 `warm_workers` (v0.2) reports `<w> warm, <s> stale, <d> dead` warm-worker registries: `info`, or `warn`
 naming the session and `glen release <handle> --force` when a heartbeat is stale or a registry unreadable.
 The `omp_env_files` check value is an array of absolute paths (empty when none need attention).
+`omp.approval` (audit S-01) is omp's `tools.approvalMode` for the agent dir glen resolves (`--profile`,
+`OMP_PROFILE`/`PI_PROFILE`, `PI_CODING_AGENT_DIR`), read from its `config.yml` (or `config.yaml`)
+without starting omp. glen passes omp no approval flag, so this is the mode a `glen send` session runs
+under, unless the session's project config (`.omp/config.yml`, `.claude/settings.json` in its cwd)
+overrides it. `mode` is `always-ask`, `always-ask-cached`, `write`, `yolo` or `unknown`; `source` is
+the config file's path, `default` (unset or an invalid value, so omp's default `yolo`) or `unknown`
+(the file cannot be read or is in a shape glen does not read, such as a flow mapping; never a
+failure). The `omp_approval` check is `ok` for a non-yolo mode and `warn` for `yolo` or `unknown`;
+`yolo` also adds the `omp_approval_yolo` warning, naming the consequence and the setting to change.
 
 ## `glen completions`
 
@@ -1470,6 +1491,10 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
           "version": "0.2.0"
         },
         "omp": {
+          "approval": {
+            "mode": "yolo",
+            "source": "default"
+          },
           "bin": null,
           "capabilities": null,
           "supported": {
@@ -1535,6 +1560,7 @@ On Linux a Codex marker hides omp's session lease, so a sandboxed refusal to res
 |---|---|---|
 | `omp_version_untested` | doctor | version is newer than the newest tested version, or cannot be parsed |
 | `omp_version_unsupported` | doctor | version is older than the supported minimum |
+| `omp_approval_yolo` | doctor | omp's approval mode for the profile is yolo (set or omp's default): a pre-approved `glen send` starts an omp agent whose tools run without asking |
 | `invalid_env` | any document, send | invalid output limit or job timeout uses fallback |
 | `settle_timeout` | send, wait | persistence settlement timed out |
 | `settle_cancelled` | send, wait | settlement cancelled during worker shutdown |
