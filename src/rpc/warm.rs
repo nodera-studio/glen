@@ -687,7 +687,7 @@ fn endpoint_present(home: &GlenHome, session_id: &str) -> bool {
     match registry::read(home, session_id) {
         registry::Read::Missing => false,
         registry::Read::Unreadable(_) => true,
-        registry::Read::Untrusted(r, _) | registry::Read::Ok(r) => !registry::pid_dead(r.pid),
+        registry::Read::Untrusted(r, _) | registry::Read::Ok(r) => !registry::pid_dead(&r),
     }
 }
 fn timestamp_after(d: Duration) -> String {
@@ -1216,7 +1216,7 @@ fn verify(store: &JobStore, offer: &Offer) -> Result<(), String> {
         offer.stream.as_fd(),
         pid,
         |pid| match liveness::start_token(pid) {
-            liveness::Probe::Running(t) if t == start => Ok(()),
+            liveness::Probe::Running(t) if liveness::same_generation(&t, &start) => Ok(()),
             liveness::Probe::Running(_) => Err(format!(
                 "process {pid} is not the job's recorded worker generation"
             )),

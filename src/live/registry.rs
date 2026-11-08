@@ -29,9 +29,20 @@ pub struct Registry {
     pub cwd: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// The endpoint's pid namespace inode (Linux, S-04/S-10): `pid` is numbered there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pidns: Option<u64>,
+    /// The kernel boot id when the endpoint registered (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 pub fn path(home: &GlenHome, id: &str) -> PathBuf {
     super::run_dir(home).join(format!("{}.json", lock_key(id)))
+}
+/// A registry file's bytes: a regular file only, opened without blocking or following a link,
+/// at most 64 KiB (a writer can plant a FIFO under `run/live`, H2/H3).
+fn read_bytes(p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    crate::glen_home::read_regular(p, 64 * 1024).map(|(b, _)| b)
 }
 pub enum Read {
     Missing,
@@ -42,7 +53,7 @@ pub enum Read {
 }
 pub fn read(home: &GlenHome, id: &str) -> Read {
     let p = path(home, id);
-    match fs::read(&p) {
+    match read_bytes(&p) {
         Ok(b) => match serde_json::from_slice::<Registry>(&b) {
             Ok(r) if r.v == 1 && r.pid > 0 && r.session_id == id && r.socket.is_absolute() => {
                 match check_socket(home, &r) {
@@ -115,16 +126,50 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
     files(home)
         .into_iter()
         .filter_map(|p| {
-            fs::read(p)
+            read_bytes(&p)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
         })
         .filter(|r| r.v == 1 && r.pid > 0 && check_socket(home, r).is_ok())
         .collect()
 }
-/// Only a pid proven gone (`liveness::observe`: never under S-04's hidden pids) is dead.
-pub fn pid_dead(pid: u32) -> bool {
-    matches!(liveness::observe(pid), Probe::Gone)
+/// Only a pid proven gone (`liveness::observe`: never under S-04's hidden pids) is dead, or one
+/// recorded at another boot. A registry recording another pid namespace (S-04/S-10: an
+/// endpoint glen's own pid namespace cannot see) is never dead; one recording neither is
+/// judged on its pid, as before.
+pub fn pid_dead(r: &Registry) -> bool {
+    match liveness::scope(r.boot_id.as_deref(), r.pidns) {
+        liveness::Scope::OtherBoot => true,
+        liveness::Scope::Elsewhere => false,
+        liveness::Scope::Here => matches!(liveness::observe(r.pid), Probe::Gone),
+    }
+}
+/// Whether `run/live/<pid>.sock` of a dead registry may go. The pid is probed in this
+/// process's pid namespace, so it must be gone here and numbered here: a registry from another
+/// boot is stale, but `<pid>.sock` is a current endpoint's unless the record names this pid
+/// namespace (the initial one keeps its inode across boots). And no current registry of another
+/// pid namespace may name the same pid, as in the extension's sweep (S-04/S-10).
+fn socket_dead(home: &GlenHome, reg: &Registry) -> bool {
+    !numbered_elsewhere(reg)
+        && matches!(liveness::observe(reg.pid), Probe::Gone)
+        && !files(home).into_iter().any(|p| {
+            read_bytes(&p)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
+                .is_some_and(|r| r.pid == reg.pid && numbered_elsewhere(&r))
+        })
+}
+/// Whether a registry's pid is numbered in a pid namespace other than this process's: another
+/// namespace, a place this process cannot compare, or another boot whose record does not name
+/// this namespace.
+fn numbered_elsewhere(r: &Registry) -> bool {
+    match liveness::scope(r.boot_id.as_deref(), r.pidns) {
+        liveness::Scope::Here => false,
+        liveness::Scope::OtherBoot => {
+            r.pidns.is_none() || r.pidns != liveness::here().map(|h| h.pidns)
+        }
+        liveness::Scope::Elsewhere => true,
+    }
 }
 /// A failed stale-registry cleanup, carrying the raw I/O error alongside the
 /// formatted message so callers can tell a sandbox permission denial from any
@@ -164,7 +209,7 @@ pub fn remove_if_unchanged(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(io(e)),
     }
-    let bytes = fs::read(&tombstone).map_err(io)?;
+    let bytes = read_bytes(&tombstone).map_err(io)?;
     let unchanged = serde_json::from_slice::<Registry>(&bytes).is_ok_and(|now| now == *reg);
     if !unchanged {
         // Restore without clobbering a concurrent atomic publisher. Keep an
@@ -178,7 +223,7 @@ pub fn remove_if_unchanged(
     }
     fs::remove_file(&tombstone).map_err(io)?;
     let owned_socket = super::run_dir(home).join(format!("{}.sock", reg.pid));
-    if socket_too && reg.socket == owned_socket && pid_dead(reg.pid) {
+    if socket_too && reg.socket == owned_socket && socket_dead(home, reg) {
         match fs::remove_file(&owned_socket) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -203,7 +248,7 @@ pub fn union(
     for r in registries {
         // AC-H109: a registry naming a process more confined than glen never lends a session
         // its cwd or title (the confinement-ordering rule, without a connection).
-        if pid_dead(r.pid)
+        if pid_dead(r)
             || catalog.sessions.iter().any(|s| s.id == r.session_id)
             || crate::proc_ident::may_trust_pid(r.pid).is_err()
         {
@@ -260,7 +305,7 @@ pub fn probe(
     let all = files(home)
         .into_iter()
         .filter_map(|p| {
-            fs::read(p)
+            read_bytes(&p)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
         })
@@ -268,7 +313,7 @@ pub fn probe(
         .filter_map(|r| match check_socket(home, &r) {
             Ok(()) => Some(Ok(r)),
             // A dead pid's registry is stale, not untrusted.
-            Err(_) if pid_dead(r.pid) => None,
+            Err(_) if pid_dead(&r) => None,
             Err(_) => Some(Err(r.session_id)),
         })
         .collect::<Vec<_>>();
@@ -389,6 +434,8 @@ mod cleanup_tests {
             started_at: Some("2026-10-30T00:00:00Z".into()),
             cwd: None,
             title: None,
+            pidns: None,
+            boot_id: None,
         };
         std::fs::write(path(&home, "stale"), serde_json::to_vec(&registry).unwrap()).unwrap();
         remove_if_unchanged(&home, &registry, true).unwrap();
@@ -399,5 +446,174 @@ mod cleanup_tests {
         std::fs::write(path(&home, "stale"), serde_json::to_vec(&registry).unwrap()).unwrap();
         remove_if_unchanged(&home, &registry, true).unwrap();
         assert!(!registry.socket.exists());
+    }
+}
+
+#[cfg(test)]
+mod h3_tests {
+    use super::*;
+    /// S-04/S-10 (AC-H302): a registry recording another pid namespace is never dead, so it and
+    /// its socket survive cleanup; another boot is dead; a legacy registry is judged on its pid.
+    #[test]
+    fn pid_dead_consults_the_recorded_namespace() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        home.ensure_dir("run/live").unwrap();
+        let pid = crate::jobs::liveness::tests_dead_pid();
+        let here = liveness::here();
+        let mut r = Registry {
+            v: 1,
+            pid,
+            session_id: "s".into(),
+            session_file: None,
+            socket: super::super::run_dir(&home).join(format!("{pid}.sock")),
+            ext_version: None,
+            omp_version: None,
+            protocol: Some(1),
+            mode: Some("tui".into()),
+            started_at: None,
+            cwd: None,
+            title: None,
+            pidns: None,
+            boot_id: None,
+        };
+        assert!(pid_dead(&r), "legacy: a gone pid is dead");
+        r.pidns = Some(here.map_or(7, |h| h.pidns + 1));
+        r.boot_id = here.map(|h| h.boot_id.clone());
+        assert!(!pid_dead(&r), "another pid namespace is never dead");
+        std::fs::write(path(&home, "s"), serde_json::to_vec(&r).unwrap()).unwrap();
+        std::fs::write(&r.socket, "endpoint").unwrap();
+        assert!(remove_if_unchanged(&home, &r, true).unwrap());
+        assert!(r.socket.exists(), "the socket of a foreign namespace stays");
+        if let Some(h) = here {
+            r.pidns = Some(h.pidns);
+            assert!(pid_dead(&r), "this namespace: a gone pid is dead");
+            r.pidns = Some(h.pidns + 1);
+            r.boot_id = Some("another-boot".into());
+            assert!(pid_dead(&r), "another boot is dead");
+            r.pidns = Some(h.pidns);
+            r.boot_id = Some(h.boot_id.clone());
+            r.pid = std::process::id();
+            assert!(!pid_dead(&r), "a live pid here");
+        }
+        // The fields are omitted when unknown and read back when present.
+        let legacy = serde_json::to_value(Registry {
+            pidns: None,
+            boot_id: None,
+            ..r.clone()
+        })
+        .unwrap();
+        assert!(legacy.get("pidns").is_none() && legacy.get("boot_id").is_none());
+        let back: Registry =
+            serde_json::from_value(serde_json::json!({"v":1,"pid":5,"session_id":"s","socket":"/x/5.sock","pidns":42,"boot_id":"b"})).unwrap();
+        assert_eq!((back.pidns, back.boot_id.as_deref()), (Some(42), Some("b")));
+    }
+}
+
+#[cfg(test)]
+mod h3_fix1_tests {
+    use super::*;
+    fn reg(home: &GlenHome, id: &str, pid: u32) -> Registry {
+        Registry {
+            v: 1,
+            pid,
+            session_id: id.into(),
+            session_file: None,
+            socket: super::super::run_dir(home).join(format!("{pid}.sock")),
+            ext_version: None,
+            omp_version: None,
+            protocol: Some(1),
+            mode: Some("tui".into()),
+            started_at: None,
+            cwd: None,
+            title: None,
+            pidns: None,
+            boot_id: None,
+        }
+    }
+    fn publish(home: &GlenHome, r: &Registry) {
+        std::fs::write(path(home, &r.session_id), serde_json::to_vec(r).unwrap()).unwrap();
+    }
+    /// MEDIUM-001: a stale registry from another boot and another pid namespace names pid P,
+    /// whose number this process probes in its own namespace: `P.sock` may be a live endpoint's
+    /// now, so cleanup removes the registry and keeps the socket.
+    #[test]
+    fn an_other_boot_registry_of_another_namespace_keeps_the_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        home.ensure_dir("run/live").unwrap();
+        let pid = liveness::tests_dead_pid();
+        let mut r = reg(&home, "old", pid);
+        r.boot_id = Some("another-boot".into());
+        r.pidns = Some(liveness::here().map_or(7, |h| h.pidns + 1));
+        publish(&home, &r);
+        std::fs::write(&r.socket, "a live endpoint's socket").unwrap();
+        remove_if_unchanged(&home, &r, true).unwrap();
+        assert!(r.socket.exists(), "the socket is kept");
+        // The same boot record in this pid namespace: the pid is dead here, the socket goes.
+        if let Some(h) = liveness::here() {
+            r.pidns = Some(h.pidns);
+            publish(&home, &r);
+            assert!(remove_if_unchanged(&home, &r, true).unwrap());
+            assert!(!path(&home, "old").exists());
+            assert!(
+                !r.socket.exists(),
+                "this namespace's dead pid: the socket goes"
+            );
+        }
+    }
+    /// A writer can plant a FIFO where a registry should be: reading registries never blocks
+    /// on it (index, read and the cleanup scan all skip it at once).
+    #[test]
+    fn a_fifo_registry_never_blocks_a_reader() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        home.ensure_dir("run/live").unwrap();
+        let fifo = path(&home, "planted");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let r = reg(&home, "old", liveness::tests_dead_pid());
+        publish(&home, &r);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = home.clone();
+        std::thread::spawn(move || {
+            let n = index(&h).len();
+            let planted = matches!(read(&h, "planted"), Read::Unreadable(_));
+            let _ = remove_if_unchanged(&h, &r, true);
+            tx.send((n, planted)).unwrap();
+        });
+        let (_, planted) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO registry blocked a reader");
+        assert!(planted, "the FIFO reads as unreadable");
+    }
+    /// MEDIUM-001, as the extension's sweep does: a socket whose pid a current registry of
+    /// another pid namespace names is never unlinked, whatever the stale registry says.
+    #[test]
+    fn a_pid_named_by_another_namespace_keeps_its_socket() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        home.ensure_dir("run/live").unwrap();
+        let pid = liveness::tests_dead_pid();
+        let mut live = reg(&home, "live", pid);
+        live.pidns = Some(liveness::here().map_or(7, |h| h.pidns + 1));
+        live.boot_id = liveness::here().map(|h| h.boot_id.clone());
+        publish(&home, &live);
+        let stale = reg(&home, "stale", pid);
+        publish(&home, &stale);
+        std::fs::write(&stale.socket, "the other namespace's endpoint").unwrap();
+        assert!(pid_dead(&stale));
+        assert!(remove_if_unchanged(&home, &stale, true).unwrap());
+        assert!(!path(&home, "stale").exists());
+        assert!(stale.socket.exists(), "the socket is kept");
+        assert!(path(&home, "live").exists());
     }
 }

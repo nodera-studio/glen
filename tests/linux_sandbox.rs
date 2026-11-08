@@ -18,9 +18,8 @@ use std::{
 /// `bwrap --ro-bind / / --dev /dev --proc /proc --die-with-parent [--unshare-net] [--bind W W]…
 /// -- <program> <args>`. Carries the harness command's own program/args/envs (via
 /// `env_clear()` + `get_envs()`), plus `PATH=/usr/bin:/bin` so `bash`/coreutils resolve. No
-/// `--unshare-pid`: glen's live-endpoint liveness check uses the host pid
-/// (`src/live/registry.rs`), which a pid namespace would hide; `bwrap_pid` adds it for
-/// scenarios that never reach a live endpoint.
+/// `--unshare-pid`; `bwrap_pid` adds it (a live registry records its pid namespace, so a
+/// sender in another one takes its pid for unknown, never dead: R8).
 fn bwrap(cmd: &Command, net: bool, writable: &[&std::path::Path]) -> Output {
     bwrap_pid(cmd, net, false, writable)
 }
@@ -398,6 +397,54 @@ fn s11_a_confined_sender_in_its_own_pid_namespace_delivers() {
     assert_eq!(exit_code(&out), 0, "{v}");
     assert_eq!(v["data"]["job"]["route"], "live", "{v}");
     assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
+}
+/// R8 (S-04/S-10, AC-H302): a sender inside `bwrap --unshare-pid` with **no** Codex marker
+/// cannot see the host endpoint's pid. It once took that pid for dead and deleted the host's
+/// live registry and socket. The registry records the endpoint's pid namespace, which is not the
+/// sender's, so the pid is unknown there, never dead: both survive, and the host still delivers.
+/// The sandboxed send itself may deliver or refuse; only the cleanup is asserted.
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn r8_an_unmarked_pid_namespace_keeps_the_host_endpoint() {
+    let mut lb = LiveBox::new();
+    lb.start_ext(A_ID, "ok", &[]);
+    let registry = lb.registry(A_ID);
+    let before = std::fs::read_to_string(&registry).unwrap();
+    let socket = std::path::PathBuf::from(
+        serde_json::from_str::<serde_json::Value>(&before).unwrap()["socket"]
+            .as_str()
+            .unwrap(),
+    );
+    assert!(socket.exists(), "the endpoint is bound");
+    let c = lb
+        .rpc
+        .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
+    let writable = lb.rpc.omp.glen_home.parent().unwrap().to_path_buf();
+    let inside = bwrap_pid(&c, true, true, &[&writable]);
+    let said = format!(
+        "exit {}: {} {}",
+        exit_code(&inside),
+        String::from_utf8_lossy(&inside.stdout),
+        String::from_utf8_lossy(&inside.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&registry).ok().as_deref(),
+        Some(before.as_str()),
+        "the host's live registry survives a sender in another pid namespace ({said})"
+    );
+    assert!(
+        socket.exists(),
+        "the host's socket survives a sender in another pid namespace ({said})"
+    );
+    // The host still reaches its own endpoint.
+    let out = lb
+        .rpc
+        .glen(&["send", "e27c0de", "again", "--wait", "20s", "--json"])
+        .captured();
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 0, "{v}");
+    assert_eq!(v["data"]["job"]["route"], "live", "{v}");
+    assert_eq!(v["data"]["assistant_text"], "pong: again", "{v}");
 }
 #[test]
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]

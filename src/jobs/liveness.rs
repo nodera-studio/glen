@@ -22,8 +22,51 @@ pub fn start_token(pid: u32) -> Probe {
         return Probe::Gone;
     }
     match f.get(19) {
-        Some(t) => Probe::Running(format!("linux:{t}")),
+        Some(t) => Probe::Running(token(here(), t)),
         None => Probe::Unknown("missing starttime".into()),
+    }
+}
+/// Where this process numbers pids (S-04/S-10): the kernel's boot id and the inode of its own
+/// pid namespace. A pid, and the start token read for it, mean something only there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Here {
+    pub boot_id: String,
+    pub pidns: u64,
+}
+/// [`Here`] for this process, read once from `/proc/self/ns/pid` and
+/// `/proc/sys/kernel/random/boot_id` (kernel files, not writer-controlled). `None` off Linux or
+/// when either cannot be read; tokens then keep the legacy `linux:<ticks>` form.
+pub fn here() -> Option<&'static Here> {
+    static HERE: std::sync::OnceLock<Option<Here>> = std::sync::OnceLock::new();
+    HERE.get_or_init(read_here).as_ref()
+}
+#[cfg(target_os = "linux")]
+fn read_here() -> Option<Here> {
+    let link = std::fs::read_link("/proc/self/ns/pid").ok()?;
+    let pidns = parse_ns_link(link.to_str()?)?;
+    let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+    let boot_id = boot_id.trim();
+    // A colon would break the token's fields; the kernel prints a UUID.
+    (!boot_id.is_empty() && !boot_id.contains(':')).then(|| Here {
+        boot_id: boot_id.to_owned(),
+        pidns,
+    })
+}
+#[cfg(not(target_os = "linux"))]
+fn read_here() -> Option<Here> {
+    None
+}
+/// The inode of a `pid:[4026531836]` namespace link.
+pub fn parse_ns_link(link: &str) -> Option<u64> {
+    link.strip_prefix("pid:[")?.strip_suffix(']')?.parse().ok()
+}
+/// A Linux start token: `linux:<boot_id>:<pidns_inode>:<ticks>`, or the legacy `linux:<ticks>`
+/// when [`here`] is unknown.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn token(here: Option<&Here>, ticks: &str) -> String {
+    match here {
+        Some(h) => format!("linux:{}:{}:{ticks}", h.boot_id, h.pidns),
+        None => format!("linux:{ticks}"),
     }
 }
 #[cfg(target_os = "macos")]
@@ -122,12 +165,106 @@ pub enum Liveness {
     Dead,
     Unknown,
 }
-pub fn check(pid: u32, start: &str) -> Liveness {
-    match observe(pid) {
-        Probe::Running(t) if t == start => Liveness::Alive,
-        Probe::Running(_) | Probe::Gone => Liveness::Dead,
-        Probe::Unknown(_) => Liveness::Unknown,
+/// Where a recorded pid lives relative to this process (S-04/S-10).
+#[derive(Debug, PartialEq, Eq)]
+pub enum Scope {
+    /// This boot and this pid namespace, or no record of either (legacy): probe the pid.
+    Here,
+    /// Another boot: the process cannot be running.
+    OtherBoot,
+    /// Another pid namespace, or a recorded place this process cannot compare with its own:
+    /// the pid number means nothing here, so its liveness is unknown, never dead.
+    Elsewhere,
+}
+/// [`Scope`] of a recorded `boot_id`/`pidns` against `here`. Each recorded field that this
+/// process cannot compare counts as elsewhere: fail toward unknown, never toward dead.
+pub fn scope_in(here: Option<&Here>, boot_id: Option<&str>, pidns: Option<u64>) -> Scope {
+    if let Some(boot_id) = boot_id {
+        match here {
+            Some(h) if h.boot_id != boot_id => return Scope::OtherBoot,
+            Some(_) => (),
+            None => return Scope::Elsewhere,
+        }
     }
+    match (pidns, here) {
+        (Some(ns), Some(h)) if ns != h.pidns => Scope::Elsewhere,
+        (Some(_), None) => Scope::Elsewhere,
+        _ => Scope::Here,
+    }
+}
+/// [`scope_in`] for this process.
+pub fn scope(boot_id: Option<&str>, pidns: Option<u64>) -> Scope {
+    scope_in(here(), boot_id, pidns)
+}
+/// A start token split into its parts. `Linux` covers both the namespaced form (`boot_id` and
+/// `pidns` set) and the legacy `linux:<ticks>`; anything else (macOS, or a token glen never
+/// wrote) is `Opaque` and compared as a string.
+#[derive(Debug, PartialEq, Eq)]
+enum Token<'a> {
+    Linux {
+        boot_id: Option<&'a str>,
+        pidns: Option<u64>,
+        ticks: &'a str,
+    },
+    Opaque(&'a str),
+}
+fn parse(token: &str) -> Token<'_> {
+    let Some(rest) = token.strip_prefix("linux:") else {
+        return Token::Opaque(token);
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    match parts.as_slice() {
+        [ticks] => Token::Linux {
+            boot_id: None,
+            pidns: None,
+            ticks,
+        },
+        [boot_id, pidns, ticks] if !boot_id.is_empty() => match pidns.parse() {
+            Ok(pidns) => Token::Linux {
+                boot_id: Some(boot_id),
+                pidns: Some(pidns),
+                ticks,
+            },
+            Err(_) => Token::Opaque(token),
+        },
+        _ => Token::Opaque(token),
+    }
+}
+/// Compares a recorded start token with what this process sees (`probe`, run only when the
+/// recorded token's place is here). A token from another boot is dead; one from another pid
+/// namespace is unknown, never dead; a legacy token compares its ticks as before.
+fn judge(recorded: &str, here: Option<&Here>, probe: impl FnOnce() -> Probe) -> Liveness {
+    match parse(recorded) {
+        Token::Linux {
+            boot_id,
+            pidns,
+            ticks,
+        } => match scope_in(here, boot_id, pidns) {
+            Scope::OtherBoot => Liveness::Dead,
+            Scope::Elsewhere => Liveness::Unknown,
+            Scope::Here => match probe() {
+                Probe::Running(t) => match parse(&t) {
+                    Token::Linux { ticks: now, .. } if now == ticks => Liveness::Alive,
+                    _ => Liveness::Dead,
+                },
+                Probe::Gone => Liveness::Dead,
+                Probe::Unknown(_) => Liveness::Unknown,
+            },
+        },
+        Token::Opaque(_) => match probe() {
+            Probe::Running(t) if t == recorded => Liveness::Alive,
+            Probe::Running(_) | Probe::Gone => Liveness::Dead,
+            Probe::Unknown(_) => Liveness::Unknown,
+        },
+    }
+}
+pub fn check(pid: u32, start: &str) -> Liveness {
+    judge(start, here(), || observe(pid))
+}
+/// Whether `observed`, a token [`start_token`] just read in this process, names the same
+/// process generation as `recorded` (any format). Unknown is not a match.
+pub fn same_generation(observed: &str, recorded: &str) -> bool {
+    judge(recorded, here(), || Probe::Running(observed.to_owned())) == Liveness::Alive
 }
 pub const SPAWN_GRACE: Duration = Duration::from_secs(10);
 pub fn is_lost(s: &Status, now: jiff::Timestamp) -> bool {
@@ -515,5 +652,182 @@ mod s04_tests {
         assert!(!is_lost(&s, jiff::Timestamp::now()));
         assert_eq!(refresh(&store, &id, s.clone()).status, State::Accepted);
         assert_eq!(store.read_status(&id).unwrap().status, State::Accepted);
+    }
+}
+
+/// S-04/S-10 (AC-H301, AC-H302, AC-H304): the namespaced token and its structured compare.
+#[cfg(test)]
+mod h3_tests {
+    use super::*;
+    fn at(boot: &str, ns: u64) -> Here {
+        Here {
+            boot_id: boot.into(),
+            pidns: ns,
+        }
+    }
+    const BOOT: &str = "6f1c0de4-0000-4000-8000-000000000001";
+    const OTHER_BOOT: &str = "6f1c0de4-0000-4000-8000-000000000002";
+    #[test]
+    fn token_format_and_parse_round_trip() {
+        let h = at(BOOT, 4026531836);
+        let t = token(Some(&h), "1234");
+        assert_eq!(t, format!("linux:{BOOT}:4026531836:1234"));
+        assert_eq!(
+            parse(&t),
+            Token::Linux {
+                boot_id: Some(BOOT),
+                pidns: Some(4026531836),
+                ticks: "1234"
+            }
+        );
+        assert_eq!(token(None, "1234"), "linux:1234");
+        assert_eq!(
+            parse("linux:1234"),
+            Token::Linux {
+                boot_id: None,
+                pidns: None,
+                ticks: "1234"
+            }
+        );
+        for opaque in [
+            "macos:1700000000.000001",
+            "bogus start",
+            "linux:b:notanumber:1",
+            "linux::1:1",
+            "linux:a:b",
+        ] {
+            assert_eq!(parse(opaque), Token::Opaque(opaque), "{opaque}");
+        }
+        assert_eq!(parse_ns_link("pid:[4026531836]"), Some(4026531836));
+        for bad in ["net:[1]", "pid:[x]", "pid:4026531836", ""] {
+            assert_eq!(parse_ns_link(bad), None, "{bad}");
+        }
+    }
+    #[test]
+    fn scope_table() {
+        let h = at(BOOT, 7);
+        type Case<'a> = (Option<&'a Here>, Option<&'a str>, Option<u64>, Scope);
+        let cases: &[Case] = &[
+            (Some(&h), None, None, Scope::Here),
+            (Some(&h), Some(BOOT), Some(7), Scope::Here),
+            (Some(&h), Some(BOOT), None, Scope::Here),
+            (Some(&h), None, Some(7), Scope::Here),
+            (Some(&h), Some(OTHER_BOOT), Some(7), Scope::OtherBoot),
+            // Another boot wins over another namespace: nothing from that boot runs now.
+            (Some(&h), Some(OTHER_BOOT), Some(8), Scope::OtherBoot),
+            (Some(&h), Some(BOOT), Some(8), Scope::Elsewhere),
+            (Some(&h), None, Some(8), Scope::Elsewhere),
+            // Recorded facts this process cannot compare: unknown, never dead.
+            (None, Some(BOOT), Some(7), Scope::Elsewhere),
+            (None, None, Some(7), Scope::Elsewhere),
+            (None, Some(BOOT), None, Scope::Elsewhere),
+            (None, None, None, Scope::Here),
+        ];
+        for (i, (here, boot, ns, want)) in cases.iter().enumerate() {
+            assert_eq!(scope_in(*here, *boot, *ns), *want, "case {i}");
+        }
+    }
+    /// AC-H301: another boot is dead, another pid namespace is unknown (whatever the probe
+    /// says, which is never consulted), legacy and opaque tokens compare as before.
+    #[test]
+    fn judge_table() {
+        use Liveness::*;
+        let h = at(BOOT, 7);
+        let now = format!("linux:{BOOT}:7:100");
+        let ours = |ticks: &str| format!("linux:{BOOT}:7:{ticks}");
+        let running = |t: &str| {
+            let t = t.to_owned();
+            move || Probe::Running(t)
+        };
+        type Case = (String, Option<&'static str>, Liveness);
+        let cases: Vec<Case> = vec![
+            // Namespaced, here.
+            (ours("100"), Some("run"), Alive),
+            (ours("99"), Some("run"), Dead),
+            (ours("100"), Some("gone"), Dead),
+            (ours("100"), Some("unknown"), Unknown),
+            // Namespaced, elsewhere: never probed.
+            (format!("linux:{OTHER_BOOT}:7:100"), None, Dead),
+            (format!("linux:{BOOT}:8:100"), None, Unknown),
+            (format!("linux:{OTHER_BOOT}:8:100"), None, Dead),
+            // Legacy: the ticks against the probe, as before.
+            ("linux:100".into(), Some("run"), Alive),
+            ("linux:99".into(), Some("run"), Dead),
+            ("linux:100".into(), Some("gone"), Dead),
+            ("linux:100".into(), Some("unknown"), Unknown),
+            // Opaque (macOS, forged, malformed): string equality, as before.
+            ("bogus".into(), Some("run"), Dead),
+            ("bogus".into(), Some("gone"), Dead),
+            ("bogus".into(), Some("unknown"), Unknown),
+        ];
+        for (recorded, probe, want) in cases {
+            let got = match probe {
+                None => judge(&recorded, Some(&h), || {
+                    panic!("{recorded}: a token from elsewhere is never probed")
+                }),
+                Some("run") => judge(&recorded, Some(&h), running(&now)),
+                Some("gone") => judge(&recorded, Some(&h), || Probe::Gone),
+                Some(_) => judge(&recorded, Some(&h), || Probe::Unknown("x".into())),
+            };
+            assert_eq!(got, want, "{recorded} probe {probe:?}");
+        }
+        // A legacy observer (no `Here`) reading a namespaced token: unknown, never dead.
+        assert_eq!(judge(&ours("100"), None, || Probe::Gone), Unknown);
+        assert_eq!(judge("linux:100", None, running("linux:100")), Alive);
+        // A legacy probe answer against a legacy record (an observer without `Here`).
+        assert_eq!(judge("linux:100", None, || Probe::Gone), Dead);
+        // macOS tokens are opaque and unchanged.
+        let mac = "macos:1700000000.000001";
+        assert_eq!(judge(mac, None, running(mac)), Alive);
+        assert_eq!(judge(mac, None, running("macos:1700000000.000002")), Dead);
+    }
+    /// AC-H304: this process's own token, in its current and its legacy form, is alive.
+    #[test]
+    fn both_formats_of_own_token_are_alive() {
+        let me = current().unwrap();
+        assert_eq!(check(me.pid, &me.start), Liveness::Alive);
+        if let Token::Linux { ticks, .. } = parse(&me.start) {
+            assert_eq!(check(me.pid, &format!("linux:{ticks}")), Liveness::Alive);
+            assert!(same_generation(&me.start, &format!("linux:{ticks}")));
+            if let Some(h) = here() {
+                assert!(
+                    me.start
+                        .starts_with(&format!("linux:{}:{}:", h.boot_id, h.pidns))
+                );
+                let foreign = format!("linux:{}:{}:{ticks}", h.boot_id, h.pidns + 1);
+                assert_eq!(check(me.pid, &foreign), Liveness::Unknown);
+                assert!(!same_generation(&me.start, &foreign));
+            }
+        }
+        assert!(same_generation(&me.start, &me.start));
+    }
+    /// AC-H302: a job whose worker token names another pid namespace is never persisted
+    /// `lost`, even when its pid is gone here; one from another boot is.
+    #[test]
+    fn a_foreign_namespace_job_is_never_lost() {
+        let gone = tests_dead_pid();
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let (boot, ns) = here()
+            .map(|h| (h.boot_id.clone(), h.pidns))
+            .unwrap_or((BOOT.into(), 7));
+        for (start, lost) in [
+            (format!("linux:{boot}:{}:1", ns + 1), false),
+            (format!("linux:{OTHER_BOOT}:{ns}:1"), here().is_some()),
+        ] {
+            let j = crate::jobs::tests::job();
+            let id = JobId::parse(&j.id).unwrap();
+            store.create(&j).unwrap();
+            let mut s = store.read_status(&id).unwrap();
+            s.status = State::Accepted;
+            s.updated_at = "2000-01-01T00:00:00Z".into();
+            s.worker_pid = Some(gone);
+            s.worker_start = Some(start.clone());
+            store.write_status(&id, &s).unwrap();
+            assert_eq!(is_lost(&s, jiff::Timestamp::now()), lost, "{start}");
+            let want = if lost { State::Lost } else { State::Accepted };
+            assert_eq!(refresh(&store, &id, s).status, want, "{start}");
+            assert_eq!(store.read_status(&id).unwrap().status, want, "{start}");
+        }
     }
 }
