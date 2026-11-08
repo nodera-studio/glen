@@ -22,7 +22,11 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
 };
-use yaml_rust2::{Yaml, YamlLoader};
+use yaml_rust2::{
+    Event, Yaml, YamlLoader,
+    parser::{MarkedEventReceiver, Parser},
+    scanner::Marker,
+};
 
 pub const SETTING: &str = "tools.approvalMode";
 pub const MODES: [&str; 4] = ["always-ask", "always-ask-cached", "write", "yolo"];
@@ -92,69 +96,140 @@ fn overlays(env: &Env) -> Vec<PathBuf> {
         .collect()
 }
 
+/// One layer's `tools`, reduced to what decides `tools.approvalMode` under omp's deep merge
+/// (`config/settings.ts` `#deepMerge`): a mapping merges into a mapping below it, anything else
+/// (null included) replaces it, and an absent key leaves the layer below alone.
+#[derive(Clone, Debug)]
+enum Tools {
+    Absent,
+    NotMap,
+    /// The `approvalMode` leaf: `None` when absent, `Some(None)` when null, else the string and
+    /// the file that set it.
+    Map(Option<Option<(String, String)>>),
+}
+fn merge(base: Tools, over: Tools) -> Tools {
+    match (base, over) {
+        (base, Tools::Absent) => base,
+        (_, Tools::NotMap) => Tools::NotMap,
+        (Tools::Map(below), Tools::Map(None)) => Tools::Map(below),
+        (_, over) => over,
+    }
+}
+
 /// The approval mode omp uses for sessions under `agent_dir`, before project config and flags.
 pub fn read(env: &Env, agent_dir: &Path) -> Approval {
-    let mut layers = vec![];
     let global = config_file(agent_dir);
-    if std::fs::symlink_metadata(&global).is_ok() {
-        layers.push(global);
-    }
-    layers.extend(overlays(env));
-    // omp's deep merge, reduced to `tools.approvalMode`: a mapping `tools` merges into a mapping
-    // below it, anything else (null included) replaces it; a null leaf replaces and reads unset.
-    let mut mode: Option<(String, String)> = None;
-    let mut tools_is_map = false;
-    for path in layers {
-        let shown = path.to_string_lossy().into_owned();
-        let root = match load(&path) {
-            Ok(root) => root,
-            Err(why) => return Approval::unknown(format!("cannot read {shown}: {why}")),
-        };
-        let Some(tools) = root
-            .as_hash()
-            .and_then(|h| h.get(&Yaml::String("tools".into())))
-        else {
-            continue;
-        };
-        let Yaml::Hash(tools) = tools else {
-            (mode, tools_is_map) = (None, false);
-            continue;
-        };
-        if !tools_is_map {
-            mode = None;
+    let global = if std::fs::symlink_metadata(&global).is_ok() {
+        match layer(&global) {
+            Ok(t) => t,
+            Err(a) => return a,
         }
-        tools_is_map = true;
-        match tools.get(&Yaml::String("approvalMode".into())) {
-            None => {}
-            Some(Yaml::Null) => mode = None,
-            Some(Yaml::String(value)) => mode = Some((value.clone(), shown)),
-            Some(_) => {
-                return Approval::unknown(format!("{SETTING} in {shown} is not a string"));
-            }
+    } else {
+        Tools::Absent
+    };
+    // omp deep-merges every overlay into one aggregate first, then merges that aggregate over
+    // the global (and project) layers (`#readConfigOverlays` and `#mergeOwnLayers`).
+    let mut overlay = Tools::Absent;
+    for path in overlays(env) {
+        match layer(&path) {
+            Ok(t) => overlay = merge(overlay, t),
+            Err(a) => return a,
         }
     }
-    match mode {
-        None => Approval::default_mode(None),
-        Some((value, source)) if MODES.contains(&value.as_str()) => Approval {
+    match merge(global, overlay) {
+        Tools::Map(Some(Some((value, source)))) if MODES.contains(&value.as_str()) => Approval {
             mode: value,
             source,
             note: None,
         },
-        Some((value, source)) => Approval::default_mode(Some(format!(
+        Tools::Map(Some(Some((value, source)))) => Approval::default_mode(Some(format!(
             "omp ignores the invalid {SETTING} {value:?} in {source} and uses its default"
         ))),
+        _ => Approval::default_mode(None),
+    }
+}
+
+/// One config file's [`Tools`], or the `unknown` answer when glen cannot read it with certainty.
+fn layer(path: &Path) -> Result<Tools, Approval> {
+    let shown = path.to_string_lossy().into_owned();
+    let root =
+        load(path).map_err(|why| Approval::unknown(format!("cannot read {shown}: {why}")))?;
+    let Some(tools) = root
+        .as_hash()
+        .and_then(|h| h.get(&Yaml::String("tools".into())))
+    else {
+        return Ok(Tools::Absent);
+    };
+    let Yaml::Hash(tools) = tools else {
+        return Ok(Tools::NotMap);
+    };
+    Ok(Tools::Map(
+        match tools.get(&Yaml::String("approvalMode".into())) {
+            None => None,
+            Some(Yaml::Null) => Some(None),
+            Some(Yaml::String(value)) => Some(Some((value.clone(), shown))),
+            Some(_) => {
+                return Err(Approval::unknown(format!(
+                    "{SETTING} in {shown} is not a string"
+                )));
+            }
+        },
+    ))
+}
+
+/// Opens `path` for reading only if it is a regular file. On Unix the open never blocks (a path
+/// swapped to a FIFO after a check cannot hang it) and the type comes from the opened file.
+fn open_regular(path: &Path) -> Result<std::fs::File, String> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .map_err(|e| e.to_string())?
+    };
+    #[cfg(not(unix))]
+    let file = {
+        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
+        if !meta.is_file() {
+            return Err("not a regular file".into());
+        }
+        std::fs::File::open(path).map_err(|e| e.to_string())?
+    };
+    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
+        return Err("not a regular file".into());
+    }
+    Ok(file)
+}
+
+/// Parser features whose handling differs between yaml-rust2 and Bun's `YAML.parse`, so a file
+/// using them anywhere is unknown: an explicit tag (`!!str`, `!custom`) and a `<<` merge key,
+/// which Bun expands and yaml-rust2 keeps as a plain key.
+struct Unsupported(Option<&'static str>);
+impl MarkedEventReceiver for Unsupported {
+    fn on_event(&mut self, ev: Event, _mark: Marker) {
+        if self.0.is_some() {
+            return;
+        }
+        match ev {
+            Event::Scalar(_, _, _, Some(_))
+            | Event::SequenceStart(_, Some(_))
+            | Event::MappingStart(_, Some(_)) => self.0 = Some("an explicit YAML tag"),
+            Event::Scalar(value, _, _, None) if value == "<<" => {
+                self.0 = Some("a YAML merge key (<<)")
+            }
+            _ => {}
+        }
     }
 }
 
 /// One config file as a YAML mapping (an empty document is an empty mapping).
 fn load(path: &Path) -> Result<Yaml, String> {
-    let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-    if !meta.is_file() {
-        return Err("not a regular file".into());
-    }
     let mut bytes = vec![];
-    std::fs::File::open(path)
-        .and_then(|f| f.take(MAX_BYTES + 1).read_to_end(&mut bytes))
+    open_regular(path)?
+        .take(MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(format!("larger than {MAX_BYTES} bytes"));
@@ -162,6 +237,13 @@ fn load(path: &Path) -> Result<Yaml, String> {
     let text = String::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let mut docs = YamlLoader::load_from_str(text).map_err(|e| format!("invalid YAML: {e}"))?;
+    let mut unsupported = Unsupported(None);
+    Parser::new_from_str(text)
+        .load(&mut unsupported, true)
+        .map_err(|e| format!("invalid YAML: {e}"))?;
+    if let Some(what) = unsupported.0 {
+        return Err(format!("uses {what}"));
+    }
     match docs.len() {
         0 => return Ok(Yaml::Hash(Default::default())),
         1 => {}
@@ -256,6 +338,13 @@ mod tests {
             "a: 1\na: 2\ntools:\n  approvalMode: write\n",
             "tools:\n  approvalMode: 1\n",
             "tools:\n  approvalMode: [write]\n",
+            // Bun expands merge keys and tags differently from yaml-rust2: never guess.
+            "tools:\n  <<: {approvalMode: yolo}\n  approvalMode: write\n",
+            "base: &b {approvalMode: yolo}\ntools:\n  <<: *b\n",
+            "tools:\n  approvalMode: !!str write\n",
+            "tools: !custom\n  approvalMode: write\n",
+            "tools:\n  approvalMode: write\nlist: !!seq [a]\n",
+            "other: {'<<': 1}\ntools:\n  approvalMode: write\n",
             "tools:\n\tapprovalMode: write\n",
             "- a\n- b\n",
             "just a string\n",
@@ -312,7 +401,8 @@ mod tests {
             // SAFETY: `c` is a valid NUL-terminated path for the duration of the call.
             assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         }
-        // Opening a FIFO with no writer would block; the type check comes first.
+        // A blocking open of a FIFO with no writer would hang; the open is non-blocking and the
+        // type comes from the opened file, so a swap after any check cannot hang it either.
         let a = read(&env(t.path(), &[]), t.path());
         assert!(a.is_unknown() && a.note.unwrap().contains("not a regular file"));
         // A symlink to a regular file is followed.
@@ -351,10 +441,30 @@ mod tests {
         assert_eq!(read(&e, dir), Approval::default_mode(None));
         std::fs::write(&b_yml, "tools: ~\n").unwrap();
         assert_eq!(read(&e, dir), Approval::default_mode(None));
-        // A mapping over a replaced `tools` starts empty: the agent dir's write is gone.
-        std::fs::write(&a_yml, "tools: off\n").unwrap();
-        std::fs::write(&b_yml, "tools:\n  other: 1\n").unwrap();
+        // omp folds the overlays into one aggregate first (settings.ts:2496-2500), then merges
+        // that over the global layer (settings.ts:3920-3923, `#deepMerge` 3943-3965): A's
+        // `tools: null` is replaced by B's mapping inside the aggregate, so the global write
+        // survives. A `tools` that stays a non-mapping in the aggregate does replace it.
+        for a in ["tools: ~\n", "tools: off\n"] {
+            std::fs::write(&a_yml, a).unwrap();
+            std::fs::write(&b_yml, "tools:\n  other: 1\n").unwrap();
+            let r = read(&e, dir);
+            assert_eq!(
+                (r.mode.as_str(), r.source.as_str()),
+                ("write", dir.join("config.yml").to_str().unwrap()),
+                "{a:?}"
+            );
+            std::fs::write(&b_yml, "theme: dark\n").unwrap();
+            assert_eq!(read(&e, dir), Approval::default_mode(None), "{a:?}");
+        }
+        std::fs::write(&a_yml, "tools:\n  approvalMode: always-ask\n").unwrap();
+        std::fs::write(&b_yml, "tools: ~\n").unwrap();
         assert_eq!(read(&e, dir), Approval::default_mode(None));
+        // The reported case: an overlay merge key over the global write is unknown, not write.
+        std::fs::write(&a_yml, "tools:\n  <<: {approvalMode: yolo}\n").unwrap();
+        std::fs::write(&b_yml, "theme: dark\n").unwrap();
+        let r = read(&e, dir);
+        assert!(r.is_unknown() && r.note.unwrap().contains("merge key"));
         // A missing or malformed overlay is unknown (omp refuses to start).
         let e = env(dir, &[("PI_CONFIG_FILES", "missing.yml")]);
         assert!(read(&e, dir).is_unknown());

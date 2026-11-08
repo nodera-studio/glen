@@ -1125,7 +1125,8 @@ session's project config (`.omp/config.yml`, `.claude/settings.json` in its cwd)
 `always-ask`, `always-ask-cached`, `write`, `yolo` or `unknown`; `source` is the file that set it,
 `default` (unset, null or a value outside those four, so omp's default `yolo`) or `unknown`. `unknown`
 means glen cannot tell: a file that is not a regular file, larger than 4 MiB, not UTF-8, not valid YAML,
-not a single mapping, with a duplicate key or a non-string `approvalMode`, or a missing overlay. It is
+not a single mapping, with a duplicate key, a `<<` merge key, an explicit tag or a non-string
+`approvalMode`, or a missing overlay. It is
 never a failure. The `omp_approval` check is `ok` for a non-yolo mode and `warn` for `yolo` (warning
 `omp_approval_yolo`) or `unknown` (warning `omp_approval_unknown`). glen runs omp with `--no-ui`, so
 under a stricter mode every tool call that needs approval fails in a glen-started session (`write`
