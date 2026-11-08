@@ -963,7 +963,6 @@ fn private_socket(path: &Path) -> Result<(), String> {
 /// Binds the warm worker's hand-off socket, `run/warm/<pid>.sock`, 0600 in the 0700
 /// `run/warm`. A leftover file at the path (a crashed worker that had this pid) is replaced.
 fn listen(home: &GlenHome) -> io::Result<(std::os::unix::net::UnixListener, PathBuf)> {
-    use std::os::unix::fs::PermissionsExt;
     home.ensure_dir("run/warm")?;
     let path = socket_path(home, std::process::id());
     if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
@@ -971,10 +970,60 @@ fn listen(home: &GlenHome) -> io::Result<(std::os::unix::net::UnixListener, Path
     }
     let listener = std::os::unix::net::UnixListener::bind(&path)
         .map_err(|e| io::Error::new(e.kind(), format!("cannot bind {}: {e}", path.display())))?;
-    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_BIND_AND_CHMOD.take() {
+        hook(&path);
+    }
+    chmod_private(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot chmod {}: {e}", path.display())))?;
     private_socket(&path).map_err(io::Error::other)?;
     listener.set_nonblocking(true)?;
     Ok((listener, path))
+}
+/// Sets `path` to 0600 without following a symlink a writer renamed over it (H2 G2): a symlink
+/// is never chmodded through, and the [`private_socket`] check that follows refuses it. Linux
+/// opens the file itself (`O_PATH | O_NOFOLLOW`, a symlink is refused at the open) and chmods
+/// that inode through `/proc/self/fd`, as glibc's `lchmod` does; macOS `fchmodat` with
+/// `AT_SYMLINK_NOFOLLOW` changes a symlink itself, never its target.
+fn chmod_private(path: &Path) -> io::Result<()> {
+    use rustix::fs::Mode;
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::OFlags;
+        let fd = rustix::fs::open(
+            path,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let st = rustix::fs::fstat(&fd)?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Socket {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a socket"));
+        }
+        use std::os::fd::AsRawFd;
+        rustix::fs::chmod(
+            format!("/proc/self/fd/{}", fd.as_raw_fd()),
+            Mode::from_raw_mode(0o600),
+        )?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        rustix::fs::chmodat(
+            rustix::fs::CWD,
+            path,
+            Mode::from_raw_mode(0o600),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Ok(())
+    }
+}
+#[cfg(test)]
+type PathHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: runs once, in this thread's next [`listen`], between its bind and chmod.
+    static BETWEEN_BIND_AND_CHMOD: std::cell::Cell<Option<PathHook>> =
+        const { std::cell::Cell::new(None) };
 }
 /// Waits up to `within` for a connection on `listener`.
 fn readable(listener: &std::os::unix::net::UnixListener, within: Duration) -> bool {
@@ -2679,6 +2728,28 @@ mod adopt_tests {
             root: t.path().join("x".repeat(120)),
         };
         assert!(listen(&long).is_err());
+    }
+    /// H2 G2: a symlink renamed over the socket between bind and chmod is never chmodded
+    /// through: its target keeps its mode and the bind fails closed (no warmth).
+    #[test]
+    fn a_symlink_renamed_over_the_socket_is_never_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let target = t.path().join("victim");
+        fs::write(&target, b"kept").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        BETWEEN_BIND_AND_CHMOD.set(Some(Box::new(move |path: &Path| {
+            fs::rename(&link, path).unwrap();
+        })));
+        assert!(listen(&store.home).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the symlink's target was chmodded"
+        );
     }
     /// AC-H206: among one tick's offers the oldest job id goes first; the others are answered
     /// `retry`. Each offer carries the job it sent, not the one on disk (AC-H205).
