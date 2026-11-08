@@ -86,3 +86,20 @@ test("a registry write without a procfs records no place, and own cleanup skips 
         assert.equal(fs.readFileSync(e.registry, "utf8"), other);
     } finally { await f.close(); }
 });
+test("MEDIUM-001 an other-boot registry of another pid namespace keeps the socket its pid names", async () => {
+    const proc = fakeProc(100, "boot-a"), f = await fixture();
+    try {
+        const dir = path.join(f.home, "run/live"); fs.mkdirSync(dir, { recursive: true });
+        const regs: [string, any][] = [
+            ["foreignboot", { pid: 90, pidns: 200, boot_id: "boot-b" }],
+            ["hereboot", { pid: 91, pidns: 100, boot_id: "boot-b" }],
+        ];
+        for (const [id, r] of regs) { fs.writeFileSync(path.join(dir, `${id}.json`), JSON.stringify(r)); fs.writeFileSync(path.join(dir, `${r.pid}.sock`), ""); }
+        f.deps.proc = proc; f.deps.isAlive = (pid: number) => pid === f.deps.pid;
+        const e = await f.start(); assert.ok(e, f.notes.join("\n"));
+        const exists = (name: string) => fs.existsSync(path.join(dir, name));
+        assert.ok(!exists("foreignboot.json") && !exists("hereboot.json"), "both stale registries go");
+        assert.ok(exists("90.sock"), "a pid numbered in another namespace keeps its socket");
+        assert.ok(!exists("91.sock"), "this namespace's dead pid loses its socket");
+    } finally { await f.close(); fs.rmSync(proc, { recursive: true, force: true }); }
+});

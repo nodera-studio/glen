@@ -335,17 +335,21 @@ function shutdown(e: Endpoint) {
     quietly(() => e.server.close()); unlink(e.socket); removeRegistry(e); ENDPOINTS.delete(e.deps.pid);
 }
 // A registry recording another pid namespace is never removed, nor any socket its pid names:
-// that pid number means nothing here (S-04/S-10). Another boot is dead.
+// that pid number means nothing here (S-04/S-10). A registry from another boot goes, but its
+// pid's socket only when that pid is numbered here and dead now.
 function sweep(home: string, deps: Deps, place: Place) {
     const dir = path.join(home, "run/live"), names = fs.readdirSync(dir).filter(n => !n.startsWith("."));
     const registries: { file: string; bytes: string; r: any }[] = [], foreign = new Set<number>();
     for (const name of names) if (name.endsWith(".json")) quietly(() => {
         const file = path.join(dir, name), bytes = fs.readFileSync(file, "utf8"), r = JSON.parse(bytes);
         if (!Number.isInteger(r.pid) || r.pid <= 0) return;
-        if (scopeOf(r, place) === "elsewhere") foreign.add(r.pid); else registries.push({ file, bytes, r });
+        const scope = scopeOf(r, place);
+        // A pid numbered in another pid namespace protects its socket: from another boot too,
+        // unless that boot's record names our namespace (the initial one keeps its inode).
+        if (scope === "elsewhere" || (scope === "other_boot" && r.pidns !== place.pidns)) foreign.add(r.pid);
+        if (scope !== "elsewhere") registries.push({ file, bytes, r });
     });
     const dead = (pid: number) => !foreign.has(pid) && !deps.isAlive(pid);
-    // A registry from another boot goes, but its pid's socket only when that pid is dead now.
     for (const { file, bytes, r } of registries) quietly(() => { if ((scopeOf(r, place) === "other_boot" || dead(r.pid)) && removeRegistryIfUnchanged(file, bytes) && dead(r.pid)) unlink(path.join(dir, `${r.pid}.sock`)); });
     for (const name of names) { const m = /^(\d+)\.sock$/.exec(name); if (m && dead(Number(m[1]))) unlink(path.join(dir, name)); }
 }
