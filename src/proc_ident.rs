@@ -463,29 +463,31 @@ fn bound_confinement(
     path: &Path,
     pid: u32,
     pidfd: bool,
-    _end: std::time::Instant,
+    end: std::time::Instant,
 ) -> Result<Confinement, Refusal> {
-    let held = holder(fd, path, pid, pidfd).map_err(Refusal::Untrusted)?;
-    held().map_err(Refusal::Untrusted)?;
+    let held = holder(fd, path, pid, pidfd, end).map_err(Refusal::Untrusted)?;
+    held()?;
     let confinement = confinement_of(pid);
-    held().map_err(Refusal::Untrusted)?;
+    held()?;
     Ok(confinement)
 }
 /// A check that `pid` is still the process holding the listener: through a pidfd when the
-/// kernel gives one, else through `/proc/<pid>/fd`.
+/// kernel gives one, else through `/proc/<pid>/fd` (F9, F11).
 #[cfg(target_os = "linux")]
 fn holder(
     fd: BorrowedFd<'_>,
     path: &Path,
     pid: u32,
     pidfd: bool,
-) -> Result<Box<dyn Fn() -> Result<(), String>>, String> {
+    end: std::time::Instant,
+) -> Result<Box<dyn Fn() -> Result<(), Refusal>>, String> {
     if pidfd {
         match peer_pidfd(fd) {
             Ok(pinned) => {
                 return Ok(Box::new(move || {
-                    pidfd_names(&pinned, pid)?;
-                    leader(pid)
+                    pidfd_names(&pinned, pid)
+                        .and_then(|()| leader(pid))
+                        .map_err(Refusal::Untrusted)
                 }));
             }
             // ENOPROTOOPT: before Linux 6.5. EINVAL: the listener has exited (6.5 to 6.8).
@@ -493,11 +495,52 @@ fn holder(
             Err(e) => return Err(format!("cannot pin the endpoint process: {e}")),
         }
     }
+    // F11: a pathname can be swapped and restored around these checks, so the listener at
+    // `path` proves nothing about which socket this connection reached. The registered process
+    // must hold the server end of this very connection: it accepted it.
     let inode = listening_inode(path)?;
+    let mine = own_inode(fd)?;
     Ok(Box::new(move || {
-        holds_socket(pid, inode)?;
-        leader(pid)
+        holds_socket(pid, inode).map_err(Refusal::Untrusted)?;
+        accepted_here(pid, mine, end)?;
+        leader(pid).map_err(Refusal::Untrusted)
     }))
+}
+/// The sockfs inode of this process's socket `fd` (what `unix_diag` reports as its `ino`).
+#[cfg(target_os = "linux")]
+fn own_inode(fd: BorrowedFd<'_>) -> Result<u32, String> {
+    let st = rustix::fs::fstat(fd).map_err(|e| format!("cannot stat this connection: {e}"))?;
+    u32::try_from(st.st_ino).map_err(|_| format!("socket inode {} out of range", st.st_ino))
+}
+/// Waits until `pid` holds the server end of this process's connected socket `mine` (the
+/// `UNIX_DIAG_PEER` of `mine`, which has an inode only once it is accepted), or `end`.
+#[cfg(target_os = "linux")]
+fn accepted_here(pid: u32, mine: u32, end: std::time::Instant) -> Result<(), Refusal> {
+    loop {
+        let all = unix_diag(u32::MAX, diag::UDIAG_SHOW_PEER).map_err(Refusal::Untrusted)?;
+        let me = match all.iter().filter(|s| s.inode == mine).collect::<Vec<_>>()[..] {
+            [me] => *me,
+            [] => {
+                return Err(Refusal::Untrusted(
+                    "unix_diag does not list this connection".into(),
+                ));
+            }
+            _ => {
+                return Err(Refusal::Untrusted(
+                    "unix_diag lists this connection twice".into(),
+                ));
+            }
+        };
+        if let Some(server) = me.peer.filter(|p| *p != 0)
+            && holds_socket(pid, u64::from(server)).is_ok()
+        {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= end {
+            return Err(Refusal::NotAccepted);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 /// `SO_PEERPIDFD` (Linux 6.5+): a pidfd for the process that `listen()`ed.
 #[cfg(target_os = "linux")]
@@ -576,9 +619,10 @@ fn listening_inode(path: &Path) -> Result<u64, String> {
         return Err(format!("{} is not a socket", path.display()));
     }
     let want = (vfs_dev(meta.dev()), meta.ino());
-    let listeners = unix_listeners()?;
+    let listeners = unix_diag(1 << diag::TCP_LISTEN, diag::UDIAG_SHOW_VFS)?;
     let found: Vec<u32> = listeners
         .iter()
+        .filter(|l| l.state == diag::TCP_LISTEN)
         .filter(|l| {
             l.vfs
                 .is_some_and(|(dev, ino)| (dev, u64::from(ino)) == (want.0, want.1 & 0xffff_ffff))
@@ -605,14 +649,18 @@ fn vfs_dev(st_dev: u64) -> u32 {
     let (major, minor) = (libc::major(st_dev), libc::minor(st_dev));
     (major << 20) | (minor & 0xf_ffff)
 }
-/// A listening unix socket as `unix_diag` reports it.
+/// A unix socket as `unix_diag` reports it.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct Listener {
+struct DiagSocket {
     /// The socket's own inode (`socket:[inode]` in an fd table).
     inode: u32,
+    /// `TCP_LISTEN`, `TCP_ESTABLISHED`, ….
+    state: u8,
     /// The bound file's device (kernel encoding) and inode (low 32 bits), when bound to a path.
     vfs: Option<(u32, u32)>,
+    /// The peer socket's inode (`UNIX_DIAG_PEER`; 0 for one not yet accepted).
+    peer: Option<u32>,
 }
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 mod diag {
@@ -624,7 +672,9 @@ mod diag {
     pub const NLM_F_DUMP: u16 = 0x300;
     pub const TCP_LISTEN: u8 = 10;
     pub const UDIAG_SHOW_VFS: u32 = 0x2;
+    pub const UDIAG_SHOW_PEER: u32 = 0x4;
     pub const UNIX_DIAG_VFS: u16 = 1;
+    pub const UNIX_DIAG_PEER: u16 = 2;
     /// `struct nlmsghdr`.
     pub const NLMSG_HDR: usize = 16;
     /// `struct unix_diag_req`.
@@ -639,9 +689,10 @@ mod diag {
         (n + 3) & !3
     }
 }
-/// Every listening unix socket in this network namespace, from one `unix_diag` dump.
+/// Every unix socket in this network namespace in one of `states` (a bit per state), from one
+/// `unix_diag` dump showing the `show` attributes.
 #[cfg(target_os = "linux")]
-fn unix_listeners() -> Result<Vec<Listener>, String> {
+fn unix_diag(states: u32, show: u32) -> Result<Vec<DiagSocket>, String> {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let fail = |what: &str| format!("unix_diag: {what}: {}", io::Error::last_os_error());
     // SAFETY: socket(2) with constant arguments; the result is checked.
@@ -683,8 +734,8 @@ fn unix_listeners() -> Result<Vec<Listener>, String> {
     // unix_diag_req: family, protocol, pad, states, ino, show, cookie[2].
     let body = diag::NLMSG_HDR;
     req[body] = libc::AF_UNIX as u8;
-    req[body + 4..body + 8].copy_from_slice(&(1u32 << diag::TCP_LISTEN).to_ne_bytes());
-    req[body + 12..body + 16].copy_from_slice(&diag::UDIAG_SHOW_VFS.to_ne_bytes());
+    req[body + 4..body + 8].copy_from_slice(&states.to_ne_bytes());
+    req[body + 12..body + 16].copy_from_slice(&show.to_ne_bytes());
     // SAFETY: zeroed sockaddr_nl is valid; nl_pid 0 is the kernel.
     let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
@@ -743,7 +794,7 @@ fn unix_listeners() -> Result<Vec<Listener>, String> {
 /// Parses one `unix_diag` reply datagram into `out`; `Ok(true)` once the dump is done. Fails
 /// on anything malformed, an error message, a foreign sequence number or an unexpected type.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_diag(mut data: &[u8], seq: u32, out: &mut Vec<Listener>) -> Result<bool, String> {
+fn parse_diag(mut data: &[u8], seq: u32, out: &mut Vec<DiagSocket>) -> Result<bool, String> {
     let malformed = |what: &str| Err(format!("unix_diag: malformed reply ({what})"));
     let u16_at = |b: &[u8], at: usize| u16::from_ne_bytes([b[at], b[at + 1]]);
     let u32_at = |b: &[u8], at: usize| u32::from_ne_bytes(b[at..at + 4].try_into().expect("4"));
@@ -788,7 +839,7 @@ fn parse_diag(mut data: &[u8], seq: u32, out: &mut Vec<Listener>) -> Result<bool
                     io::Error::from_raw_os_error(errno)
                 ));
             }
-            diag::SOCK_DIAG_BY_FAMILY => out.push(parse_listener(payload)?),
+            diag::SOCK_DIAG_BY_FAMILY => out.push(parse_socket(payload)?),
             other => return malformed(&format!("message type {other}")),
         }
         data = &data[diag::align4(len).min(data.len())..];
@@ -797,7 +848,7 @@ fn parse_diag(mut data: &[u8], seq: u32, out: &mut Vec<Listener>) -> Result<bool
 }
 /// One `unix_diag_msg` and its attributes.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn parse_listener(msg: &[u8]) -> Result<Listener, String> {
+fn parse_socket(msg: &[u8]) -> Result<DiagSocket, String> {
     let malformed = |what: &str| Err(format!("unix_diag: malformed socket record ({what})"));
     let u16_at = |b: &[u8], at: usize| u16::from_ne_bytes([b[at], b[at + 1]]);
     let u32_at = |b: &[u8], at: usize| u32::from_ne_bytes(b[at..at + 4].try_into().expect("4"));
@@ -808,11 +859,10 @@ fn parse_listener(msg: &[u8]) -> Result<Listener, String> {
     if msg[0] != libc::AF_UNIX as u8 {
         return malformed("family");
     }
-    if msg[2] != diag::TCP_LISTEN {
-        return malformed("a socket that is not listening");
-    }
+    let state = msg[2];
     let inode = u32_at(msg, 4);
     let mut vfs = None;
+    let mut peer = None;
     let mut attrs = &msg[diag::MSG..];
     while !attrs.is_empty() {
         if attrs.len() < 4 {
@@ -828,10 +878,20 @@ fn parse_listener(msg: &[u8]) -> Result<Listener, String> {
             }
             // unix_diag_vfs: ino, then dev.
             vfs = Some((u32_at(attrs, 8), u32_at(attrs, 4)));
+        } else if u16_at(attrs, 2) == diag::UNIX_DIAG_PEER {
+            if len != 4 + 4 || peer.is_some() {
+                return malformed("UNIX_DIAG_PEER");
+            }
+            peer = Some(u32_at(attrs, 4));
         }
         attrs = &attrs[diag::align4(len).min(attrs.len())..];
     }
-    Ok(Listener { inode, vfs })
+    Ok(DiagSocket {
+        inode,
+        state,
+        vfs,
+        peer,
+    })
 }
 /// `pid`'s fd table holds the socket `inode`.
 #[cfg(target_os = "linux")]
@@ -846,7 +906,7 @@ fn holds_socket(pid: u32, inode: u64) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "process {pid} does not hold the endpoint's listening socket"
+            "process {pid} does not hold the endpoint's socket {inode}"
         ))
     }
 }
@@ -1829,8 +1889,8 @@ mod tests {
 
     /// F9: the `unix_diag` reply parser takes well-formed records and fails closed on anything
     /// else: an error, a failed dump, a foreign sequence, an unknown type, truncation, bad
-    /// attribute lengths, a duplicated VFS attribute, a socket that is not a listener, and data
-    /// after the end of the dump.
+    /// attribute lengths, duplicated or short VFS and peer attributes, and data after the end of
+    /// the dump. A connected socket's `UNIX_DIAG_PEER` is read.
     #[test]
     fn f9_the_unix_diag_parser_fails_closed() {
         const SEQ: u32 = 9;
@@ -1851,13 +1911,17 @@ mod tests {
         assert_eq!(
             out,
             [
-                Listener {
+                DiagSocket {
                     inode: 11,
-                    vfs: Some((0x80_0001, 77))
+                    state: diag::TCP_LISTEN,
+                    vfs: Some((0x80_0001, 77)),
+                    peer: None
                 },
-                Listener {
+                DiagSocket {
                     inode: 12,
-                    vfs: None
+                    state: diag::TCP_LISTEN,
+                    vfs: None,
+                    peer: None
                 }
             ]
         );
@@ -1867,6 +1931,24 @@ mod tests {
             Ok(true)
         );
         assert_eq!(out.len(), 1);
+        let mut connected = record(1, 21, None);
+        connected.extend(8u16.to_ne_bytes());
+        connected.extend(diag::UNIX_DIAG_PEER.to_ne_bytes());
+        connected.extend(22u32.to_ne_bytes());
+        let mut out = vec![];
+        assert_eq!(
+            parse_diag(&nlmsg(by, SEQ, &connected), SEQ, &mut out),
+            Ok(false)
+        );
+        assert_eq!(
+            out,
+            [DiagSocket {
+                inode: 21,
+                state: 1,
+                vfs: None,
+                peer: Some(22)
+            }]
+        );
         let bad: Vec<(&str, Vec<u8>)> = vec![
             ("empty", vec![]),
             ("short header", a[..10].to_vec()),
@@ -1885,7 +1967,22 @@ mod tests {
             ),
             ("unknown type", nlmsg(1, SEQ, &[])),
             ("short record", nlmsg(by, SEQ, &[1, 1, 10, 0])),
-            ("not listening", nlmsg(by, SEQ, &record(1, 1, None))),
+            ("short peer attribute", {
+                let mut r = record(1, 1, None);
+                r.extend(6u16.to_ne_bytes());
+                r.extend(diag::UNIX_DIAG_PEER.to_ne_bytes());
+                r.extend([0u8; 4]);
+                nlmsg(by, SEQ, &r)
+            }),
+            ("duplicated peer attribute", {
+                let mut r = record(1, 1, None);
+                for _ in 0..2 {
+                    r.extend(8u16.to_ne_bytes());
+                    r.extend(diag::UNIX_DIAG_PEER.to_ne_bytes());
+                    r.extend(5u32.to_ne_bytes());
+                }
+                nlmsg(by, SEQ, &r)
+            }),
             ("data after done", [done.clone(), a.clone()].concat()),
             ("length below a header", {
                 let mut m = a.clone();
@@ -1932,7 +2029,7 @@ mod tests {
         let listener = UnixListener::bind(&path).unwrap();
         let meta = std::fs::symlink_metadata(&path).unwrap();
         let want = (vfs_dev(meta.dev()), meta.ino() as u32);
-        let all = unix_listeners().unwrap();
+        let all = unix_diag(1 << diag::TCP_LISTEN, diag::UDIAG_SHOW_VFS).unwrap();
         let mine: Vec<_> = all.iter().filter(|l| l.vfs == Some(want)).collect();
         assert_eq!(mine.len(), 1, "{want:?} in {all:?}");
         let inode = listening_inode(&path).unwrap();
@@ -1976,6 +2073,47 @@ mod tests {
         let stream = UnixStream::connect(&path).unwrap();
         let got = trust_endpoint_with(stream.as_fd(), &path, std::process::id(), false, soon());
         assert!(got.is_err(), "{got:?}");
+    }
+
+    /// F11: the fallback proof binds to this connection, not to the pathname. Here the listener
+    /// at the registered path is the registered process's (this one), as after a swap and
+    /// restore of the path, but the connection reached another process's listener (B), which
+    /// accepted it: refused once the deadline passes. The connection the registered process
+    /// itself accepts is trusted, and not before it is accepted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn f11_the_fallback_requires_the_endpoint_to_hold_the_accepted_connection() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("l.sock");
+        let mine = UnixListener::bind(&path).unwrap();
+        let other = t.path().join("o.sock");
+        let (_a, b) = orphaned_listener_serving(&other, true);
+        let _kill = Kill(b);
+        let me = std::process::id();
+        let stream = UnixStream::connect(&other).unwrap();
+        let ours = own_inode(stream.as_fd()).unwrap();
+        wait_until("B never accepted", || {
+            accepted_here(b, ours, std::time::Instant::now()).is_ok()
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(
+            bound_confinement(stream.as_fd(), &path, me, false, soon()),
+            Err(Refusal::NotAccepted)
+        );
+        assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+        // The registered process's own connection: not before it accepts, then trusted.
+        let stream = UnixStream::connect(&path).unwrap();
+        let ours = own_inode(stream.as_fd()).unwrap();
+        assert_eq!(
+            accepted_here(me, ours, std::time::Instant::now()),
+            Err(Refusal::NotAccepted)
+        );
+        let _accepted = mine.accept().unwrap();
+        assert_eq!(accepted_here(me, ours, std::time::Instant::now()), Ok(()));
+        assert_eq!(
+            trust_endpoint_with(stream.as_fd(), &path, me, false, soon()),
+            Ok(())
+        );
     }
 
     /// F9: `st_dev` back to the kernel's `MAJOR << 20 | MINOR`.
