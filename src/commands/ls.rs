@@ -151,14 +151,24 @@ fn read_rows(
     owners: &Path,
     env: &Env,
 ) -> (Vec<Row>, usize, usize) {
-    read_endpoint_rows(catalog, candidates, args, owners, &HashMap::new(), env)
+    read_endpoint_rows(
+        catalog,
+        candidates,
+        args,
+        owners,
+        (&HashMap::new(), &Default::default()),
+        env,
+    )
 }
 fn read_endpoint_rows(
     catalog: &Catalog,
     candidates: Vec<&Summary>,
     args: &LsArgs,
     owners: &Path,
-    endpoints: &HashMap<String, crate::live::client::Hello>,
+    (endpoints, untrusted): (
+        &HashMap<String, crate::live::client::Hello>,
+        &std::collections::HashSet<String>,
+    ),
     env: &Env,
 ) -> (Vec<Row>, usize, usize) {
     let mut total_all = catalog.sessions.len();
@@ -173,6 +183,13 @@ fn read_endpoint_rows(
             total_all = total_all.saturating_sub(1);
             continue;
         };
+        // AC-H109, as in `show`: a session whose endpoint glen does not trust is never shown
+        // live, and lends the row neither cwd nor title.
+        if untrusted.contains(&s.id) {
+            row.state = State::Unknown;
+            row.summary.cwd = None;
+            row.summary.title = None;
+        }
         if args.live && !matches!(row.state, State::Live | State::Busy) {
             continue;
         }
@@ -206,9 +223,9 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
     );
     let mut catalog = Catalog::read(&paths.sessions_dir)?;
     let home = crate::glen_home::resolve(env).ok();
-    let endpoints = home
+    let (endpoints, untrusted) = home
         .as_ref()
-        .map(crate::live::registry::states)
+        .map(crate::live::registry::probe)
         .unwrap_or_default();
     if let Some(home) = &home {
         let registries = crate::live::registry::index(home)
@@ -239,7 +256,7 @@ pub fn run(cli: &Cli, args: &LsArgs, env: &Env, ctx: &OutputCtx) -> Result<Outco
         candidates,
         args,
         &paths.session_owners_dir,
-        &endpoints,
+        (&endpoints, &untrusted),
         env,
     );
     if let Some(home) = &home {

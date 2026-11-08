@@ -143,7 +143,8 @@ fn live_client_drains_a_reply_after_a_partial_request_write() {
                 expect_session_id: Some(A_ID.into()),
             };
             if route == "open_send" {
-                let result = client::open_send(&path, "quoted\"\\id", args, &|| false);
+                let result =
+                    client::open_send(&path, std::process::id(), "quoted\"\\id", args, &|| false);
                 if reply == "none" {
                     assert!(
                         matches!(result, Err(ClientError::Protocol(ref message)) if message == "endpoint closed the connection before reading the request")
@@ -179,10 +180,16 @@ fn live_client_drains_a_reply_after_a_partial_request_write() {
             } else {
                 let op = Op::Send(args);
                 let result = if route == "unary" {
-                    client::unary(&path, &op, flake::scaled(Duration::from_secs(10)))
+                    client::unary(
+                        &path,
+                        std::process::id(),
+                        &op,
+                        flake::scaled(Duration::from_secs(10)),
+                    )
                 } else {
                     client::unary_for(
                         &path,
+                        std::process::id(),
                         &op,
                         A_ID,
                         flake::scaled(Duration::from_secs(10)),
@@ -242,7 +249,7 @@ fn fake_ext_protocol_table() {
         } else {
             flake::scaled(Duration::from_secs(10))
         };
-        let hello = client::hello(&r.socket, timeout);
+        let hello = client::hello(&r.socket, r.pid, timeout);
         if scenario == "hang" {
             assert!(matches!(hello, Err(client::ClientError::Timeout)));
             continue;
@@ -252,9 +259,10 @@ fn fake_ext_protocol_table() {
             continue;
         }
         assert!(hello.is_ok());
-        assert!(client::state(&r.socket, flake::scaled(Duration::from_secs(10))).is_ok());
+        assert!(client::state(&r.socket, r.pid, flake::scaled(Duration::from_secs(10))).is_ok());
         let err = client::unary(
             &r.socket,
+            r.pid,
             &Op::Abort,
             flake::scaled(Duration::from_secs(10)),
         )
@@ -268,6 +276,7 @@ fn fake_ext_protocol_table() {
         }
         let conn = client::open_send(
             &r.socket,
+            r.pid,
             "r",
             SendArgs {
                 text: "hi".into(),
@@ -761,7 +770,7 @@ fn ac326_unpersisted_readers_and_follow_do_not_need_a_socket() {
     let b = LiveBox::new();
     let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";
     fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
-    fs::write(b.registry(id),serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":null,"socket":live::run_dir(&home(&b)).join("unbound.sock"),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
+    fs::write(b.registry(id),serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":null,"socket":live::run_dir(&home(&b)).join(format!("{}.sock", std::process::id())),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
     for command in ["show", "tail"] {
         for arg in [id, "e212345", "@latest"] {
             let o = b.rpc.glen(&[command, arg, "--json"]).captured();
@@ -905,7 +914,7 @@ fn endpoint_only_tail_ends_not_found_after_disappearance_grace() {
     let b = LiveBox::new();
     let id = "01a0f6b1-2680-7a3c-8b21-4a1f9e212345";
     fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
-    fs::write(b.registry(id), serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":null,"socket":live::run_dir(&home(&b)).join("unbound.sock"),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
+    fs::write(b.registry(id), serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":null,"socket":live::run_dir(&home(&b)).join(format!("{}.sock", std::process::id())),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
     let mut child = b
         .rpc
         .glen(&["tail", id, "-f", "--json"])
@@ -989,8 +998,9 @@ fn show_and_tail_keep_an_endpoint_answer_that_arrived_while_glen_was_stopped() {
     use std::os::unix::net::{UnixListener, UnixStream};
     let b = LiveBox::new();
     fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
-    let socket = live::run_dir(&home(&b)).join("stall.sock");
+    let socket = live::run_dir(&home(&b)).join(format!("{}.sock", std::process::id()));
     let listener = UnixListener::bind(&socket).unwrap();
+    fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     b.write_registry(A_ID, std::process::id(), &socket);
     // A blocking accept on its own thread hands each connection over as soon as glen connects.
     let (accepted, connections) = std::sync::mpsc::channel();
@@ -1066,7 +1076,7 @@ fn endpoint_only_tail_waits_for_persistence_then_streams_fixture_items() {
         .unwrap()
         .join(format!("2026-10-30T09-00-00-000Z_{id}.jsonl"));
     fs::create_dir_all(live::run_dir(&home(&b))).unwrap();
-    fs::write(b.registry(id), serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":path,"socket":live::run_dir(&home(&b)).join("unbound.sock"),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
+    fs::write(b.registry(id), serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"session_file":path,"socket":live::run_dir(&home(&b)).join(format!("{}.sock", std::process::id())),"protocol":1,"mode":"tui","started_at":jiff::Timestamp::now().to_string(),"cwd":b.rpc.omp.alpha()}).to_string()).unwrap();
     let mut child = b
         .rpc
         .glen(&["tail", id, "-f", "--json"])
@@ -1228,30 +1238,25 @@ fn ac410b_connect_denied_maps_to_sandboxed() {
         );
         return;
     }
-    struct Restore(std::path::PathBuf);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(0o700));
-        }
-    }
     for (vars, exit) in [
         (&[("CODEX_SANDBOX_NETWORK_DISABLED", "1")][..], 6),
         (&[][..], 1),
     ] {
         let b = LiveBox::new();
-        let dir = home(&b).root.join("denied");
+        // S-18: the socket is the registered `run/live/<pid>.sock`; its mode 000 denies
+        // connect(2) with EACCES.
+        let dir = live::run_dir(&home(&b));
         fs::create_dir_all(&dir).unwrap();
-        let socket = dir.join("x.sock");
+        let socket = dir.join(format!("{}.sock", std::process::id()));
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         b.write_registry(A_ID, std::process::id(), &socket);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
-        let _restore = Restore(dir.clone());
+        fs::set_permissions(&socket, fs::Permissions::from_mode(0o000)).unwrap();
         let o = b
             .rpc
             .glen(&["send", "e27c0de", "hi", "--json"])
             .env("GLEN_OMP_BIN", "/nonexistent")
             .envs(vars.iter().copied())
             .captured();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
         if exit == 6 {
             assert_eq!(o.status.code(), Some(6), "{o:?}");
             let e = &json(&o)["error"];
@@ -1306,4 +1311,128 @@ fn ac410c_registry_cleanup_denied_maps_to_sandboxed() {
             assert!(hint.contains("glen install-extension"), "{hint}");
         }
     }
+}
+
+/// Whether this test process cannot stand in for an unconfined glen, so the S-18 test skips: a
+/// confined glen trusts more endpoints by design, so these refusals may not show. Under CI
+/// (`CI` or `GITHUB_ACTIONS` set) a confined runner fails the test instead (LOW-006).
+fn confined_self() -> bool {
+    let why = match glen::proc_ident::self_confinement() {
+        glen::proc_ident::Confinement::Unconfined => return false,
+        other => format!("this test process is {other:?}"),
+    };
+    let ci = ["CI", "GITHUB_ACTIONS"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
+    assert!(!ci, "cannot run under CI: {why}");
+    eprintln!("skipped: {why}");
+    true
+}
+/// `glen send e27c0de <text>`: exit 6 `untrusted_endpoint`, the text never reached the
+/// endpoint, and its registry is kept.
+fn assert_untrusted(b: &LiveBox, text: &str) {
+    let o = b
+        .rpc
+        .glen(&["send", "e27c0de", text, "--json"])
+        .env("GLEN_OMP_BIN", "/nonexistent")
+        .captured();
+    let log = fs::read_to_string(&b.log).unwrap_or_default();
+    assert!(!log.contains(text), "the text reached the endpoint: {log}");
+    // AC-H106: refused before any request line, `hello` included, is written. glen must connect
+    // to read the kernel peer, so the fake may log the empty read of that closed connection
+    // (frame null); it never logs a request.
+    assert!(
+        !b.ext_log()
+            .iter()
+            .any(|l| l["dir"] == "in" && !l["frame"].is_null()),
+        "a request reached the endpoint: {:?}",
+        b.ext_log()
+    );
+    assert_eq!(o.status.code(), Some(6), "{o:?}");
+    let e = &json(&o)["error"];
+    assert_eq!(e["code"], "no_route", "{e}");
+    assert_eq!(e["details"]["reason"], "untrusted_endpoint", "{e}");
+    assert!(b.registry(A_ID).exists(), "the registry is never deleted");
+    // AC-H109 (LOW-007): `ls` shows the session as `show` does: never live, no cwd or title.
+    let d = data(&b.rpc.glen(&["ls", "--all", "--json"]).captured());
+    let row = d["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == A_ID)
+        .unwrap_or_else(|| panic!("no row: {d}"));
+    assert_eq!(row["state"], "unknown", "{row}");
+    assert!(row["cwd"].is_null() && row["title"].is_null(), "{row}");
+    assert!(b.registry(A_ID).exists(), "ls never deletes it either");
+}
+
+/// R2 (S-18, own pid): a confined listener publishes a correct registry under its own pid and
+/// `run/live/<pid>.sock`. An unconfined glen never hands it the text.
+#[test]
+fn s18_r2_a_confined_endpoint_never_receives_the_text() {
+    if confined_self() {
+        return;
+    }
+    let mut b = LiveBox::new();
+    b.start_ext_as(A_ID, "ok", &[], true);
+    assert_untrusted(&b, "SECRET-R2");
+}
+
+/// R3 (S-18, replaced socket): the registry names a live unconfined process P, and another
+/// process binds `run/live/<P>.sock` and answers `hello` as P. The kernel peer is not P.
+#[test]
+fn s18_r3_a_socket_bound_by_another_process_is_refused() {
+    if confined_self() {
+        return;
+    }
+    let mut p = std::process::Command::new("/bin/sleep")
+        .arg("30")
+        .spawn()
+        .unwrap();
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[("FAKE_EXT_PID", &p.id().to_string())]);
+    assert_untrusted(&b, "SECRET-R3");
+    p.kill().unwrap();
+    p.wait().unwrap();
+}
+
+/// R4 (S-18, the audit's reproduction): the registry's `socket` is outside `run/live`.
+#[test]
+fn s18_r4_a_socket_outside_run_live_is_refused() {
+    let mut b = LiveBox::new();
+    let socket = b.rpc.omp.glen_home.parent().unwrap().join("elsewhere.sock");
+    b.start_ext(A_ID, "ok", &[("FAKE_EXT_SOCKET", socket.to_str().unwrap())]);
+    assert_untrusted(&b, "SECRET-R4");
+}
+
+/// AC-H107 (macOS): a sandboxed glen (`sandbox-exec`) still delivers to an unconfined endpoint:
+/// confinement ordering never ranks a confined sender's peer.
+#[cfg(target_os = "macos")]
+#[test]
+fn s18_a_sandboxed_glen_still_delivers_to_an_unconfined_endpoint() {
+    if confined_self() {
+        return;
+    }
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let inner = b.rpc.glen(&["send", "e27c0de", "hi", "--json"]);
+    let mut c = std::process::Command::new("/usr/bin/sandbox-exec");
+    c.args(["-p", "(version 1)(allow default)"])
+        .arg(inner.get_program())
+        .args(inner.get_args())
+        .env_clear()
+        .env("GLEN_OMP_BIN", "/nonexistent");
+    for (k, v) in inner.get_envs() {
+        if let Some(v) = v {
+            c.env(k, v);
+        }
+    }
+    if let Some(dir) = inner.get_current_dir() {
+        c.current_dir(dir);
+    }
+    let o = c.captured();
+    let d = data(&o);
+    assert_eq!(d["job"]["route"], "live", "{d}");
+    assert_eq!(d["assistant_text"], "pong: hi", "{d}");
+    b.rpc.wait_worker_gone(job_id(&d));
 }

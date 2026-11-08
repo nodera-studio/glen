@@ -78,6 +78,9 @@ pub enum ClientError {
     Protocol(String),
     Refused(WireError),
     Cancelled,
+    /// S-18: the kernel peer of the socket is not the registered process, or runs more
+    /// confined than glen. Nothing was written to it.
+    Untrusted(String),
 }
 impl std::fmt::Display for ClientError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -92,6 +95,7 @@ impl std::fmt::Display for ClientError {
             Self::Protocol(message) => write!(f, "invalid endpoint response: {message}"),
             Self::Refused(e) => write!(f, "endpoint refused: {} ({})", e.code, e.message),
             Self::Cancelled => f.write_str("endpoint request cancelled"),
+            Self::Untrusted(reason) => write!(f, "endpoint is not trusted: {reason}"),
         }
     }
 }
@@ -122,8 +126,15 @@ fn unix_socket() -> io::Result<std::os::fd::OwnedFd> {
 /// in steps of at most `POLL_STEP` so `cancelled` is checked between them. The first attempt is
 /// made even when `end` has already passed, so an endpoint that can take the connection is never
 /// reported as timed out because glen itself ran late.
+///
+/// S-18: before the stream is returned (so before any request byte), the socket's kernel peer
+/// must be `pid`, the registered endpoint process, in the generation that holds the listening
+/// socket, and pass the confinement-ordering rule ([`crate::proc_ident::trust_endpoint`]). A
+/// peer pid the kernel cannot map into this pid namespace is allowed only when glen itself is
+/// confined (sandboxed live delivery, §A13).
 fn bounded_connect(
     path: &Path,
+    pid: u32,
     end: Instant,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<UnixStream, ClientError> {
@@ -154,6 +165,14 @@ fn bounded_connect(
             Err(e) => return Err(connect_error(e.into())),
         }
     }
+    use std::os::fd::AsFd;
+    // macOS waits for the endpoint to accept (F10) until the deadline, or a moment past one
+    // that had passed already (a glen that ran late still reaches an available endpoint).
+    let accept_by = end.max(Instant::now() + POLL_STEP);
+    crate::proc_ident::trust_endpoint(fd.as_fd(), path, pid, accept_by).map_err(|r| match r {
+        crate::proc_ident::Refusal::Untrusted(why) => ClientError::Untrusted(why),
+        crate::proc_ident::Refusal::NotAccepted => ClientError::Timeout,
+    })?;
     let stream = UnixStream::from(fd);
     stream
         .set_write_timeout(Some(super::WRITE))
@@ -379,33 +398,35 @@ fn read_reply(
 /// One request and its answer within `timeout`: connect, write and read share one absolute
 /// deadline. Everything runs on the caller's thread, so an answer that arrived in time is never
 /// lost to a competing timer while a glen I/O thread waited to be scheduled (F10).
-pub fn unary(path: &Path, op: &Op, timeout: Duration) -> Result<Value, ClientError> {
-    exchange(path, op, None, timeout, &|| false)
+pub fn unary(path: &Path, pid: u32, op: &Op, timeout: Duration) -> Result<Value, ClientError> {
+    exchange(path, pid, op, None, timeout, &|| false)
 }
 /// Control requests carry an expected session id and close their connection on interruption:
 /// `stop` is checked between steps of at most `POLL_STEP`, and the connection is dropped with
 /// the error. No bytes are sent once the deadline has passed.
 pub fn unary_for(
     path: &Path,
+    pid: u32,
     op: &Op,
     expect: &str,
     timeout: Duration,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<Value, ClientError> {
     use std::sync::atomic::Ordering;
-    exchange(path, op, Some(expect), timeout, &|| {
+    exchange(path, pid, op, Some(expect), timeout, &|| {
         stop.load(Ordering::SeqCst)
     })
 }
 fn exchange(
     path: &Path,
+    pid: u32,
     op: &Op,
     expect: Option<&str>,
     timeout: Duration,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Value, ClientError> {
     let end = Instant::now() + timeout;
-    let mut stream = bounded_connect(path, end, cancelled)?;
+    let mut stream = bounded_connect(path, pid, end, cancelled)?;
     let id = uuid::Uuid::now_v7().to_string();
     stream
         .set_write_timeout(Some(
@@ -465,9 +486,10 @@ pub struct Hello {
     pub queued: bool,
     pub active_requests: usize,
 }
-pub fn hello(path: &Path, timeout: Duration) -> Result<Hello, ClientError> {
+pub fn hello(path: &Path, pid: u32, timeout: Duration) -> Result<Hello, ClientError> {
     let data = unary(
         path,
+        pid,
         &Op::Hello {
             client_version: env!("CARGO_PKG_VERSION").into(),
         },
@@ -483,8 +505,8 @@ pub fn hello(path: &Path, timeout: Duration) -> Result<Hello, ClientError> {
     }
     serde_json::from_value(data).map_err(|e| ClientError::Protocol(e.to_string()))
 }
-pub fn state(path: &Path, timeout: Duration) -> Result<Hello, ClientError> {
-    let data = unary(path, &Op::State, timeout)?;
+pub fn state(path: &Path, pid: u32, timeout: Duration) -> Result<Hello, ClientError> {
+    let data = unary(path, pid, &Op::State, timeout)?;
     if data["session_id"].as_str().is_none_or(str::is_empty) || !data["busy"].is_boolean() {
         return Err(ClientError::Protocol("malformed state data".into()));
     }
@@ -506,12 +528,13 @@ impl Drop for SendConn {
 }
 pub fn open_send(
     path: &Path,
+    pid: u32,
     id: &str,
     args: SendArgs,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<SendConn, ClientError> {
     let end = Instant::now() + super::WRITE;
-    let mut stream = bounded_connect(path, end, cancelled)?;
+    let mut stream = bounded_connect(path, pid, end, cancelled)?;
     stream
         .set_write_timeout(Some(Duration::from_millis(200)))
         .map_err(|e| ClientError::Protocol(e.to_string()))?;
@@ -952,7 +975,9 @@ mod unary_tests {
     fn open_send_drain_against_a_trickling_peer_is_bounded_and_cancellable() {
         let (_tmp, path, peer) = trickling_peer("gdrain-");
         let start = Instant::now();
-        let result = open_send(&path, "trickle", large_send(), &|| false);
+        let result = open_send(&path, std::process::id(), "trickle", large_send(), &|| {
+            false
+        });
         let elapsed = start.elapsed();
         assert!(
             matches!(result, Err(ClientError::Protocol(ref m)) if m == "endpoint closed the connection before reading the request"),
@@ -969,7 +994,7 @@ mod unary_tests {
         let (_tmp, path, peer) = trickling_peer("gdrainc-");
         let start = Instant::now();
         let cancel_at = start + Duration::from_millis(400);
-        let result = open_send(&path, "trickle", large_send(), &|| {
+        let result = open_send(&path, std::process::id(), "trickle", large_send(), &|| {
             Instant::now() >= cancel_at
         });
         let elapsed = start.elapsed();
@@ -1049,13 +1074,14 @@ mod unary_tests {
             let result = if control {
                 unary_for(
                     &path,
+                    std::process::id(),
                     &Op::Abort,
                     "expected-session",
                     timeout,
                     Arc::new(AtomicBool::new(false)),
                 )
             } else {
-                unary(&path, &Op::State, timeout)
+                unary(&path, std::process::id(), &Op::State, timeout)
             };
             let (_open, request) = peer.join().unwrap();
             assert_eq!(result.unwrap()["answer"], 42, "control={control}");
@@ -1076,18 +1102,29 @@ mod unary_tests {
             .tempdir_in("/tmp")
             .unwrap();
         let path = tmp.path().join("s");
-        let _listener = UnixListener::bind(&path).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
         let end = Instant::now();
         std::thread::sleep(Duration::from_millis(5));
-        let stream = bounded_connect(&path, end, &|| false).unwrap();
+        // An available endpoint accepts (macOS proves the connection by its accepted end, F10).
+        let acceptor = std::thread::spawn(move || {
+            let accepted = listener.accept().unwrap();
+            (listener, accepted)
+        });
+        let stream = bounded_connect(&path, std::process::id(), end, &|| false).unwrap();
         assert!(stream.peer_addr().is_ok());
+        let (_listener, _accepted) = acceptor.join().unwrap();
         assert!(matches!(
-            bounded_connect(&tmp.path().join("missing"), end, &|| false),
+            bounded_connect(
+                &tmp.path().join("missing"),
+                std::process::id(),
+                end,
+                &|| false
+            ),
             Err(ClientError::Connect(ConnectError::Missing))
         ));
         drop(_listener);
         assert!(matches!(
-            bounded_connect(&path, end, &|| false),
+            bounded_connect(&path, std::process::id(), end, &|| false),
             Err(ClientError::Connect(ConnectError::Refused))
         ));
     }
@@ -1110,7 +1147,12 @@ mod unary_tests {
         // Backlog 0 holds one pending connection; the next connect waits.
         let _pending = UnixStream::connect(&path).unwrap();
         let start = Instant::now();
-        let result = bounded_connect(&path, start + Duration::from_millis(300), &|| false);
+        let result = bounded_connect(
+            &path,
+            std::process::id(),
+            start + Duration::from_millis(300),
+            &|| false,
+        );
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
         assert!(
@@ -1123,7 +1165,12 @@ mod unary_tests {
             let second = listener.accept().unwrap();
             (first, second)
         });
-        let stream = bounded_connect(&path, Instant::now() + Duration::from_secs(10), &|| false);
+        let stream = bounded_connect(
+            &path,
+            std::process::id(),
+            Instant::now() + Duration::from_secs(10),
+            &|| false,
+        );
         assert!(stream.is_ok(), "{:?}", stream.err());
         let _accepted = accepter.join().unwrap();
     }
@@ -1158,7 +1205,14 @@ mod unary_tests {
             rest
         });
         let start = Instant::now();
-        let result = unary_for(&path, &Op::Abort, "s", Duration::from_secs(10), stop);
+        let result = unary_for(
+            &path,
+            std::process::id(),
+            &Op::Abort,
+            "s",
+            Duration::from_secs(10),
+            stop,
+        );
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(ClientError::Cancelled)), "{result:?}");
         assert!(
@@ -1192,7 +1246,12 @@ mod unary_tests {
             }
         });
         let start = Instant::now();
-        let result = unary(&path, &Op::State, Duration::from_millis(300));
+        let result = unary(
+            &path,
+            std::process::id(),
+            &Op::State,
+            Duration::from_millis(300),
+        );
         let elapsed = start.elapsed();
         assert!(matches!(result, Err(ClientError::Timeout)), "{result:?}");
         assert!(
@@ -1231,7 +1290,13 @@ mod unary_tests {
             drop(stream);
             closed_tx.send(()).unwrap();
         });
-        let answer = unary(&path, &Op::State, Duration::from_secs(10)).unwrap();
+        let answer = unary(
+            &path,
+            std::process::id(),
+            &Op::State,
+            Duration::from_secs(10),
+        )
+        .unwrap();
         assert_eq!(answer["answer"], 42);
         peer.join().unwrap();
         assert!(!hook_pending(&path));
@@ -1257,7 +1322,12 @@ mod unary_tests {
                 match scenario {"garbage"=>writeln!(s,"garbage").unwrap(),"timeout"=>std::thread::sleep(scaled(Duration::from_millis(400))),_=>writeln!(s,"{}",serde_json::json!({"v":1,"id":if scenario=="wrong_id"{serde_json::json!("other")}else{request["id"].clone()},"ok":true,"data":{"answer":1}})).unwrap()}
             });
             let start = Instant::now();
-            let result = unary(&path, &Op::State, scaled(Duration::from_millis(200)));
+            let result = unary(
+                &path,
+                std::process::id(),
+                &Op::State,
+                scaled(Duration::from_millis(200)),
+            );
             assert!(start.elapsed() < scaled(Duration::from_millis(350)));
             match scenario {
                 "ok" => assert_eq!(result.unwrap()["answer"], 1),

@@ -506,6 +506,7 @@ fn ac_v2_405_a_mismatched_registry_is_cleaned_and_never_signalled() {
         session_id: A_ID.into(),
         session_handle: None,
         job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+        origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
         omp_pid: None,
         omp_start: None,
         warm_ms: 1000,
@@ -540,6 +541,7 @@ fn forged_entry(pid: u32) -> warm::Entry {
         session_id: A_ID.into(),
         session_handle: None,
         job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+        origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
         omp_pid: None,
         omp_start: None,
         warm_ms: 1000,
@@ -588,6 +590,40 @@ fn s09_a_misnamed_registry_is_never_signalled_or_removed() {
     );
     sleeper.kill().unwrap();
     sleeper.wait().unwrap();
+}
+
+/// R1 (S-09), the audit's reproduction for a *correctly named* registry: a forger writes
+/// `run/warm/<lock_key(S)>.json` naming a non-glen victim (its own process group) by its real
+/// pid and start token, as worker and omp at once, with an old mtime. `release --force` signals
+/// nothing: the victim is no glen worker (image and argv), so the row is a timeout with
+/// `reason:"unverified_process"` and the registry stays.
+#[test]
+fn s09_r1_a_correctly_named_forged_registry_never_kills_a_non_glen_victim() {
+    use std::os::unix::process::CommandExt;
+    let b = WarmBox::new();
+    let mut victim = Command::new("/bin/sleep")
+        .arg("60")
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut forged = forged_entry(victim.id());
+    forged.omp_pid = Some(victim.id());
+    forged.omp_start = forged.start.clone();
+    std::fs::create_dir_all(&b.omp.glen_home).unwrap();
+    warm::publish(&b.home(), &forged).unwrap();
+    age(&warm::path(&b.home(), A_ID));
+    let out = b.run(&["release", "e27c0de", "--force", "--json"]);
+    let alive = victim.try_wait().unwrap().is_none();
+    let _ = victim.kill();
+    let _ = victim.wait();
+    assert!(alive, "the victim was signalled: {out:?}");
+    assert_eq!(out.status.code(), Some(7), "{out:?}");
+    let e = &json(&out)["error"];
+    assert_eq!(e["details"]["reason"], "release_timeout", "{e}");
+    let row = &e["details"]["workers"][0];
+    assert_eq!(row["outcome"], "timeout", "{row}");
+    assert_eq!(row["reason"], "unverified_process", "{row}");
+    assert!(b.registry().is_some(), "the registry is kept");
 }
 
 /// Tech-debt F4: a torn registry may still name a running worker, so `release --all` releases
@@ -756,6 +792,7 @@ fn ac_v2_405_a_blocked_metadata_lock_is_never_reported_cooling_or_cleaned() {
         session_id: A_ID.into(),
         session_handle: None,
         job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+        origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
         omp_pid: None,
         omp_start: None,
         warm_ms: 1000,

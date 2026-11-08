@@ -34,7 +34,7 @@ use crate::rpc_support::*;
 use crate::support::*;
 
 /// AC-1004: the allowed `details.reason` values of an exit-6 `no_route` envelope.
-const NO_ROUTE_REASONS: [&str; 8] = [
+const NO_ROUTE_REASONS: [&str; 9] = [
     "live_owner",
     "unknown_lease",
     "unhealthy_endpoint",
@@ -43,6 +43,7 @@ const NO_ROUTE_REASONS: [&str; 8] = [
     "rpc_job_running",
     "sandboxed",
     "extension_outdated",
+    "untrusted_endpoint",
 ];
 
 /// Fix cycle 1, decision 5: a pre-W10 job record's no_route is normalised to this reason.

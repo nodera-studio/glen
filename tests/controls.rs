@@ -1178,8 +1178,13 @@ fn fakes_cover_every_op() {
         Op::Compact(CompactArgs::default()),
     ] {
         assert_eq!(
-            glen::live::client::unary(&registry.socket, &op, flake::scaled(Duration::from_secs(3)))
-                .unwrap()["session_id"],
+            glen::live::client::unary(
+                &registry.socket,
+                registry.pid,
+                &op,
+                flake::scaled(Duration::from_secs(3))
+            )
+            .unwrap()["session_id"],
             A_ID
         );
     }

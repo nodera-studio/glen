@@ -171,8 +171,11 @@ fn ac314_a_dead_pid_registry_and_its_socket_are_removed_and_send_uses_rpc() {
 fn ac314_a_refused_socket_is_stale_but_a_live_pids_socket_file_stays() {
     let lb = LiveBox::new();
     mkdir_private(&lb.run_live());
-    let sock = lb.run_live().join("leftover.sock");
+    // S-18: the registered `run/live/<pid>.sock`, private to this user, so only the refused
+    // connection decides.
+    let sock = lb.run_live().join(format!("{}.sock", std::process::id()));
     stale_socket(&sock);
+    std::fs::set_permissions(&sock, std::os::unix::fs::PermissionsExt::from_mode(0o600)).unwrap();
     let reg = write_registry_doc(&lb, A.id, &registry_doc(A.id, std::process::id(), &sock));
     let d = data_of(&lb.send(A.handle, "hi", &["--wait", "20s"]).run(), 0);
     assert_eq!(d["job"]["route"], "rpc", "{d}");
@@ -187,7 +190,7 @@ fn ac314_a_refused_socket_is_stale_but_a_live_pids_socket_file_stays() {
 #[test]
 fn ac314_a_missing_socket_is_stale_and_send_uses_rpc() {
     let lb = LiveBox::new();
-    let sock = lb.run_live().join("missing.sock");
+    let sock = lb.run_live().join(format!("{}.sock", std::process::id()));
     let reg = write_registry_doc(&lb, A.id, &registry_doc(A.id, std::process::id(), &sock));
     let d = data_of(&lb.send(A.handle, "hi", &["--wait", "20s"]).run(), 0);
     assert_eq!(d["job"]["route"], "rpc", "{d}");

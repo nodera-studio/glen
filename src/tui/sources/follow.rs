@@ -380,7 +380,7 @@ mod tests {
         fs::write(
             &reg,
             serde_json::to_vec(&serde_json::json!({"v":1,"pid":std::process::id(),
-            "session_id":id,"session_file":path,"socket":rig.temp.path().join("absent.sock"),
+            "session_id":id,"session_file":path,"socket":crate::live::run_dir(&rig.home).join(format!("{}.sock", std::process::id())),
             "cwd":rig.env.cwd(),"title":"pending session"}))
             .unwrap(),
         )

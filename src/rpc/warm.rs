@@ -167,6 +167,11 @@ pub struct Entry {
     pub session_handle: Option<String>,
     /// The job that made the worker warm, or the job it runs or ran last.
     pub job_id: String,
+    /// The job on the worker's own argv (`__worker <origin_job_id>`), which `job_id` leaves on
+    /// adoption. `glen release --force` signals only a process proven to run it (S-09); a
+    /// registry without it is never force-killed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_job_id: Option<String>,
     #[serde(default)]
     pub omp_pid: Option<u32>,
     #[serde(default)]
@@ -673,7 +678,7 @@ fn endpoint_present(home: &GlenHome, session_id: &str) -> bool {
     match registry::read(home, session_id) {
         registry::Read::Missing => false,
         registry::Read::Unreadable(_) => true,
-        registry::Read::Ok(r) => !registry::pid_dead(r.pid),
+        registry::Read::Untrusted(r, _) | registry::Read::Ok(r) => !registry::pid_dead(r.pid),
     }
 }
 fn timestamp_after(d: Duration) -> String {
@@ -811,6 +816,7 @@ pub(crate) fn idle(first: &Worker, warm: Warm) -> Result<(), Failure> {
             session_id: warm.session_id.clone(),
             session_handle: Some(super::session_handle(&warm.session_id)),
             job_id: first.id.as_str().into(),
+            origin_job_id: Some(first.id.as_str().into()),
             omp_pid: warm.client.pid(),
             omp_start: warm
                 .client
@@ -1372,6 +1378,7 @@ mod registry_tests {
             session_id: ID.into(),
             session_handle: Some("e27c0de".into()),
             job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+            origin_job_id: None,
             omp_pid: None,
             omp_start: None,
             warm_ms: 2000,
@@ -1978,6 +1985,7 @@ mod idle_tests {
                 session_id: ID.into(),
                 session_handle: None,
                 job_id: "j".into(),
+                origin_job_id: None,
                 omp_pid: None,
                 omp_start: None,
                 warm_ms: 1000,
@@ -2058,6 +2066,7 @@ mod idle_tests {
                 session_id: ID.into(),
                 session_handle: None,
                 job_id: "j".into(),
+                origin_job_id: None,
                 omp_pid: None,
                 omp_start: None,
                 warm_ms: 1000,

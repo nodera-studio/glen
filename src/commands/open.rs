@@ -135,6 +135,18 @@ fn open_mode(
             .find(|s| s.file.path == path)
             .cloned()
     {
+        // AC-H109: an endpoint glen does not trust is never shown live, and lends the session
+        // neither its cwd nor its title.
+        let mut summary = summary;
+        let (extension, untrusted) = match probe.then(|| endpoint_state(&registries, &summary.id)) {
+            Some(Err(())) => {
+                summary.cwd = None;
+                summary.title = None;
+                (None, true)
+            }
+            Some(Ok(answer)) => (answer, false),
+            None => (None, false),
+        };
         let header = serde_json::json!({"type":"session","version":3,"id":summary.id,"cwd":summary.cwd,"timestamp":summary.created.map(|t|t.to_string()),"title":summary.title});
         let session = Session::parse(&path, format!("{header}\n").as_bytes())
             .map_err(|e| load_error(&path, e))?;
@@ -150,16 +162,12 @@ fn open_mode(
             catalog.assign_handles(Some(&summary.id));
         }
         let handle = catalog.handle(&summary.id);
-        let extension = if probe {
-            endpoint_state(&registries, &summary.id)
-        } else {
-            None
-        };
         // An answering endpoint is authoritative, exactly as in `ls::infer_row`; the hidden
         // lease only matters when no endpoint answered (fixes2 decision 4).
         let state = match &extension {
             Some(s) if s.busy => State::Busy,
             Some(_) => State::Live,
+            None if untrusted => State::Unknown,
             None if probe && crate::sandbox::lease_hidden(env, cfg!(target_os = "linux")) => {
                 State::Unknown
             }
@@ -215,7 +223,7 @@ fn open_mode(
         }
     };
     let extension = if probe {
-        endpoint_state(&registries, &session.header.id)
+        endpoint_state(&registries, &session.header.id).unwrap_or_default()
     } else {
         None
     };
@@ -249,14 +257,22 @@ fn open_mode(
         extension,
     })
 }
+/// The session's endpoint state: `Ok(None)` when none answered, `Err` when one answered that
+/// glen does not trust (S-18: its kernel peer or reported pid is not the registered process, or
+/// it runs more confined than glen).
 fn endpoint_state(
     registries: &[crate::live::registry::Registry],
     id: &str,
-) -> Option<crate::live::client::Hello> {
-    let registry = registries.iter().find(|r| r.session_id == id)?;
-    crate::live::client::state(&registry.socket, crate::live::STATE_LS)
-        .ok()
-        .filter(|s| s.session_id == id)
+) -> Result<Option<crate::live::client::Hello>, ()> {
+    let Some(registry) = registries.iter().find(|r| r.session_id == id) else {
+        return Ok(None);
+    };
+    match crate::live::client::state(&registry.socket, registry.pid, crate::live::STATE_LS) {
+        Err(crate::live::client::ClientError::Untrusted(_)) => Err(()),
+        Ok(s) if s.pid != registry.pid => Err(()),
+        Ok(s) => Ok(Some(s).filter(|s| s.session_id == id)),
+        Err(_) => Ok(None),
+    }
 }
 pub(crate) fn session_json(o: &Opened) -> serde_json::Value {
     let mut value = super::ls::session_json(
@@ -411,14 +427,13 @@ mod assignment_tests {
                 tree.path(),
                 &[("PI_CODING_AGENT_DIR", agent.to_str().unwrap())],
             );
-            let sock_dir = tempfile::Builder::new()
-                .prefix("gshow-")
-                .tempdir_in("/tmp")
-                .unwrap();
-            let socket = sock_dir.path().join("s");
-            let listener = UnixListener::bind(&socket).unwrap();
             let home = crate::glen_home::resolve(&env).unwrap();
             home.ensure_dir("run/live").unwrap();
+            // S-18: the registered `run/live/<pid>.sock`, private to this user.
+            let socket = crate::live::run_dir(&home).join(format!("{}.sock", std::process::id()));
+            let listener = UnixListener::bind(&socket).unwrap();
+            fs::set_permissions(&socket, std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                .unwrap();
             let registry =
                 serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"socket":socket});
             fs::write(crate::live::registry::path(&home, id), registry.to_string()).unwrap();
@@ -433,7 +448,7 @@ mod assignment_tests {
                 writeln!(
                     &stream,
                     "{}",
-                    serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":id,"busy":busy,"state":"ready"}})
+                    serde_json::json!({"v":1,"id":request["id"],"ok":true,"data":{"session_id":id,"busy":busy,"state":"ready","pid":std::process::id()}})
                 )
                 .unwrap();
             });
