@@ -1065,7 +1065,9 @@ mod tests {
         let started = Instant::now();
         assert!(client.notify("session/cancel", json!({"sessionId":"s1"})));
         assert!(matches!(pump(&mut client, TICK), Pump::Idle));
-        assert!(started.elapsed() < scaled(TICK + Duration::from_millis(150)));
+        // The writer never finishes (nobody reads), so waiting on it would never return; the
+        // bound only has to tell "returned" from "blocked", not time the tick on a busy runner.
+        assert!(started.elapsed() < scaled(TICK + Duration::from_secs(2)));
     }
     #[test]
     fn a_stop_or_an_expired_deadline_before_the_turn_writes_nothing() {
