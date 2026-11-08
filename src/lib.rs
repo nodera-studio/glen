@@ -9,6 +9,7 @@ pub mod jobs;
 pub mod mcp;
 pub mod omp;
 pub mod output;
+pub mod proc_ident;
 pub mod render;
 pub mod rpc;
 pub mod sandbox;
