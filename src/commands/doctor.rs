@@ -666,6 +666,7 @@ mod warm_tests {
             session_id: ID.into(),
             session_handle: None,
             job_id: "j".into(),
+            origin_job_id: None,
             omp_pid: None,
             omp_start: None,
             warm_ms: 1000,

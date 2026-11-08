@@ -41,7 +41,7 @@ pub fn run(
             .entry
             .class(target.mtime, SystemTime::now(), stale)
             .as_str(&target.entry);
-        let outcome = match release_one(env, &home, target, args, stale) {
+        let outcome = match release_one(env, &home, target, args, stale, &KERNEL) {
             Ok((outcome, ok)) => {
                 timed_out |= !ok;
                 outcome
@@ -59,7 +59,7 @@ pub fn run(
         .collect();
     let done = rows
         .iter()
-        .filter(|(_, _, o)| !matches!(*o, "failed" | "timeout"))
+        .filter(|(_, _, o)| !matches!(*o, "failed" | "timeout" | UNVERIFIED))
         .count();
     if let Some(mut e) = failed {
         e.message = format!(
@@ -167,13 +167,18 @@ fn select(home: &GlenHome, entries: Vec<Indexed>, target: &str) -> Result<Indexe
 
 fn row(t: &Indexed, state: &str, outcome: &str) -> Value {
     let e = &t.entry;
-    json!({
+    let mut row = json!({
         "session":{"id":e.session_id,"handle":rpc::session_handle(&e.session_id)},
         "job":JobId::parse(&e.job_id).map(|id| id.handle()),
         "pid":e.pid,
         "state":state,
         "outcome":outcome,
-    })
+    });
+    if outcome == UNVERIFIED {
+        row["outcome"] = json!("timeout");
+        row["reason"] = json!("unverified_process");
+    }
+    row
 }
 
 fn human_line(ctx: &OutputCtx, t: &Indexed, outcome: &str) -> String {
@@ -208,6 +213,7 @@ fn release_one(
     t: &Indexed,
     args: &ReleaseArgs,
     stale: Duration,
+    facts: &Facts<'_>,
 ) -> Result<(&'static str, bool), GlenError> {
     let e = &t.entry;
     let io = |err| crate::sandbox::map_home_write(env, "release", err);
@@ -222,7 +228,7 @@ fn release_one(
         return Ok(("cooling", true));
     }
     if class == Class::Stale && args.force {
-        return force(home, t).map_err(io);
+        return force(home, t, facts).map_err(io);
     }
     let end = Instant::now() + args.timeout;
     loop {
@@ -231,7 +237,7 @@ fn release_one(
         }
         if Instant::now() >= end {
             return if args.force {
-                force(home, t).map_err(io)
+                force(home, t, facts).map_err(io)
             } else {
                 Ok(("timeout", false))
             };
@@ -254,37 +260,100 @@ fn gone(home: &GlenHome, e: &warm::Entry) -> bool {
 
 /// How long `--force` waits for a killed worker and its omp group to be gone.
 const FORCE_BOUND: Duration = Duration::from_secs(2);
+/// `--force` could not prove a recorded process is the session's glen worker or its omp
+/// (S-09): nothing more is signalled and the row is `timeout` with `reason:"unverified_process"`.
+const UNVERIFIED: &str = "unverified";
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Kill {
     Group(u32),
     Process(u32),
 }
-/// SIGKILL; a process or group that is already gone is not an error.
-fn signal(target: Kill) -> std::io::Result<()> {
-    match target {
-        Kill::Group(pid) => rpc::kill_group(pid, rustix::process::Signal::KILL),
-        Kill::Process(pid) => {
-            let p = rpc::signal_pid(pid)
-                .ok_or_else(|| std::io::Error::other(format!("invalid worker pid {pid}")))?;
-            match rustix::process::kill_process(p, rustix::process::Signal::KILL) {
-                Ok(()) | Err(rustix::io::Errno::SRCH) => Ok(()),
+/// SIGKILL; a process or group that is already gone is not an error. A worker is signalled
+/// through its [`Pinned`] handle.
+fn signal(target: Kill, pinned: Option<&Pinned>) -> std::io::Result<()> {
+    match (target, pinned) {
+        (Kill::Group(pid), _) => rpc::kill_group(pid, rustix::process::Signal::KILL),
+        (Kill::Process(_), Some(p)) => p.kill().map(drop),
+        (Kill::Process(pid), None) => Pinned::open(pid).kill().map(drop),
+    }
+}
+/// A worker held for signalling. On Linux it is a pidfd opened before the worker's identity is
+/// proven, so the signal reaches the proven process or none (AC-H103); elsewhere, or on a
+/// kernel without pidfds, it is the pid, proven again right before the signal.
+struct Pinned {
+    pid: u32,
+    #[cfg(target_os = "linux")]
+    fd: Option<std::os::fd::OwnedFd>,
+}
+impl Pinned {
+    fn open(pid: u32) -> Self {
+        Self {
+            pid,
+            #[cfg(target_os = "linux")]
+            fd: crate::proc_ident::pidfd(pid),
+        }
+    }
+    /// SIGKILL; `Ok(false)` when the process had already exited, so nothing was signalled.
+    fn kill(&self) -> std::io::Result<bool> {
+        use rustix::{io::Errno, process::Signal};
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.fd {
+            return match rustix::process::pidfd_send_signal(fd, Signal::KILL) {
+                Ok(()) => Ok(true),
+                Err(Errno::SRCH) => Ok(false),
                 Err(e) => Err(e.into()),
-            }
+            };
+        }
+        let p = rpc::signal_pid(self.pid)
+            .ok_or_else(|| std::io::Error::other(format!("invalid worker pid {}", self.pid)))?;
+        match rustix::process::kill_process(p, Signal::KILL) {
+            Ok(()) => Ok(true),
+            Err(Errno::SRCH) => Ok(false),
+            Err(e) => Err(e.into()),
         }
     }
 }
-fn force(home: &GlenHome, t: &Indexed) -> std::io::Result<(&'static str, bool)> {
-    force_with(home, &t.entry, &signal, FORCE_BOUND)
+/// What `--force` must prove from the kernel before each signal (S-09), a seam for tests.
+struct Facts<'a> {
+    /// The worker `pid` runs this glen executable as `__worker <origin_job_id>` (AC-H101).
+    worker: &'a dyn Fn(u32, &str) -> bool,
+    /// The recorded omp `(worker, omp)`: omp's parent is the worker and it leads its own
+    /// process group (AC-H102).
+    omp: &'a dyn Fn(u32, u32) -> bool,
+}
+const KERNEL: Facts<'static> = Facts {
+    worker: &is_glen_worker,
+    omp: &is_workers_omp,
+};
+fn is_glen_worker(pid: u32, origin: &str) -> bool {
+    let Some(argv) = crate::proc_ident::argv(pid) else {
+        return false;
+    };
+    let job = |a: &std::ffi::OsString| a.to_str().and_then(JobId::parse);
+    crate::proc_ident::runs_current_exe(pid)
+        && argv.len() == 3
+        && argv[1] == "__worker"
+        && job(&argv[2]).is_some_and(|id| Some(id) == JobId::parse(origin))
+}
+fn is_workers_omp(worker: u32, omp: u32) -> bool {
+    crate::proc_ident::ppid(omp) == Some(worker) && crate::proc_ident::pgid(omp) == Some(omp)
+}
+fn force(home: &GlenHome, t: &Indexed, facts: &Facts<'_>) -> std::io::Result<(&'static str, bool)> {
+    force_with(home, &t.entry, facts, &signal, FORCE_BOUND)
 }
 /// SIGKILL the omp group and the worker, but only when every recorded process is proven by pid
-/// and start token (binding J11): an `Unknown` worker or omp is never signalled, and a failed
-/// signal or a worker still alive after `bound` falls to `release_timeout` with the registry kept.
-/// `forced` only once the worker is proven dead, the recorded omp group is gone, whether or not
-/// its leader was alive to be signalled, and its files are removed (see [`cleaned`]).
+/// and start token (binding J11) and by what it runs (S-09): the worker is this glen executable
+/// as `__worker <origin_job_id>`, and omp is the worker's child leading its own group, both
+/// proven before the first signal and again right before each one. An `Unknown` or unproven
+/// process is never signalled, and a failed signal or a worker still alive after `bound` falls
+/// to `release_timeout` with the registry kept. `forced` only once the worker is proven dead,
+/// the recorded omp group is gone, whether or not its leader was alive to be signalled, and its
+/// files are removed (see [`cleaned`]).
 fn force_with(
     home: &GlenHome,
     e: &warm::Entry,
-    kill: &dyn Fn(Kill) -> std::io::Result<()>,
+    facts: &Facts<'_>,
+    kill: &dyn Fn(Kill, Option<&Pinned>) -> std::io::Result<()>,
     bound: Duration,
 ) -> std::io::Result<(&'static str, bool)> {
     let identity = warm::kill_identity(e);
@@ -292,6 +361,15 @@ fn force_with(
         Liveness::Dead => return cleaned(home, e, "cleaned"),
         Liveness::Unknown => return Ok(("timeout", false)),
         Liveness::Alive => (),
+    }
+    // AC-H104: a registry that does not name the worker's argv job cannot be proven.
+    let Some(origin) = e.origin_job_id.as_deref() else {
+        return Ok((UNVERIFIED, false));
+    };
+    // AC-H103: pinned before the proof below.
+    let worker = Pinned::open(e.pid);
+    if !(facts.worker)(e.pid, origin) {
+        return Ok((UNVERIFIED, false));
     }
     // Only a proven omp leader's group is signalled: once the leader is gone its pid may be
     // reused, so its group cannot be proven omp's. An unproven leader blocks the kill. The
@@ -301,26 +379,32 @@ fn force_with(
         (Some(pid), Some(Liveness::Alive)) => (Some(pid), Some(pid)),
         (pid, _) => (None, pid),
     };
+    // AC-H102: before the first signal.
+    if signalled.is_some_and(|pid| !(facts.omp)(e.pid, pid)) {
+        return Ok((UNVERIFIED, false));
+    }
     // S-09: each identity is proven again right before its own signal, so a process that ended
     // since the first check (its pid now free for reuse) is never signalled. A leader gone by
     // then is skipped (its group must still be gone below); a worker gone by then needs no kill.
     if let Some(pid) = signalled {
         match warm::kill_identity(e).omp {
-            Some(Liveness::Alive) => {
-                if kill(Kill::Group(pid)).is_err() {
+            Some(Liveness::Alive) if (facts.omp)(e.pid, pid) => {
+                if kill(Kill::Group(pid), None).is_err() {
                     return Ok(("timeout", false));
                 }
             }
+            Some(Liveness::Alive) => return Ok((UNVERIFIED, false)),
             Some(Liveness::Dead) => (),
             _ => return Ok(("timeout", false)),
         }
     }
     match warm::kill_identity(e).worker {
-        Liveness::Alive => {
-            if kill(Kill::Process(e.pid)).is_err() {
+        Liveness::Alive if (facts.worker)(e.pid, origin) => {
+            if kill(Kill::Process(e.pid), Some(&worker)).is_err() {
                 return Ok(("timeout", false));
             }
         }
+        Liveness::Alive => return Ok((UNVERIFIED, false)),
         Liveness::Dead => (),
         Liveness::Unknown => return Ok(("timeout", false)),
     }
@@ -361,6 +445,11 @@ fn cleaned(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Facts that prove any process: these tests are about the pid and start-token proofs.
+    const TRUSTING: Facts<'static> = Facts {
+        worker: &|_, _| true,
+        omp: &|_, _| true,
+    };
     const A: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e27c0de";
     const B: &str = "01a0f6b1-2680-7a3c-8b21-4a1f9e00c0de";
     fn entry(session: &str, pid: u32, start: Option<String>) -> warm::Entry {
@@ -371,6 +460,7 @@ mod tests {
             session_id: session.into(),
             session_handle: None,
             job_id: "01a18bcc-6970-7685-8f03-0ecc16977273".into(),
+            origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
             omp_pid: None,
             omp_start: None,
             warm_ms: 1000,
@@ -437,7 +527,8 @@ mod tests {
         // This test process stands in for a worker whose start token no longer matches.
         warm::publish(&h, &entry(A, std::process::id(), Some("reused".into()))).unwrap();
         let entries = warm::index(&h).entries;
-        let (outcome, ok) = release_one(&env, &h, &entries[0], &args, warm::STALE).unwrap();
+        let (outcome, ok) =
+            release_one(&env, &h, &entries[0], &args, warm::STALE, &TRUSTING).unwrap();
         assert_eq!((outcome, ok), ("cleaned", true));
         assert!(warm::read(&h, A).is_none());
         assert!(!warm::release_path(&h, A).exists());
@@ -458,7 +549,7 @@ mod tests {
             entry: e,
             mtime: SystemTime::now() - Duration::from_secs(60),
         };
-        assert_eq!(force(&h, &indexed).unwrap(), ("timeout", false));
+        assert_eq!(force(&h, &indexed, &KERNEL).unwrap(), ("timeout", false));
     }
     fn me() -> crate::jobs::liveness::Identity {
         crate::jobs::liveness::current().unwrap()
@@ -525,6 +616,7 @@ mod tests {
                 &snapshot,
                 &args(force, Duration::from_millis(300)),
                 warm::STALE,
+                &TRUSTING,
             )
             .unwrap();
             assert_eq!(got, ("released", true), "force {force}");
@@ -553,6 +645,7 @@ mod tests {
                 &snapshot,
                 &args(force, Duration::from_millis(100)),
                 warm::STALE,
+                &TRUSTING,
             )
             .unwrap();
             assert_eq!(got, ("cleaned", true), "force {force}");
@@ -579,6 +672,7 @@ mod tests {
                 &snapshot,
                 &args(true, Duration::from_millis(100)),
                 warm::STALE,
+                &TRUSTING,
             )
             .unwrap()
         };
@@ -600,9 +694,10 @@ mod tests {
         let mut e = entry(A, me.pid, Some(me.start));
         e.omp_pid = Some(me.pid);
         warm::publish(&h, &e).unwrap();
-        let never = |k: Kill| -> std::io::Result<()> { panic!("signalled {k:?}") };
+        let never =
+            |k: Kill, _: Option<&Pinned>| -> std::io::Result<()> { panic!("signalled {k:?}") };
         assert_eq!(
-            force_with(&h, &e, &never, Duration::ZERO).unwrap(),
+            force_with(&h, &e, &TRUSTING, &never, Duration::ZERO).unwrap(),
             ("timeout", false)
         );
         assert_eq!(warm::read(&h, A).unwrap().entry, e, "the registry is kept");
@@ -614,23 +709,24 @@ mod tests {
         let me = me();
         let e = entry(A, me.pid, Some(me.start));
         warm::publish(&h, &e).unwrap();
-        let refused =
-            |_: Kill| -> std::io::Result<()> { Err(std::io::ErrorKind::PermissionDenied.into()) };
+        let refused = |_: Kill, _: Option<&Pinned>| -> std::io::Result<()> {
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        };
         assert_eq!(
-            force_with(&h, &e, &refused, Duration::ZERO).unwrap(),
+            force_with(&h, &e, &TRUSTING, &refused, Duration::ZERO).unwrap(),
             ("timeout", false)
         );
         assert_eq!(warm::read(&h, A).unwrap().entry, e);
         // A signal that reported success but left the worker (this process) running.
         let sent = std::cell::Cell::new(vec![]);
-        let ignored = |k: Kill| -> std::io::Result<()> {
+        let ignored = |k: Kill, _: Option<&Pinned>| -> std::io::Result<()> {
             let mut all = sent.take();
             all.push(k);
             sent.set(all);
             Ok(())
         };
         assert_eq!(
-            force_with(&h, &e, &ignored, Duration::from_millis(100)).unwrap(),
+            force_with(&h, &e, &TRUSTING, &ignored, Duration::from_millis(100)).unwrap(),
             ("timeout", false)
         );
         assert_eq!(sent.take(), [Kill::Process(me.pid)]);
@@ -643,7 +739,7 @@ mod tests {
         let (mut child, e) = sleeper();
         warm::publish(&h, &e).unwrap();
         assert_eq!(
-            force_with(&h, &e, &signal, FORCE_BOUND).unwrap(),
+            force_with(&h, &e, &TRUSTING, &signal, FORCE_BOUND).unwrap(),
             ("forced", true)
         );
         assert!(warm::read(&h, A).is_none());
@@ -679,14 +775,14 @@ mod tests {
         assert_eq!(warm::kill_identity(&e).omp, Some(Liveness::Dead));
         warm::publish(&h, &e).unwrap();
         let sent = std::cell::Cell::new(vec![]);
-        let recorded = |k: Kill| -> std::io::Result<()> {
+        let recorded = |k: Kill, p: Option<&Pinned>| -> std::io::Result<()> {
             let mut all = sent.take();
             all.push(k);
             sent.set(all);
-            signal(k)
+            signal(k, p)
         };
         assert_eq!(
-            force_with(&h, &e, &recorded, Duration::from_millis(300)).unwrap(),
+            force_with(&h, &e, &TRUSTING, &recorded, Duration::from_millis(300)).unwrap(),
             ("timeout", false)
         );
         assert_eq!(
@@ -712,7 +808,7 @@ mod tests {
         e.omp_start = Some("the-exited-leader".into());
         warm::publish(&h, &e).unwrap();
         assert_eq!(
-            force_with(&h, &e, &signal, FORCE_BOUND).unwrap(),
+            force_with(&h, &e, &TRUSTING, &signal, FORCE_BOUND).unwrap(),
             ("forced", true)
         );
         assert!(warm::read(&h, A).is_none());
@@ -736,6 +832,7 @@ mod tests {
                 &snapshot,
                 &args(force, Duration::from_millis(100)),
                 warm::STALE,
+                &TRUSTING,
             )
             .unwrap();
             assert_eq!(got, ("timeout", false), "force {force}");
@@ -754,6 +851,7 @@ mod tests {
                 &snapshot,
                 &args(false, Duration::from_millis(100)),
                 warm::STALE,
+                &TRUSTING,
             )
             .unwrap();
             assert_eq!(got, ("cooling", true));
@@ -778,6 +876,7 @@ mod tests {
                 &snapshot,
                 &args(force, Duration::from_millis(100)),
                 warm::STALE,
+                &TRUSTING,
             )
             .unwrap()
         };
@@ -793,7 +892,7 @@ mod tests {
         warm::publish(&h, &live).unwrap();
         let stopped_b = warm::hold_meta_lock(&h, B);
         assert_eq!(
-            force_with(&h, &live, &signal, FORCE_BOUND).unwrap(),
+            force_with(&h, &live, &TRUSTING, &signal, FORCE_BOUND).unwrap(),
             ("timeout", false)
         );
         assert!(!child.wait().unwrap().success(), "killed");
@@ -809,7 +908,15 @@ mod tests {
         assert!(warm::read(&h, A).is_none() && !warm::release_path(&h, A).exists());
         let dead_b = warm::read(&h, B).unwrap();
         assert_eq!(
-            release_one(&env, &h, &dead_b, &args(false, Duration::ZERO), warm::STALE).unwrap(),
+            release_one(
+                &env,
+                &h,
+                &dead_b,
+                &args(false, Duration::ZERO),
+                warm::STALE,
+                &TRUSTING
+            )
+            .unwrap(),
             ("cleaned", true)
         );
         assert!(warm::read(&h, B).is_none());
@@ -842,9 +949,9 @@ mod tests {
         let worker_pid = worker.id();
         let omp = std::cell::RefCell::new(omp);
         let sent = std::cell::RefCell::new(vec![]);
-        let kill = |k: Kill| -> std::io::Result<()> {
+        let kill = |k: Kill, p: Option<&Pinned>| -> std::io::Result<()> {
             sent.borrow_mut().push(k);
-            signal(k)?;
+            signal(k, p)?;
             if k == Kill::Group(omp_pid) {
                 omp.borrow_mut().wait()?;
                 let pid = rpc::signal_pid(worker_pid).unwrap();
@@ -861,7 +968,7 @@ mod tests {
             Ok(())
         };
         assert_eq!(
-            force_with(&h, &e, &kill, FORCE_BOUND).unwrap(),
+            force_with(&h, &e, &TRUSTING, &kill, FORCE_BOUND).unwrap(),
             ("forced", true)
         );
         assert_eq!(*sent.borrow(), [Kill::Group(omp_pid)], "no second signal");
@@ -897,6 +1004,7 @@ mod tests {
                 &snapshot,
                 &args(force, Duration::from_millis(100)),
                 warm::STALE,
+                &TRUSTING,
             );
             assert_eq!(got.unwrap(), ("timeout", false), "force {force}");
             assert_eq!(warm::read(&h, A).unwrap().entry, dead, "force {force}");
@@ -908,9 +1016,162 @@ mod tests {
             &snapshot,
             &args(false, Duration::from_millis(100)),
             warm::STALE,
+            &TRUSTING,
         );
         assert_eq!(got.unwrap(), ("cleaned", true));
         assert!(warm::read(&h, A).is_none());
+    }
+    /// Records every signal `force_with` asks for, and sends it.
+    fn recorder(
+        sent: &std::cell::RefCell<Vec<Kill>>,
+    ) -> impl Fn(Kill, Option<&Pinned>) -> std::io::Result<()> {
+        move |k, p| {
+            sent.borrow_mut().push(k);
+            signal(k, p)
+        }
+    }
+    /// AC-H101: a live process proven by pid and start token is still never signalled unless
+    /// it runs this glen executable as `__worker <origin_job_id>`; the kernel facts reject a
+    /// `sleep`, and the row is `timeout` with `reason:"unverified_process"`.
+    #[test]
+    fn s09_force_never_signals_a_process_that_is_not_the_glen_worker() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (mut child, e) = sleeper();
+        warm::publish(&h, &e).unwrap();
+        assert!(!is_glen_worker(e.pid, e.origin_job_id.as_deref().unwrap()));
+        let sent = std::cell::RefCell::new(vec![]);
+        assert_eq!(
+            force_with(&h, &e, &KERNEL, &recorder(&sent), FORCE_BOUND).unwrap(),
+            (UNVERIFIED, false)
+        );
+        assert!(sent.borrow().is_empty(), "nothing signalled");
+        assert!(child.try_wait().unwrap().is_none(), "alive");
+        assert_eq!(warm::read(&h, A).unwrap().entry, e, "the registry is kept");
+        let doc = row(&warm::read(&h, A).unwrap(), "stale", UNVERIFIED);
+        assert_eq!(doc["outcome"], "timeout");
+        assert_eq!(doc["reason"], "unverified_process");
+        // This process does run the glen executable, but not as `__worker <origin>`.
+        assert!(!is_glen_worker(
+            std::process::id(),
+            "01a18bcc-6970-7685-8f03-0ecc16977273"
+        ));
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    /// AC-H102: the omp group is signalled only once omp is the worker's child and leads its
+    /// own group, proven before the first signal: a failed omp proof signals nothing at all,
+    /// not even the proven worker.
+    #[test]
+    fn s09_an_omp_that_is_not_the_workers_child_blocks_every_signal() {
+        use std::os::unix::process::CommandExt;
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let omp = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let omp_pid = omp.id();
+        let _cleanup = Group(omp_pid);
+        let crate::jobs::liveness::Probe::Running(omp_start) =
+            crate::jobs::liveness::start_token(omp_pid)
+        else {
+            panic!("no start token for omp")
+        };
+        let omp = std::cell::RefCell::new(omp);
+        let (mut worker, mut e) = sleeper();
+        e.omp_pid = Some(omp_pid);
+        e.omp_start = Some(omp_start);
+        warm::publish(&h, &e).unwrap();
+        // The real omp fact: this "omp" is the test process's child, not the worker's.
+        assert!(!is_workers_omp(e.pid, omp_pid));
+        assert!(is_workers_omp(std::process::id(), omp_pid));
+        let asked = std::cell::RefCell::new(vec![]);
+        let facts = Facts {
+            worker: &|_, _| true,
+            omp: &|w, o| {
+                asked.borrow_mut().push((w, o));
+                is_workers_omp(w, o)
+            },
+        };
+        let sent = std::cell::RefCell::new(vec![]);
+        assert_eq!(
+            force_with(&h, &e, &facts, &recorder(&sent), FORCE_BOUND).unwrap(),
+            (UNVERIFIED, false)
+        );
+        assert_eq!(*asked.borrow(), [(e.pid, omp_pid)]);
+        assert!(sent.borrow().is_empty(), "no signal before both proofs");
+        assert!(worker.try_wait().unwrap().is_none());
+        assert_eq!(warm::read(&h, A).unwrap().entry, e);
+        // With both facts proven, the group then the worker are signalled.
+        let trusted = Facts {
+            worker: &|_, _| true,
+            omp: &|_, _| true,
+        };
+        // The group is gone only once its killed leader (this test's child) is reaped.
+        let reaping = |k: Kill, p: Option<&Pinned>| -> std::io::Result<()> {
+            recorder(&sent)(k, p)?;
+            if k == Kill::Group(omp_pid) {
+                omp.borrow_mut().wait()?;
+            }
+            Ok(())
+        };
+        assert_eq!(
+            force_with(&h, &e, &trusted, &reaping, FORCE_BOUND).unwrap(),
+            ("forced", true)
+        );
+        assert_eq!(*sent.borrow(), [Kill::Group(omp_pid), Kill::Process(e.pid)]);
+        assert!(!worker.wait().unwrap().success());
+    }
+    /// AC-H104: a registry without `origin_job_id` (written before it existed, or forged) is
+    /// never force-killed, whatever else is proven.
+    #[test]
+    fn s09_a_registry_without_its_origin_job_is_never_force_killed() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (mut child, mut e) = sleeper();
+        e.origin_job_id = None;
+        warm::publish(&h, &e).unwrap();
+        let sent = std::cell::RefCell::new(vec![]);
+        assert_eq!(
+            force_with(&h, &e, &TRUSTING, &recorder(&sent), FORCE_BOUND).unwrap(),
+            (UNVERIFIED, false)
+        );
+        assert!(sent.borrow().is_empty());
+        assert!(child.try_wait().unwrap().is_none());
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+    /// AC-H103: the worker is pinned before its proof and signalled through that pin. When it
+    /// exits (and is reaped, so its pid is free for reuse) between the proof and the signal,
+    /// the signal reaches nothing. On Linux the pin is a pidfd, so this holds even if the pid
+    /// were reused; elsewhere the pid is proven again right before the signal.
+    #[test]
+    fn s09_a_worker_that_exits_between_proof_and_signal_is_never_signalled() {
+        let t = tempfile::tempdir().unwrap();
+        let h = home(&t);
+        let (child, e) = sleeper();
+        warm::publish(&h, &e).unwrap();
+        #[cfg(target_os = "linux")]
+        assert!(Pinned::open(e.pid).fd.is_some(), "a pidfd on Linux");
+        let child = std::cell::RefCell::new(child);
+        let outcomes = std::cell::RefCell::new(vec![]);
+        let exits_first = |k: Kill, p: Option<&Pinned>| -> std::io::Result<()> {
+            let mut c = child.borrow_mut();
+            c.kill()?;
+            c.wait()?;
+            assert_eq!(k, Kill::Process(e.pid));
+            outcomes
+                .borrow_mut()
+                .push(p.expect("the pinned worker").kill()?);
+            Ok(())
+        };
+        assert_eq!(
+            force_with(&h, &e, &TRUSTING, &exits_first, FORCE_BOUND).unwrap(),
+            ("forced", true)
+        );
+        assert_eq!(*outcomes.borrow(), [false], "the signal reached nothing");
     }
     #[test]
     fn an_at_new_job_handle_finds_its_worker_after_a_follow_up_was_adopted() {
