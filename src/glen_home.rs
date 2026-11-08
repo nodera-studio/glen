@@ -38,7 +38,7 @@ pub(crate) fn read_regular(path: &Path, max: u64) -> io::Result<(Vec<u8>, fs::Me
     let file = open_regular(path, false)?;
     let meta = file.metadata()?;
     let mut bytes = Vec::new();
-    file.take(max + 1).read_to_end(&mut bytes)?;
+    file.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > max {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,

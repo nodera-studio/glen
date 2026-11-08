@@ -359,13 +359,15 @@ impl JobStore {
         )
     }
     pub fn read_job(&self, id: &JobId) -> Result<Job, GlenError> {
-        read_json(&self.dir(id).join("job.json"))
+        read_json(&self.dir(id).join("job.json"), MAX_RECORD)
     }
     pub fn read_status(&self, id: &JobId) -> Result<Status, GlenError> {
-        read_json(&self.dir(id).join("status.json"))
+        read_json(&self.dir(id).join("status.json"), MAX_RECORD)
     }
     pub fn read_result(&self, id: &JobId) -> Result<JobResult, GlenError> {
-        read_json(&self.dir(id).join("result.json"))
+        // A result has no aggregate size limit (every reply of a long job), so it is read
+        // whole; it is still checked to be a regular file, so a FIFO cannot stall a reader.
+        read_json(&self.dir(id).join("result.json"), u64::MAX)
     }
     pub fn write_status(&self, id: &JobId, s: &Status) -> Result<(), GlenError> {
         let _lock = self.status_lock(id)?;
@@ -533,9 +535,9 @@ impl JobStore {
 /// reads at most 8 MiB of job), a status far less.
 const MAX_RECORD: u64 = 16 * 1024 * 1024;
 /// A job record, read without blocking or following a symlink, regular files only and at most
-/// [`MAX_RECORD`] (H2: a writer can plant a FIFO where a record should be).
-fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, GlenError> {
-    let (bytes, _) = crate::glen_home::read_regular(path, MAX_RECORD).map_err(|e| {
+/// `max` bytes (H2: a writer can plant a FIFO where a record should be).
+fn read_json<T: DeserializeOwned>(path: &Path, max: u64) -> Result<T, GlenError> {
+    let (bytes, _) = crate::glen_home::read_regular(path, max).map_err(|e| {
         GlenError::new(
             if e.kind() == io::ErrorKind::NotFound {
                 ErrorCode::NotFound
@@ -830,6 +832,33 @@ pub(crate) mod tests {
             session_settled: true,
             settled_at: Some(jiff::Timestamp::now().to_string()),
         });
+    }
+    #[test]
+    fn a_result_larger_than_a_record_is_still_read() {
+        // A long job's replies have no aggregate limit; only job and status records are capped.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path());
+        let job = job();
+        store.create(&job).unwrap();
+        let id = JobId::parse(&job.id).unwrap();
+        let big = "x".repeat(MAX_RECORD as usize + 1024);
+        store
+            .write_result(
+                &id,
+                &JobResult {
+                    v: 1,
+                    prompt_status: None,
+                    agent_invoked: true,
+                    assistant_text: Some(big.clone()),
+                    replies: vec![],
+                    command_output: vec![],
+                    stop_reason: None,
+                    session_settled: true,
+                    settled_at: None,
+                },
+            )
+            .unwrap();
+        assert_eq!(store.read_result(&id).unwrap().assistant_text.unwrap(), big);
     }
     #[test]
     fn task_state_follows_status_and_error_code() {
