@@ -18,7 +18,7 @@ use crate::{
 use omp_rpc::{Client, Event};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
@@ -1595,26 +1595,24 @@ fn choose(
         offer.answer(Answer::Retry);
         return Ok(None);
     }
-    defer.waiting.remove(&offer.id);
+    defer.claimed(&offer.id);
     Ok(Some(offer))
 }
-/// How long an offer waits for an older queued job's own offer (AC-v2-402): one cold-worker
-/// poll (200 ms) and slack.
+/// The most one offer is deferred for older queued jobs' own offers (AC-v2-402), however many
+/// there are: one cold-worker poll (200 ms) and slack.
 pub(crate) const DEFER: Duration = Duration::from_millis(400);
 /// AC-v2-402 across ticks (H2): the oldest queued job goes first even when a newer one's worker
-/// polls first. Disk may only defer an offer, never adopt one: an older queued job of the
-/// session whose recorded worker is alive (pid and start token) makes a newer offer `retry` for
-/// at most [`DEFER`]; an older job never offered by then never defers again, so a forged one
-/// costs one bounded delay.
+/// polls first. Disk may only defer an offer, never adopt one: while an older queued job of the
+/// session has a live recorded worker (pid and start token), a newer offer is answered `retry`,
+/// but each offered job is deferred for at most [`DEFER`] in all, however many older jobs there
+/// are, so forged older jobs cost one bounded delay per offer.
 #[derive(Default)]
 pub(crate) struct Defer {
-    /// Older jobs waited for, and until when.
-    waiting: BTreeMap<JobId, Instant>,
-    /// Older jobs whose wait ran out.
-    spent: BTreeSet<JobId>,
+    /// Each deferred offer's job, and when its deferral budget runs out.
+    budget: BTreeMap<JobId, Instant>,
 }
 impl Defer {
-    /// The older job `id` must wait for at `now`, if any.
+    /// The older job offer `id` must wait for at `now`, if any.
     fn blocker(
         &mut self,
         store: &JobStore,
@@ -1622,20 +1620,20 @@ impl Defer {
         id: &JobId,
         now: Instant,
     ) -> Option<JobId> {
+        if self.budget.get(id).is_some_and(|until| now >= *until) {
+            return None;
+        }
         let mut older: Vec<JobId> = store.list().into_iter().filter(|o| o < id).collect();
         older.sort();
-        for o in older {
-            if self.spent.contains(&o) || !waiting_job(store, session_id, &o) {
-                continue;
-            }
-            let until = *self.waiting.entry(o.clone()).or_insert(now + DEFER);
-            if now < until {
-                return Some(o);
-            }
-            self.waiting.remove(&o);
-            self.spent.insert(o);
-        }
-        None
+        let blocker = older
+            .into_iter()
+            .find(|o| waiting_job(store, session_id, o))?;
+        self.budget.entry(id.clone()).or_insert(now + DEFER);
+        Some(blocker)
+    }
+    /// `id` was claimed: its budget is no longer needed.
+    fn claimed(&mut self, id: &JobId) {
+        self.budget.remove(id);
     }
 }
 /// A queued, unclaimed RPC job of `session_id` whose recorded worker (pid and start token) is
@@ -2981,8 +2979,8 @@ mod adopt_tests {
         assert_eq!(answer_of(&stream), Answer::Refused);
     }
     /// AC-v2-402 (H2 G1): an older queued job whose recorded worker is alive makes a newer
-    /// offer wait, at most [`DEFER`], and never again after; a dead worker's, a claimed or a
-    /// foreign-session older job never defers it.
+    /// offer wait, at most [`DEFER`], and that offer never again after; a dead worker's, a
+    /// claimed or a foreign-session older job never defers it.
     #[test]
     fn an_older_live_job_defers_a_newer_offer_once_and_boundedly() {
         let t = tempfile::tempdir().unwrap();
@@ -3003,7 +3001,7 @@ mod adopt_tests {
             defer.blocker(&store, SESSION, &newer, now + DEFER / 2),
             Some(older.clone())
         );
-        // A forged older job that is never offered delays the newer one once, then never again.
+        // A forged older job that is never offered delays the newer offer once, then never again.
         assert_eq!(defer.blocker(&store, SESSION, &newer, now + DEFER), None);
         assert_eq!(
             defer.blocker(&store, SESSION, &newer, now + DEFER * 3),
@@ -3187,6 +3185,36 @@ mod adopt_tests {
             started.elapsed()
         );
         assert!(store.read_status(&older).is_err());
+        live.kill().unwrap();
+        live.wait().unwrap();
+    }
+    /// H2 fix 2 (H2): however many older jobs name a live worker, one offer is deferred at most
+    /// [`DEFER`] in all, then the oldest offer actually pending is claimed.
+    #[test]
+    fn many_forged_older_jobs_defer_an_offer_once_in_total() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        for _ in 0..10 {
+            offered(&store, live.id(), |_| ());
+        }
+        let (newer, _) = offered(&store, std::process::id(), |_| ());
+        let mut defer = Defer::default();
+        let now = Instant::now();
+        assert!(defer.blocker(&store, SESSION, &newer, now).is_some());
+        assert!(
+            defer
+                .blocker(&store, SESSION, &newer, now + DEFER / 2)
+                .is_some()
+        );
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now + DEFER),
+            None,
+            "the whole budget is one DEFER, not one per older job"
+        );
         live.kill().unwrap();
         live.wait().unwrap();
     }
