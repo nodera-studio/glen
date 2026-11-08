@@ -146,8 +146,18 @@ struct Facts {
     seccomp: u8,
     /// The initial user namespace maps the whole uid range (`0 0 4294967295`).
     initial_userns: bool,
-    /// `ns/{user,pid,mnt}` link targets.
-    ns: [PathBuf; 3],
+    /// `ns/{user,pid,mnt}` link targets, or why they cannot be read. The links are
+    /// ptrace-gated (`status` and `uid_map` are not): EACCES or EPERM for a peer in an
+    /// ancestor user namespace, or for one that made itself non-dumpable.
+    ns: Result<[PathBuf; 3], NsError>,
+}
+/// Why a process's `ns` links could not be read.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NsError {
+    /// EACCES or EPERM: the kernel's ptrace access check refused the read.
+    denied: bool,
+    why: String,
 }
 #[cfg(target_os = "linux")]
 const NAMESPACES: [&str; 3] = ["user", "pid", "mnt"];
@@ -169,7 +179,8 @@ impl Facts {
     }
 }
 /// The facts under `dir` (`/proc/self` or `/proc/<pid>`). The `ns` links can fail with EACCES
-/// on a non-dumpable process: that is an error, so the peer is `Unknown` and refused.
+/// (a non-dumpable process, or one in an ancestor user namespace): [`rank`] decides what that
+/// means.
 #[cfg(target_os = "linux")]
 fn facts(dir: &str) -> Result<Facts, String> {
     let status = std::fs::read_to_string(format!("{dir}/status"))
@@ -193,24 +204,35 @@ fn facts(dir: &str) -> Result<Facts, String> {
         m.split_whitespace().collect::<Vec<_>>() == ["0", "0", "4294967295"]
     });
     let link = |ns: &str| {
-        std::fs::read_link(format!("{dir}/ns/{ns}"))
-            .map_err(|e| format!("cannot read the {ns} namespace of {dir}: {e}"))
+        std::fs::read_link(format!("{dir}/ns/{ns}")).map_err(|e| NsError {
+            denied: matches!(e.raw_os_error(), Some(libc::EACCES | libc::EPERM)),
+            why: format!("cannot read the {ns} namespace of {dir}: {e}"),
+        })
     };
+    let ns = (|| {
+        Ok([
+            link(NAMESPACES[0])?,
+            link(NAMESPACES[1])?,
+            link(NAMESPACES[2])?,
+        ])
+    })();
     Ok(Facts {
         nnp,
         seccomp,
         initial_userns,
-        ns: [
-            link(NAMESPACES[0])?,
-            link(NAMESPACES[1])?,
-            link(NAMESPACES[2])?,
-        ],
+        ns,
     })
 }
 /// F5: `peer` ranked against `me`. The peer is no more confined when it sets no_new_privs only
 /// if `me` does, its seccomp mode is at most mine, and it shares my user, pid and mount
 /// namespaces. A peer in other namespaces passes only when it carries no confinement at all
 /// and `me` does: glen runs in the sandbox and the peer on the host (§A13).
+///
+/// F7: a peer whose `ns` links the kernel refuses to show (EACCES/EPERM) while `me` runs in a
+/// user namespace of its own is outside my namespaces (from inside a bwrap user namespace the
+/// host's processes are not ptrace-readable); it is ranked on no_new_privs and seccomp alone,
+/// which `status` still shows. Anywhere else an unreadable peer stays unknown: from the initial
+/// user namespace only a peer that made itself non-dumpable hides them, and it is refused.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn rank(me: &Facts, peer: &Facts) -> Confinement {
     if peer.nnp && !me.nnp {
@@ -219,13 +241,18 @@ fn rank(me: &Facts, peer: &Facts) -> Confinement {
     if peer.seccomp > me.seccomp {
         return Confinement::Confined("seccomp");
     }
+    let (mine, theirs) = match (&me.ns, &peer.ns) {
+        (Ok(mine), Ok(theirs)) => (mine, theirs),
+        (Ok(_), Err(e)) if e.denied && !me.initial_userns => return Confinement::Unconfined,
+        (Err(e), _) | (_, Err(e)) => return Confinement::Unknown(e.why.clone()),
+    };
     let host_peer = peer.absolute() == Confinement::Unconfined;
     let caged_me = me.absolute() != Confinement::Unconfined;
     for (i, what) in ["user_namespace", "pid_namespace", "mnt_namespace"]
         .into_iter()
         .enumerate()
     {
-        if me.ns[i] != peer.ns[i] && !(host_peer && caged_me) {
+        if mine[i] != theirs[i] && !(host_peer && caged_me) {
             return Confinement::Confined(what);
         }
     }
@@ -1033,7 +1060,7 @@ mod tests {
             nnp,
             seccomp,
             initial_userns,
-            ns: ns.clone(),
+            ns: Ok(ns.clone()),
         };
         let host = facts(false, 0, true, &host_ns);
         // Docker: a seccomp filter in its own pid and mount namespaces, no no_new_privs.
@@ -1124,6 +1151,91 @@ mod tests {
                 "{name}: {:?}",
                 rank(me, peer)
             );
+        }
+    }
+
+    /// F7: a peer whose `ns` links the kernel will not show (EACCES/EPERM: ptrace-gated) is
+    /// ranked on no_new_privs and seccomp only when glen runs in a user namespace of its own
+    /// (bwrap; the peer is then the host's omp), and stays unknown everywhere else, since from
+    /// the initial user namespace only a non-dumpable process hides them.
+    #[test]
+    fn f7_a_peer_with_unreadable_namespaces_is_ranked_only_from_a_user_namespace() {
+        let host_ns = [
+            PathBuf::from("user:[1]"),
+            PathBuf::from("pid:[2]"),
+            PathBuf::from("mnt:[3]"),
+        ];
+        let bwrap_ns = [
+            PathBuf::from("user:[10]"),
+            host_ns[1].clone(),
+            PathBuf::from("mnt:[30]"),
+        ];
+        let denied = |denied| {
+            Err(NsError {
+                denied,
+                why: "cannot read the user namespace of /proc/7: Permission denied".into(),
+            })
+        };
+        let facts = |nnp, seccomp, initial_userns, ns| Facts {
+            nnp,
+            seccomp,
+            initial_userns,
+            ns,
+        };
+        // glen inside bwrap: no_new_privs, its own user and mount namespaces.
+        let bwrap = facts(true, 0, false, Ok(bwrap_ns.clone()));
+        let host = facts(false, 0, true, Ok(host_ns.clone()));
+        let free = Confinement::Unconfined;
+        let cases = [
+            (
+                "userns self, unreadable unconfined peer",
+                &bwrap,
+                facts(false, 0, true, denied(true)),
+                true,
+            ),
+            (
+                "userns self, unreadable peer with no_new_privs as glen",
+                &bwrap,
+                facts(true, 0, true, denied(true)),
+                true,
+            ),
+            (
+                "userns self, unreadable seccomp peer",
+                &bwrap,
+                facts(false, 2, true, denied(true)),
+                false,
+            ),
+            (
+                "userns self without no_new_privs, unreadable nnp peer",
+                &facts(false, 0, false, Ok(bwrap_ns.clone())),
+                facts(true, 0, true, denied(true)),
+                false,
+            ),
+            (
+                "userns self, namespaces unreadable for another reason",
+                &bwrap,
+                facts(false, 0, true, denied(false)),
+                false,
+            ),
+            (
+                "initial-userns self, unreadable (non-dumpable) peer",
+                &host,
+                facts(false, 0, true, denied(true)),
+                false,
+            ),
+            (
+                "confined initial-userns self, unreadable peer",
+                &facts(true, 2, true, Ok(host_ns.clone())),
+                facts(false, 0, true, denied(true)),
+                false,
+            ),
+        ];
+        for (name, me, peer, allowed) in cases {
+            let got = rank(me, &peer);
+            assert_eq!(got == free, allowed, "{name}: {got:?}");
+            if !allowed && !(peer.nnp && !me.nnp) && peer.seccomp <= me.seccomp {
+                assert!(matches!(got, Confinement::Unknown(_)), "{name}: {got:?}");
+            }
         }
     }
 
