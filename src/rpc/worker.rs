@@ -100,10 +100,11 @@ pub(crate) struct Worker {
 pub fn main(arg: &str) -> ExitCode {
     let loaded = (|| -> Result<Worker, GlenError> {
         let env = Env::from_process();
-        let store = JobStore::new(glen_home::resolve(&env)?);
         let id = JobId::parse(arg)
             .ok_or_else(|| GlenError::new(ErrorCode::Usage, "invalid worker job id"))?;
-        let job = store.read_job(&id)?;
+        // S-13: nothing is read from, or spawned under, a GLEN_HOME another user can write.
+        let store = JobStore::new(glen_home::resolve_trusted(&env, &["jobs", "run/locks"])?);
+        let job = stdin_job(&mut std::io::stdin().lock(), &id)?;
         let status = store.read_status(&id)?;
         let deadline = job.deadline_at.parse::<jiff::Timestamp>().map_err(|e| {
             GlenError::new(
@@ -136,6 +137,38 @@ pub fn main(arg: &str) -> ExitCode {
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.run()));
     conclude(&mut w, result)
+}
+/// The most a worker reads of its stdin job (S-13); a message is at most 512 KiB.
+pub(crate) const MAX_JOB_BYTES: u64 = 8 * 1024 * 1024;
+/// The job `send` handed this worker on stdin (S-13), never `job.json`, which a writer to
+/// GLEN_HOME can rewrite after `send` created it: at most [`MAX_JOB_BYTES`], and for the job id
+/// on the worker's own argv.
+pub(crate) fn stdin_job(input: &mut impl std::io::Read, id: &JobId) -> Result<Job, GlenError> {
+    use std::io::Read;
+    let invalid = |why: String| GlenError::new(ErrorCode::Internal, why);
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_JOB_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| invalid(format!("cannot read the job from stdin: {e}")))?;
+    if bytes.len() as u64 > MAX_JOB_BYTES {
+        return Err(invalid(format!(
+            "the job on stdin is larger than {MAX_JOB_BYTES} bytes"
+        )));
+    }
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(invalid("no job on stdin".into()));
+    }
+    let job: Job = serde_json::from_slice(&bytes)
+        .map_err(|e| invalid(format!("invalid job on stdin: {e}")))?;
+    if JobId::parse(&job.id).as_ref() != Some(id) {
+        return Err(invalid(format!(
+            "the job on stdin is {:?}, not {}",
+            job.id,
+            id.as_str()
+        )));
+    }
+    Ok(job)
 }
 pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload

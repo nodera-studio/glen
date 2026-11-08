@@ -180,7 +180,19 @@ pub(crate) fn kill_group(pid: u32, signal: rustix::process::Signal) -> io::Resul
         )),
     }
 }
-pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
+/// The canonical job bytes `send` hands its worker on stdin (S-13): `job.json`'s own encoding.
+pub fn job_bytes(job: &Job) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(job)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+/// Spawns `__worker <id>` with `job` on its stdin (S-13): the worker never reads its job from
+/// `job.json`, which a writer to GLEN_HOME can rewrite after `send` created it. The bytes are
+/// written from a thread that `send` waits for at most [`STDIN_WRITE_BOUND`] (the worker reads
+/// stdin first thing), so a worker that never reads cannot hold `send`; a worker that exits
+/// first only costs the thread an EPIPE, ignored.
+pub fn spawn_worker(home: &GlenHome, id: &JobId, job: &Job) -> io::Result<Child> {
+    let bytes = job_bytes(job)?;
     let mut opts = OpenOptions::new();
     opts.append(true).create(true);
     #[cfg(unix)]
@@ -195,7 +207,7 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
         .map_err(|e| io::Error::new(e.kind(), format!("cannot open {}: {e}", path.display())))?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["__worker", id.as_str()])
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
         .stderr(log.try_clone()?)
         .stdout(log)
         .current_dir("/")
@@ -208,7 +220,7 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
             cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
         }
     }
-    cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
@@ -217,8 +229,24 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
                 path.display()
             ),
         )
-    })
+    })?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let (done, written) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            use std::io::Write;
+            // EPIPE: the worker exited before reading; it fails on its own missing job.
+            let _ = stdin.write_all(&bytes);
+            drop(stdin);
+            let _ = done.send(());
+        });
+        // `send --no-wait` exits right after this, and the thread with it: wait for the write,
+        // bounded, since the worker reads its stdin first thing.
+        let _ = written.recv_timeout(STDIN_WRITE_BOUND);
+    }
+    Ok(child)
 }
+/// The longest `send` waits for its worker to take the job from stdin.
+const STDIN_WRITE_BOUND: Duration = Duration::from_secs(5);
 /// The last 7 non-hyphen characters of a plain id (`lease_name`'s rule: ASCII letters, digits,
 /// `_` and `-`), as omp's UUIDs always are. Any other id is untrusted text that could carry
 /// terminal escapes (S-25), so it is never shown: its handle is `h` and 6 hex digits of its
@@ -311,7 +339,7 @@ mod tests {
         let victim = t.path().join("victim.jsonl");
         std::fs::write(&victim, b"kept\n").unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("worker.log")).unwrap();
-        let e = spawn_worker(&home, &id).unwrap_err();
+        let e = spawn_worker(&home, &id, &crate::jobs::tests::job()).unwrap_err();
         assert!(e.to_string().contains("worker.log"), "{e}");
         assert_eq!(std::fs::read(&victim).unwrap(), b"kept\n");
     }
