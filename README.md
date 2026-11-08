@@ -181,7 +181,9 @@ The skill's `allowed-tools` pre-approves those eight commands (`Bash(glen ls *)`
 for the turn; every other glen command, such as `abort`, `model`, `compact`, `release` or the installers, asks first.
 glen starts omp with no approval flag of its own, so a prompt-injected agent that reaches that turn can still use
 `glen send` to start an omp agent whose tools then run unattended under omp's own default (yolo) approval mode
-(design.md §A13).
+(design.md §A13). `glen doctor` warns when that profile's mode is yolo. glen runs omp without a UI, so a stricter
+`tools.approvalMode` makes every tool call that needs approval fail in sessions glen starts; to block one tool
+instead, set `tools.approval.<tool>: deny` in the profile's `config.yml` (for example `~/.omp/agent/config.yml`).
 
 Headless Claude Code needs the skill itself allowed: `claude -p --permission-mode dontAsk` denies
 a skill that is not on the allow list, so pass `--allowedTools "Skill(glen)"`. The skill's own

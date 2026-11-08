@@ -106,6 +106,13 @@ fn usage_envelopes() {
 fn doctor_success() {
     let t = tempfile::tempdir().unwrap();
     let home = t.path().join("home");
+    // A non-yolo approval mode, so a supported omp leaves no warning (omp_approval_yolo).
+    fs::create_dir_all(home.join(".omp/agent")).unwrap();
+    fs::write(
+        home.join(".omp/agent/config.yml"),
+        "tools:\n  approvalMode: always-ask\n",
+    )
+    .unwrap();
     let o = glen(
         &["doctor"],
         &[("GLEN_OMP_BIN", &fake()), ("HOME", home.to_str().unwrap())],
@@ -819,4 +826,158 @@ fn doctor_json_explains_glen_home_permissions() {
         fs::metadata(t.path()).unwrap().permissions().mode() & 0o777,
         0o755
     );
+}
+
+/// S-01: doctor reads `tools.approvalMode` from the profile glen would use and warns on yolo,
+/// explicit or omp's default; an unreadable config is `unknown`, never a failure.
+#[test]
+fn doctor_reports_the_omp_approval_mode() {
+    let t = tempfile::tempdir().unwrap();
+    let home = t.path().join("home");
+    let default_agent = home.join(".omp/agent");
+    let work_agent = home.join(".omp/profiles/work/agent");
+    let run = |args: &[&str], vars: &[(&str, &str)]| {
+        let mut all = vec![
+            ("GLEN_OMP_BIN", fake()),
+            ("HOME", home.to_str().unwrap().into()),
+        ];
+        all.extend(vars.iter().map(|(k, v)| (*k, v.to_string())));
+        let vars: Vec<(&str, &str)> = all.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let o = glen(args, &vars);
+        assert!(o.status.success(), "{o:?}");
+        o
+    };
+    let check = |v: &serde_json::Value| {
+        v["data"]["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "omp_approval")
+            .unwrap()
+            .clone()
+    };
+    let yolo_warning = |v: &serde_json::Value| {
+        v["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| w["code"] == "omp_approval_yolo")
+            .map(|w| w["message"].as_str().unwrap().to_owned())
+    };
+    // Unset (no config file at all): omp's default yolo.
+    let v = json(&run(&["doctor"], &[]));
+    assert_eq!(
+        v["data"]["omp"]["approval"],
+        serde_json::json!({"mode":"yolo","source":"default"})
+    );
+    assert_eq!(check(&v)["status"], "warn");
+    let message = yolo_warning(&v).expect("unset is yolo");
+    assert!(
+        message.contains(
+            "a pre-approved `glen send` starts an omp agent whose tools run without asking"
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains("`tools.approval.<tool>: deny`"),
+        "{message}"
+    );
+    assert!(message.contains("no UI to ask"), "{message}");
+    assert!(
+        message.contains(default_agent.join("config.yml").to_str().unwrap()),
+        "{message}"
+    );
+    // Explicit yolo names its file.
+    fs::create_dir_all(&default_agent).unwrap();
+    let config = default_agent.join("config.yml");
+    fs::write(
+        &config,
+        "theme: dark\ntools:\n  approvalMode: yolo # explicit\n",
+    )
+    .unwrap();
+    let v = json(&run(&["doctor"], &[]));
+    assert_eq!(v["data"]["omp"]["approval"]["mode"], "yolo");
+    assert_eq!(
+        v["data"]["omp"]["approval"]["source"],
+        config.to_str().unwrap()
+    );
+    assert!(yolo_warning(&v).is_some());
+    // Explicit non-yolo: no warning, an ok row.
+    fs::write(&config, "tools:\n  approvalMode: write\n").unwrap();
+    let v = json(&run(&["doctor"], &[]));
+    assert_eq!(v["data"]["omp"]["approval"]["mode"], "write");
+    assert_eq!(check(&v)["status"], "ok");
+    assert!(v.get("warnings").is_none(), "{v}");
+    // Malformed: unknown, still exit 0 and no yolo warning.
+    fs::write(&config, "tools: [unterminated\n").unwrap();
+    let v = json(&run(&["doctor"], &[]));
+    assert_eq!(
+        v["data"]["omp"]["approval"],
+        serde_json::json!({"mode":"unknown","source":"unknown"})
+    );
+    assert_eq!(check(&v)["value"], "unknown");
+    assert_eq!(check(&v)["status"], "warn");
+    assert!(yolo_warning(&v).is_none());
+    let codes: Vec<_> = v["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|w| w["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["omp_approval_unknown"]);
+    // A PI_CONFIG_FILES overlay decides over the agent dir, and a missing one is unknown.
+    fs::write(&config, "tools:\n  approvalMode: write\n").unwrap();
+    let overlay = t.path().join("overlay.yml");
+    fs::write(&overlay, "tools:\n  approvalMode: yolo\n").unwrap();
+    let v = json(&run(
+        &["doctor"],
+        &[("PI_CONFIG_FILES", overlay.to_str().unwrap())],
+    ));
+    assert_eq!(
+        v["data"]["omp"]["approval"]["source"],
+        overlay.to_str().unwrap()
+    );
+    assert!(yolo_warning(&v).is_some());
+    let missing = t.path().join("missing.yml");
+    let v = json(&run(
+        &["doctor"],
+        &[("PI_CONFIG_FILES", missing.to_str().unwrap())],
+    ));
+    assert_eq!(v["data"]["omp"]["approval"]["mode"], "unknown");
+    // A named profile reads its own agent dir: --profile, OMP_PROFILE and PI_PROFILE.
+    fs::write(&config, "tools:\n  approvalMode: write\n").unwrap();
+    fs::create_dir_all(&work_agent).unwrap();
+    fs::write(
+        work_agent.join("config.yml"),
+        "tools:\n  approvalMode: yolo\n",
+    )
+    .unwrap();
+    for (args, vars) in [
+        (vec!["--profile", "work", "doctor"], vec![]),
+        (vec!["doctor"], vec![("OMP_PROFILE", "work")]),
+        (vec!["doctor"], vec![("PI_PROFILE", "work")]),
+    ] {
+        let v = json(&run(&args, &vars));
+        assert_eq!(
+            v["data"]["omp"]["approval"]["source"],
+            work_agent.join("config.yml").to_str().unwrap(),
+            "{args:?} {vars:?}"
+        );
+        assert!(yolo_warning(&v).unwrap().contains("profile work"));
+    }
+    let v = json(&run(
+        &["--profile", "default", "doctor"],
+        &[("OMP_PROFILE", "work")],
+    ));
+    assert_eq!(v["data"]["omp"]["approval"]["mode"], "write");
+    // Human output: the row, and the warning on stderr.
+    fs::write(&config, "").unwrap();
+    let o = run(&["doctor", "--human"], &[]);
+    let out = String::from_utf8(o.stdout).unwrap();
+    assert!(
+        out.contains("omp approval") && out.contains("yolo"),
+        "{out}"
+    );
+    let err = String::from_utf8(o.stderr).unwrap();
+    assert!(err.contains("omp approval mode is yolo"), "{err}");
 }

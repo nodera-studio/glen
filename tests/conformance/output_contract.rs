@@ -29,6 +29,7 @@ fn ac003_piped_document_command_prints_one_compact_envelope() {
 #[test]
 fn a10_success_envelope_shape() {
     let sb = Sandbox::new();
+    sb.approval_always_ask();
     let out = sb.glen(["doctor", "--json"]).fake_omp().run();
     let env = out.ok_envelope();
     let keys: Vec<&str> = env
@@ -57,6 +58,7 @@ fn ac010_error_envelope_carries_string_code_and_message() {
 #[test]
 fn ac004_human_flag_prints_human_output_on_a_pipe() {
     let sb = Sandbox::new();
+    sb.approval_always_ask();
     let out = sb.glen(["doctor", "--human"]).fake_omp().run();
     out.assert_exit(0).assert_no_ansi();
     assert!(!out.is_json(), "--human must not print JSON\n{}", out.ctx());
@@ -175,6 +177,7 @@ fn ac010_exit_codes_follow_the_design_table() {
 #[test]
 fn ac021_no_spinner_when_stderr_is_not_a_terminal() {
     let sb = Sandbox::new();
+    sb.approval_always_ask();
     let tools = sb.dir("tools");
     // A slow omp gives a spinner time to draw if one were (wrongly) enabled.
     let slow = write_script(&tools, "slow-omp", "/bin/sleep 1\necho omp/18.14.0");

@@ -2208,7 +2208,7 @@ fn ac_v2_406_ls_shows_idle_and_busy_warmth_and_doctor_counts_it() {
         .collect();
     assert_eq!(
         names, DOCTOR_CHECKS,
-        "14 checks, warm_workers after live_endpoints"
+        "15 checks, warm_workers after live_endpoints"
     );
     let row_doc = check(&doc, "warm_workers");
     assert_eq!(row_doc["status"], "info", "{row_doc}");
@@ -2724,10 +2724,11 @@ fn ac_v2_406_the_w4_rows_exist_in_a9_a15_a16_and_the_changelog() {
     );
 
     let changelog = fs::read_to_string(repo_root().join("CHANGELOG.md")).expect("CHANGELOG.md");
-    // W7 renames `## Unreleased` to the `## v0.2.0 — <date>` release heading.
+    // W7 renamed `## Unreleased` to the `## v0.2.0 — <date>` release heading; a later
+    // `## Unreleased` above it holds post-v0.2.0 changes only.
     let unreleased: String = changelog
         .lines()
-        .skip_while(|l| l.trim() != "## Unreleased" && !l.starts_with("## v0.2.0"))
+        .skip_while(|l| !l.starts_with("## v0.2.0"))
         .skip(1)
         .take_while(|l| !l.starts_with("## "))
         .collect::<Vec<_>>()

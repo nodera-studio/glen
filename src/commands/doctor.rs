@@ -377,6 +377,10 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
     }
     let (status, value, detail) = crate::sandbox::describe(env);
     add("sandbox", status, value, detail);
+    // Last, so the earlier rows keep their positions.
+    let approval = omp::approval::read(env, &paths.agent_dir);
+    let (status, detail) = approval_row(&approval, &paths.agent_dir, profile, &mut warnings);
+    add("omp_approval", status, approval.mode.clone(), detail);
     let json_paths = if ctx.mode == Mode::Json {
         serde_json::to_value(&paths).map_err(|e| {
             GlenError::new(
@@ -390,7 +394,7 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
     if let Some(check) = checks.iter_mut().find(|c| c.name == "omp_env_files") {
         check.value = json!(env_files);
     }
-    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":*omp::TESTED_OMP_VERSION,"supported":compat::get().supported(),"capabilities":capabilities},"paths":json_paths,"extension":{"path":path_value(&extension_path),"state":extension_state_name,"version":extension_version,"current":current},"checks":checks,"skills":skills});
+    let data = json!({"glen":{"version":env!("CARGO_PKG_VERSION"),"home":glen_home.root.to_string_lossy(),"home_exists":exists},"omp":{"bin":binary.as_deref().map(path_value),"version":version,"tested_version":*omp::TESTED_OMP_VERSION,"supported":compat::get().supported(),"capabilities":capabilities,"approval":approval},"paths":json_paths,"extension":{"path":path_value(&extension_path),"state":extension_state_name,"version":extension_version,"current":current},"checks":checks,"skills":skills});
     let p = &ctx.painter;
     let mut table = render::Table::new(p, ctx.width);
     for (name, status, value, detail) in rows {
@@ -441,6 +445,56 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
     let mut outcome = Outcome::new(data, human);
     outcome.warnings = warnings;
     Ok(outcome)
+}
+/// The `omp_approval` row's status and detail, plus the `omp_approval_yolo` or
+/// `omp_approval_unknown` warning (audit S-01): glen passes omp no approval flag, so the
+/// profile's mode is what a `glen send` session runs under. glen runs omp with `--no-ui`, so a
+/// stricter mode makes every tool call that needs approval fail in those sessions; per-tool
+/// `tools.approval.<tool>: deny` blocks one tool in every mode.
+fn approval_row(
+    approval: &omp::approval::Approval,
+    agent_dir: &Path,
+    profile: &str,
+    warnings: &mut Vec<Warning>,
+) -> (&'static str, String) {
+    use omp::approval::SETTING;
+    const PROJECT: &str = "a project's .omp/config.yml or .claude/settings.json can override it";
+    let mut warn = |code: &str, message: String| {
+        warnings.push(Warning {
+            code: code.into(),
+            message: render::sanitize(&message).into_owned(),
+        })
+    };
+    if approval.is_unknown() {
+        let note = approval.note.clone().unwrap_or_default();
+        warn(
+            "omp_approval_unknown",
+            format!("cannot tell omp's approval mode for profile {profile}: {note}"),
+        );
+        return ("warn", format!("{note}; glen cannot tell the mode"));
+    }
+    let origin = match (&approval.note, approval.source.as_str()) {
+        (Some(note), _) => note.clone(),
+        (None, "default") => format!("{SETTING} is unset, so omp's default"),
+        (None, source) => format!("set in {source}"),
+    };
+    if !approval.is_yolo() {
+        return (
+            "ok",
+            format!(
+                "{origin}; glen runs omp without a UI, so tools that need approval fail in glen-started sessions; {PROJECT}"
+            ),
+        );
+    }
+    let file = omp::approval::config_file(agent_dir);
+    warn(
+        "omp_approval_yolo",
+        format!(
+            "omp approval mode is yolo for profile {profile} ({origin}): a pre-approved `glen send` starts an omp agent whose tools run without asking. `tools.approval.<tool>: deny` in {} blocks one tool; a stricter {SETTING} makes every tool call that needs approval fail in glen-started sessions, which have no UI to ask",
+            file.display()
+        ),
+    );
+    ("warn", format!("{origin}; omp tools run without asking"))
 }
 /// Adds the `omp_version` row for one `omp --version` line and returns the normalized text.
 fn omp_version_row(

@@ -10,6 +10,7 @@ use serde_json::Value;
 #[test]
 fn ac014_doctor_reports_omp_paths_and_glen_home() {
     let sb = Sandbox::new();
+    sb.approval_always_ask();
     let out = sb.glen(["doctor"]).fake_omp().run();
     let data = out.ok_data();
     out.assert_stderr_empty();

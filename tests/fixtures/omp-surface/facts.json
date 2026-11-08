@@ -136,6 +136,31 @@
       "id": "session.title_slot",
       "file": "packages/coding-agent/src/session/session-entries.ts",
       "contains": "export const SESSION_TITLE_SLOT_ENTRY_TYPE = \"title\";"
+    },
+    {
+      "id": "settings.approval_mode",
+      "file": "packages/coding-agent/src/tools/settings.ts",
+      "contains": "\tid: \"tools.approvalMode\",\n\ttype: \"enum\",\n\tvalues: [\"always-ask\", \"always-ask-cached\", \"write\", \"yolo\"] as const,\n\tdefault: \"yolo\","
+    },
+    {
+      "id": "settings.main_config_files",
+      "file": "packages/utils/src/dirs.ts",
+      "contains": "export const MAIN_CONFIG_FILENAMES = [\"config.yml\", \"config.yaml\"] as const;"
+    },
+    {
+      "id": "settings.invalid_value_uses_default",
+      "file": "packages/coding-agent/src/config/registry.ts",
+      "contains": "logger.warn(\"Settings: ignoring invalid value, using the default\""
+    },
+    {
+      "id": "settings.config_files_overlay",
+      "file": "packages/coding-agent/src/config/settings.ts",
+      "contains": "const configFiles = process.env.PI_CONFIG_FILES?.split(path.delimiter).filter(Boolean) ?? [];"
+    },
+    {
+      "id": "settings.layer_order",
+      "file": "packages/coding-agent/src/config/settings.ts",
+      "contains": "let merged = this.#deepMerge(this.#deepMerge({}, layers.global), projectLayerForMerge(layers.project));\n\t\tmerged = this.#deepMerge(merged, layers.configOverlay);"
     }
   ]
 }

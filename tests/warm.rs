@@ -310,7 +310,7 @@ fn ac_v2_406_abort_keeps_an_idle_warm_session_and_ls_and_doctor_show_it() {
         .collect();
     let at = names.iter().position(|n| *n == "warm_workers").unwrap();
     assert_eq!(names[at - 1], "live_endpoints");
-    assert_eq!(names.len(), 14);
+    assert_eq!(names.len(), 15);
     let row = check(&doctor["data"], "warm_workers");
     assert_eq!(row["status"], "info");
     assert_eq!(row["value"], "1 warm, 0 stale, 0 dead");
