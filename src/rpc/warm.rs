@@ -18,6 +18,7 @@ use crate::{
 use omp_rpc::{Client, Event};
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::{BTreeMap, BTreeSet},
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
@@ -1231,6 +1232,7 @@ impl Idler<'_> {
             Err(reason) => return reason,
         };
         let mut beat = Instant::now();
+        let mut defer = Defer::default();
         loop {
             let tick = Tick {
                 cancelled: self.first.cancel.load(Ordering::SeqCst),
@@ -1260,6 +1262,7 @@ impl Idler<'_> {
                 &warm.session_id,
                 &warm.key,
                 offers,
+                &mut defer,
                 &|line| self.log(line),
             ) {
                 Ok(Some(offer)) => offer,
@@ -1385,6 +1388,7 @@ fn choose(
     session_id: &str,
     key: &Key,
     mut offers: Vec<Offer>,
+    defer: &mut Defer,
     log: &dyn Fn(&str),
 ) -> Result<Option<Offer>, Reason> {
     let mut cool = None;
@@ -1425,7 +1429,74 @@ fn choose(
         offer.answer(Answer::Refused);
         return Err(Reason::Mismatch);
     }
+    if let Some(older) = defer.blocker(store, session_id, &offer.id, Instant::now()) {
+        log(&format!(
+            "{} waits for the older {} to be offered",
+            offer.id.handle(),
+            older.handle()
+        ));
+        offer.answer(Answer::Retry);
+        return Ok(None);
+    }
+    defer.waiting.remove(&offer.id);
     Ok(Some(offer))
+}
+/// How long an offer waits for an older queued job's own offer (AC-v2-402): one cold-worker
+/// poll (200 ms) and slack.
+pub(crate) const DEFER: Duration = Duration::from_millis(400);
+/// AC-v2-402 across ticks (H2): the oldest queued job goes first even when a newer one's worker
+/// polls first. Disk may only defer an offer, never adopt one: an older queued job of the
+/// session whose recorded worker is alive (pid and start token) makes a newer offer `retry` for
+/// at most [`DEFER`]; an older job never offered by then never defers again, so a forged one
+/// costs one bounded delay.
+#[derive(Default)]
+pub(crate) struct Defer {
+    /// Older jobs waited for, and until when.
+    waiting: BTreeMap<JobId, Instant>,
+    /// Older jobs whose wait ran out.
+    spent: BTreeSet<JobId>,
+}
+impl Defer {
+    /// The older job `id` must wait for at `now`, if any.
+    fn blocker(
+        &mut self,
+        store: &JobStore,
+        session_id: &str,
+        id: &JobId,
+        now: Instant,
+    ) -> Option<JobId> {
+        let mut older: Vec<JobId> = store.list().into_iter().filter(|o| o < id).collect();
+        older.sort();
+        for o in older {
+            if self.spent.contains(&o) || !waiting_job(store, session_id, &o) {
+                continue;
+            }
+            let until = *self.waiting.entry(o.clone()).or_insert(now + DEFER);
+            if now < until {
+                return Some(o);
+            }
+            self.waiting.remove(&o);
+            self.spent.insert(o);
+        }
+        None
+    }
+}
+/// A queued, unclaimed RPC job of `session_id` whose recorded worker (pid and start token) is
+/// alive: one whose worker is waiting to offer it.
+fn waiting_job(store: &JobStore, session_id: &str, id: &JobId) -> bool {
+    let Ok(s) = store.read_status(id) else {
+        return false;
+    };
+    let (Some(pid), Some(start)) = (s.worker_pid, s.worker_start.as_deref()) else {
+        return false;
+    };
+    s.status == State::Queued
+        && !s.omp_reused
+        && pid != std::process::id()
+        && liveness::check(pid, start) == Liveness::Alive
+        && store.read_job(id).is_ok_and(|j| {
+            j.route == crate::jobs::Route::Rpc && j.session_id.as_deref() == Some(session_id)
+        })
 }
 /// What [`Idler::adopt`] did with a found job.
 enum Adopted {
@@ -2625,9 +2696,16 @@ mod adopt_tests {
             .collect();
         let offers = receive(&listener, Duration::from_secs(1));
         assert_eq!(offers.len(), 3);
-        let chosen = choose(&store, SESSION, &key(), offers, &|_| ())
-            .unwrap()
-            .unwrap();
+        let chosen = choose(
+            &store,
+            SESSION,
+            &key(),
+            offers,
+            &mut Defer::default(),
+            &|_| (),
+        )
+        .unwrap()
+        .unwrap();
         assert_eq!(chosen.id, jobs[0].0);
         assert_eq!(chosen.job.text, "sent over the wire");
         assert_eq!(store.read_job(&jobs[0].0).unwrap().text, "hello");
@@ -2658,6 +2736,7 @@ mod adopt_tests {
             SESSION,
             &key(),
             receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
             &|l| logged.borrow_mut().push(l.to_owned()),
         );
         assert!(matches!(got, Err(Reason::Untrusted)));
@@ -2681,6 +2760,7 @@ mod adopt_tests {
             SESSION,
             &key(),
             receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
             &|_| (),
         );
         assert!(matches!(got, Err(Reason::Untrusted)));
@@ -2693,6 +2773,7 @@ mod adopt_tests {
             SESSION,
             &key(),
             receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
             &|_| (),
         );
         assert!(matches!(got, Err(Reason::Mismatch)));
@@ -2705,10 +2786,68 @@ mod adopt_tests {
             SESSION,
             &key(),
             receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
             &|_| (),
         );
         assert!(matches!(got, Ok(None)));
         assert_eq!(answer_of(&stream), Answer::Refused);
+    }
+    /// AC-v2-402 (H2 G1): an older queued job whose recorded worker is alive makes a newer
+    /// offer wait, at most [`DEFER`], and never again after; a dead worker's, a claimed or a
+    /// foreign-session older job never defers it.
+    #[test]
+    fn an_older_live_job_defers_a_newer_offer_once_and_boundedly() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (older, _) = offered(&store, live.id(), |_| ());
+        let (newer, _) = offered(&store, std::process::id(), |_| ());
+        let mut defer = Defer::default();
+        let now = Instant::now();
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now),
+            Some(older.clone())
+        );
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now + DEFER / 2),
+            Some(older.clone())
+        );
+        // A forged older job that is never offered delays the newer one once, then never again.
+        assert_eq!(defer.blocker(&store, SESSION, &newer, now + DEFER), None);
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now + DEFER * 3),
+            None
+        );
+        assert_eq!(
+            Defer::default().blocker(&store, SESSION, &older, now),
+            None,
+            "nothing older than the oldest"
+        );
+        // A dead recorded worker never defers.
+        live.kill().unwrap();
+        live.wait().unwrap();
+        assert_eq!(Defer::default().blocker(&store, SESSION, &newer, now), None);
+        // Neither does another session's job, nor a claimed one.
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (elsewhere, _) = offered(&store, other.id(), |j| j.session_id = Some("x".into()));
+        let (claimed, _) = offered(&store, other.id(), |_| ());
+        let mut s = store.read_status(&claimed).unwrap();
+        s.omp_reused = true;
+        store.write_status(&claimed, &s).unwrap();
+        let (newest, _) = offered(&store, std::process::id(), |_| ());
+        assert!(elsewhere < newest && claimed < newest);
+        assert_eq!(
+            Defer::default().blocker(&store, SESSION, &newest, now),
+            None
+        );
+        other.kill().unwrap();
+        other.wait().unwrap();
     }
     /// A connection that sends nothing well-formed, an id that is not its job's, or that its
     /// offerer already closed, is dropped unanswered within the read bound.
