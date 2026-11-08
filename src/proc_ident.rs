@@ -527,34 +527,33 @@ fn leader(pid: u32) -> Result<(), String> {
         Err(format!("pid {pid} is not a process (Tgid {tgid:?})"))
     }
 }
-/// The inode of the one listening unix socket bound to `path` in this network namespace
-/// (`/proc/net/unix`). Two listeners bound to the same name (one renamed or unlinked under the
-/// other) cannot be told apart and are refused.
+/// The socket inode of the one listening unix socket whose bound file is the file now at
+/// `path` (F9). The kernel is asked through `NETLINK_SOCK_DIAG` (`unix_diag`, this network
+/// namespace's listeners with their `UNIX_DIAG_VFS` device and inode), and the listener is
+/// selected by `lstat(path)`'s device and inode, never by its name: a bound name is not
+/// escaped in `/proc/net/unix` and need not be the file's current name (a socket renamed over
+/// `path` keeps the name it was bound under). No match, or more than one, is refused, and so
+/// is any malformed, truncated or error reply.
 #[cfg(target_os = "linux")]
 fn listening_inode(path: &Path) -> Result<u64, String> {
-    const ACCEPTCON: u32 = 1 << 16;
-    let table = std::fs::read_to_string("/proc/net/unix")
-        .map_err(|e| format!("cannot read /proc/net/unix: {e}"))?;
-    let mut found = vec![];
-    for line in table.lines().skip(1) {
-        // `Num RefCount Protocol Flags Type St Inode Path`; the path may hold spaces.
-        let mut rest = line;
-        let mut fields = [""; 7];
-        for f in &mut fields {
-            rest = rest.trim_start();
-            let end = rest.find(' ').unwrap_or(rest.len());
-            (*f, rest) = rest.split_at(end);
-        }
-        let Some(bound) = rest.strip_prefix(' ') else {
-            continue;
-        };
-        let listening = u32::from_str_radix(fields[3], 16).is_ok_and(|f| f & ACCEPTCON != 0);
-        if listening && same_socket_path(Path::new(bound), path) {
-            found.extend(fields[6].parse::<u64>().ok());
-        }
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("cannot lstat {}: {e}", path.display()))?;
+    if !meta.file_type().is_socket() {
+        return Err(format!("{} is not a socket", path.display()));
     }
+    let want = (vfs_dev(meta.dev()), meta.ino());
+    let listeners = unix_listeners()?;
+    let found: Vec<u32> = listeners
+        .iter()
+        .filter(|l| {
+            l.vfs
+                .is_some_and(|(dev, ino)| (dev, u64::from(ino)) == (want.0, want.1 & 0xffff_ffff))
+        })
+        .map(|l| l.inode)
+        .collect();
     match found[..] {
-        [inode] => Ok(inode),
+        [inode] => Ok(u64::from(inode)),
         [] => Err(format!(
             "no listening socket is bound to {}",
             path.display()
@@ -565,6 +564,241 @@ fn listening_inode(path: &Path) -> Result<u64, String> {
             path.display()
         )),
     }
+}
+/// `st_dev` (the kernel's `new_encode_dev` of the superblock's device) in the kernel's internal
+/// `dev_t` encoding (`MAJOR << 20 | MINOR`), which `UNIX_DIAG_VFS` reports (`s_dev`).
+#[cfg(target_os = "linux")]
+fn vfs_dev(st_dev: u64) -> u32 {
+    let (major, minor) = (libc::major(st_dev), libc::minor(st_dev));
+    (major << 20) | (minor & 0xf_ffff)
+}
+/// A listening unix socket as `unix_diag` reports it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Listener {
+    /// The socket's own inode (`socket:[inode]` in an fd table).
+    inode: u32,
+    /// The bound file's device (kernel encoding) and inode (low 32 bits), when bound to a path.
+    vfs: Option<(u32, u32)>,
+}
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod diag {
+    pub const NETLINK_SOCK_DIAG: libc::c_int = 4;
+    pub const SOCK_DIAG_BY_FAMILY: u16 = 20;
+    pub const NLMSG_ERROR: u16 = 2;
+    pub const NLMSG_DONE: u16 = 3;
+    pub const NLM_F_REQUEST: u16 = 0x1;
+    pub const NLM_F_DUMP: u16 = 0x300;
+    pub const TCP_LISTEN: u8 = 10;
+    pub const UDIAG_SHOW_VFS: u32 = 0x2;
+    pub const UNIX_DIAG_VFS: u16 = 1;
+    /// `struct nlmsghdr`.
+    pub const NLMSG_HDR: usize = 16;
+    /// `struct unix_diag_req`.
+    pub const REQ: usize = 24;
+    /// `struct unix_diag_msg`.
+    pub const MSG: usize = 16;
+    /// One receive: larger than any dump datagram the kernel builds (at most 32 KiB).
+    pub const RECV: usize = 64 * 1024;
+    /// The whole reply: far more listeners than a host has, so a reply this large is refused.
+    pub const TOTAL: usize = 16 * 1024 * 1024;
+    pub const fn align4(n: usize) -> usize {
+        (n + 3) & !3
+    }
+}
+/// Every listening unix socket in this network namespace, from one `unix_diag` dump.
+#[cfg(target_os = "linux")]
+fn unix_listeners() -> Result<Vec<Listener>, String> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let fail = |what: &str| format!("unix_diag: {what}: {}", io::Error::last_os_error());
+    // SAFETY: socket(2) with constant arguments; the result is checked.
+    let raw = unsafe {
+        libc::socket(
+            libc::AF_NETLINK,
+            libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+            diag::NETLINK_SOCK_DIAG,
+        )
+    };
+    if raw < 0 {
+        return Err(fail("socket"));
+    }
+    // SAFETY: a new fd nothing else owns.
+    let sock = unsafe { OwnedFd::from_raw_fd(raw) };
+    let timeout = libc::timeval {
+        tv_sec: 2,
+        tv_usec: 0,
+    };
+    // SAFETY: a valid timeval of the size passed.
+    if unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVTIMEO,
+            (&raw const timeout).cast(),
+            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(fail("SO_RCVTIMEO"));
+    }
+    const SEQ: u32 = 0x676c_656e;
+    let mut req = [0u8; diag::NLMSG_HDR + diag::REQ];
+    req[0..4].copy_from_slice(&((diag::NLMSG_HDR + diag::REQ) as u32).to_ne_bytes());
+    req[4..6].copy_from_slice(&diag::SOCK_DIAG_BY_FAMILY.to_ne_bytes());
+    req[6..8].copy_from_slice(&(diag::NLM_F_REQUEST | diag::NLM_F_DUMP).to_ne_bytes());
+    req[8..12].copy_from_slice(&SEQ.to_ne_bytes());
+    // unix_diag_req: family, protocol, pad, states, ino, show, cookie[2].
+    let body = diag::NLMSG_HDR;
+    req[body] = libc::AF_UNIX as u8;
+    req[body + 4..body + 8].copy_from_slice(&(1u32 << diag::TCP_LISTEN).to_ne_bytes());
+    req[body + 12..body + 16].copy_from_slice(&diag::UDIAG_SHOW_VFS.to_ne_bytes());
+    // SAFETY: zeroed sockaddr_nl is valid; nl_pid 0 is the kernel.
+    let mut kernel: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+    kernel.nl_family = libc::AF_NETLINK as libc::sa_family_t;
+    // SAFETY: req and kernel are valid for the lengths passed.
+    let sent = unsafe {
+        libc::sendto(
+            sock.as_raw_fd(),
+            req.as_ptr().cast(),
+            req.len(),
+            0,
+            (&raw const kernel).cast(),
+            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
+        )
+    };
+    if sent != req.len() as isize {
+        return Err(fail("sendto"));
+    }
+    let mut buf = vec![0u8; diag::RECV];
+    let mut listeners = vec![];
+    let mut total = 0usize;
+    loop {
+        // SAFETY: zeroed sockaddr_nl is valid storage for the sender's address.
+        let mut from: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
+        let mut from_len = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
+        // SAFETY: buf and from are writable for the lengths passed. MSG_TRUNC makes the
+        // return value the datagram's real length, so a truncated one is detected.
+        let n = unsafe {
+            libc::recvfrom(
+                sock.as_raw_fd(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+                libc::MSG_TRUNC,
+                (&raw mut from).cast(),
+                &mut from_len,
+            )
+        };
+        if n < 0 {
+            return Err(fail("recv"));
+        }
+        let n = n as usize;
+        if n > buf.len() {
+            return Err("unix_diag: a reply datagram was truncated".into());
+        }
+        if from.nl_pid != 0 {
+            return Err("unix_diag: a reply came from outside the kernel".into());
+        }
+        total += n;
+        if total > diag::TOTAL {
+            return Err("unix_diag: the reply is too large".into());
+        }
+        if parse_diag(&buf[..n], SEQ, &mut listeners)? {
+            return Ok(listeners);
+        }
+    }
+}
+/// Parses one `unix_diag` reply datagram into `out`; `Ok(true)` once the dump is done. Fails
+/// on anything malformed, an error message, a foreign sequence number or an unexpected type.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_diag(mut data: &[u8], seq: u32, out: &mut Vec<Listener>) -> Result<bool, String> {
+    let malformed = |what: &str| Err(format!("unix_diag: malformed reply ({what})"));
+    let u16_at = |b: &[u8], at: usize| u16::from_ne_bytes([b[at], b[at + 1]]);
+    let u32_at = |b: &[u8], at: usize| u32::from_ne_bytes(b[at..at + 4].try_into().expect("4"));
+    if data.is_empty() {
+        return malformed("empty datagram");
+    }
+    while !data.is_empty() {
+        if data.len() < diag::NLMSG_HDR {
+            return malformed("short header");
+        }
+        let len = u32_at(data, 0) as usize;
+        if len < diag::NLMSG_HDR || len > data.len() {
+            return malformed("message length");
+        }
+        if u32_at(data, 8) != seq {
+            return malformed("sequence number");
+        }
+        let payload = &data[diag::NLMSG_HDR..len];
+        match u16_at(data, 4) {
+            diag::NLMSG_DONE => {
+                // The dump's final status (0, or a negative errno).
+                if payload.len() >= 4 && u32_at(payload, 0) != 0 {
+                    return Err(format!(
+                        "unix_diag: the dump failed ({})",
+                        io::Error::from_raw_os_error(-(u32_at(payload, 0) as i32))
+                    ));
+                }
+                return if data.len() == diag::align4(len).min(data.len()) {
+                    Ok(true)
+                } else {
+                    malformed("data after the end of the dump")
+                };
+            }
+            diag::NLMSG_ERROR => {
+                let errno = if payload.len() >= 4 {
+                    -(u32_at(payload, 0) as i32)
+                } else {
+                    0
+                };
+                return Err(format!(
+                    "unix_diag: the kernel refused the request ({})",
+                    io::Error::from_raw_os_error(errno)
+                ));
+            }
+            diag::SOCK_DIAG_BY_FAMILY => out.push(parse_listener(payload)?),
+            other => return malformed(&format!("message type {other}")),
+        }
+        data = &data[diag::align4(len).min(data.len())..];
+    }
+    Ok(false)
+}
+/// One `unix_diag_msg` and its attributes.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn parse_listener(msg: &[u8]) -> Result<Listener, String> {
+    let malformed = |what: &str| Err(format!("unix_diag: malformed socket record ({what})"));
+    let u16_at = |b: &[u8], at: usize| u16::from_ne_bytes([b[at], b[at + 1]]);
+    let u32_at = |b: &[u8], at: usize| u32::from_ne_bytes(b[at..at + 4].try_into().expect("4"));
+    if msg.len() < diag::MSG {
+        return malformed("short record");
+    }
+    // unix_diag_msg: family, type, state, pad, ino, cookie[2].
+    if msg[0] != libc::AF_UNIX as u8 {
+        return malformed("family");
+    }
+    if msg[2] != diag::TCP_LISTEN {
+        return malformed("a socket that is not listening");
+    }
+    let inode = u32_at(msg, 4);
+    let mut vfs = None;
+    let mut attrs = &msg[diag::MSG..];
+    while !attrs.is_empty() {
+        if attrs.len() < 4 {
+            return malformed("short attribute");
+        }
+        let len = usize::from(u16_at(attrs, 0));
+        if len < 4 || len > attrs.len() {
+            return malformed("attribute length");
+        }
+        if u16_at(attrs, 2) == diag::UNIX_DIAG_VFS {
+            if len != 4 + 8 || vfs.is_some() {
+                return malformed("UNIX_DIAG_VFS");
+            }
+            // unix_diag_vfs: ino, then dev.
+            vfs = Some((u32_at(attrs, 8), u32_at(attrs, 4)));
+        }
+        attrs = &attrs[diag::align4(len).min(attrs.len())..];
+    }
+    Ok(Listener { inode, vfs })
 }
 /// `pid`'s fd table holds the socket `inode`.
 #[cfg(target_os = "linux")]
@@ -729,7 +963,7 @@ fn bound_confinement(
 
 /// Whether the socket name `bound` (as the listener spelled it) is `path`: equal, or the same
 /// file name in the same real directory (the extension may spell GLEN_HOME differently).
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "macos")]
 fn same_socket_path(bound: &Path, path: &Path) -> bool {
     bound == path
         || (bound.file_name().is_some() && bound.file_name() == path.file_name())
@@ -1460,6 +1694,193 @@ mod tests {
             );
         }
     }
+    /// One netlink message of type `ty` around `payload`, padded to 4 bytes.
+    fn nlmsg(ty: u16, seq: u32, payload: &[u8]) -> Vec<u8> {
+        let len = diag::NLMSG_HDR + payload.len();
+        let mut m = vec![];
+        m.extend((len as u32).to_ne_bytes());
+        m.extend(ty.to_ne_bytes());
+        m.extend(0x2u16.to_ne_bytes()); // NLM_F_MULTI
+        m.extend(seq.to_ne_bytes());
+        m.extend(0u32.to_ne_bytes());
+        m.extend(payload);
+        m.resize(diag::align4(len), 0);
+        m
+    }
+    /// A `unix_diag_msg` for a listener with socket inode `ino`, and its `UNIX_DIAG_VFS`.
+    fn record(state: u8, ino: u32, vfs: Option<(u32, u32)>) -> Vec<u8> {
+        let mut r = vec![libc::AF_UNIX as u8, libc::SOCK_STREAM as u8, state, 0];
+        r.extend(ino.to_ne_bytes());
+        r.extend([0u8; 8]);
+        if let Some((dev, vino)) = vfs {
+            r.extend(12u16.to_ne_bytes());
+            r.extend(diag::UNIX_DIAG_VFS.to_ne_bytes());
+            r.extend(vino.to_ne_bytes());
+            r.extend(dev.to_ne_bytes());
+        }
+        r
+    }
+
+    /// F9: the `unix_diag` reply parser takes well-formed records and fails closed on anything
+    /// else: an error, a failed dump, a foreign sequence, an unknown type, truncation, bad
+    /// attribute lengths, a duplicated VFS attribute, a socket that is not a listener, and data
+    /// after the end of the dump.
+    #[test]
+    fn f9_the_unix_diag_parser_fails_closed() {
+        const SEQ: u32 = 9;
+        let by = diag::SOCK_DIAG_BY_FAMILY;
+        let done = nlmsg(diag::NLMSG_DONE, SEQ, &0i32.to_ne_bytes());
+        let a = nlmsg(
+            by,
+            SEQ,
+            &record(diag::TCP_LISTEN, 11, Some((0x80_0001, 77))),
+        );
+        let b = nlmsg(by, SEQ, &record(diag::TCP_LISTEN, 12, None));
+        let mut out = vec![];
+        assert_eq!(
+            parse_diag(&[a.clone(), b.clone()].concat(), SEQ, &mut out),
+            Ok(false)
+        );
+        assert_eq!(parse_diag(&done, SEQ, &mut out), Ok(true));
+        assert_eq!(
+            out,
+            [
+                Listener {
+                    inode: 11,
+                    vfs: Some((0x80_0001, 77))
+                },
+                Listener {
+                    inode: 12,
+                    vfs: None
+                }
+            ]
+        );
+        let mut out = vec![];
+        assert_eq!(
+            parse_diag(&[a.clone(), done.clone()].concat(), SEQ, &mut out),
+            Ok(true)
+        );
+        assert_eq!(out.len(), 1);
+        let bad: Vec<(&str, Vec<u8>)> = vec![
+            ("empty", vec![]),
+            ("short header", a[..10].to_vec()),
+            ("cut message", a[..a.len() - 4].to_vec()),
+            (
+                "foreign sequence",
+                nlmsg(by, SEQ + 1, &record(diag::TCP_LISTEN, 1, None)),
+            ),
+            (
+                "error",
+                nlmsg(diag::NLMSG_ERROR, SEQ, &(-libc::EINVAL).to_ne_bytes()),
+            ),
+            (
+                "failed dump",
+                nlmsg(diag::NLMSG_DONE, SEQ, &(-libc::ENOBUFS).to_ne_bytes()),
+            ),
+            ("unknown type", nlmsg(1, SEQ, &[])),
+            ("short record", nlmsg(by, SEQ, &[1, 1, 10, 0])),
+            ("not listening", nlmsg(by, SEQ, &record(1, 1, None))),
+            ("data after done", [done.clone(), a.clone()].concat()),
+            ("length below a header", {
+                let mut m = a.clone();
+                m[0..4].copy_from_slice(&8u32.to_ne_bytes());
+                m
+            }),
+            ("attribute length", {
+                let mut r = record(diag::TCP_LISTEN, 1, Some((1, 2)));
+                let at = diag::MSG;
+                r[at..at + 2].copy_from_slice(&40u16.to_ne_bytes());
+                nlmsg(by, SEQ, &r)
+            }),
+            ("short VFS attribute", {
+                let mut r = record(diag::TCP_LISTEN, 1, Some((1, 2)));
+                let at = diag::MSG;
+                r[at..at + 2].copy_from_slice(&8u16.to_ne_bytes());
+                nlmsg(by, SEQ, &r)
+            }),
+            ("duplicated VFS attribute", {
+                let mut r = record(diag::TCP_LISTEN, 1, Some((1, 2)));
+                let attr = r[diag::MSG..].to_vec();
+                r.extend(attr);
+                nlmsg(by, SEQ, &r)
+            }),
+            ("foreign family", {
+                let mut r = record(diag::TCP_LISTEN, 1, None);
+                r[0] = libc::AF_INET as u8;
+                nlmsg(by, SEQ, &r)
+            }),
+        ];
+        for (name, data) in bad {
+            assert!(parse_diag(&data, SEQ, &mut vec![]).is_err(), "{name}");
+        }
+    }
+
+    /// F9: a listener bound here is found by its file's device and inode (the kernel's `s_dev`
+    /// encoding matches `st_dev` converted back), and this process holds its socket inode.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn f9_a_bound_listener_is_found_by_its_file() {
+        use std::os::unix::fs::MetadataExt;
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("l.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let meta = std::fs::symlink_metadata(&path).unwrap();
+        let want = (vfs_dev(meta.dev()), meta.ino() as u32);
+        let all = unix_listeners().unwrap();
+        let mine: Vec<_> = all.iter().filter(|l| l.vfs == Some(want)).collect();
+        assert_eq!(mine.len(), 1, "{want:?} in {all:?}");
+        let inode = listening_inode(&path).unwrap();
+        assert_eq!(inode, u64::from(mine[0].inode));
+        // The socket inode is the one the fd table names.
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&listener);
+        assert_eq!(
+            std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap(),
+            PathBuf::from(format!("socket:[{inode}]"))
+        );
+        assert_eq!(holds_socket(std::process::id(), inode), Ok(()));
+        drop(listener);
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            listening_inode(&path).is_err(),
+            "nothing is bound there now"
+        );
+    }
+
+    /// F9: another process's listener renamed over the registered path is the socket at that
+    /// path; the registered process (this one, still listening on the socket it bound under that
+    /// same name) does not hold it, so the endpoint is refused. Selecting by bound name, as
+    /// `/proc/net/unix` would, picks this process's own listener instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn f9_a_listener_renamed_over_the_path_is_refused() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("l.sock");
+        let _mine = UnixListener::bind(&path).unwrap();
+        let other = t.path().join("o.sock");
+        let (_a, b) = orphaned_listener(&other);
+        let _kill = Kill(b);
+        std::fs::rename(&other, &path).unwrap();
+        let theirs = listening_inode(&path).unwrap();
+        assert_eq!(
+            holds_socket(b, theirs),
+            Ok(()),
+            "B holds the socket at the path"
+        );
+        assert!(holds_socket(std::process::id(), theirs).is_err());
+        let stream = UnixStream::connect(&path).unwrap();
+        let got = trust_endpoint_with(stream.as_fd(), &path, std::process::id(), false);
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    /// F9: `st_dev` back to the kernel's `MAJOR << 20 | MINOR`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn f9_st_dev_converts_to_the_kernel_encoding() {
+        assert_eq!(vfs_dev(libc::makedev(8, 1)), (8 << 20) | 1);
+        assert_eq!(vfs_dev(libc::makedev(0, 300)), 300);
+        assert_eq!(vfs_dev(libc::makedev(259, 70_000)), (259 << 20) | 70_000);
+    }
+
     struct Kill(u32);
     impl Drop for Kill {
         fn drop(&mut self) {
