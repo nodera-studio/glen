@@ -1733,3 +1733,130 @@ fn cwd_resolves_a_handle_in_its_bucket_but_recorded_cwd_still_wins() {
     assert_ne!(started["cwd"], scope.to_str().unwrap());
     b.wait_worker_gone(&job_id(&value));
 }
+
+/// Waits for a `FAKE_SEND_CREATED_GATE` at `gate` and returns the job id `send` wrote there.
+fn created_gate(gate: &std::path::Path) -> String {
+    let ready = std::path::PathBuf::from(format!("{}.ready", gate.display()));
+    poll(flake::scaled(Duration::from_secs(10)), || {
+        fs::read_to_string(&ready).ok().filter(|s| !s.is_empty())
+    })
+}
+/// Rewrites a created job's `job.json` as a writer to GLEN_HOME could, between `send` writing it
+/// and its worker starting.
+fn tamper_job(b: &RpcBox, id: &str, edit: impl FnOnce(&mut Value)) {
+    let path = b.job_dir(id).join("job.json");
+    let mut job: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    edit(&mut job);
+    fs::write(&path, serde_json::to_vec_pretty(&job).unwrap()).unwrap();
+}
+
+/// R7 (S-13): the worker runs the job `send` handed it on stdin, never the `job.json` a writer
+/// rewrote after `send` created it (AC-H201).
+#[test]
+fn h2_r7_a_rewritten_job_json_never_changes_what_the_worker_runs() {
+    let b = RpcBox::new();
+    let gate = b.omp.tmp.path().join("created.gate");
+    let marker = b.omp.tmp.path().join("tampered-ran");
+    let evil = b.omp.tmp.path().join("evil-omp");
+    fs::write(
+        &evil,
+        format!("#!/bin/sh\n/usr/bin/touch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&evil, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+    let child = flake::Captured::spawn(
+        b.glen(&["send", "e27c0de", "original", "--json"])
+            .env("FAKE_SEND_CREATED_GATE", &gate),
+    )
+    .unwrap();
+    let id = created_gate(&gate);
+    tamper_job(&b, &id, |job| {
+        job["text"] = "tampered".into();
+        job["omp_bin"] = evil.to_str().unwrap().into();
+    });
+    fs::write(&gate, b"go").unwrap();
+    let out = child.wait_with_output();
+    let v = envelope(&out, 0);
+    assert_eq!(v["data"]["assistant_text"], "pong: original", "{v}");
+    assert!(!marker.exists(), "the rewritten omp_bin ran");
+    let prompts = b.frames_in("prompt");
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0]["message"], "original");
+    b.wait_worker_gone(&id);
+}
+
+/// AC-H201: a worker with no job on stdin, or a job for another id, exits non-zero and writes
+/// nothing; one in an untrusted `jobs/` refuses before it reads anything (AC-H202).
+#[test]
+fn h2_a_worker_takes_its_job_only_from_stdin() {
+    let b = RpcBox::new();
+    let gate = b.omp.tmp.path().join("created.gate");
+    let child = flake::Captured::spawn(
+        b.glen(&["send", "e27c0de", "original", "--no-wait", "--json"])
+            .env("FAKE_SEND_CREATED_GATE", &gate),
+    )
+    .unwrap();
+    let id = created_gate(&gate);
+    let job = fs::read(b.job_dir(&id).join("job.json")).unwrap();
+    let status = || fs::read(b.job_dir(&id).join("status.json")).unwrap();
+    let before = status();
+    let other = {
+        let mut v: Value = serde_json::from_slice(&job).unwrap();
+        v["id"] = "01a18bcc-6970-7685-8f03-0ecc16977273".into();
+        serde_json::to_vec(&v).unwrap()
+    };
+    let huge = vec![b' '; 8 * 1024 * 1024 + 2];
+    for (what, stdin) in [
+        ("empty", Vec::new()),
+        ("not json", b"{".to_vec()),
+        ("another id", other),
+        ("over 8 MiB", huge),
+    ] {
+        let mut worker =
+            flake::Captured::spawn(b.glen(&["__worker", &id]).stdin(Stdio::piped())).unwrap();
+        let mut input = worker.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = input.write_all(&stdin);
+        });
+        let out = worker.wait_with_output();
+        writer.join().unwrap();
+        assert!(!out.status.success(), "{what}: {out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("worker:"),
+            "{what}: {out:?}"
+        );
+        assert_eq!(status(), before, "{what}: the worker wrote the status");
+    }
+    assert!(b.fake_log().is_empty(), "no omp started");
+    // AC-H202: a `jobs/` other users can write is refused before anything is read.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let jobs = b.omp.glen_home.join("jobs");
+        fs::set_permissions(&jobs, fs::Permissions::from_mode(0o777)).unwrap();
+        let mut worker =
+            flake::Captured::spawn(b.glen(&["__worker", &id]).stdin(Stdio::piped())).unwrap();
+        let mut input = worker.stdin.take().unwrap();
+        let bytes = job.clone();
+        let writer = std::thread::spawn(move || {
+            let _ = input.write_all(&bytes);
+        });
+        let out = worker.wait_with_output();
+        writer.join().unwrap();
+        assert!(!out.status.success(), "{out:?}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("refusing GLEN_HOME directory"),
+            "{out:?}"
+        );
+        assert_eq!(status(), before, "the worker wrote the status");
+        fs::set_permissions(&jobs, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    fs::write(&gate, b"go").unwrap();
+    let out = child.wait_with_output();
+    envelope(&out, 10);
+    let done = b.wait_terminal(&id, flake::scaled(Duration::from_secs(20)));
+    assert_eq!(done["status"], "completed", "{done}");
+    b.wait_worker_gone(&id);
+}

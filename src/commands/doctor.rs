@@ -670,6 +670,7 @@ mod warm_tests {
             origin_job_id: None,
             omp_pid: None,
             omp_start: None,
+            socket: None,
             warm_ms: 1000,
             expires_at: "2099-01-01T00:00:00Z".into(),
             state: EntryState::Idle,

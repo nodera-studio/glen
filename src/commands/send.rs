@@ -314,15 +314,16 @@ pub(crate) fn submit(
     }
     route_warnings.extend(warning);
     let store = JobStore::new(home.clone());
-    // From here a warm worker may claim the job: the sender never rewrites its status again,
-    // except for a spawn failure on a job nobody claimed.
+    // From here a warm worker may claim the job (offered by the worker spawned below): the
+    // sender never rewrites its status again, except for a spawn failure on a job nobody
+    // claimed. The worker takes the job from this `job` on its stdin, never from `job.json`.
     store.create_for_send(&job, route_warnings, env)?;
     #[cfg(debug_assertions)]
     if let Some(path) = env.get("FAKE_SEND_CREATED_GATE") {
         test_gate(path, id.as_str())?;
     }
     store.prune(now);
-    let child = match rpc::spawn_worker(&home, &id) {
+    let child = match rpc::spawn_worker(&home, &id, &job) {
         Ok(c) => Some(c),
         Err(e) if fail_unclaimed(&store, &id, &e)? => {
             return Err(GlenError::new(

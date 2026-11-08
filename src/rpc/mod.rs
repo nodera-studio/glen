@@ -180,7 +180,25 @@ pub(crate) fn kill_group(pid: u32, signal: rustix::process::Signal) -> io::Resul
         )),
     }
 }
-pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
+/// The canonical job bytes `send` hands its worker on stdin (S-13): `job.json`'s own encoding.
+pub fn job_bytes(job: &Job) -> io::Result<Vec<u8>> {
+    let mut bytes = serde_json::to_vec_pretty(job)?;
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+/// Spawns `__worker <id>` with `job` on its stdin (S-13): the worker never reads its job from
+/// `job.json`, which a writer to GLEN_HOME can rewrite after `send` created it.
+///
+/// - Linux: stdin is a sealed memfd (`F_SEAL_WRITE | F_SEAL_SHRINK | F_SEAL_GROW |
+///   F_SEAL_SEAL`), written and sealed before the spawn. A same-uid process can reopen a pipe
+///   through `/proc/<pid>/fd/0` and write into it; a sealed memfd stays these bytes whoever
+///   opens it.
+/// - macOS (no `/proc` reopen): a pipe, written from a thread that `send` waits for at most
+///   [`STDIN_WRITE_BOUND`] (`send --no-wait` exits right after, and the thread with it). A worker
+///   that has not taken the job by then is killed and the spawn fails (H2 G6), so the send never
+///   reports a job no worker will run.
+pub fn spawn_worker(home: &GlenHome, id: &JobId, job: &Job) -> io::Result<Child> {
+    let bytes = job_bytes(job)?;
     let mut opts = OpenOptions::new();
     opts.append(true).create(true);
     #[cfg(unix)]
@@ -195,7 +213,7 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
         .map_err(|e| io::Error::new(e.kind(), format!("cannot open {}: {e}", path.display())))?;
     let mut cmd = Command::new(std::env::current_exe()?);
     cmd.args(["__worker", id.as_str()])
-        .stdin(Stdio::null())
+        .stdin(job_stdin(&bytes)?)
         .stderr(log.try_clone()?)
         .stdout(log)
         .current_dir("/")
@@ -208,7 +226,7 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
             cmd.pre_exec(|| rustix::process::setsid().map(drop).map_err(io::Error::from));
         }
     }
-    cmd.spawn().map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         io::Error::new(
             e.kind(),
             format!(
@@ -217,7 +235,60 @@ pub fn spawn_worker(home: &GlenHome, id: &JobId) -> io::Result<Child> {
                 path.display()
             ),
         )
-    })
+    })?;
+    if let Some(stdin) = child.stdin.take()
+        && !write_bounded(stdin, bytes, STDIN_WRITE_BOUND)
+    {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the worker for {} did not take its job within {}s",
+                id.handle(),
+                STDIN_WRITE_BOUND.as_secs()
+            ),
+        ));
+    }
+    Ok(child)
+}
+/// The longest `send` waits for its worker to take the job from a stdin pipe.
+const STDIN_WRITE_BOUND: Duration = Duration::from_secs(5);
+/// The worker's stdin: Linux a sealed memfd holding `bytes`, read from its start; elsewhere a
+/// pipe that [`write_bounded`] fills.
+#[cfg(target_os = "linux")]
+fn job_stdin(bytes: &[u8]) -> io::Result<Stdio> {
+    job_memfd(bytes).map(Stdio::from)
+}
+/// A sealed memfd holding `bytes`, at offset 0.
+#[cfg(target_os = "linux")]
+fn job_memfd(bytes: &[u8]) -> io::Result<std::fs::File> {
+    use rustix::fs::{MemfdFlags, SealFlags};
+    let fd = rustix::fs::memfd_create("glen-job", MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING)?;
+    let mut file = std::fs::File::from(fd);
+    std::io::Write::write_all(&mut file, bytes)?;
+    rustix::fs::fcntl_add_seals(
+        &file,
+        SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL,
+    )?;
+    std::io::Seek::rewind(&mut file)?;
+    Ok(file)
+}
+#[cfg(not(target_os = "linux"))]
+fn job_stdin(_bytes: &[u8]) -> io::Result<Stdio> {
+    Ok(Stdio::piped())
+}
+/// Writes `bytes` to `stdin` from a thread, waiting at most `bound`; true once written (or the
+/// worker closed its end first: EPIPE, it fails on its own missing job).
+fn write_bounded(mut stdin: std::process::ChildStdin, bytes: Vec<u8>, bound: Duration) -> bool {
+    let (done, written) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let _ = stdin.write_all(&bytes);
+        drop(stdin);
+        let _ = done.send(());
+    });
+    written.recv_timeout(bound).is_ok()
 }
 /// The last 7 non-hyphen characters of a plain id (`lease_name`'s rule: ASCII letters, digits,
 /// `_` and `-`), as omp's UUIDs always are. Any other id is untrusted text that could carry
@@ -311,9 +382,66 @@ mod tests {
         let victim = t.path().join("victim.jsonl");
         std::fs::write(&victim, b"kept\n").unwrap();
         std::os::unix::fs::symlink(&victim, dir.join("worker.log")).unwrap();
-        let e = spawn_worker(&home, &id).unwrap_err();
+        let e = spawn_worker(&home, &id, &crate::jobs::tests::job()).unwrap_err();
         assert!(e.to_string().contains("worker.log"), "{e}");
         assert_eq!(std::fs::read(&victim).unwrap(), b"kept\n");
+    }
+    /// H2 G6: a worker that never takes its job from a pipe fails the spawn within the bound.
+    #[test]
+    fn a_worker_that_never_reads_its_pipe_fails_within_the_bound() {
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        let started = std::time::Instant::now();
+        assert!(!write_bounded(
+            stdin,
+            vec![b'x'; 1 << 20],
+            Duration::from_millis(200)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        let mut cat = Command::new("/bin/cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stdin = cat.stdin.take().unwrap();
+        assert!(write_bounded(
+            stdin,
+            vec![b'x'; 1 << 20],
+            Duration::from_secs(5)
+        ));
+        cat.wait().unwrap();
+    }
+    /// H2 G3: on Linux the job reaches the worker through a sealed memfd, which no reopen of
+    /// `/proc/<pid>/fd/0` can write, shrink or grow.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_linux_job_stdin_is_a_sealed_memfd() {
+        use std::io::{Read, Write};
+        let fd: std::os::fd::OwnedFd = job_memfd(b"job bytes").unwrap().into();
+        let seals = rustix::fs::fcntl_get_seals(&fd).unwrap();
+        use rustix::fs::SealFlags;
+        assert!(
+            seals
+                .contains(SealFlags::WRITE | SealFlags::SHRINK | SealFlags::GROW | SealFlags::SEAL)
+        );
+        use std::os::fd::AsRawFd;
+        let reopened = format!("/proc/self/fd/{}", fd.as_raw_fd());
+        let mut w = std::fs::OpenOptions::new().write(true).open(&reopened);
+        if let Ok(w) = w.as_mut() {
+            assert!(
+                w.write_all(b"evil").is_err(),
+                "a reopened memfd is not writable"
+            );
+        }
+        let mut text = String::new();
+        std::fs::File::from(fd).read_to_string(&mut text).unwrap();
+        assert_eq!(text, "job bytes");
     }
     #[test]
     fn s30_only_a_pid_above_one_that_fits_pid_t_is_signalled() {

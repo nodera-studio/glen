@@ -334,10 +334,36 @@ fn sandbox_check_by_token(token: AuditToken) -> Option<i32> {
 /// confined glen allows any peer: it is an add-only principal already.
 const RANKS: bool = cfg!(target_os = "linux");
 
+/// Which side of a connection the peer is, for the wording of a refusal (H2 G7).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    /// The listener glen connected to (S-18, and an offerer checking a warm worker).
+    Endpoint,
+    /// The process that connected to glen's listener (S-03).
+    Connector,
+}
+impl Role {
+    /// The peer's name in a refusal.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Endpoint => "endpoint",
+            Self::Connector => "connector",
+        }
+    }
+    /// The process the kernel recorded for the socket.
+    #[cfg(target_os = "linux")]
+    fn process(self) -> &'static str {
+        match self {
+            Self::Endpoint => "the process that listened on the socket",
+            Self::Connector => "the process that connected",
+        }
+    }
+}
 /// The confinement-ordering rule: `Ok` when `peer` may exchange work with this process,
 /// otherwise why not. `of` answers the peer's confinement relative to this process, or why the
 /// peer is not the process it claims to be.
 fn may_trust_with(
+    role: Role,
     peer: &Peer,
     me: &Confinement,
     ranks: bool,
@@ -346,7 +372,8 @@ fn may_trust_with(
     let euid = rustix::process::geteuid().as_raw();
     if peer.uid != euid {
         return Err(format!(
-            "the endpoint runs as uid {}, not as this user ({euid})",
+            "the {} runs as uid {}, not as this user ({euid})",
+            role.noun(),
             peer.uid
         ));
     }
@@ -356,7 +383,10 @@ fn may_trust_with(
         return if confined {
             Ok(())
         } else {
-            Err("the endpoint process is outside this process's pid namespace".into())
+            Err(format!(
+                "the {} process is outside this process's pid namespace",
+                role.noun()
+            ))
         };
     };
     if confined && !ranks {
@@ -365,10 +395,12 @@ fn may_trust_with(
     match of(pid)? {
         Confinement::Unconfined => Ok(()),
         Confinement::Confined(what) => Err(format!(
-            "the endpoint process {pid} runs more confined ({what}) than glen"
+            "the {} process {pid} runs more confined ({what}) than glen",
+            role.noun()
         )),
         Confinement::Unknown(why) => Err(format!(
-            "cannot tell whether the endpoint process {pid} runs more confined than glen ({why})"
+            "cannot tell whether the {} process {pid} runs more confined than glen ({why})",
+            role.noun()
         )),
     }
 }
@@ -379,7 +411,7 @@ pub fn may_trust_pid(pid: u32) -> Result<(), String> {
         pid: Some(pid),
         uid: rustix::process::geteuid().as_raw(),
     };
-    may_trust_with(&peer, self_confinement(), RANKS, |pid| {
+    may_trust_with(Role::Endpoint, &peer, self_confinement(), RANKS, |pid| {
         Ok(confinement_of(pid))
     })
 }
@@ -437,7 +469,7 @@ fn trust_endpoint_with(
         )));
     }
     let late = std::cell::Cell::new(false);
-    may_trust_with(&peer, self_confinement(), RANKS, |pid| {
+    may_trust_with(Role::Endpoint, &peer, self_confinement(), RANKS, |pid| {
         bound_confinement(fd, path, pid, pidfd, end).map_err(|r| match r {
             Refusal::Untrusted(why) => why,
             Refusal::NotAccepted => {
@@ -453,6 +485,142 @@ fn trust_endpoint_with(
             Refusal::Untrusted(why)
         }
     })
+}
+
+/// S-03, the listener's side (H2): `fd` is a connection this process accepted, and its
+/// connector must be `pid` and may hand this process work under the confinement-ordering rule.
+/// The kernel records the connector's pid at `connect()`, so the number alone may name a
+/// successor; `pid` is proven to be the process generation that holds the connector's end of
+/// this very connection before and after `check` (the caller's own reading of `pid`, such as its
+/// start token) and the confinement are read:
+///
+/// - Linux: a `SO_PEERPIDFD` pidfd (6.5+) pins the connecting process; it must still be `pid`
+///   (and a thread-group leader). On an older kernel `pid`'s fd table must hold the socket that
+///   `unix_diag` names as this connection's peer.
+/// - macOS: the `LOCAL_PEERTOKEN` audit token must name `pid` (it fails once the connector has
+///   exited, but names a successor after pid reuse), and `pid`'s fd table must hold the socket
+///   this connection is connected to (`PROC_PIDFDSOCKETINFO`: its `soi_so` equal to this
+///   socket's `unsi_conn_so`). The confinement is judged by token.
+///
+/// An unmappable connector pid (0) is refused whatever this process's own confinement: it can
+/// never be shown to be `pid`.
+pub fn trust_connector(
+    fd: BorrowedFd<'_>,
+    pid: u32,
+    check: impl Fn(u32) -> Result<(), String>,
+) -> Result<(), String> {
+    trust_connector_with(fd, pid, true, check)
+}
+/// [`trust_connector`]; `pidfd` false forces the Linux fallback (tests).
+fn trust_connector_with(
+    fd: BorrowedFd<'_>,
+    pid: u32,
+    pidfd: bool,
+    check: impl Fn(u32) -> Result<(), String>,
+) -> Result<(), String> {
+    let peer =
+        peer_of(fd).map_err(|e| format!("cannot read the connector's peer credentials: {e}"))?;
+    match peer.pid {
+        Some(got) if got == pid => (),
+        Some(got) => {
+            return Err(format!(
+                "the connection is from pid {got}, not from the job's worker {pid}"
+            ));
+        }
+        None => {
+            return Err("the connecting process is outside this process's pid namespace".into());
+        }
+    }
+    // The identity and `check` hold whatever this process's own confinement, so they are read
+    // here, not only inside the ordering rule (which skips them for a confined self on macOS).
+    let confinement = connector_confinement(fd, pid, pidfd, &check)?;
+    may_trust_with(Role::Connector, &peer, self_confinement(), RANKS, |_| {
+        Ok(confinement)
+    })
+}
+/// `check` and the confinement of `pid`, proven to be the connector of `fd` before and after
+/// both are read.
+#[cfg(target_os = "linux")]
+fn connector_confinement(
+    fd: BorrowedFd<'_>,
+    pid: u32,
+    pidfd: bool,
+    check: &dyn Fn(u32) -> Result<(), String>,
+) -> Result<Confinement, String> {
+    let held: Box<dyn Fn() -> Result<(), String>> = match pidfd.then(|| peer_pidfd(fd)) {
+        Some(Ok(pinned)) => {
+            Box::new(move || pidfd_names(&pinned, pid, Role::Connector).and_then(|()| leader(pid)))
+        }
+        // ENOPROTOOPT: before Linux 6.5. EINVAL: the connector has exited (6.5 to 6.8).
+        Some(Err(e)) if !matches!(e.raw_os_error(), Some(libc::ENOPROTOOPT | libc::EINVAL)) => {
+            return Err(format!("cannot pin the connecting process: {e}"));
+        }
+        _ => {
+            // This connection's peer (`UNIX_DIAG_PEER`) is the connector's own socket, known
+            // from `connect()` on, so no wait: it must be in `pid`'s fd table.
+            let mine = own_inode(fd)?;
+            Box::new(move || {
+                accepted_here(pid, mine, std::time::Instant::now()).map_err(|r| match r {
+                    Refusal::Untrusted(why) => why,
+                    Refusal::NotAccepted => {
+                        format!("process {pid} does not hold the other end of this connection")
+                    }
+                })?;
+                leader(pid)
+            })
+        }
+    };
+    held()?;
+    check(pid)?;
+    let confinement = confinement_of(pid);
+    held()?;
+    Ok(confinement)
+}
+#[cfg(target_os = "macos")]
+fn connector_confinement(
+    fd: BorrowedFd<'_>,
+    pid: u32,
+    _pidfd: bool,
+    check: &dyn Fn(u32) -> Result<(), String>,
+) -> Result<Confinement, String> {
+    let token = peer_token(fd).map_err(|e| {
+        if e.raw_os_error() == Some(libc::EINVAL) {
+            "the connecting process has exited".to_owned()
+        } else {
+            format!("cannot read the connector's audit token: {e}")
+        }
+    })?;
+    if token.val[5] != pid {
+        return Err(format!(
+            "the connection's audit token names pid {}, not the job's worker {pid}",
+            token.val[5]
+        ));
+    }
+    // `server_end` reads this socket's `unsi_conn_so`: here, the connector's socket.
+    let theirs = server_end(fd)?;
+    let held = || match any_socket(pid, |s| s.so() == theirs)? {
+        true => Ok(()),
+        false => Err(format!(
+            "process {pid} does not hold the other end of this connection"
+        )),
+    };
+    held()?;
+    check(pid)?;
+    let confinement = sandbox_answer(
+        "sandbox_check_by_audit_token",
+        sandbox_check_by_token(token),
+    );
+    held()?;
+    Ok(confinement)
+}
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn connector_confinement(
+    _fd: BorrowedFd<'_>,
+    _pid: u32,
+    _pidfd: bool,
+    _check: &dyn Fn(u32) -> Result<(), String>,
+) -> Result<Confinement, String> {
+    Err("the connecting process is not provable on this platform".into())
 }
 
 /// [`confinement_of`] `pid`, proven to be the process that holds the listening socket behind
@@ -485,7 +653,7 @@ fn holder(
         match peer_pidfd(fd) {
             Ok(pinned) => {
                 return Ok(Box::new(move || {
-                    pidfd_names(&pinned, pid)
+                    pidfd_names(&pinned, pid, Role::Endpoint)
                         .and_then(|()| leader(pid))
                         .map_err(Refusal::Untrusted)
                 }));
@@ -568,24 +736,23 @@ fn peer_pidfd(fd: BorrowedFd<'_>) -> io::Result<std::os::fd::OwnedFd> {
 /// The pidfd still names a live `pid`: `/proc/self/fdinfo/<fd>` shows `Pid: -1` once the process
 /// has exited and `0` when it is outside this pid namespace.
 #[cfg(target_os = "linux")]
-fn pidfd_names(pidfd: &std::os::fd::OwnedFd, pid: u32) -> Result<(), String> {
+fn pidfd_names(pidfd: &std::os::fd::OwnedFd, pid: u32, role: Role) -> Result<(), String> {
     use std::os::fd::AsRawFd;
     let info = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))
-        .map_err(|e| format!("cannot read the endpoint pidfd: {e}"))?;
+        .map_err(|e| format!("cannot read the {} pidfd: {e}", role.noun()))?;
     let got = info
         .lines()
         .find_map(|l| l.strip_prefix("Pid:"))
         .and_then(|v| v.trim().parse::<i64>().ok());
     match got {
         Some(n) if n == i64::from(pid) => Ok(()),
-        Some(-1) => Err("the process that listened on the socket has exited".into()),
-        Some(0) => {
-            Err("the process that listened on the socket is outside this pid namespace".into())
-        }
+        Some(-1) => Err(format!("{} has exited", role.process())),
+        Some(0) => Err(format!("{} is outside this pid namespace", role.process())),
         Some(n) => Err(format!(
-            "the socket was bound by pid {n}, not by the registered pid {pid}"
+            "{} is pid {n}, not the expected pid {pid}",
+            role.process()
         )),
-        None => Err("the endpoint pidfd names no pid".into()),
+        None => Err(format!("the {} pidfd names no pid", role.noun())),
     }
 }
 /// `pid` is a thread-group leader: a recycled number held by a thread is not a process.
@@ -1445,27 +1612,56 @@ mod tests {
         let of = |c: Confinement| move |_| Ok(c);
         for ranks in [false, true] {
             assert_eq!(
-                may_trust_with(&peer(Some(7)), &free, ranks, of(free.clone())),
+                may_trust_with(
+                    Role::Endpoint,
+                    &peer(Some(7)),
+                    &free,
+                    ranks,
+                    of(free.clone())
+                ),
                 Ok(())
             );
             for other in [caged.clone(), Confinement::Unknown("eacces".into())] {
-                assert!(may_trust_with(&peer(Some(7)), &free, ranks, of(other.clone())).is_err());
+                assert!(
+                    may_trust_with(
+                        Role::Endpoint,
+                        &peer(Some(7)),
+                        &free,
+                        ranks,
+                        of(other.clone())
+                    )
+                    .is_err()
+                );
                 // A confined glen allows any peer only where sandboxes cannot be ranked.
-                let got = may_trust_with(&peer(Some(7)), &caged, ranks, of(other));
+                let got = may_trust_with(Role::Endpoint, &peer(Some(7)), &caged, ranks, of(other));
                 assert_eq!(got.is_ok(), !ranks, "ranks {ranks}: {got:?}");
             }
             // An unknown self is refused like an unconfined one.
             let unknown = Confinement::Unknown("no /proc".into());
-            assert!(may_trust_with(&peer(Some(7)), &unknown, ranks, of(caged.clone())).is_err());
+            assert!(
+                may_trust_with(
+                    Role::Endpoint,
+                    &peer(Some(7)),
+                    &unknown,
+                    ranks,
+                    of(caged.clone())
+                )
+                .is_err()
+            );
             // An unmappable peer pid (0) only when this process is confined.
-            assert!(may_trust_with(&peer(None), &free, ranks, of(free.clone())).is_err());
+            assert!(
+                may_trust_with(Role::Endpoint, &peer(None), &free, ranks, of(free.clone()))
+                    .is_err()
+            );
             assert_eq!(
-                may_trust_with(&peer(None), &caged, ranks, of(free.clone())),
+                may_trust_with(Role::Endpoint, &peer(None), &caged, ranks, of(free.clone())),
                 Ok(())
             );
             // A peer that is not the process it claims is refused, whatever its confinement.
             assert_eq!(
-                may_trust_with(&peer(Some(7)), &free, ranks, |_| Err("gone".into())),
+                may_trust_with(Role::Endpoint, &peer(Some(7)), &free, ranks, |_| Err(
+                    "gone".into()
+                )),
                 Err("gone".into())
             );
             // Another uid never.
@@ -1473,7 +1669,9 @@ mod tests {
                 pid: Some(7),
                 uid: me.wrapping_add(1),
             };
-            assert!(may_trust_with(&foreign, &caged, ranks, of(free.clone())).is_err());
+            assert!(
+                may_trust_with(Role::Endpoint, &foreign, &caged, ranks, of(free.clone())).is_err()
+            );
         }
     }
 
@@ -2179,6 +2377,99 @@ mod tests {
         );
     }
 
+    /// A forked child that connects to `path` and then pauses; returns its pid (the caller
+    /// kills it).
+    fn connector(path: &Path) -> u32 {
+        use std::os::unix::ffi::OsStrExt;
+        // SAFETY: zeroed sockaddr_un is a valid value.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as _;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len());
+        for (d, s) in addr.sun_path.iter_mut().zip(bytes) {
+            *d = *s as _;
+        }
+        // SAFETY: the child runs only async-signal-safe system calls, then pauses or `_exit`s.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0);
+        if pid == 0 {
+            // SAFETY: plain system calls on local storage.
+            unsafe {
+                let s = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+                if s < 0 || libc::connect(s, (&raw const addr).cast(), len) != 0 {
+                    libc::_exit(1);
+                }
+                loop {
+                    libc::pause();
+                }
+            }
+        }
+        pid as u32
+    }
+
+    /// H2 (S-03): the listener side proves the connector of an accepted connection. This
+    /// process's own connection is its own; a forked connector is that child and no other pid;
+    /// the caller's own check runs; and once the connector has exited (and been reaped) the
+    /// connection proves nothing, through the pidfd and through the Linux fallback.
+    #[test]
+    fn h2_the_connector_of_an_accepted_connection_is_proven() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("c.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let me = std::process::id();
+        let _mine = UnixStream::connect(&path).unwrap();
+        let (accepted, _) = listener.accept().unwrap();
+        let ok = |_: u32| Ok(());
+        for pidfd in [true, false] {
+            assert_eq!(
+                trust_connector_with(accepted.as_fd(), me, pidfd, ok),
+                Ok(()),
+                "pidfd {pidfd}"
+            );
+            assert!(trust_connector_with(accepted.as_fd(), me + 1, pidfd, ok).is_err());
+            let refused = trust_connector_with(accepted.as_fd(), me, pidfd, |pid| {
+                Err(format!("{pid} is another generation"))
+            });
+            assert_eq!(refused, Err(format!("{me} is another generation")));
+        }
+        let child = connector(&path);
+        let mut kill = Some(Kill(child));
+        let (theirs, _) = listener.accept().unwrap();
+        assert_eq!(peer_of(&theirs).unwrap().pid, Some(child));
+        if *self_confinement() == Confinement::Unconfined {
+            for pidfd in [true, false] {
+                assert_eq!(
+                    trust_connector_with(theirs.as_fd(), child, pidfd, ok),
+                    Ok(()),
+                    "pidfd {pidfd}"
+                );
+            }
+        }
+        // The kernel's pid is the connector's; any other claimed pid is refused.
+        assert!(trust_connector_with(theirs.as_fd(), me, true, ok).is_err());
+        // H2 G7: a refusal names the connector, never an endpoint.
+        let caged = may_trust_with(
+            Role::Connector,
+            &peer_of(&theirs).unwrap(),
+            &Confinement::Unconfined,
+            true,
+            |_| Ok(Confinement::Confined("sandbox")),
+        )
+        .unwrap_err();
+        assert!(caged.starts_with("the connector process"), "{caged}");
+        drop(kill.take());
+        // SAFETY: reaps the child this test forked.
+        unsafe {
+            let mut status = 0;
+            libc::waitpid(child as libc::pid_t, &mut status, 0);
+        }
+        for pidfd in [true, false] {
+            let got = trust_connector_with(theirs.as_fd(), child, pidfd, ok);
+            assert!(got.is_err(), "pidfd {pidfd}: an exited connector: {got:?}");
+        }
+    }
+
     struct Kill(u32);
     impl Drop for Kill {
         fn drop(&mut self) {
@@ -2210,8 +2501,8 @@ mod tests {
             let pinned = peer_pidfd(stream.as_fd());
             // CI runs Linux 6.8, which has SO_PEERPIDFD; older kernels take the fallback.
             if let Ok(p) = &pinned {
-                assert_eq!(pidfd_names(p, me), Ok(()));
-                assert!(pidfd_names(p, me + 1).is_err());
+                assert_eq!(pidfd_names(p, me, Role::Endpoint), Ok(()));
+                assert!(pidfd_names(p, me + 1, Role::Endpoint).is_err());
             } else {
                 eprintln!("no SO_PEERPIDFD here: {pinned:?}");
             }

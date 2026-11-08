@@ -1,5 +1,6 @@
 //! The opt-in warm worker (v0.2 W4, design §A21): settings, the match key, the on-disk
-//! registry and release request, the claim, the idle loop and its one teardown.
+//! registry and release request, the hand-off socket and its offers (S-03), the claim, the idle
+//! loop and its one teardown.
 use super::{
     reply::PendingReply,
     worker::{Failure, Worker},
@@ -17,7 +18,7 @@ use crate::{
 use omp_rpc::{Client, Event};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeMap,
     fs, io,
     path::{Path, PathBuf},
     sync::{Arc, atomic::Ordering, mpsc},
@@ -26,7 +27,8 @@ use std::{
 
 /// The longest a worker may stay warm after a job (`--warm`, `GLEN_WARM`).
 pub const MAX_WARM: Duration = Duration::from_secs(600);
-/// One idle-loop tick: a queued job waits at most this long behind an idle warm worker.
+/// One idle-loop tick: the longest the loop waits on its socket for an offer before it checks
+/// its endings again (an offer is taken the moment it arrives).
 pub const CLAIM_TICK: Duration = Duration::from_millis(100);
 /// How often an idle warm worker touches its registry (the heartbeat is the file's mtime).
 pub const HEARTBEAT: Duration = Duration::from_secs(1);
@@ -176,6 +178,10 @@ pub struct Entry {
     pub omp_pid: Option<u32>,
     #[serde(default)]
     pub omp_start: Option<String>,
+    /// The worker's hand-off socket, `run/warm/<pid>.sock` (S-03): a cold worker offers its job
+    /// there, and nowhere else.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket: Option<PathBuf>,
     pub warm_ms: u64,
     pub expires_at: String,
     pub state: EntryState,
@@ -433,12 +439,10 @@ pub fn remove_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<b
     }
     remove_file(&path(home, session_id)).map(|()| true)
 }
+/// A registry or release request: never blocking, never through a symlink, regular files only,
+/// at most 64 KiB (H2: a writer can plant a FIFO there).
 fn read_regular(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let bytes = fs::read(path).ok()?;
+    let (bytes, meta) = crate::glen_home::read_regular(path, 64 * 1024).ok()?;
     Some((bytes, meta.modified().ok()?))
 }
 pub fn read(home: &GlenHome, session_id: &str) -> Option<Indexed> {
@@ -530,14 +534,16 @@ pub fn clear_release_if(home: &GlenHome, session_id: &str, ident: &str) -> io::R
     }
     remove_file(&release_path(home, session_id)).map(|()| true)
 }
-/// Teardown's cleanup: removes the registry and the release request under one acquisition of the
-/// metadata lock, waited for until `end`.
+/// Teardown's cleanup: removes the registry, the release request and this worker's hand-off
+/// socket under one acquisition of the metadata lock, waited for until `end`.
 fn remove_both(home: &GlenHome, session_id: &str, end: Instant) -> io::Result<()> {
     let Some(_meta) = meta_lock_until(home, session_id, end)? else {
         return Ok(());
     };
     remove_file(&path(home, session_id))?;
-    remove_file(&release_path(home, session_id))
+    remove_file(&release_path(home, session_id))?;
+    // This worker's own hand-off socket (AC-H207), with the registry that published it.
+    remove_file(&socket_path(home, std::process::id()))
 }
 /// What `glen release --force` may signal: only a process whose pid and start token are proven
 /// unchanged (`Alive`). `Unknown` never signals.
@@ -598,6 +604,8 @@ pub(crate) enum Reason {
     Signal,
     OmpExited,
     Mismatch,
+    /// An offer whose sender is not its job's worker, or is more confined (S-03).
+    Untrusted,
     Moved,
     StateError,
     Ended,
@@ -611,6 +619,7 @@ impl Reason {
             Self::Signal => "signal",
             Self::OmpExited => "omp_exited",
             Self::Mismatch => "mismatch",
+            Self::Untrusted => "untrusted",
             Self::Moved => "moved",
             Self::StateError => "state_error",
             Self::Ended => "ended",
@@ -627,7 +636,7 @@ pub(crate) struct Tick {
     pub expired: bool,
 }
 /// The first ending a tick observed: a signal, omp exiting, a release request, a live endpoint
-/// for the session, expiry. `None` stays warm (and scans for a queued job).
+/// for the session, expiry. `None` stays warm (and takes offers on its socket).
 pub(crate) fn decide(t: &Tick) -> Option<Reason> {
     [
         (t.cancelled, Reason::Signal),
@@ -727,83 +736,523 @@ fn hold(
         },
     )
 }
-/// The steal scan's outcome: the oldest queued RPC job of the warm session, if any.
-#[derive(Debug)]
-pub(crate) enum Found {
-    Nothing,
-    Adopt(JobId, Box<Job>),
-    /// The oldest candidate differs in its match key: the worker cools and it runs cold.
-    Mismatch(JobId),
+/// `run/warm/<pid>.sock`, the hand-off socket of the warm worker `pid` (design §A21, S-03).
+pub fn socket_path(home: &GlenHome, pid: u32) -> PathBuf {
+    dir(home).join(format!("{pid}.sock"))
 }
-enum Seen {
-    Candidate(Box<Job>),
-    Irrelevant,
+/// The longest an offer line may be: a job of at most `worker::MAX_JOB_BYTES` and its envelope.
+const MAX_OFFER_BYTES: usize = super::worker::MAX_JOB_BYTES as usize + 4096;
+/// How long the warm worker waits for the offer lines of one tick's connections, together.
+const OFFER_READ: Duration = Duration::from_secs(1);
+/// How long an offerer waits for the warm worker to accept and answer.
+const OFFER_CONNECT: Duration = Duration::from_secs(1);
+const OFFER_ANSWER: Duration = Duration::from_secs(5);
+/// How often an offerer waiting for an answer re-checks its own stop and deadline (H2 G5).
+const STOP_POLL: Duration = Duration::from_millis(200);
+
+/// A cold worker's offer of its own in-memory job (S-03): `{v:1,op:"adopt",job_id,job}`.
+#[derive(Serialize, Deserialize)]
+struct OfferLine {
+    v: u32,
+    op: String,
+    job_id: String,
+    job: Job,
+}
+/// The warm worker's answer to an offer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Answer {
+    /// Claimed: the warm worker runs the offered job.
+    Adopted,
+    /// Never: the warm worker cools, and the offerer runs its job cold.
+    Refused,
+    /// Not now: another offer went first; offer again on the next poll.
     Retry,
 }
-/// The steal scan with its cache (design §A21): ids classified for good (terminal, not queued,
-/// reused, another route or session) are skipped, so an idle tick costs one `read_dir`. A read
-/// error is retried on the next tick, at most [`Scan::RETRIES`] times: a job directory is
-/// visible before `create` wrote both of its files.
-#[derive(Default)]
-pub(crate) struct Scan {
-    settled: BTreeSet<JobId>,
-    errors: BTreeMap<JobId, u32>,
+#[derive(Serialize, Deserialize)]
+struct AnswerLine {
+    v: u32,
+    answer: Answer,
 }
-impl Scan {
-    pub(crate) const RETRIES: u32 = 20;
-    pub(crate) fn next(&mut self, store: &JobStore, session_id: &str, key: &Key) -> Found {
-        let mut oldest: Option<(JobId, Box<Job>)> = None;
-        for id in store.list() {
-            if self.settled.contains(&id) {
+
+/// Reads one `\n`-terminated line of at most `max` bytes from `stream` by `end`.
+/// `stop` is asked at least every 200 ms; true ends the wait (`Interrupted`).
+fn read_line(
+    stream: &std::os::unix::net::UnixStream,
+    max: usize,
+    end: Instant,
+    stop: &dyn Fn() -> bool,
+) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut line = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        if stop() {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "stopped"));
+        }
+        let left = end.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "no line in time"));
+        }
+        timeout(stream.set_read_timeout(Some(left.min(STOP_POLL))))?;
+        let n = match (&*stream).read(&mut buf) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    io::ErrorKind::Interrupted
+                        | io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                ) =>
+            {
                 continue;
             }
-            match seen(store, &id, session_id) {
-                Seen::Candidate(job) => {
-                    if oldest.as_ref().is_none_or(|(o, _)| id < *o) {
-                        oldest = Some((id, job));
-                    }
-                }
-                Seen::Irrelevant => {
-                    self.errors.remove(&id);
-                    self.settled.insert(id);
-                }
-                Seen::Retry => {
-                    let n = self.errors.entry(id.clone()).or_default();
-                    *n += 1;
-                    if *n >= Self::RETRIES {
-                        self.errors.remove(&id);
-                        self.settled.insert(id);
+            Err(e) => return Err(e),
+        };
+        if let Some(at) = buf[..n].iter().position(|b| *b == b'\n') {
+            line.extend_from_slice(&buf[..at]);
+            if line.len() > max {
+                break;
+            }
+            return Ok(line);
+        }
+        line.extend_from_slice(&buf[..n]);
+        if line.len() > max {
+            break;
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("a line longer than {max} bytes"),
+    ))
+}
+fn write_line(
+    stream: &std::os::unix::net::UnixStream,
+    value: &impl Serialize,
+    within: Duration,
+) -> io::Result<()> {
+    use std::io::Write;
+    let mut bytes = serde_json::to_vec(value)?;
+    bytes.push(b'\n');
+    timeout(stream.set_write_timeout(Some(within)))?;
+    (&*stream).write_all(&bytes)
+}
+/// A socket timeout's result: macOS refuses the option (EINVAL) on a connection its peer has
+/// closed, which never blocks anyway; its buffered data is still read.
+fn timeout(set: io::Result<()>) -> io::Result<()> {
+    match set {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
+    }
+}
+
+/// What a cold worker's [`offer`] came to.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Offered {
+    /// No idle warm worker holds the session (or this one was offered to already).
+    No,
+    /// The warm worker claimed the job: it is no longer this worker's.
+    Adopted,
+    /// Refused for good: the warm worker cools and the job runs cold here.
+    Refused,
+    /// Busy or answered `retry`: offer again on the next poll.
+    Retry,
+    /// The warm worker could not be offered to, and why: never offered to again.
+    Failed(String),
+}
+/// A cold worker waiting for the session lock offers its own in-memory `job` (the one `send`
+/// handed it on stdin) to the session's idle warm worker (design §A21, S-03). Only when the
+/// lock's holder is `warm` and names the same worker as the registry; the registry's socket must
+/// be `run/warm/<pid>.sock`, a 0600 socket this user owns, held by that worker generation and no
+/// more confined than this process (`proc_ident::trust_endpoint`). `offered` keeps the worker
+/// already offered to, so each warm worker is offered the job once, unless it answers `retry`.
+/// Every wait is bounded by `deadline` (the job's) as well as its own bound, and `stop` (the
+/// worker's cancel and claim checks) is asked between the phases and while the answer is
+/// awaited (H2 G5): a stop or a passed deadline makes it `Retry`, and the lock wait decides.
+pub(crate) fn offer(
+    home: &GlenHome,
+    session_id: &str,
+    job: &Job,
+    offered: &mut Option<String>,
+    deadline: Instant,
+    stop: &dyn Fn() -> bool,
+) -> Offered {
+    let Some(holder) = crate::jobs::lock::holder(home, session_id) else {
+        return Offered::No;
+    };
+    if holder.kind != crate::jobs::lock::HolderKind::Warm {
+        return Offered::No;
+    }
+    let Some(reg) = read(home, session_id) else {
+        return Offered::No;
+    };
+    let entry = reg.entry;
+    let me = entry.ident();
+    if entry.state != EntryState::Idle
+        || ident(holder.pid, holder.start.as_deref()) != me
+        || offered.as_deref() == Some(me.as_str())
+    {
+        return Offered::No;
+    }
+    *offered = Some(me);
+    let outcome = (|| {
+        let path = socket_path(home, entry.pid);
+        if entry.socket.as_deref() != Some(path.as_path()) {
+            return Err(format!(
+                "the warm registry names socket {:?}, not {}",
+                entry.socket,
+                path.display()
+            ));
+        }
+        private_socket(&path)?;
+        let Some(start) = entry.start.as_deref() else {
+            return Err("the warm registry has no start token".into());
+        };
+        let within = |bound: Duration| (Instant::now() + bound).min(deadline);
+        // H2 fix 2 (H3): a non-blocking connect bounded by the deadline and the stop, so a
+        // listener whose backlog is full and that never accepts cannot hold this worker; then
+        // the peer checks (`proc_ident::trust_endpoint`) before a byte is written.
+        use crate::live::client::{ClientError, bounded_connect};
+        let stream = match bounded_connect(&path, entry.pid, within(OFFER_CONNECT), stop) {
+            Ok(stream) => stream,
+            Err(ClientError::Timeout | ClientError::Cancelled) => return Ok(Offered::Retry),
+            Err(ClientError::Untrusted(why)) => return Err(why),
+            Err(e) => return Err(format!("cannot connect to {}: {e}", path.display())),
+        };
+        if liveness::check(entry.pid, start) != Liveness::Alive {
+            return Err(format!(
+                "warm worker {} is not the registered one",
+                entry.pid
+            ));
+        }
+        if stop() || Instant::now() >= deadline {
+            return Ok(Offered::Retry);
+        }
+        let line = OfferLine {
+            v: 1,
+            op: "adopt".into(),
+            job_id: job.id.clone(),
+            job: job.clone(),
+        };
+        let left = within(OFFER_ANSWER).saturating_duration_since(Instant::now());
+        if left.is_zero() || write_line(&stream, &line, left).is_err() {
+            return Ok(Offered::Retry);
+        }
+        let Ok(answer) = read_line(&stream, 4096, within(OFFER_ANSWER), stop) else {
+            // Busy with another job, or gone: the holder tells on the next poll.
+            return Ok(Offered::Retry);
+        };
+        Ok(match serde_json::from_slice::<AnswerLine>(&answer) {
+            Ok(AnswerLine {
+                v: 1,
+                answer: Answer::Adopted,
+            }) => Offered::Adopted,
+            Ok(AnswerLine {
+                v: 1,
+                answer: Answer::Refused,
+            }) => Offered::Refused,
+            _ => Offered::Retry,
+        })
+    })();
+    match outcome {
+        Ok(Offered::Retry) => {
+            *offered = None;
+            Offered::Retry
+        }
+        Ok(o) => o,
+        Err(why) => Offered::Failed(why),
+    }
+}
+/// `path` is a socket this user owns with no group or other permission bits (never followed).
+fn private_socket(path: &Path) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let meta =
+        fs::symlink_metadata(path).map_err(|e| format!("cannot lstat {}: {e}", path.display()))?;
+    let euid = rustix::process::geteuid().as_raw();
+    if !meta.file_type().is_socket() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is not a private socket owned by uid {euid}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+/// Binds the warm worker's hand-off socket, `run/warm/<pid>.sock`, 0600 in the 0700
+/// `run/warm`. A leftover file at the path (a crashed worker that had this pid) is replaced.
+fn listen(home: &GlenHome) -> io::Result<(std::os::unix::net::UnixListener, PathBuf)> {
+    home.ensure_dir("run/warm")?;
+    let path = socket_path(home, std::process::id());
+    if fs::symlink_metadata(&path).is_ok_and(|m| !m.is_dir()) {
+        remove_file(&path)?;
+    }
+    let listener = std::os::unix::net::UnixListener::bind(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot bind {}: {e}", path.display())))?;
+    #[cfg(test)]
+    if let Some(hook) = BETWEEN_BIND_AND_CHMOD.take() {
+        hook(&path);
+    }
+    chmod_private(&path)
+        .map_err(|e| io::Error::new(e.kind(), format!("cannot chmod {}: {e}", path.display())))?;
+    private_socket(&path).map_err(io::Error::other)?;
+    listener.set_nonblocking(true)?;
+    Ok((listener, path))
+}
+/// Sets `path` to 0600 without following a symlink a writer renamed over it (H2 G2): a symlink
+/// is never chmodded through, and the [`private_socket`] check that follows refuses it. Linux
+/// opens the file itself (`O_PATH | O_NOFOLLOW`, a symlink is refused at the open) and chmods
+/// that inode through `/proc/self/fd`, as glibc's `lchmod` does; macOS `fchmodat` with
+/// `AT_SYMLINK_NOFOLLOW` changes a symlink itself, never its target.
+fn chmod_private(path: &Path) -> io::Result<()> {
+    use rustix::fs::Mode;
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::OFlags;
+        let fd = rustix::fs::open(
+            path,
+            OFlags::PATH | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?;
+        let st = rustix::fs::fstat(&fd)?;
+        if rustix::fs::FileType::from_raw_mode(st.st_mode) != rustix::fs::FileType::Socket {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "not a socket"));
+        }
+        use std::os::fd::AsRawFd;
+        rustix::fs::chmod(
+            format!("/proc/self/fd/{}", fd.as_raw_fd()),
+            Mode::from_raw_mode(0o600),
+        )?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        rustix::fs::chmodat(
+            rustix::fs::CWD,
+            path,
+            Mode::from_raw_mode(0o600),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        )?;
+        Ok(())
+    }
+}
+#[cfg(test)]
+type PathHook = Box<dyn FnOnce(&Path)>;
+#[cfg(test)]
+thread_local! {
+    /// Test-only seam: runs once, in this thread's next [`listen`], between its bind and chmod.
+    static BETWEEN_BIND_AND_CHMOD: std::cell::Cell<Option<PathHook>> =
+        const { std::cell::Cell::new(None) };
+}
+/// The peer of `stream` has closed it (an offerer that gave up waiting): nothing is pending.
+fn closed(stream: &std::os::unix::net::UnixStream) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut byte = 0u8;
+    // SAFETY: a one-byte peek into local storage.
+    let n = unsafe {
+        libc::recv(
+            stream.as_raw_fd(),
+            (&raw mut byte).cast(),
+            1,
+            libc::MSG_PEEK | libc::MSG_DONTWAIT,
+        )
+    };
+    n == 0
+}
+/// One offer the warm worker received over its socket.
+pub(crate) struct Offer {
+    stream: std::os::unix::net::UnixStream,
+    pub(crate) id: JobId,
+    pub(crate) job: Job,
+}
+impl Offer {
+    fn answer(&self, answer: Answer) {
+        let _ = write_line(
+            &self.stream,
+            &AnswerLine { v: 1, answer },
+            Duration::from_secs(1),
+        );
+    }
+}
+/// The most connections the warm worker holds open while their offers arrive; later ones wait
+/// in the listen backlog.
+const MAX_PENDING: usize = 16;
+/// A connection whose offer line is still arriving.
+struct Pending {
+    stream: std::os::unix::net::UnixStream,
+    line: Vec<u8>,
+    /// [`OFFER_READ`] from its accept.
+    end: Instant,
+}
+/// The connections an idle warm worker is reading offers from (H2 G4). Each has its own
+/// deadline and they are read together, so a silent or slow connection delays no other offer;
+/// at most [`MAX_PENDING`] are held, and each line is capped at [`MAX_OFFER_BYTES`].
+#[derive(Default)]
+pub(crate) struct Inbox {
+    pending: Vec<Pending>,
+}
+impl Inbox {
+    /// Waits up to `within` for connections and offer bytes; returns the offers completed by
+    /// then (every one complete at that moment). A connection that sends no well-formed offer
+    /// by its deadline, sends too much, or that its offerer already closed, is dropped
+    /// unanswered.
+    fn receive(
+        &mut self,
+        listener: &std::os::unix::net::UnixListener,
+        within: Duration,
+    ) -> Vec<Offer> {
+        use std::{io::Read, os::fd::AsRawFd};
+        let end = Instant::now() + within;
+        let mut done = vec![];
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let now = Instant::now();
+            self.pending.retain(|p| now < p.end);
+            let mut fds: Vec<libc::pollfd> = self
+                .pending
+                .iter()
+                .map(|p| libc::pollfd {
+                    fd: p.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            let accepting = self.pending.len() < MAX_PENDING;
+            if accepting {
+                fds.push(libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            if !done.is_empty() || now >= end {
+                break;
+            }
+            let wake = self.pending.iter().map(|p| p.end).fold(end, Instant::min);
+            let ms = wake
+                .saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: fds is a valid array of `fds.len()` pollfds for the duration of the call.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } <= 0 {
+                continue;
+            }
+            let polled = self.pending.len();
+            if accepting && fds.last().is_some_and(|f| f.revents != 0) {
+                while self.pending.len() < MAX_PENDING {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if stream.set_nonblocking(true).is_ok() {
+                        self.pending.push(Pending {
+                            stream,
+                            line: Vec::new(),
+                            end: Instant::now() + OFFER_READ,
+                        });
                     }
                 }
             }
+            // Read every readable connection; finished or failed ones leave `pending`.
+            let mut keep = Vec::with_capacity(self.pending.len());
+            for (i, mut p) in std::mem::take(&mut self.pending).into_iter().enumerate() {
+                if i >= polled || fds[i].revents == 0 {
+                    keep.push(p);
+                    continue;
+                }
+                match (&p.stream).read(&mut buf) {
+                    Ok(0) => (),
+                    Ok(n) => {
+                        p.line.extend_from_slice(&buf[..n]);
+                        if let Some(at) = p.line.iter().position(|b| *b == b'\n') {
+                            p.line.truncate(at);
+                            done.extend(offer_of(p));
+                        } else if p.line.len() <= MAX_OFFER_BYTES {
+                            keep.push(p);
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        keep.push(p)
+                    }
+                    Err(_) => (),
+                }
+            }
+            self.pending = keep;
         }
-        match oldest {
-            None => Found::Nothing,
-            Some((id, job)) if key.matches(&job) => Found::Adopt(id, job),
-            Some((id, _)) => Found::Mismatch(id),
-        }
+        done
     }
 }
-fn seen(store: &JobStore, id: &JobId, session_id: &str) -> Seen {
-    let Ok(s) = store.read_status(id) else {
-        return Seen::Retry;
-    };
-    if s.status != State::Queued || s.omp_reused {
-        return Seen::Irrelevant;
+/// The offer a finished line carries, if it is well-formed, at most [`MAX_OFFER_BYTES`], and
+/// its offerer is still connected.
+fn offer_of(p: Pending) -> Option<Offer> {
+    if p.line.len() > MAX_OFFER_BYTES {
+        return None;
     }
-    let Ok(job) = store.read_job(id) else {
-        return Seen::Retry;
+    p.stream.set_nonblocking(false).ok()?;
+    let o: OfferLine = serde_json::from_slice(&p.line).ok()?;
+    let id = JobId::parse(&o.job_id)?;
+    (o.v == 1 && o.op == "adopt" && JobId::parse(&o.job.id).as_ref() == Some(&id)).then_some(())?;
+    (!closed(&p.stream)).then_some(Offer {
+        stream: p.stream,
+        id,
+        job: o.job,
+    })
+}
+/// AC-H204: the offer comes from its job's own recorded worker (the job's `status.worker_pid`,
+/// the same process generation as `status.worker_start`), proven on the connection itself, and
+/// that process is no more confined than this one (`proc_ident::trust_connector`).
+fn verify(store: &JobStore, offer: &Offer) -> Result<(), String> {
+    use std::os::fd::AsFd;
+    let status = store
+        .read_status(&offer.id)
+        .map_err(|e| format!("cannot read the offered job's status: {e}"))?;
+    let (Some(pid), Some(start)) = (status.worker_pid, status.worker_start) else {
+        return Err("the offered job records no worker identity".into());
     };
-    if job.route != crate::jobs::Route::Rpc || job.session_id.as_deref() != Some(session_id) {
-        return Seen::Irrelevant;
+    crate::proc_ident::trust_connector(
+        offer.stream.as_fd(),
+        pid,
+        |pid| match liveness::start_token(pid) {
+            liveness::Probe::Running(t) if t == start => Ok(()),
+            liveness::Probe::Running(_) => Err(format!(
+                "process {pid} is not the job's recorded worker generation"
+            )),
+            _ => Err(format!("cannot read the start token of process {pid}")),
+        },
+    )
+}
+/// A debug-build test gate between an offer's checks and its claim (AC-H205): writes
+/// `<path>.ready` with the job id, then waits up to 5 s for `path`.
+#[cfg(debug_assertions)]
+fn offer_gate(id: &JobId) {
+    let Some(path) = Env::from_process()
+        .get("GLEN_TEST_WARM_OFFER_GATE")
+        .map(PathBuf::from)
+    else {
+        return;
+    };
+    let _ = fs::write(format!("{}.ready", path.display()), id.as_str());
+    let end = Instant::now() + Duration::from_secs(5);
+    while !path.exists() && Instant::now() < end {
+        std::thread::sleep(Duration::from_millis(10));
     }
-    Seen::Candidate(Box::new(job))
 }
 /// The idle phase after a job that stays warm (design §A21). It never writes the status of a
 /// job it is not running: every failure here ends warmth through [`teardown`]. `Err` only when
 /// an adopted job panicked, so the worker exits non-zero.
 pub(crate) fn idle(first: &Worker, warm: Warm) -> Result<(), Failure> {
     let me = liveness::current();
+    // AC-H207: no socket, no warmth (a GLEN_HOME too long for a socket path, say).
+    let (listener, socket) = match listen(&first.store.home) {
+        Ok(bound) => (Some(bound.0), Some(bound.1)),
+        Err(e) => {
+            first.log("warm", &format!("{e}; not staying warm"));
+            (None, None)
+        }
+    };
     let mut idler = Idler {
         first,
         home: first.store.home.clone(),
@@ -825,6 +1274,7 @@ pub(crate) fn idle(first: &Worker, warm: Warm) -> Result<(), Failure> {
                     liveness::Probe::Running(t) => Some(t),
                     _ => None,
                 }),
+            socket,
             warm_ms: first.job.warm_ms.unwrap_or(0),
             expires_at: String::new(),
             state: EntryState::Idle,
@@ -833,7 +1283,11 @@ pub(crate) fn idle(first: &Worker, warm: Warm) -> Result<(), Failure> {
         last: None,
         panicked: false,
     };
-    let reason = idler.run(&warm);
+    let reason = match &listener {
+        Some(listener) => idler.run(&warm, listener),
+        None => Reason::StateError,
+    };
+    drop(listener);
     let Idler {
         home,
         last,
@@ -925,13 +1379,14 @@ impl Idler<'_> {
         ));
         Ok(expires)
     }
-    fn run(&mut self, warm: &Warm) -> Reason {
+    fn run(&mut self, warm: &Warm, listener: &std::os::unix::net::UnixListener) -> Reason {
         let mut expires = match self.go_idle(warm) {
             Ok(t) => t,
             Err(reason) => return reason,
         };
         let mut beat = Instant::now();
-        let mut scan = Scan::default();
+        let mut defer = Defer::default();
+        let mut inbox = Inbox::default();
         loop {
             let tick = Tick {
                 cancelled: self.first.cancel.load(Ordering::SeqCst),
@@ -952,41 +1407,63 @@ impl Idler<'_> {
                 touch(&self.home, &warm.session_id);
                 beat = Instant::now();
             }
-            match scan.next(&self.first.store, &warm.session_id, &warm.key) {
-                Found::Nothing => std::thread::sleep(CLAIM_TICK),
-                Found::Mismatch(id) => {
-                    self.log(&format!("{} differs from the warm omp", id.handle()));
-                    return Reason::Mismatch;
+            let offers = inbox.receive(listener, CLAIM_TICK);
+            if offers.is_empty() {
+                continue;
+            }
+            let offer = match choose(
+                &self.first.store,
+                &warm.session_id,
+                &warm.key,
+                offers,
+                &mut defer,
+                &|line| self.log(line),
+            ) {
+                Ok(Some(offer)) => offer,
+                Ok(None) => continue,
+                Err(reason) => return reason,
+            };
+            match self.adopt(warm, offer) {
+                Adopted::End(reason) => return reason,
+                // Nothing ran: the window and its expiry stay as they were.
+                Adopted::Refused => (),
+                Adopted::Ran => {
+                    expires = match self.go_idle(warm) {
+                        Ok(t) => t,
+                        Err(reason) => return reason,
+                    };
+                    beat = Instant::now();
                 }
-                Found::Adopt(id, job) => match self.adopt(warm, id, *job) {
-                    Adopted::End(reason) => return reason,
-                    // Nothing ran: the window and its expiry stay as they were.
-                    Adopted::Refused => (),
-                    Adopted::Ran => {
-                        expires = match self.go_idle(warm) {
-                            Ok(t) => t,
-                            Err(reason) => return reason,
-                        };
-                        beat = Instant::now();
-                    }
-                },
             }
         }
     }
-    /// Claims and runs one queued job on the warm omp: `Ran` when the worker stays warm after
-    /// it, `Refused` when the claim lost (nothing ran; the scan moves on next tick).
-    fn adopt(&mut self, warm: &Warm, id: JobId, job: Job) -> Adopted {
+    /// Claims and runs one offered job on the warm omp, the job received over the wire (never
+    /// `job.json`, AC-H205): `Ran` when the worker stays warm after it, `Refused` when the claim
+    /// lost (nothing ran; the offerer is told to retry).
+    fn adopt(&mut self, warm: &Warm, offer: Offer) -> Adopted {
         // (1) The omp process still drives the warm session.
         let state = match super::worker::query_state(&warm.client, Duration::from_secs(1)) {
             Ok(s) if s.session_id == warm.session_id => s,
             Ok(s) => {
                 self.log(&format!("omp moved to session {}", s.session_id));
+                offer.answer(Answer::Refused);
                 return Adopted::End(Reason::Moved);
             }
             Err(e) => {
                 self.log(&format!("cannot check the warm session: {e}"));
+                offer.answer(Answer::Refused);
                 return Adopted::End(Reason::StateError);
             }
+        };
+        #[cfg(debug_assertions)]
+        offer_gate(&offer.id);
+        let Offer { stream, id, job } = offer;
+        let answer = |a: Answer| {
+            let _ = write_line(
+                &stream,
+                &AnswerLine { v: 1, answer: a },
+                Duration::from_secs(1),
+            );
         };
         // (2) The holder names the job before the claim, so a control never sees `warm` while a
         // claimed job is about to run; (3) the claim itself.
@@ -1005,6 +1482,7 @@ impl Idler<'_> {
             self.start.as_deref(),
         ) {
             self.log(&format!("cannot mark the holder for {}: {e}", id.handle()));
+            answer(Answer::Refused);
             return Adopted::End(Reason::StateError);
         }
         let status = match claim(
@@ -1015,6 +1493,7 @@ impl Idler<'_> {
         ) {
             Ok(Some(status)) => status,
             Ok(None) => {
+                answer(Answer::Retry);
                 return match warm_holder(self) {
                     Ok(()) => Adopted::Refused,
                     Err(e) => {
@@ -1025,9 +1504,12 @@ impl Idler<'_> {
             }
             Err(e) => {
                 self.log(&format!("cannot claim {}: {e}", id.handle()));
+                answer(Answer::Refused);
                 return Adopted::End(Reason::StateError);
             }
         };
+        answer(Answer::Adopted);
+        drop(stream);
         // (4) Busy: committed to the job from here; any failure ends it through its own path.
         self.entry.state = EntryState::Busy;
         self.entry.job_id = id.as_str().into();
@@ -1051,11 +1533,128 @@ impl Idler<'_> {
         }
     }
 }
+/// One tick's offers (AC-H204, AC-H206): any whose sender fails [`verify`] is refused and
+/// the worker cools (`untrusted`); otherwise the oldest job id goes first, and is refused with
+/// cooling (`mismatch`) when it does not match the warm omp. Every other offer is answered
+/// `retry`. `Ok(None)`: nothing to run, stay warm.
+fn choose(
+    store: &JobStore,
+    session_id: &str,
+    key: &Key,
+    mut offers: Vec<Offer>,
+    defer: &mut Defer,
+    log: &dyn Fn(&str),
+) -> Result<Option<Offer>, Reason> {
+    let mut cool = None;
+    offers.retain(|o| match verify(store, o) {
+        Ok(()) => true,
+        Err(why) => {
+            log(&format!("refused the offer of {}: {why}", o.id.handle()));
+            o.answer(Answer::Refused);
+            cool = Some(Reason::Untrusted);
+            false
+        }
+    });
+    offers.sort_by(|a, b| a.id.cmp(&b.id));
+    let mut offers = offers.into_iter();
+    let first = if cool.is_some() { None } else { offers.next() };
+    for later in offers {
+        later.answer(Answer::Retry);
+    }
+    if let Some(reason) = cool {
+        return Err(reason);
+    }
+    let Some(offer) = first else {
+        return Ok(None);
+    };
+    if offer.job.route != crate::jobs::Route::Rpc
+        || offer.job.session_id.as_deref() != Some(session_id)
+    {
+        log(&format!(
+            "refused the offer of {}: not a job for {}",
+            offer.id.handle(),
+            session_id
+        ));
+        offer.answer(Answer::Refused);
+        return Ok(None);
+    }
+    if !key.matches(&offer.job) {
+        log(&format!("{} differs from the warm omp", offer.id.handle()));
+        offer.answer(Answer::Refused);
+        return Err(Reason::Mismatch);
+    }
+    if let Some(older) = defer.blocker(store, session_id, &offer.id, Instant::now()) {
+        log(&format!(
+            "{} waits for the older {} to be offered",
+            offer.id.handle(),
+            older.handle()
+        ));
+        offer.answer(Answer::Retry);
+        return Ok(None);
+    }
+    defer.claimed(&offer.id);
+    Ok(Some(offer))
+}
+/// The most one offer is deferred for older queued jobs' own offers (AC-v2-402), however many
+/// there are: one cold-worker poll (200 ms) and slack.
+pub(crate) const DEFER: Duration = Duration::from_millis(400);
+/// AC-v2-402 across ticks (H2): the oldest queued job goes first even when a newer one's worker
+/// polls first. Disk may only defer an offer, never adopt one: while an older queued job of the
+/// session has a live recorded worker (pid and start token), a newer offer is answered `retry`,
+/// but each offered job is deferred for at most [`DEFER`] in all, however many older jobs there
+/// are, so forged older jobs cost one bounded delay per offer.
+#[derive(Default)]
+pub(crate) struct Defer {
+    /// Each deferred offer's job, and when its deferral budget runs out.
+    budget: BTreeMap<JobId, Instant>,
+}
+impl Defer {
+    /// The older job offer `id` must wait for at `now`, if any.
+    fn blocker(
+        &mut self,
+        store: &JobStore,
+        session_id: &str,
+        id: &JobId,
+        now: Instant,
+    ) -> Option<JobId> {
+        if self.budget.get(id).is_some_and(|until| now >= *until) {
+            return None;
+        }
+        let mut older: Vec<JobId> = store.list().into_iter().filter(|o| o < id).collect();
+        older.sort();
+        let blocker = older
+            .into_iter()
+            .find(|o| waiting_job(store, session_id, o))?;
+        self.budget.entry(id.clone()).or_insert(now + DEFER);
+        Some(blocker)
+    }
+    /// `id` was claimed: its budget is no longer needed.
+    fn claimed(&mut self, id: &JobId) {
+        self.budget.remove(id);
+    }
+}
+/// A queued, unclaimed RPC job of `session_id` whose recorded worker (pid and start token) is
+/// alive: one whose worker is waiting to offer it.
+fn waiting_job(store: &JobStore, session_id: &str, id: &JobId) -> bool {
+    let Ok(s) = store.read_status(id) else {
+        return false;
+    };
+    let (Some(pid), Some(start)) = (s.worker_pid, s.worker_start.as_deref()) else {
+        return false;
+    };
+    s.status == State::Queued
+        && !s.omp_reused
+        && pid != std::process::id()
+        && liveness::check(pid, start) == Liveness::Alive
+        && store.read_job(id).is_ok_and(|j| {
+            j.route == crate::jobs::Route::Rpc && j.session_id.as_deref() == Some(session_id)
+        })
+}
 /// What [`Idler::adopt`] did with a found job.
 enum Adopted {
     /// The job ran and the worker stays warm: the window re-arms after it.
     Ran,
-    /// Another worker claimed the job first; nothing ran.
+    /// The claim lost (the job is no longer queued); nothing ran.
     Refused,
     /// Warmth ends.
     End(Reason),
@@ -1381,6 +1980,7 @@ mod registry_tests {
             origin_job_id: None,
             omp_pid: None,
             omp_start: None,
+            socket: None,
             warm_ms: 2000,
             expires_at: "2026-11-02T00:00:10Z".into(),
             state,
@@ -1988,6 +2588,7 @@ mod idle_tests {
                 origin_job_id: None,
                 omp_pid: None,
                 omp_start: None,
+                socket: None,
                 warm_ms: 1000,
                 expires_at: timestamp_after(Duration::from_secs(1)),
                 state: EntryState::Idle,
@@ -2069,6 +2670,7 @@ mod idle_tests {
                 origin_job_id: None,
                 omp_pid: None,
                 omp_start: None,
+                socket: None,
                 warm_ms: 1000,
                 expires_at: timestamp_after(Duration::from_secs(1)),
                 state: EntryState::Idle,
@@ -2169,96 +2771,557 @@ mod adopt_tests {
         store.create(&j).unwrap();
         id
     }
-    #[test]
-    fn scan_takes_the_oldest_matching_queued_job_of_the_session() {
-        let t = tempfile::tempdir().unwrap();
-        let store = crate::jobs::tests::store(t.path());
-        let mut scan = Scan::default();
-        assert!(matches!(scan.next(&store, SESSION, &key()), Found::Nothing));
-        // Not candidates, cached for good: another session, the live route, a reused job.
-        queued(&store, |j| j.session_id = Some("other".into()));
-        queued(&store, |j| j.route = crate::jobs::Route::Live);
-        let reused = queued(&store, |_| ());
-        store
-            .update_status_if(&reused, |s| {
-                s.omp_reused = true;
-                true
-            })
-            .unwrap();
-        assert!(matches!(scan.next(&store, SESSION, &key()), Found::Nothing));
-        assert_eq!(scan.settled.len(), 3);
-        let first = queued(&store, |_| ());
-        std::thread::sleep(Duration::from_millis(2));
-        queued(&store, |_| ());
-        match scan.next(&store, SESSION, &key()) {
-            Found::Adopt(id, _) => assert_eq!(id, first, "the oldest first"),
-            other => panic!("{other:?}"),
-        }
-        let mut s = store.read_status(&first).unwrap();
-        s.status = State::Completed;
-        store.write_status(&first, &s).unwrap();
-        assert!(matches!(
-            scan.next(&store, SESSION, &key()),
-            Found::Adopt(..)
-        ));
-        assert!(scan.settled.contains(&first));
+    /// A queued job whose status names `pid` (with its start token) as its worker, as a cold
+    /// worker records itself before it waits for the lock.
+    fn offered(store: &JobStore, pid: u32, edit: impl FnOnce(&mut Job)) -> (JobId, Job) {
+        let id = queued(store, edit);
+        let mut s = store.read_status(&id).unwrap();
+        s.worker_pid = Some(pid);
+        s.worker_start = match liveness::start_token(pid) {
+            liveness::Probe::Running(t) => Some(t),
+            other => panic!("no start token for {pid}: {other:?}"),
+        };
+        store.write_status(&id, &s).unwrap();
+        let job = store.read_job(&id).unwrap();
+        (id, job)
     }
-    #[test]
-    fn scan_cools_on_a_mismatching_oldest_job() {
-        let t = tempfile::tempdir().unwrap();
-        let store = crate::jobs::tests::store(t.path());
-        let other = queued(&store, |j| j.thinking_flag = Some("high".into()));
-        std::thread::sleep(Duration::from_millis(2));
-        queued(&store, |_| ());
-        match Scan::default().next(&store, SESSION, &key()) {
-            Found::Mismatch(id) => assert_eq!(id, other),
-            found => panic!("{found:?}"),
-        }
-        let t = tempfile::tempdir().unwrap();
-        let store = crate::jobs::tests::store(t.path());
-        queued(&store, |j| j.env_digest = None);
-        assert!(matches!(
-            Scan::default().next(&store, SESSION, &key()),
-            Found::Mismatch(_)
-        ));
+    /// Connects to the warm socket and writes an offer of `job` (as `job_id`), unanswered yet.
+    fn connect_offer(path: &Path, job_id: &str, job: &Job) -> std::os::unix::net::UnixStream {
+        let stream = std::os::unix::net::UnixStream::connect(path).unwrap();
+        let line = OfferLine {
+            v: 1,
+            op: "adopt".into(),
+            job_id: job_id.into(),
+            job: job.clone(),
+        };
+        write_line(&stream, &line, Duration::from_secs(1)).unwrap();
+        stream
     }
-    #[test]
-    fn scan_retries_a_job_seen_before_its_files_exist() {
+    fn answer_of(stream: &std::os::unix::net::UnixStream) -> Answer {
+        let line = read_line(
+            stream,
+            4096,
+            Instant::now() + Duration::from_secs(2),
+            &|| false,
+        )
+        .unwrap();
+        serde_json::from_slice::<AnswerLine>(&line).unwrap().answer
+    }
+    fn receive(listener: &std::os::unix::net::UnixListener, within: Duration) -> Vec<Offer> {
+        Inbox::default().receive(listener, within)
+    }
+    fn setup() -> (
+        tempfile::TempDir,
+        JobStore,
+        std::os::unix::net::UnixListener,
+        PathBuf,
+    ) {
         let t = tempfile::tempdir().unwrap();
         let store = crate::jobs::tests::store(t.path());
-        let j = crate::jobs::tests::job();
-        let id = JobId::parse(&j.id).unwrap();
-        // Tick 1: the directory exists, neither file yet (`create` is mid-way).
-        store
-            .home
-            .ensure_dir(&format!("jobs/{}", id.as_str()))
+        let (listener, path) = listen(&store.home).unwrap();
+        (t, store, listener, path)
+    }
+    /// AC-H207: the socket is `run/warm/<pid>.sock`, a 0600 socket of this user's; a leftover
+    /// file at the path is replaced; a path too long for a socket fails the bind.
+    #[test]
+    fn the_hand_off_socket_is_private_and_named_for_the_pid() {
+        use std::os::unix::fs::PermissionsExt;
+        let (t, store, listener, path) = setup();
+        assert_eq!(path, socket_path(&store.home, std::process::id()));
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(private_socket(&path), Ok(()));
+        drop(listener);
+        let (_again, again) = listen(&store.home).unwrap();
+        assert_eq!(again, path, "a leftover socket is replaced");
+        let long = GlenHome {
+            root: t.path().join("x".repeat(120)),
+        };
+        assert!(listen(&long).is_err());
+    }
+    /// H2 G2: a symlink renamed over the socket between bind and chmod is never chmodded
+    /// through: its target keeps its mode and the bind fails closed (no warmth).
+    #[test]
+    fn a_symlink_renamed_over_the_socket_is_never_followed() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let target = t.path().join("victim");
+        fs::write(&target, b"kept").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        let link = t.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        BETWEEN_BIND_AND_CHMOD.set(Some(Box::new(move |path: &Path| {
+            fs::rename(&link, path).unwrap();
+        })));
+        assert!(listen(&store.home).is_err());
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "the symlink's target was chmodded"
+        );
+    }
+    /// AC-H206: among one tick's offers the oldest job id goes first; the others are answered
+    /// `retry`. Each offer carries the job it sent, not the one on disk (AC-H205).
+    #[test]
+    fn the_oldest_offer_goes_first_and_the_others_retry() {
+        let (_t, store, listener, path) = setup();
+        let me = std::process::id();
+        let mut jobs: Vec<_> = (0..3).map(|_| offered(&store, me, |_| ())).collect();
+        jobs[0].1.text = "sent over the wire".into();
+        // Sent out of order: the newest first.
+        let streams: Vec<_> = jobs
+            .iter()
+            .rev()
+            .map(|(id, job)| connect_offer(&path, id.as_str(), job))
+            .collect();
+        let offers = receive(&listener, Duration::from_secs(1));
+        assert_eq!(offers.len(), 3);
+        let chosen = choose(
+            &store,
+            SESSION,
+            &key(),
+            offers,
+            &mut Defer::default(),
+            &|_| (),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(chosen.id, jobs[0].0);
+        assert_eq!(chosen.job.text, "sent over the wire");
+        assert_eq!(store.read_job(&jobs[0].0).unwrap().text, "hello");
+        for stream in &streams[..2] {
+            assert_eq!(answer_of(stream), Answer::Retry);
+        }
+        assert!(receive(&listener, Duration::from_millis(50)).is_empty());
+    }
+    /// AC-H204: an offer whose connection is not from its job's recorded worker is refused and
+    /// the worker cools (`untrusted`); a key mismatch is refused and cools (`mismatch`); a job of
+    /// another session is refused without cooling.
+    #[test]
+    fn offers_from_another_process_or_with_another_key_are_refused() {
+        let (_t, store, listener, path) = setup();
+        let me = std::process::id();
+        // The job names another live process as its worker; this process sends the offer.
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
             .unwrap();
-        let mut scan = Scan::default();
-        assert!(matches!(scan.next(&store, SESSION, &key()), Found::Nothing));
-        assert!(!scan.settled.contains(&id), "a read error is never cached");
-        // Tick 2: both files.
-        std::fs::remove_dir(store.dir(&id)).unwrap();
-        queued(&store, |job| {
-            *job = Job {
-                env_digest: Some("0123456789abcdef".into()),
-                ..j.clone()
+        let (forged, forged_job) = offered(&store, other.id(), |_| ());
+        let (good, good_job) = offered(&store, me, |_| ());
+        let refused = connect_offer(&path, forged.as_str(), &forged_job);
+        let later = connect_offer(&path, good.as_str(), &good_job);
+        let logged = std::cell::RefCell::new(vec![]);
+        let got = choose(
+            &store,
+            SESSION,
+            &key(),
+            receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
+            &|l| logged.borrow_mut().push(l.to_owned()),
+        );
+        assert!(matches!(got, Err(Reason::Untrusted)));
+        assert_eq!(answer_of(&refused), Answer::Refused);
+        assert_eq!(answer_of(&later), Answer::Retry);
+        assert!(
+            logged.borrow()[0].contains("not from the job's worker"),
+            "{:?}",
+            logged.borrow()
+        );
+        other.kill().unwrap();
+        other.wait().unwrap();
+        // A recorded worker identity is required: no start token, no adoption.
+        let (bare, bare_job) = offered(&store, me, |_| ());
+        let mut s = store.read_status(&bare).unwrap();
+        s.worker_start = None;
+        store.write_status(&bare, &s).unwrap();
+        let stream = connect_offer(&path, bare.as_str(), &bare_job);
+        let got = choose(
+            &store,
+            SESSION,
+            &key(),
+            receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
+            &|_| (),
+        );
+        assert!(matches!(got, Err(Reason::Untrusted)));
+        assert_eq!(answer_of(&stream), Answer::Refused);
+        // Another key: refused, and the worker cools.
+        let (thinking, job) = offered(&store, me, |j| j.thinking_flag = Some("high".into()));
+        let stream = connect_offer(&path, thinking.as_str(), &job);
+        let got = choose(
+            &store,
+            SESSION,
+            &key(),
+            receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
+            &|_| (),
+        );
+        assert!(matches!(got, Err(Reason::Mismatch)));
+        assert_eq!(answer_of(&stream), Answer::Refused);
+        // Another session's job: refused, the worker stays warm.
+        let (elsewhere, job) = offered(&store, me, |j| j.session_id = Some("other".into()));
+        let stream = connect_offer(&path, elsewhere.as_str(), &job);
+        let got = choose(
+            &store,
+            SESSION,
+            &key(),
+            receive(&listener, Duration::from_secs(1)),
+            &mut Defer::default(),
+            &|_| (),
+        );
+        assert!(matches!(got, Ok(None)));
+        assert_eq!(answer_of(&stream), Answer::Refused);
+    }
+    /// AC-v2-402 (H2 G1): an older queued job whose recorded worker is alive makes a newer
+    /// offer wait, at most [`DEFER`], and that offer never again after; a dead worker's, a
+    /// claimed or a foreign-session older job never defers it.
+    #[test]
+    fn an_older_live_job_defers_a_newer_offer_once_and_boundedly() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (older, _) = offered(&store, live.id(), |_| ());
+        let (newer, _) = offered(&store, std::process::id(), |_| ());
+        let mut defer = Defer::default();
+        let now = Instant::now();
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now),
+            Some(older.clone())
+        );
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now + DEFER / 2),
+            Some(older.clone())
+        );
+        // A forged older job that is never offered delays the newer offer once, then never again.
+        assert_eq!(defer.blocker(&store, SESSION, &newer, now + DEFER), None);
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now + DEFER * 3),
+            None
+        );
+        assert_eq!(
+            Defer::default().blocker(&store, SESSION, &older, now),
+            None,
+            "nothing older than the oldest"
+        );
+        // A dead recorded worker never defers.
+        live.kill().unwrap();
+        live.wait().unwrap();
+        assert_eq!(Defer::default().blocker(&store, SESSION, &newer, now), None);
+        // Neither does another session's job, nor a claimed one.
+        let mut other = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (elsewhere, _) = offered(&store, other.id(), |j| j.session_id = Some("x".into()));
+        let (claimed, _) = offered(&store, other.id(), |_| ());
+        let mut s = store.read_status(&claimed).unwrap();
+        s.omp_reused = true;
+        store.write_status(&claimed, &s).unwrap();
+        let (newest, _) = offered(&store, std::process::id(), |_| ());
+        assert!(elsewhere < newest && claimed < newest);
+        assert_eq!(
+            Defer::default().blocker(&store, SESSION, &newest, now),
+            None
+        );
+        other.kill().unwrap();
+        other.wait().unwrap();
+    }
+    /// H2 G4: connections are read together, each by its own deadline: a silent one held
+    /// open delays no other offer, and stays pending (not dropped) for a later tick until its
+    /// own deadline.
+    #[test]
+    fn a_silent_connection_delays_no_other_offer() {
+        let (_t, store, listener, path) = setup();
+        let (id, job) = offered(&store, std::process::id(), |_| ());
+        let _silent = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let mut inbox = Inbox::default();
+        assert!(
+            inbox
+                .receive(&listener, Duration::from_millis(50))
+                .is_empty()
+        );
+        assert_eq!(inbox.pending.len(), 1);
+        let _good = connect_offer(&path, id.as_str(), &job);
+        let started = Instant::now();
+        let got = inbox.receive(&listener, Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, id);
+        // The silent connection is dropped at its own deadline.
+        std::thread::sleep(OFFER_READ);
+        assert!(
+            inbox
+                .receive(&listener, Duration::from_millis(20))
+                .is_empty()
+        );
+        assert!(inbox.pending.is_empty());
+    }
+    /// H2 G5: an offer to a warm worker that never answers ends at the job's deadline, or as
+    /// soon as the worker is stopped, not after the full answer bound.
+    #[test]
+    fn an_unanswered_offer_ends_at_the_deadline_or_a_stop() {
+        let (_t, store, listener, path) = setup();
+        let home = store.home.clone();
+        let me = liveness::current().unwrap();
+        let lock = crate::jobs::lock::try_acquire(&home, SESSION)
+            .unwrap()
+            .unwrap();
+        hold(
+            &lock,
+            crate::jobs::lock::HolderKind::Warm,
+            &JobId::new(),
+            Some(&me.start),
+        )
+        .unwrap();
+        let mut entry = Entry {
+            v: 1,
+            pid: me.pid,
+            start: Some(me.start.clone()),
+            session_id: SESSION.into(),
+            session_handle: None,
+            job_id: JobId::new().as_str().into(),
+            origin_job_id: None,
+            omp_pid: None,
+            omp_start: None,
+            socket: Some(path.clone()),
+            warm_ms: 30_000,
+            expires_at: "2099-01-01T00:00:00Z".into(),
+            state: EntryState::Idle,
+            started_at: "2026-11-08T00:00:00Z".into(),
+        };
+        publish(&home, &entry).unwrap();
+        // Accept and hold every connection, never answering.
+        listener.set_nonblocking(false).unwrap();
+        std::thread::spawn(move || {
+            let mut held = vec![];
+            while let Ok((s, _)) = listener.accept() {
+                held.push(s);
             }
         });
-        match scan.next(&store, SESSION, &key()) {
-            Found::Adopt(found, _) => assert_eq!(found, id),
-            other => panic!("{other:?}"),
-        }
-        // A directory that never becomes a job is given up after the retry bound.
-        let broken = JobId::new();
-        store
-            .home
-            .ensure_dir(&format!("jobs/{}", broken.as_str()))
+        let job = crate::jobs::tests::job();
+        let started = Instant::now();
+        let got = offer(
+            &home,
+            SESSION,
+            &job,
+            &mut None,
+            Instant::now() + Duration::from_millis(300),
+            &|| false,
+        );
+        assert_eq!(got, Offered::Retry);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        let stopped = std::sync::atomic::AtomicBool::new(false);
+        let started = Instant::now();
+        let got = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                std::thread::sleep(Duration::from_millis(100));
+                stopped.store(true, Ordering::SeqCst);
+            });
+            offer(
+                &home,
+                SESSION,
+                &job,
+                &mut None,
+                Instant::now() + Duration::from_secs(60),
+                &|| stopped.load(Ordering::SeqCst),
+            )
+        });
+        assert_eq!(got, Offered::Retry);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        entry.state = EntryState::Busy;
+        publish(&home, &entry).unwrap();
+        drop(lock);
+    }
+    /// H2 fix 2 (H1): an older job directory whose `status.json` (or `job.json`) is a FIFO
+    /// with no writer never stalls the warm worker: the read does not block, and that job does
+    /// not defer the offer.
+    #[test]
+    fn a_fifo_status_in_an_older_job_never_stalls_the_warm_worker() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
             .unwrap();
-        let mut scan = Scan::default();
-        for _ in 0..Scan::RETRIES {
-            scan.next(&store, "none", &key());
+        let (older, _) = offered(&store, live.id(), |_| ());
+        let (oldish, _) = offered(&store, live.id(), |_| ());
+        let (newer, _) = offered(&store, std::process::id(), |_| ());
+        for (id, name) in [(&older, "status.json"), (&oldish, "job.json")] {
+            let path = store.dir(id).join(name);
+            fs::remove_file(&path).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
         }
-        assert!(scan.settled.contains(&broken));
+        let started = Instant::now();
+        assert_eq!(
+            Defer::default().blocker(&store, SESSION, &newer, Instant::now()),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(store.read_status(&older).is_err());
+        live.kill().unwrap();
+        live.wait().unwrap();
+    }
+    /// H2 fix 2 (H2): however many older jobs name a live worker, one offer is deferred at most
+    /// [`DEFER`] in all, then the oldest offer actually pending is claimed.
+    #[test]
+    fn many_forged_older_jobs_defer_an_offer_once_in_total() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        for _ in 0..10 {
+            offered(&store, live.id(), |_| ());
+        }
+        let (newer, _) = offered(&store, std::process::id(), |_| ());
+        let mut defer = Defer::default();
+        let now = Instant::now();
+        assert!(defer.blocker(&store, SESSION, &newer, now).is_some());
+        assert!(
+            defer
+                .blocker(&store, SESSION, &newer, now + DEFER / 2)
+                .is_some()
+        );
+        assert_eq!(
+            defer.blocker(&store, SESSION, &newer, now + DEFER),
+            None,
+            "the whole budget is one DEFER, not one per older job"
+        );
+        live.kill().unwrap();
+        live.wait().unwrap();
+    }
+    /// H2 fix 2 (H3): a warm socket whose backlog is full and that never accepts makes the
+    /// offer give up within its bound; it never blocks the cold worker.
+    #[test]
+    fn a_listener_that_never_accepts_never_blocks_the_offer() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let home = store.home.clone();
+        home.ensure_dir("run/warm").unwrap();
+        let path = socket_path(&home, std::process::id());
+        // A listener with a backlog of 1, filled and never accepted.
+        let fd = rustix::net::socket(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(&fd, &rustix::net::SocketAddrUnix::new(&path).unwrap()).unwrap();
+        rustix::net::listen(&fd, 0).unwrap();
+        chmod_private(&path).unwrap();
+        let mut fillers = vec![];
+        for _ in 0..8 {
+            let s = rustix::net::socket(
+                rustix::net::AddressFamily::UNIX,
+                rustix::net::SocketType::STREAM,
+                None,
+            )
+            .unwrap();
+            rustix::net::sockopt::set_socket_timeout(
+                &s,
+                rustix::net::sockopt::Timeout::Send,
+                Some(Duration::from_millis(50)),
+            )
+            .unwrap();
+            let _ = rustix::net::connect(&s, &rustix::net::SocketAddrUnix::new(&path).unwrap());
+            fillers.push(s);
+        }
+        let me = liveness::current().unwrap();
+        let lock = crate::jobs::lock::try_acquire(&home, SESSION)
+            .unwrap()
+            .unwrap();
+        hold(
+            &lock,
+            crate::jobs::lock::HolderKind::Warm,
+            &JobId::new(),
+            Some(&me.start),
+        )
+        .unwrap();
+        publish(
+            &home,
+            &Entry {
+                v: 1,
+                pid: me.pid,
+                start: Some(me.start.clone()),
+                session_id: SESSION.into(),
+                session_handle: None,
+                job_id: JobId::new().as_str().into(),
+                origin_job_id: None,
+                omp_pid: None,
+                omp_start: None,
+                socket: Some(path.clone()),
+                warm_ms: 30_000,
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                state: EntryState::Idle,
+                started_at: "2026-11-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let job = crate::jobs::tests::job();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let home2 = home.clone();
+        std::thread::spawn(move || {
+            let got = offer(
+                &home2,
+                SESSION,
+                &job,
+                &mut None,
+                Instant::now() + Duration::from_secs(60),
+                &|| false,
+            );
+            let _ = tx.send(got);
+        });
+        let got = rx
+            .recv_timeout(OFFER_CONNECT + Duration::from_secs(2))
+            .expect("the offer blocked on a listener that never accepts");
+        assert!(
+            matches!(got, Offered::Retry | Offered::Failed(_)),
+            "{got:?}"
+        );
+        drop(lock);
+        drop(fd);
+    }
+    /// A connection that sends nothing well-formed, an id that is not its job's, or that its
+    /// offerer already closed, is dropped unanswered within the read bound.
+    #[test]
+    fn malformed_and_abandoned_offers_are_dropped() {
+        use std::io::Write;
+        let (_t, store, listener, path) = setup();
+        let (id, job) = offered(&store, std::process::id(), |_| ());
+        let mut garbage = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        garbage.write_all(b"{not json}\n").unwrap();
+        let _silent = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let other = JobId::new();
+        let _wrong_id = connect_offer(&path, other.as_str(), &job);
+        drop(connect_offer(&path, id.as_str(), &job));
+        let started = Instant::now();
+        assert!(receive(&listener, Duration::from_secs(1)).is_empty());
+        assert!(started.elapsed() < Duration::from_secs(3));
     }
     #[test]
     fn a_panic_in_an_adopted_job_fails_that_job_only() {

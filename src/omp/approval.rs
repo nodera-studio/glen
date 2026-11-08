@@ -177,32 +177,6 @@ fn layer(path: &Path) -> Result<Tools, Approval> {
     ))
 }
 
-/// Opens `path` for reading only if it is a regular file. On Unix the open never blocks (a path
-/// swapped to a FIFO after a check cannot hang it) and the type comes from the opened file.
-fn open_regular(path: &Path) -> Result<std::fs::File, String> {
-    #[cfg(unix)]
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(path)
-            .map_err(|e| e.to_string())?
-    };
-    #[cfg(not(unix))]
-    let file = {
-        let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
-        if !meta.is_file() {
-            return Err("not a regular file".into());
-        }
-        std::fs::File::open(path).map_err(|e| e.to_string())?
-    };
-    if !file.metadata().map_err(|e| e.to_string())?.is_file() {
-        return Err("not a regular file".into());
-    }
-    Ok(file)
-}
-
 /// Parser features whose handling differs between yaml-rust2 and Bun's `YAML.parse`, so a file
 /// using them anywhere is unknown: an explicit tag (`!!str`, `!custom`) and a `<<` merge key,
 /// which Bun expands and yaml-rust2 keeps as a plain key.
@@ -227,7 +201,8 @@ impl MarkedEventReceiver for Unsupported {
 /// One config file as a YAML mapping (an empty document is an empty mapping).
 fn load(path: &Path) -> Result<Yaml, String> {
     let mut bytes = vec![];
-    open_regular(path)?
+    crate::glen_home::open_regular(path, true)
+        .map_err(|e| e.to_string())?
         .take(MAX_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| e.to_string())?;

@@ -1436,3 +1436,40 @@ fn s18_a_sandboxed_glen_still_delivers_to_an_unconfined_endpoint() {
     assert_eq!(d["assistant_text"], "pong: hi", "{d}");
     b.rpc.wait_worker_gone(job_id(&d));
 }
+
+/// R7 (S-13), live route: the worker sends the text `send` handed it on stdin, never the text
+/// of a `job.json` a writer rewrote after `send` created it (AC-H201).
+#[test]
+fn h2_r7_a_rewritten_live_job_json_never_changes_what_is_sent() {
+    let mut b = LiveBox::new();
+    b.start_ext(A_ID, "ok", &[]);
+    let gate = b.log.with_file_name("created.gate");
+    let child = flake::Captured::spawn(
+        b.rpc
+            .glen(&["send", "e27c0de", "original", "--json"])
+            .env("GLEN_OMP_BIN", "/nonexistent")
+            .env("FAKE_SEND_CREATED_GATE", &gate),
+    )
+    .unwrap();
+    let ready = std::path::PathBuf::from(format!("{}.ready", gate.display()));
+    let id = poll(flake::scaled(Duration::from_secs(10)), || {
+        fs::read_to_string(&ready).ok().filter(|s| !s.is_empty())
+    });
+    let path = b.rpc.job_dir(&id).join("job.json");
+    let mut job: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(job["route"], "live");
+    job["text"] = "tampered".into();
+    fs::write(&path, serde_json::to_vec_pretty(&job).unwrap()).unwrap();
+    fs::write(&gate, b"go").unwrap();
+    let out = child.wait_with_output();
+    let d = data(&out);
+    assert_eq!(d["assistant_text"], "pong: original", "{d}");
+    let sent: Vec<_> = b
+        .ext_log()
+        .into_iter()
+        .filter(|v| v["dir"] == "in" && v["frame"]["op"] == "send")
+        .collect();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["frame"]["args"]["text"], "original", "{sent:?}");
+    b.rpc.wait_worker_gone(&id);
+}

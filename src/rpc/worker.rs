@@ -100,10 +100,17 @@ pub(crate) struct Worker {
 pub fn main(arg: &str) -> ExitCode {
     let loaded = (|| -> Result<Worker, GlenError> {
         let env = Env::from_process();
-        let store = JobStore::new(glen_home::resolve(&env)?);
         let id = JobId::parse(arg)
             .ok_or_else(|| GlenError::new(ErrorCode::Usage, "invalid worker job id"))?;
-        let job = store.read_job(&id)?;
+        // S-13: nothing is read from, or spawned under, a GLEN_HOME another user can write.
+        let store = JobStore::new(glen_home::resolve_trusted(&env, &["jobs", "run/locks"])?);
+        let job = stdin_job(
+            &mut Deadlined {
+                input: std::io::stdin().lock(),
+                end: Instant::now() + STDIN_BOUND,
+            },
+            &id,
+        )?;
         let status = store.read_status(&id)?;
         let deadline = job.deadline_at.parse::<jiff::Timestamp>().map_err(|e| {
             GlenError::new(
@@ -136,6 +143,76 @@ pub fn main(arg: &str) -> ExitCode {
     };
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.run()));
     conclude(&mut w, result)
+}
+/// The longest a worker waits for its whole stdin job (S-13, H2 G3).
+const STDIN_BOUND: Duration = Duration::from_secs(5);
+/// A reader of stdin that fails with `TimedOut` once `end` passes with nothing to read.
+struct Deadlined<R> {
+    input: R,
+    end: Instant,
+}
+impl<R: std::io::Read + std::os::fd::AsFd> std::io::Read for Deadlined<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::fd::AsRawFd;
+        loop {
+            let left = self.end.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("no complete job on stdin within {}s", STDIN_BOUND.as_secs()),
+                ));
+            }
+            let mut fds = [libc::pollfd {
+                fd: self.input.as_fd().as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            }];
+            let ms = left.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: fds is a valid array of one pollfd for the duration of the call.
+            match unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) } {
+                0 => continue,
+                n if n < 0 => {
+                    let e = std::io::Error::last_os_error();
+                    if e.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(e);
+                    }
+                }
+                _ => return self.input.read(buf),
+            }
+        }
+    }
+}
+/// The most a worker reads of its stdin job (S-13); a message is at most 512 KiB.
+pub(crate) const MAX_JOB_BYTES: u64 = 8 * 1024 * 1024;
+/// The job `send` handed this worker on stdin (S-13), never `job.json`, which a writer to
+/// GLEN_HOME can rewrite after `send` created it: at most [`MAX_JOB_BYTES`], and for the job id
+/// on the worker's own argv.
+pub(crate) fn stdin_job(input: &mut impl std::io::Read, id: &JobId) -> Result<Job, GlenError> {
+    use std::io::Read;
+    let invalid = |why: String| GlenError::new(ErrorCode::Internal, why);
+    let mut bytes = Vec::new();
+    input
+        .take(MAX_JOB_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| invalid(format!("cannot read the job from stdin: {e}")))?;
+    if bytes.len() as u64 > MAX_JOB_BYTES {
+        return Err(invalid(format!(
+            "the job on stdin is larger than {MAX_JOB_BYTES} bytes"
+        )));
+    }
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Err(invalid("no job on stdin".into()));
+    }
+    let job: Job = serde_json::from_slice(&bytes)
+        .map_err(|e| invalid(format!("invalid job on stdin: {e}")))?;
+    if JobId::parse(&job.id).as_ref() != Some(id) {
+        return Err(invalid(format!(
+            "the job on stdin is {:?}, not {}",
+            job.id,
+            id.as_str()
+        )));
+    }
+    Ok(job)
 }
 pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
     payload
@@ -432,7 +509,10 @@ impl Worker {
             let home = self.store.home.clone();
             // A claim is checked before any stop: a stolen job's control requests are the
             // claimant's to answer.
-            let acquired = lock::acquire(
+            // S-03: an idle warm holder is offered this worker's own job (the one `send`
+            // handed it), at once and on every poll; adopted, the claim makes it `stolen`.
+            let mut offered = None;
+            let acquired = lock::acquire_with(
                 &home,
                 &id,
                 self.deadline,
@@ -444,6 +524,28 @@ impl Worker {
                     self.write_if_mine(&status)
                         .map(drop)
                         .map_err(std::io::Error::other)
+                },
+                &mut || match rpc::warm::offer(
+                    &home,
+                    &id,
+                    &self.job,
+                    &mut offered,
+                    self.deadline,
+                    &|| self.stolen() || self.stop_requested(),
+                ) {
+                    rpc::warm::Offered::Adopted => {
+                        self.log("warm", "offered to the warm worker: adopted");
+                        true
+                    }
+                    rpc::warm::Offered::Refused => {
+                        self.log("warm", "offered to the warm worker: refused, running cold");
+                        false
+                    }
+                    rpc::warm::Offered::Failed(why) => {
+                        self.log("warm", &format!("not offered to the warm worker: {why}"));
+                        false
+                    }
+                    rpc::warm::Offered::No | rpc::warm::Offered::Retry => false,
                 },
             )?;
             match acquired {
@@ -1672,6 +1774,29 @@ fn next(run: &Run, now: Instant, deadline: Instant) -> Next {
     Next::Wait
 }
 
+#[cfg(test)]
+mod stdin_tests {
+    use super::*;
+    /// H2 G3: a worker whose stdin stays open with no complete job gives up at its deadline.
+    #[test]
+    fn a_stdin_that_never_ends_times_out() {
+        let (reader, mut writer) = std::io::pipe().unwrap();
+        std::io::Write::write_all(&mut writer, b"{\"v\":1").unwrap();
+        let id = JobId::new();
+        let started = Instant::now();
+        let e = stdin_job(
+            &mut Deadlined {
+                input: reader,
+                end: Instant::now() + Duration::from_millis(200),
+            },
+            &id,
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("no complete job on stdin"), "{e}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        drop(writer);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

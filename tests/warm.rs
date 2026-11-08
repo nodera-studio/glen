@@ -509,6 +509,7 @@ fn ac_v2_405_a_mismatched_registry_is_cleaned_and_never_signalled() {
         origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
         omp_pid: None,
         omp_start: None,
+        socket: None,
         warm_ms: 1000,
         expires_at: "2099-01-01T00:00:00Z".into(),
         state: warm::EntryState::Idle,
@@ -544,6 +545,7 @@ fn forged_entry(pid: u32) -> warm::Entry {
         origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
         omp_pid: None,
         omp_start: None,
+        socket: None,
         warm_ms: 1000,
         expires_at: "2099-01-01T00:00:00Z".into(),
         state: warm::EntryState::Idle,
@@ -795,6 +797,7 @@ fn ac_v2_405_a_blocked_metadata_lock_is_never_reported_cooling_or_cleaned() {
         origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
         omp_pid: None,
         omp_start: None,
+        socket: None,
         warm_ms: 1000,
         expires_at: "2099-01-01T00:00:00Z".into(),
         state: warm::EntryState::Busy,
@@ -1423,4 +1426,188 @@ fn harness_output_returns_at_exit_while_another_process_holds_the_output() {
     assert!(out.status.success(), "{out:?}");
     assert_eq!(out.stderr, b"done\n");
     assert!(took < scaled(Duration::from_secs(10)), "{took:?}");
+}
+
+/// A forged queued job for the warm session (S-03): the key fields of the warm worker's own job
+/// `origin`, a fresh id and `text`. Written to disk only; no worker is spawned for it.
+fn forge_job(b: &WarmBox, origin: &str, text: &str, warm_ms: Option<u64>) -> glen::jobs::Job {
+    use glen::jobs::{JobId, JobStore};
+    let mut job: glen::jobs::Job =
+        serde_json::from_slice(&std::fs::read(b.job_dir(origin).join("job.json")).unwrap())
+            .unwrap();
+    let id = JobId::new();
+    let now = jiff::Timestamp::now();
+    job.id = id.as_str().into();
+    job.handle = id.handle();
+    job.text = text.into();
+    job.warm_ms = warm_ms;
+    job.created_at = now.to_string();
+    job.deadline_at = now
+        .checked_add(jiff::SignedDuration::from_secs(30))
+        .unwrap()
+        .to_string();
+    JobStore::new(b.home()).create(&job).unwrap();
+    job
+}
+
+/// R5 (S-03, the audit's repro): a job written to disk alone, with the warm job's key, is never
+/// adopted: adoption takes only an offer over the warm worker's socket (AC-H203).
+#[test]
+fn h2_r5_a_job_present_only_on_disk_is_never_adopted() {
+    let b = WarmBox::new();
+    let first = b.send(&["--warm", "30s"]);
+    let one = job_id(&first);
+    b.wait_registry();
+    let forged = forge_job(&b, &one, "forged-r5", Some(30_000));
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(2) {
+        let s = status_of(&b, &forged.id);
+        assert_eq!(s["status"], "queued", "{s}");
+        assert_ne!(s["omp_reused"], true, "adopted from disk: {s}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let reg = b.registry().expect("still warm");
+    assert_eq!(reg.entry.state, warm::EntryState::Idle);
+    assert_eq!(reg.entry.job_id, one);
+    assert!(
+        b.frames_in("prompt")
+            .iter()
+            .all(|f| f["message"] != "forged-r5"),
+        "the forged text reached omp"
+    );
+    release_all(&b);
+}
+
+/// `c` (a glen command of the box) wrapped in the platform's sandbox: `sandbox-exec` on macOS,
+/// `setpriv --no-new-privs` on Linux. Both exec it, so its pid is glen's own.
+fn confined(c: &Command) -> Command {
+    let mut out = if cfg!(target_os = "macos") {
+        let mut o = Command::new("/usr/bin/sandbox-exec");
+        o.args(["-p", "(version 1)(allow default)"]);
+        o
+    } else {
+        // The box's commands run with an empty PATH.
+        let mut o = Command::new("/usr/bin/setpriv");
+        o.arg("--no-new-privs");
+        o
+    };
+    out.arg(c.get_program()).args(c.get_args()).env_clear();
+    for (k, v) in c.get_envs() {
+        if let Some(v) = v {
+            out.env(k, v);
+        }
+    }
+    if let Some(dir) = c.get_current_dir() {
+        out.current_dir(dir);
+    }
+    out
+}
+
+/// R6 (S-03): a confined `glen __worker` offering a forged job to an unconfined warm worker is
+/// refused; the warm worker cools (`untrusted`) and the job runs cold inside its own sandbox
+/// (AC-H204).
+#[test]
+fn h2_r6_a_confined_offer_is_refused_and_runs_cold() {
+    if *glen::proc_ident::self_confinement() != glen::proc_ident::Confinement::Unconfined {
+        eprintln!("skipped: the test process is itself confined");
+        return;
+    }
+    if cfg!(target_os = "linux") && !std::path::Path::new("/usr/bin/setpriv").exists() {
+        eprintln!("skipped: setpriv is not installed");
+        return;
+    }
+    let b = WarmBox::new();
+    let first = b.send(&["--warm", "30s"]);
+    let one = job_id(&first);
+    b.wait_registry();
+    let forged = forge_job(&b, &one, "forged-r6", None);
+    let bytes = serde_json::to_vec_pretty(&forged).unwrap();
+    let mut worker = confined(&b.cmd(&["__worker", &forged.id]));
+    let log = std::fs::File::create(b.job_dir(&forged.id).join("worker.log")).unwrap();
+    worker
+        .stdin(std::process::Stdio::piped())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log);
+    let mut worker = worker.spawn().unwrap();
+    {
+        use std::io::Write;
+        let mut stdin = worker.stdin.take().unwrap();
+        let _ = stdin.write_all(&bytes);
+    }
+    let s = b.wait_terminal(&forged.id, scaled(Duration::from_secs(20)));
+    assert!(worker.wait().unwrap().success(), "{}", b.log(&forged.id));
+    assert_eq!(s["status"], "completed", "{s}\n{}", b.log(&forged.id));
+    assert_ne!(s["omp_reused"], true, "{s}");
+    assert_eq!(s["worker_pid"], worker.id(), "{s}");
+    assert!(
+        b.log(&one).contains("warm: cooling (untrusted)"),
+        "{}",
+        b.log(&one)
+    );
+    assert_eq!(b.starts(), 2, "the forged job started its own omp");
+    b.wait_worker_gone(&forged.id);
+}
+
+/// AC-H205: the warm worker runs the job bytes it received in the offer; a `job.json` rewritten
+/// between the offer and the claim (a debug gate holds the worker there) changes nothing.
+#[test]
+fn h2_an_adopted_job_runs_the_offered_bytes_not_job_json() {
+    let (_dir, gate) = gate_path();
+    let b = WarmBox::with(&[("GLEN_TEST_WARM_OFFER_GATE", gate.to_str().unwrap())]);
+    b.send(&["--warm", &window(30)]);
+    b.wait_registry();
+    let two = job_id(&b.no_wait(&["original", "--warm", &window(30)]));
+    let ready = std::path::PathBuf::from(format!("{}.ready", gate.display()));
+    let gated = poll(scaled(Duration::from_secs(5)), || {
+        std::fs::read_to_string(&ready)
+            .ok()
+            .filter(|s| !s.is_empty())
+    });
+    assert_eq!(gated, two);
+    let path = b.job_dir(&two).join("job.json");
+    let mut job: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    job["text"] = "tampered".into();
+    job["omp_bin"] = "/nonexistent/evil".into();
+    std::fs::write(&path, serde_json::to_vec_pretty(&job).unwrap()).unwrap();
+    std::fs::write(&gate, b"go").unwrap();
+    let done = data(&b.run(&["wait", &two, "--json"]));
+    assert_eq!(done["job"]["omp_reused"], true, "{done}");
+    assert_eq!(done["assistant_text"], "pong: original", "{done}");
+    assert!(
+        b.frames_in("prompt")
+            .iter()
+            .all(|f| f["message"] != "tampered")
+    );
+    release_all(&b);
+}
+
+/// AC-H207: the registry publishes `run/warm/<pid>.sock` (a 0600 socket) with `state:"idle"`,
+/// and teardown removes it with the registry.
+#[test]
+fn h2_the_socket_is_published_with_the_idle_registry_and_removed_at_teardown() {
+    use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+    let b = WarmBox::new();
+    b.send(&["--warm", &window(30)]);
+    let reg = b.wait_registry();
+    let socket = warm::socket_path(&b.home(), reg.entry.pid);
+    assert_eq!(reg.entry.socket.as_deref(), Some(socket.as_path()));
+    let meta = std::fs::symlink_metadata(&socket).unwrap();
+    assert!(meta.file_type().is_socket());
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    release_all(&b);
+    assert!(!socket.exists(), "teardown removed the socket");
+}
+
+/// AC-H207: a GLEN_HOME too long for a socket path: the worker logs it and does not stay warm;
+/// the job itself completes normally.
+#[test]
+fn h2_no_socket_means_no_warmth_and_the_job_completes() {
+    let mut b = WarmBox::new();
+    b.b.omp.glen_home = b.b.omp.tmp.path().join("g".repeat(110));
+    let first = b.send(&["--warm", "30s"]);
+    assert_eq!(first["job"]["status"], "completed", "{first}");
+    let one = job_id(&first);
+    b.wait_job_cold(&one, Duration::from_secs(6));
+    assert!(b.log(&one).contains("not staying warm"), "{}", b.log(&one));
+    assert!(b.registry().is_none());
 }
