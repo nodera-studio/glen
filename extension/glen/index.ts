@@ -12,10 +12,31 @@ export const OPS = ["hello", "state", "send", "abort", "list_models", "set_model
 export const RESERVED_OPS: string[] = [];
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 export const LIMITS = { maxLine: 4 * 1024 * 1024, maxText: 524288, maxInstructions: 524288, maxReply: 65536, idleMs: 5000, deliveryMs: 30000 };
-type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number; abortWaitMs?: number; uid?: number | null };
+type Deps = { env: Record<string, string | undefined>; pid: number; platform: string; homedir: string; isAlive: (pid: number) => boolean; ompVersion: () => Promise<string | null>; idleMs: number; deliveryMs?: number; abortWaitMs?: number; uid?: number | null; proc?: string };
 type Request = { id: string; sessionId: string; jobId: string | null; text: string; deliveredAs: string; conn: net.Socket | null; ackSeq: number; acked: boolean; outbox: object[]; consumed: boolean; consumptionSeq: number | null; deliveryTimer?: ReturnType<typeof setTimeout>; lastAssistant: any; lastTextAssistant: any; settled: boolean };
-type Endpoint = { compacting: boolean; server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any };
+type Endpoint = { compacting: boolean; server: net.Server; connections: Set<net.Socket>; socket: string; home: string; sessionId: string; eventSessionId: string; sessionFile: string | null; ctx: any; requests: Request[]; settledIds: Set<string>; seq: number; lastStart: number; active: Request[]; spanHasOutput: boolean; spanHasActivity: boolean; spanStart: number; boundaryStarted: boolean; mode: string; startedAt: string; ompVersion: string | null; timer?: any; deps: Deps; pi: any; place: Place };
 const ENDPOINTS = new Map<number, Endpoint>();
+// Where this process numbers pids (S-04/S-10): its pid namespace inode and the kernel boot id,
+// read from a procfs root (Linux `/proc`; absent elsewhere). A registry's pid means something
+// only there.
+type Place = { pidns: number | null; bootId: string | null };
+export function procPlace(root: string | undefined): Place {
+    const place: Place = { pidns: null, bootId: null };
+    if (!root) return place;
+    quietly(() => { const m = /^pid:\[(\d+)\]$/.exec(fs.readlinkSync(path.join(root, "self/ns/pid"))); if (m) place.pidns = Number(m[1]); });
+    quietly(() => { const b = fs.readFileSync(path.join(root, "sys/kernel/random/boot_id"), "utf8").trim(); if (b && !b.includes(":")) place.bootId = b; });
+    return place;
+}
+// A registry's place against ours, as glen judges it: another boot is dead; another pid
+// namespace, or a recorded place we cannot compare, is elsewhere (never dead); none recorded is here.
+export function scopeOf(r: any, me: Place): "here" | "other_boot" | "elsewhere" {
+    if (r.boot_id != null) {
+        if (typeof r.boot_id !== "string" || me.bootId === null) return "elsewhere";
+        if (r.boot_id !== me.bootId) return "other_boot";
+    }
+    if (r.pidns != null && (!Number.isInteger(r.pidns) || me.pidns === null || r.pidns !== me.pidns)) return "elsewhere";
+    return "here";
+}
 export function isPlainToken(id: unknown): id is string { return typeof id === "string" && /^[A-Za-z0-9_-]{1,128}$/.test(id); }
 export function sunPathMax(platform: string) { return platform === "darwin" ? 104 : 108; }
 export function resolveGlenHome(env: Deps["env"], baked: string, homedir: string): string {
@@ -76,12 +97,12 @@ export function removeRegistryIfUnchanged(file: string, expected: string): boole
 }
 function removeRegistry(e: Endpoint, id = e.sessionId) {
     if (!isPlainToken(id)) return;
-    quietly(() => { const file = registry(e, id), bytes = fs.readFileSync(file, "utf8"); if (JSON.parse(bytes).pid === e.deps.pid) removeRegistryIfUnchanged(file, bytes); });
+    quietly(() => { const file = registry(e, id), bytes = fs.readFileSync(file, "utf8"); const r = JSON.parse(bytes); if (r.pid === e.deps.pid && scopeOf(r, e.place) === "here") removeRegistryIfUnchanged(file, bytes); });
 }
 function publish(e: Endpoint, id: string, file: string | null) {
     if (!isPlainToken(id)) return;
     const target = registry(e, id), tmp = path.join(path.dirname(target), `.${id}.${e.deps.pid}.${crypto.randomUUID()}.tmp`);
-    const body = { v: 1, pid: e.deps.pid, session_id: id, session_file: file, socket: e.socket, ext_version: version(), omp_version: e.ompVersion, protocol: 1, mode: e.mode, started_at: e.startedAt, cwd: e.ctx.cwd ?? null };
+    const body = { v: 1, pid: e.deps.pid, session_id: id, session_file: file, socket: e.socket, ext_version: version(), omp_version: e.ompVersion, protocol: 1, mode: e.mode, started_at: e.startedAt, cwd: e.ctx.cwd ?? null, ...(e.place.pidns !== null ? { pidns: e.place.pidns } : {}), ...(e.place.bootId !== null ? { boot_id: e.place.bootId } : {}) };
     try { fs.writeFileSync(tmp, JSON.stringify(body) + "\n", { mode: 0o600, flag: "wx" }); fs.renameSync(tmp, target); }
     finally { unlink(tmp); }
 }
@@ -313,14 +334,20 @@ function shutdown(e: Endpoint) {
     for (const conn of e.connections) if (!active.has(conn)) quietly(() => conn.destroy());
     quietly(() => e.server.close()); unlink(e.socket); removeRegistry(e); ENDPOINTS.delete(e.deps.pid);
 }
-function sweep(home: string, deps: Deps) {
-    const dir = path.join(home, "run/live");
-    for (const name of fs.readdirSync(dir)) {
-        if (name.startsWith(".")) continue;
-        if (name.endsWith(".json")) quietly(() => { const file = path.join(dir, name), bytes = fs.readFileSync(file, "utf8"), r = JSON.parse(bytes); if (Number.isInteger(r.pid) && r.pid > 0 && !deps.isAlive(r.pid) && removeRegistryIfUnchanged(file, bytes)) unlink(path.join(dir, `${r.pid}.sock`)); });
-        const m = /^(\d+)\.sock$/.exec(name);
-        if (m && !deps.isAlive(Number(m[1]))) unlink(path.join(dir, name));
-    }
+// A registry recording another pid namespace is never removed, nor any socket its pid names:
+// that pid number means nothing here (S-04/S-10). Another boot is dead.
+function sweep(home: string, deps: Deps, place: Place) {
+    const dir = path.join(home, "run/live"), names = fs.readdirSync(dir).filter(n => !n.startsWith("."));
+    const registries: { file: string; bytes: string; r: any }[] = [], foreign = new Set<number>();
+    for (const name of names) if (name.endsWith(".json")) quietly(() => {
+        const file = path.join(dir, name), bytes = fs.readFileSync(file, "utf8"), r = JSON.parse(bytes);
+        if (!Number.isInteger(r.pid) || r.pid <= 0) return;
+        if (scopeOf(r, place) === "elsewhere") foreign.add(r.pid); else registries.push({ file, bytes, r });
+    });
+    const dead = (pid: number) => !foreign.has(pid) && !deps.isAlive(pid);
+    // A registry from another boot goes, but its pid's socket only when that pid is dead now.
+    for (const { file, bytes, r } of registries) quietly(() => { if ((scopeOf(r, place) === "other_boot" || dead(r.pid)) && removeRegistryIfUnchanged(file, bytes) && dead(r.pid)) unlink(path.join(dir, `${r.pid}.sock`)); });
+    for (const name of names) { const m = /^(\d+)\.sock$/.exec(name); if (m && dead(Number(m[1]))) unlink(path.join(dir, name)); }
 }
 export function createGlen(pi: ExtensionAPI, deps: Deps) {
     const handle = { managed: deps.env.GLEN_MANAGED === "1", endpoint: () => { const e = ENDPOINTS.get(deps.pid); return e ? { socket: e.socket, registry: registry(e), sessionId: e.sessionId } : null; }, requests: () => ENDPOINTS.get(deps.pid)?.requests ?? [] };
@@ -385,10 +412,11 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
             if (!problem) { fs.mkdirSync(path.dirname(socket), { recursive: true, mode: 0o700 }); problem = unsafeHome(home, uid); }
             if (problem) { notify(ctx, `glen: refusing GLEN_HOME: ${problem}; point GLEN_HOME at a private directory you own (mkdir -m 700); live delivery is off`); return; }
         } catch (err) { notify(ctx, `glen: cannot check GLEN_HOME: ${String(err)}; live delivery is off`); return; }
-        sweep(home, deps); unlink(socket);
+        const place = procPlace(deps.proc);
+        sweep(home, deps, place); unlink(socket);
         const server = net.createServer(conn => { try { connection(e, conn); } catch { conn.destroy(); } });
         server.on("error", err => trace(e, "server_error", { reason: String(err) }));
-        const e: Endpoint = { compacting: false, server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanHasActivity: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi };
+        const e: Endpoint = { compacting: false, server, connections: new Set(), socket, home, sessionId: id, eventSessionId: id, sessionFile: ctx.sessionManager.getSessionFile() ?? null, ctx, requests: [], settledIds: new Set(), seq: 0, lastStart: 0, active: [], spanHasOutput: false, spanHasActivity: false, spanStart: 0, boundaryStarted: false, mode: ctx.mode, startedAt: new Date().toISOString(), ompVersion: null, deps, pi, place };
         try {
             await new Promise<void>((resolve, reject) => { server.once("error", reject); server.listen(socket, () => { server.removeListener("error", reject); resolve(); }); });
             fs.chmodSync(socket, 0o600);
@@ -433,7 +461,7 @@ export function createGlen(pi: ExtensionAPI, deps: Deps) {
     return handle;
 }
 function realDeps(): Deps {
-    return { env: process.env, pid: process.pid, platform: process.platform, homedir: os.homedir(), idleMs: LIMITS.idleMs, isAlive(pid) { try { process.kill(pid, 0); return true; } catch (err: any) { return err.code !== "ESRCH"; } }, ompVersion: () => import("@oh-my-pi/pi-coding-agent").then(m => m.VERSION ?? null).catch(() => null) };
+    return { env: process.env, pid: process.pid, platform: process.platform, homedir: os.homedir(), idleMs: LIMITS.idleMs, proc: process.platform === "linux" ? "/proc" : undefined, isAlive(pid) { try { process.kill(pid, 0); return true; } catch (err: any) { return err.code !== "ESRCH"; } }, ompVersion: () => import("@oh-my-pi/pi-coding-agent").then(m => m.VERSION ?? null).catch(() => null) };
 }
 // Modules are rebound for subagents; distinct installed/-e copies must not register twice.
 const COPY = Symbol.for("glen.extension");
