@@ -630,6 +630,7 @@ mod tests {
             origin_job_id: Some("01a18bcc-6970-7685-8f03-0ecc16977273".into()),
             omp_pid: None,
             omp_start: None,
+            socket: None,
             warm_ms: 1000,
             expires_at: "2099-01-01T00:00:00Z".into(),
             state: EntryState::Idle,

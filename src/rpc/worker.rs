@@ -465,7 +465,10 @@ impl Worker {
             let home = self.store.home.clone();
             // A claim is checked before any stop: a stolen job's control requests are the
             // claimant's to answer.
-            let acquired = lock::acquire(
+            // S-03: an idle warm holder is offered this worker's own job (the one `send`
+            // handed it), at once and on every poll; adopted, the claim makes it `stolen`.
+            let mut offered = None;
+            let acquired = lock::acquire_with(
                 &home,
                 &id,
                 self.deadline,
@@ -477,6 +480,21 @@ impl Worker {
                     self.write_if_mine(&status)
                         .map(drop)
                         .map_err(std::io::Error::other)
+                },
+                &mut || match rpc::warm::offer(&home, &id, &self.job, &mut offered) {
+                    rpc::warm::Offered::Adopted => {
+                        self.log("warm", "offered to the warm worker: adopted");
+                        true
+                    }
+                    rpc::warm::Offered::Refused => {
+                        self.log("warm", "offered to the warm worker: refused, running cold");
+                        false
+                    }
+                    rpc::warm::Offered::Failed(why) => {
+                        self.log("warm", &format!("not offered to the warm worker: {why}"));
+                        false
+                    }
+                    rpc::warm::Offered::No | rpc::warm::Offered::Retry => false,
                 },
             )?;
             match acquired {

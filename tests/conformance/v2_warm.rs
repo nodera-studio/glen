@@ -1756,9 +1756,9 @@ fn ac_v2_404_a_queued_job_without_an_env_digest_is_never_adopted() {
     let w = Wm::new(&rb);
     let c = w.first("30s");
 
-    // A job a glen from before v0.2 W4 could have queued: `rpc`, `queued`, no `env_digest`.
-    // `job.json` goes first and `status.json` last, so the warm worker never sees a half-made
-    // job, and never one that carries a digest.
+    // A job without an `env_digest` (as a glen from before v0.2 W4 recorded): `rpc`, `queued`.
+    // H2: a warm worker adopts only a job its own worker offers (S-03), so the job's worker is
+    // started here, with the job on stdin as `send` hands it over.
     let created = SystemTime::now();
     let id = job_uuid(ms_since_epoch(created) + 1, 0x00d1_9e57);
     let dir = rb.job_dir(&id);
@@ -1797,14 +1797,30 @@ fn ac_v2_404_a_queued_job_without_an_env_digest_is_never_adopted() {
         &dir.join("status.json"),
         &serde_json::to_vec_pretty(&st).unwrap(),
     );
+    let mut worker = rb.command(&["__worker", id.as_str()]);
+    worker.stdin(std::process::Stdio::piped());
+    let mut worker = crate::flake::Captured::spawn(&mut worker).expect("spawn glen __worker");
+    {
+        use std::io::Write;
+        let mut stdin = worker.stdin.take().unwrap();
+        stdin
+            .write_all(&serde_json::to_vec_pretty(&job).unwrap())
+            .unwrap();
+    }
     assert_cooled(&rb, &c, "mismatch", from, FOUR_SECONDS);
-    let st = rb.status(&id);
-    assert_eq!(
-        st["status"], "queued",
-        "the warm worker did not run it: {st}"
+    let st = rb.wait_status(&id, "completed", scaled(LONG), |s| {
+        s["status"] == "completed"
+    });
+    assert_ne!(
+        st["omp_reused"], true,
+        "the warm worker did not claim it: {st}"
     );
-    assert_ne!(st["omp_reused"], true, "nor claim it: {st}");
-    assert_eq!(starts(&rb.recs()).len(), 1, "no second omp ran it");
+    assert_eq!(
+        starts(&rb.recs()).len(),
+        2,
+        "it ran cold, on an omp of its own"
+    );
+    assert!(worker.wait().unwrap().success());
     rb.assert_quiet();
 }
 

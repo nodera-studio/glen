@@ -155,7 +155,20 @@ pub fn acquire(
     id: &str,
     deadline: Instant,
     cancel: &dyn Fn() -> bool,
+    on_blocked: impl FnMut() -> io::Result<()>,
+) -> io::Result<Acquired> {
+    acquire_with(home, id, deadline, cancel, on_blocked, &mut || false)
+}
+/// [`acquire`] with `on_wait`, run after every attempt that found the lock held (the first at
+/// once, then on each 200 ms poll): a cold worker offers its job to an idle warm holder there
+/// (design §A21). True re-checks `cancel` and the lock at once, without the poll's sleep.
+pub fn acquire_with(
+    home: &GlenHome,
+    id: &str,
+    deadline: Instant,
+    cancel: &dyn Fn() -> bool,
     mut on_blocked: impl FnMut() -> io::Result<()>,
+    on_wait: &mut dyn FnMut() -> bool,
 ) -> io::Result<Acquired> {
     let started = Instant::now();
     let mut blocked = false;
@@ -172,6 +185,9 @@ pub fn acquire(
         if !blocked {
             on_blocked()?;
             blocked = true;
+        }
+        if on_wait() {
+            continue;
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
