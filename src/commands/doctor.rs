@@ -249,7 +249,7 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
     let registries = crate::live::registry::index(&glen_home);
     let stale = registries
         .iter()
-        .filter(|r| crate::live::registry::pid_dead(r.pid))
+        .filter(|r| crate::live::registry::pid_dead(r))
         .count();
     let unreadable = crate::live::registry::files(&glen_home).len() != registries.len();
     let path_warning = crate::extension::socket_path_warning(&glen_home.root);

@@ -29,6 +29,12 @@ pub struct Registry {
     pub cwd: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    /// The endpoint's pid namespace inode (Linux, S-04/S-10): `pid` is numbered there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pidns: Option<u64>,
+    /// The kernel boot id when the endpoint registered (Linux).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
 }
 pub fn path(home: &GlenHome, id: &str) -> PathBuf {
     super::run_dir(home).join(format!("{}.json", lock_key(id)))
@@ -122,9 +128,16 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
         .filter(|r| r.v == 1 && r.pid > 0 && check_socket(home, r).is_ok())
         .collect()
 }
-/// Only a pid proven gone (`liveness::observe`: never under S-04's hidden pids) is dead.
-pub fn pid_dead(pid: u32) -> bool {
-    matches!(liveness::observe(pid), Probe::Gone)
+/// Only a pid proven gone (`liveness::observe`: never under S-04's hidden pids) is dead, or one
+/// recorded at another boot. A registry recording another pid namespace (S-04/S-10: an
+/// endpoint glen's own pid namespace cannot see) is never dead; one recording neither is
+/// judged on its pid, as before.
+pub fn pid_dead(r: &Registry) -> bool {
+    match liveness::scope(r.boot_id.as_deref(), r.pidns) {
+        liveness::Scope::OtherBoot => true,
+        liveness::Scope::Elsewhere => false,
+        liveness::Scope::Here => matches!(liveness::observe(r.pid), Probe::Gone),
+    }
 }
 /// A failed stale-registry cleanup, carrying the raw I/O error alongside the
 /// formatted message so callers can tell a sandbox permission denial from any
@@ -178,7 +191,13 @@ pub fn remove_if_unchanged(
     }
     fs::remove_file(&tombstone).map_err(io)?;
     let owned_socket = super::run_dir(home).join(format!("{}.sock", reg.pid));
-    if socket_too && reg.socket == owned_socket && pid_dead(reg.pid) {
+    // A registry from another boot is stale, but its pid may name a live endpoint now: the
+    // socket goes only when that pid is also gone here.
+    if socket_too
+        && reg.socket == owned_socket
+        && pid_dead(reg)
+        && matches!(liveness::observe(reg.pid), Probe::Gone)
+    {
         match fs::remove_file(&owned_socket) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
@@ -203,7 +222,7 @@ pub fn union(
     for r in registries {
         // AC-H109: a registry naming a process more confined than glen never lends a session
         // its cwd or title (the confinement-ordering rule, without a connection).
-        if pid_dead(r.pid)
+        if pid_dead(r)
             || catalog.sessions.iter().any(|s| s.id == r.session_id)
             || crate::proc_ident::may_trust_pid(r.pid).is_err()
         {
@@ -268,7 +287,7 @@ pub fn probe(
         .filter_map(|r| match check_socket(home, &r) {
             Ok(()) => Some(Ok(r)),
             // A dead pid's registry is stale, not untrusted.
-            Err(_) if pid_dead(r.pid) => None,
+            Err(_) if pid_dead(&r) => None,
             Err(_) => Some(Err(r.session_id)),
         })
         .collect::<Vec<_>>();
@@ -389,6 +408,8 @@ mod cleanup_tests {
             started_at: Some("2026-10-30T00:00:00Z".into()),
             cwd: None,
             title: None,
+            pidns: None,
+            boot_id: None,
         };
         std::fs::write(path(&home, "stale"), serde_json::to_vec(&registry).unwrap()).unwrap();
         remove_if_unchanged(&home, &registry, true).unwrap();
@@ -399,5 +420,68 @@ mod cleanup_tests {
         std::fs::write(path(&home, "stale"), serde_json::to_vec(&registry).unwrap()).unwrap();
         remove_if_unchanged(&home, &registry, true).unwrap();
         assert!(!registry.socket.exists());
+    }
+}
+
+#[cfg(test)]
+mod h3_tests {
+    use super::*;
+    /// S-04/S-10 (AC-H302): a registry recording another pid namespace is never dead, so it and
+    /// its socket survive cleanup; another boot is dead; a legacy registry is judged on its pid.
+    #[test]
+    fn pid_dead_consults_the_recorded_namespace() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        home.ensure_dir("run/live").unwrap();
+        let pid = crate::jobs::liveness::tests_dead_pid();
+        let here = liveness::here();
+        let mut r = Registry {
+            v: 1,
+            pid,
+            session_id: "s".into(),
+            session_file: None,
+            socket: super::super::run_dir(&home).join(format!("{pid}.sock")),
+            ext_version: None,
+            omp_version: None,
+            protocol: Some(1),
+            mode: Some("tui".into()),
+            started_at: None,
+            cwd: None,
+            title: None,
+            pidns: None,
+            boot_id: None,
+        };
+        assert!(pid_dead(&r), "legacy: a gone pid is dead");
+        r.pidns = Some(here.map_or(7, |h| h.pidns + 1));
+        r.boot_id = here.map(|h| h.boot_id.clone());
+        assert!(!pid_dead(&r), "another pid namespace is never dead");
+        std::fs::write(path(&home, "s"), serde_json::to_vec(&r).unwrap()).unwrap();
+        std::fs::write(&r.socket, "endpoint").unwrap();
+        assert!(remove_if_unchanged(&home, &r, true).unwrap());
+        assert!(r.socket.exists(), "the socket of a foreign namespace stays");
+        if let Some(h) = here {
+            r.pidns = Some(h.pidns);
+            assert!(pid_dead(&r), "this namespace: a gone pid is dead");
+            r.pidns = Some(h.pidns + 1);
+            r.boot_id = Some("another-boot".into());
+            assert!(pid_dead(&r), "another boot is dead");
+            r.pidns = Some(h.pidns);
+            r.boot_id = Some(h.boot_id.clone());
+            r.pid = std::process::id();
+            assert!(!pid_dead(&r), "a live pid here");
+        }
+        // The fields are omitted when unknown and read back when present.
+        let legacy = serde_json::to_value(Registry {
+            pidns: None,
+            boot_id: None,
+            ..r.clone()
+        })
+        .unwrap();
+        assert!(legacy.get("pidns").is_none() && legacy.get("boot_id").is_none());
+        let back: Registry =
+            serde_json::from_value(serde_json::json!({"v":1,"pid":5,"session_id":"s","socket":"/x/5.sock","pidns":42,"boot_id":"b"})).unwrap();
+        assert_eq!((back.pidns, back.boot_id.as_deref()), (Some(42), Some("b")));
     }
 }

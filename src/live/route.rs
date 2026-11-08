@@ -73,7 +73,7 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
     };
     // A dead pid's registry is provably stale whatever it names: cleanup unlinks only
     // `run/live/<pid>.sock`, never the registry's own socket path.
-    if registry::pid_dead(reg.pid) {
+    if registry::pid_dead(&reg) {
         if let Some(e) = cleanup(home, &reg, true) {
             return e;
         }
@@ -350,6 +350,8 @@ mod s04_tests {
             started_at: None,
             cwd: None,
             title: None,
+            pidns: None,
+            boot_id: None,
         };
         std::fs::write(
             registry::path(&home, &reg.session_id),

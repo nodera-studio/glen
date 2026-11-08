@@ -524,6 +524,9 @@ fn main() -> io::Result<()> {
         started_at: Some(jiff::Timestamp::now().to_string()),
         cwd: std::env::var("FAKE_EXT_CWD").ok(),
         title: None,
+        // As the extension does (S-04/S-10): where `pid` is numbered.
+        pidns: glen::jobs::liveness::here().map(|h| h.pidns),
+        boot_id: glen::jobs::liveness::here().map(|h| h.boot_id.clone()),
     };
     write_private_atomic(
         &registry::path(&peer.home, &peer.id),
