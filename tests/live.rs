@@ -1313,13 +1313,20 @@ fn ac410c_registry_cleanup_denied_maps_to_sandboxed() {
     }
 }
 
-/// Why this test process cannot stand in for an unconfined glen (S-18 tests skip then): a
-/// confined glen trusts any endpoint by design, so these refusals cannot show.
-fn confined_self() -> Option<String> {
-    match glen::proc_ident::self_confinement() {
-        glen::proc_ident::Confinement::Unconfined => None,
-        other => Some(format!("this test process is {other:?}")),
-    }
+/// Whether this test process cannot stand in for an unconfined glen, so the S-18 test skips: a
+/// confined glen trusts more endpoints by design, so these refusals may not show. Under CI
+/// (`CI` or `GITHUB_ACTIONS` set) a confined runner fails the test instead (LOW-006).
+fn confined_self() -> bool {
+    let why = match glen::proc_ident::self_confinement() {
+        glen::proc_ident::Confinement::Unconfined => return false,
+        other => format!("this test process is {other:?}"),
+    };
+    let ci = ["CI", "GITHUB_ACTIONS"]
+        .iter()
+        .any(|v| std::env::var_os(v).is_some_and(|s| !s.is_empty()));
+    assert!(!ci, "cannot run under CI: {why}");
+    eprintln!("skipped: {why}");
+    true
 }
 /// `glen send e27c0de <text>`: exit 6 `untrusted_endpoint`, the text never reached the
 /// endpoint, and its registry is kept.
@@ -1331,24 +1338,39 @@ fn assert_untrusted(b: &LiveBox, text: &str) {
         .captured();
     let log = fs::read_to_string(&b.log).unwrap_or_default();
     assert!(!log.contains(text), "the text reached the endpoint: {log}");
-    // AC-H106: refused before any request line, `hello` included, is written.
+    // AC-H106: refused before any request line, `hello` included, is written. glen must connect
+    // to read the kernel peer, so the fake may log the empty read of that closed connection
+    // (frame null); it never logs a request.
     assert!(
-        !b.ext_log().iter().any(|l| l["dir"] == "in"),
-        "a request reached the endpoint"
+        !b.ext_log()
+            .iter()
+            .any(|l| l["dir"] == "in" && !l["frame"].is_null()),
+        "a request reached the endpoint: {:?}",
+        b.ext_log()
     );
     assert_eq!(o.status.code(), Some(6), "{o:?}");
     let e = &json(&o)["error"];
     assert_eq!(e["code"], "no_route", "{e}");
     assert_eq!(e["details"]["reason"], "untrusted_endpoint", "{e}");
     assert!(b.registry(A_ID).exists(), "the registry is never deleted");
+    // AC-H109 (LOW-007): `ls` shows the session as `show` does: never live, no cwd or title.
+    let d = data(&b.rpc.glen(&["ls", "--all", "--json"]).captured());
+    let row = d["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["id"] == A_ID)
+        .unwrap_or_else(|| panic!("no row: {d}"));
+    assert_eq!(row["state"], "unknown", "{row}");
+    assert!(row["cwd"].is_null() && row["title"].is_null(), "{row}");
+    assert!(b.registry(A_ID).exists(), "ls never deletes it either");
 }
 
 /// R2 (S-18, own pid): a confined listener publishes a correct registry under its own pid and
 /// `run/live/<pid>.sock`. An unconfined glen never hands it the text.
 #[test]
 fn s18_r2_a_confined_endpoint_never_receives_the_text() {
-    if let Some(why) = confined_self() {
-        eprintln!("skipped: {why}");
+    if confined_self() {
         return;
     }
     let mut b = LiveBox::new();
@@ -1360,8 +1382,7 @@ fn s18_r2_a_confined_endpoint_never_receives_the_text() {
 /// process binds `run/live/<P>.sock` and answers `hello` as P. The kernel peer is not P.
 #[test]
 fn s18_r3_a_socket_bound_by_another_process_is_refused() {
-    if let Some(why) = confined_self() {
-        eprintln!("skipped: {why}");
+    if confined_self() {
         return;
     }
     let mut p = std::process::Command::new("/bin/sleep")
@@ -1389,8 +1410,7 @@ fn s18_r4_a_socket_outside_run_live_is_refused() {
 #[cfg(target_os = "macos")]
 #[test]
 fn s18_a_sandboxed_glen_still_delivers_to_an_unconfined_endpoint() {
-    if let Some(why) = confined_self() {
-        eprintln!("skipped: {why}");
+    if confined_self() {
         return;
     }
     let mut b = LiveBox::new();

@@ -245,15 +245,52 @@ pub fn union(
     sort_newest_first(&mut catalog.sessions);
 }
 pub fn states(home: &GlenHome) -> std::collections::HashMap<String, super::client::Hello> {
+    probe(home).0
+}
+/// Every registered endpoint's `state`, within one second: the answers of trusted endpoints by
+/// session id, and the session ids whose endpoint glen does not trust (S-18: its socket, kernel
+/// peer or reported pid is not the registered process, or it runs more confined than glen).
+pub fn probe(
+    home: &GlenHome,
+) -> (
+    std::collections::HashMap<String, super::client::Hello>,
+    std::collections::HashSet<String>,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
-    let registries = index(home);
-    let count = registries.len();
-    for r in registries {
+    let all = files(home)
+        .into_iter()
+        .filter_map(|p| {
+            fs::read(p)
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
+        })
+        .filter(|r| r.v == 1 && r.pid > 0)
+        .filter_map(|r| match check_socket(home, &r) {
+            Ok(()) => Some(Ok(r)),
+            // A dead pid's registry is stale, not untrusted.
+            Err(_) if pid_dead(r.pid) => None,
+            Err(_) => Some(Err(r.session_id)),
+        })
+        .collect::<Vec<_>>();
+    let mut untrusted = std::collections::HashSet::new();
+    let mut count = 0;
+    for r in all {
+        let r = match r {
+            Ok(r) => r,
+            Err(id) => {
+                untrusted.insert(id);
+                continue;
+            }
+        };
+        count += 1;
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let result = super::client::state(&r.socket, r.pid, super::STATE_LS)
-                .ok()
-                .filter(|s| s.session_id == r.session_id && s.pid == r.pid);
+            let result = match super::client::state(&r.socket, r.pid, super::STATE_LS) {
+                Err(super::client::ClientError::Untrusted(_)) => Err(r.session_id),
+                Ok(s) if s.pid != r.pid => Err(r.session_id),
+                Ok(s) if s.session_id == r.session_id => Ok(Some(s)),
+                _ => Ok(None),
+            };
             let _ = tx.send(result);
         });
     }
@@ -262,14 +299,17 @@ pub fn states(home: &GlenHome) -> std::collections::HashMap<String, super::clien
     let mut states = std::collections::HashMap::new();
     for _ in 0..count {
         match rx.recv_timeout(end.saturating_duration_since(std::time::Instant::now())) {
-            Ok(Some(s)) => {
+            Ok(Ok(Some(s))) => {
                 states.insert(s.session_id.clone(), s);
             }
-            Ok(None) => (),
+            Ok(Ok(None)) => (),
+            Ok(Err(id)) => {
+                untrusted.insert(id);
+            }
             Err(_) => break,
         }
     }
-    states
+    (states, untrusted)
 }
 
 #[cfg(test)]
