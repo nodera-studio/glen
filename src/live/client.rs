@@ -132,7 +132,7 @@ fn unix_socket() -> io::Result<std::os::fd::OwnedFd> {
 /// socket, and pass the confinement-ordering rule ([`crate::proc_ident::trust_endpoint`]). A
 /// peer pid the kernel cannot map into this pid namespace is allowed only when glen itself is
 /// confined (sandboxed live delivery, §A13).
-fn bounded_connect(
+pub(crate) fn bounded_connect(
     path: &Path,
     pid: u32,
     end: Instant,

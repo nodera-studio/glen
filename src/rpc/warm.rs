@@ -878,7 +878,6 @@ pub(crate) fn offer(
     deadline: Instant,
     stop: &dyn Fn() -> bool,
 ) -> Offered {
-    use std::os::fd::AsFd;
     let Some(holder) = crate::jobs::lock::holder(home, session_id) else {
         return Offered::No;
     };
@@ -911,18 +910,16 @@ pub(crate) fn offer(
             return Err("the warm registry has no start token".into());
         };
         let within = |bound: Duration| (Instant::now() + bound).min(deadline);
-        let stream = std::os::unix::net::UnixStream::connect(&path)
-            .map_err(|e| format!("cannot connect to {}: {e}", path.display()))?;
-        match crate::proc_ident::trust_endpoint(
-            stream.as_fd(),
-            &path,
-            entry.pid,
-            within(OFFER_CONNECT),
-        ) {
-            Ok(()) => (),
-            Err(crate::proc_ident::Refusal::NotAccepted) => return Ok(Offered::Retry),
-            Err(crate::proc_ident::Refusal::Untrusted(why)) => return Err(why),
-        }
+        // H2 fix 2 (H3): a non-blocking connect bounded by the deadline and the stop, so a
+        // listener whose backlog is full and that never accepts cannot hold this worker; then
+        // the peer checks (`proc_ident::trust_endpoint`) before a byte is written.
+        use crate::live::client::{ClientError, bounded_connect};
+        let stream = match bounded_connect(&path, entry.pid, within(OFFER_CONNECT), stop) {
+            Ok(stream) => stream,
+            Err(ClientError::Timeout | ClientError::Cancelled) => return Ok(Offered::Retry),
+            Err(ClientError::Untrusted(why)) => return Err(why),
+            Err(e) => return Err(format!("cannot connect to {}: {e}", path.display())),
+        };
         if liveness::check(entry.pid, start) != Liveness::Alive {
             return Err(format!(
                 "warm worker {} is not the registered one",
@@ -3217,6 +3214,97 @@ mod adopt_tests {
         );
         live.kill().unwrap();
         live.wait().unwrap();
+    }
+    /// H2 fix 2 (H3): a warm socket whose backlog is full and that never accepts makes the
+    /// offer give up within its bound; it never blocks the cold worker.
+    #[test]
+    fn a_listener_that_never_accepts_never_blocks_the_offer() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let home = store.home.clone();
+        home.ensure_dir("run/warm").unwrap();
+        let path = socket_path(&home, std::process::id());
+        // A listener with a backlog of 1, filled and never accepted.
+        let fd = rustix::net::socket(
+            rustix::net::AddressFamily::UNIX,
+            rustix::net::SocketType::STREAM,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(&fd, &rustix::net::SocketAddrUnix::new(&path).unwrap()).unwrap();
+        rustix::net::listen(&fd, 0).unwrap();
+        chmod_private(&path).unwrap();
+        let mut fillers = vec![];
+        for _ in 0..8 {
+            let s = rustix::net::socket(
+                rustix::net::AddressFamily::UNIX,
+                rustix::net::SocketType::STREAM,
+                None,
+            )
+            .unwrap();
+            rustix::net::sockopt::set_socket_timeout(
+                &s,
+                rustix::net::sockopt::Timeout::Send,
+                Some(Duration::from_millis(50)),
+            )
+            .unwrap();
+            let _ = rustix::net::connect(&s, &rustix::net::SocketAddrUnix::new(&path).unwrap());
+            fillers.push(s);
+        }
+        let me = liveness::current().unwrap();
+        let lock = crate::jobs::lock::try_acquire(&home, SESSION)
+            .unwrap()
+            .unwrap();
+        hold(
+            &lock,
+            crate::jobs::lock::HolderKind::Warm,
+            &JobId::new(),
+            Some(&me.start),
+        )
+        .unwrap();
+        publish(
+            &home,
+            &Entry {
+                v: 1,
+                pid: me.pid,
+                start: Some(me.start.clone()),
+                session_id: SESSION.into(),
+                session_handle: None,
+                job_id: JobId::new().as_str().into(),
+                origin_job_id: None,
+                omp_pid: None,
+                omp_start: None,
+                socket: Some(path.clone()),
+                warm_ms: 30_000,
+                expires_at: "2099-01-01T00:00:00Z".into(),
+                state: EntryState::Idle,
+                started_at: "2026-11-08T00:00:00Z".into(),
+            },
+        )
+        .unwrap();
+        let job = crate::jobs::tests::job();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let home2 = home.clone();
+        std::thread::spawn(move || {
+            let got = offer(
+                &home2,
+                SESSION,
+                &job,
+                &mut None,
+                Instant::now() + Duration::from_secs(60),
+                &|| false,
+            );
+            let _ = tx.send(got);
+        });
+        let got = rx
+            .recv_timeout(OFFER_CONNECT + Duration::from_secs(2))
+            .expect("the offer blocked on a listener that never accepts");
+        assert!(
+            matches!(got, Offered::Retry | Offered::Failed(_)),
+            "{got:?}"
+        );
+        drop(lock);
+        drop(fd);
     }
     /// A connection that sends nothing well-formed, an id that is not its job's, or that its
     /// offerer already closed, is dropped unanswered within the read bound.
