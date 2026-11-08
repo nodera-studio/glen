@@ -32,6 +32,9 @@ pub enum Unhealthy {
     PathTooLong,
     Unresponsive,
     Incompatible,
+    /// S-18: the registry's socket or its kernel peer is not the registered endpoint process, or
+    /// that process runs more confined than glen. Never cleaned up: glen cannot prove it dead.
+    Untrusted,
 }
 fn cleanup(home: &GlenHome, reg: &Registry, socket_too: bool) -> Option<Endpoint> {
     let (reason, io_err) = match registry::remove_if_unchanged(home, reg, socket_too) {
@@ -56,7 +59,7 @@ fn cleanup(home: &GlenHome, reg: &Registry, socket_too: bool) -> Option<Endpoint
     })
 }
 pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
-    let reg = match registry::read(home, id) {
+    let (reg, refused) = match registry::read(home, id) {
         registry::Read::Missing => return Endpoint::None,
         registry::Read::Unreadable(reason) => {
             return Endpoint::Unhealthy {
@@ -65,8 +68,11 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
                 io: None,
             };
         }
-        registry::Read::Ok(r) => r,
+        registry::Read::Untrusted(r, reason) => (r, Some(reason)),
+        registry::Read::Ok(r) => (r, None),
     };
+    // A dead pid's registry is provably stale whatever it names: cleanup unlinks only
+    // `run/live/<pid>.sock`, never the registry's own socket path.
     if registry::pid_dead(reg.pid) {
         if let Some(e) = cleanup(home, &reg, true) {
             return e;
@@ -80,7 +86,14 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
             io: None,
         };
     }
-    match client::hello(&reg.socket, timeout) {
+    if let Some(reason) = refused {
+        return untrusted(reason);
+    }
+    match client::hello(&reg.socket, reg.pid, timeout) {
+        Ok(hello) if hello.pid != reg.pid => untrusted(format!(
+            "the endpoint answers as pid {}, not as the registered pid {}",
+            hello.pid, reg.pid
+        )),
         Ok(hello) if hello.session_id != id => {
             if let Some(e) = cleanup(home, &reg, false) {
                 return e;
@@ -98,6 +111,7 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
             kind: Unhealthy::Incompatible,
             io: None,
         },
+        Err(ClientError::Untrusted(reason)) => untrusted(reason),
         Err(ClientError::Connect(ConnectError::Missing | ConnectError::Refused)) => {
             if let Some(e) = cleanup(home, &reg, false) {
                 return e;
@@ -119,8 +133,17 @@ pub fn find(home: &GlenHome, id: &str, timeout: Duration) -> Endpoint {
         }
     }
 }
+fn untrusted(reason: String) -> Endpoint {
+    Endpoint::Unhealthy {
+        reason,
+        kind: Unhealthy::Untrusted,
+        io: None,
+    }
+}
 pub fn hint(kind: Unhealthy) -> String {
-    if matches!(kind, Unhealthy::PathTooLong) {
+    if matches!(kind, Unhealthy::Untrusted) {
+        "glen sends only to the omp process a live registry names, and never from outside a sandbox into one; restart that omp session outside any sandbox, or run `glen doctor`".into()
+    } else if matches!(kind, Unhealthy::PathTooLong) {
         "shorten GLEN_HOME, run `glen install-extension`, then restart that omp session".into()
     } else {
         "run `glen install-extension`, then restart that omp session (only TUI sessions accept glen messages)".into()
@@ -193,6 +216,15 @@ pub(crate) fn unhealthy_refusal(
     } else {
         "controls"
     };
+    if matches!(kind, Unhealthy::Untrusted) {
+        return GlenError::no_route(
+            NoRouteReason::UntrustedEndpoint,
+            format!(
+                "session {handle} has a live endpoint glen does not trust with {what} ({reason})"
+            ),
+        )
+        .with_hint(hint(kind));
+    }
     GlenError::no_route(
         NoRouteReason::UnhealthyEndpoint,
         format!("session {handle} has a glen live endpoint that cannot take {what} ({reason})"),

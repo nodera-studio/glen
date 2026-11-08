@@ -320,6 +320,12 @@ pub(crate) fn run(w: &mut Worker) -> Result<(), Failure> {
         .as_deref()
         .ok_or_else(|| Failure::new("internal", "live job has no socket"))?
         .to_owned();
+    let pid = w.job.live_pid.ok_or_else(|| {
+        Failure::no_route(
+            NoRouteReason::UntrustedEndpoint,
+            "the live job records no endpoint pid to check its socket against",
+        )
+    })?;
     w.status.request_id = Some(uuid::Uuid::now_v7().to_string());
     w.save()?;
     // Live controls cannot stop the TUI; answer them without W2's abort behaviour.
@@ -338,6 +344,7 @@ pub(crate) fn run(w: &mut Worker) -> Result<(), Failure> {
     };
     let conn = client::open_send(
         &socket,
+        pid,
         w.status.request_id.as_deref().unwrap_or_default(),
         args,
         &|| {
@@ -367,6 +374,17 @@ pub(crate) fn run(w: &mut Worker) -> Result<(), Failure> {
                 "live socket path too long",
             );
             f.hint = Some(super::route::hint(super::route::Unhealthy::PathTooLong));
+            f
+        }
+        ClientError::Untrusted(reason) => {
+            let mut f = Failure::no_route(
+                NoRouteReason::UntrustedEndpoint,
+                format!(
+                    "the live endpoint of session {} is not trusted ({reason})",
+                    w.job.session_handle.as_deref().unwrap_or("?")
+                ),
+            );
+            f.hint = Some(super::route::hint(super::route::Unhealthy::Untrusted));
             f
         }
         ClientError::Connect(ConnectError::Io(e)) => Failure::new(

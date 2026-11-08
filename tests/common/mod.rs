@@ -341,8 +341,30 @@ impl LiveBox {
         }
     }
     pub fn start_ext(&mut self, id: &str, scenario: &str, vars: &[(&str, &str)]) -> u32 {
+        self.start_ext_as(id, scenario, vars, false)
+    }
+    /// `start_ext`, optionally confined as a sandboxed writer would be (S-18): under
+    /// `sandbox-exec` on macOS, with no_new_privs (`--nnp`) on Linux. Its pid is still the
+    /// fake's own (`sandbox-exec` execs it).
+    pub fn start_ext_as(
+        &mut self,
+        id: &str,
+        scenario: &str,
+        vars: &[(&str, &str)],
+        confined: bool,
+    ) -> u32 {
         use std::io::BufRead;
-        let mut c = Command::new(fake_ext_bin());
+        let mut c = if confined && cfg!(target_os = "macos") {
+            let mut c = Command::new("/usr/bin/sandbox-exec");
+            c.args(["-p", "(version 1)(allow default)"])
+                .arg(fake_ext_bin());
+            c
+        } else {
+            Command::new(fake_ext_bin())
+        };
+        if confined && cfg!(target_os = "linux") {
+            c.arg("--nnp");
+        }
         c.args([
             "--home",
             self.rpc.omp.glen_home.to_str().unwrap(),

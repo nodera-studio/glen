@@ -380,6 +380,25 @@ fn s9_live_route_across_netns() {
     assert_eq!(v["data"]["job"]["route"], "live", "{v}");
     assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
 }
+/// AC-H107 (S-18): a sender inside `bwrap --unshare-pid` (Codex's shape, with its marker so the
+/// host pid is not taken for dead) sees the host endpoint's kernel peer pid as 0. glen is
+/// confined there (bwrap sets no_new_privs), so it still delivers.
+#[test]
+#[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
+fn s11_a_confined_sender_in_its_own_pid_namespace_delivers() {
+    let mut lb = LiveBox::new();
+    lb.start_ext(A_ID, "ok", &[]);
+    let mut c = lb
+        .rpc
+        .glen(&["send", "e27c0de", "hi", "--wait", "20s", "--json"]);
+    c.env("CODEX_SANDBOX", "linux-ci");
+    let writable = lb.rpc.omp.glen_home.parent().unwrap().to_path_buf();
+    let out = bwrap_pid(&c, true, true, &[&writable]);
+    let v = json(&out);
+    assert_eq!(exit_code(&out), 0, "{v}");
+    assert_eq!(v["data"]["job"]["route"], "live", "{v}");
+    assert_eq!(v["data"]["assistant_text"], "pong: hi", "{v}");
+}
 #[test]
 #[ignore = "needs bubblewrap; run by the linux-sandbox CI job"]
 fn s10_network_is_isolated() {

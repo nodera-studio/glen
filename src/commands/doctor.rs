@@ -263,7 +263,8 @@ pub fn run(cli: &Cli, args: &DoctorArgs, env: &Env, ctx: &OutputCtx) -> Result<O
         format!("{} live, {stale} stale", registries.len() - stale),
         path_warning.map(|w| w.message).unwrap_or_else(|| {
             if unreadable {
-                "an endpoint registry is unreadable".into()
+                // `index` also leaves out a registry whose socket glen will not trust (S-18).
+                "an endpoint registry is unreadable or names an untrusted socket".into()
             } else {
                 String::new()
             }

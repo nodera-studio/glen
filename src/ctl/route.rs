@@ -89,22 +89,32 @@ impl Target {
                 } else {
                     remaining
                 };
-                client::unary_for(&reg.socket, op, &reg.session_id, timeout, stop.clone()).map_err(
-                    |e| match e {
-                        client::ClientError::Refused(error) => OpError {
-                            code: error.code,
-                            message: error.message,
-                            details: error.details,
-                        },
-                        client::ClientError::Timeout => {
-                            OpError::new(ops::TIMEOUT, "the live control timed out")
-                        }
-                        client::ClientError::Cancelled => {
-                            OpError::new("interrupted", "the live control was interrupted")
-                        }
-                        error => OpError::new(ops::INTERNAL, error.to_string()),
-                    },
+                client::unary_for(
+                    &reg.socket,
+                    reg.pid,
+                    op,
+                    &reg.session_id,
+                    timeout,
+                    stop.clone(),
                 )
+                .map_err(|e| match e {
+                    client::ClientError::Refused(error) => OpError {
+                        code: error.code,
+                        message: error.message,
+                        details: error.details,
+                    },
+                    client::ClientError::Timeout => {
+                        OpError::new(ops::TIMEOUT, "the live control timed out")
+                    }
+                    client::ClientError::Cancelled => {
+                        OpError::new("interrupted", "the live control was interrupted")
+                    }
+                    client::ClientError::Untrusted(reason) => OpError::new(
+                        crate::error::NoRouteReason::UntrustedEndpoint.as_str(),
+                        format!("the live endpoint is not trusted ({reason})"),
+                    ),
+                    error => OpError::new(ops::INTERNAL, error.to_string()),
+                })
             }
             Self::Job {
                 id,

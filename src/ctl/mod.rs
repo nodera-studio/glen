@@ -78,6 +78,10 @@ pub fn to_glen_error(e: OpError, ctx: &ErrCtx<'_>) -> GlenError {
         ops::TIMEOUT => (ErrorCode::ControlFailed, ops::TIMEOUT),
         ops::JOB_ENDED => (ErrorCode::ControlFailed, ops::JOB_ENDED),
         ops::OUTCOME_UNKNOWN => (ErrorCode::ControlFailed, ops::OUTCOME_UNKNOWN),
+        // S-18: never a wire code; glen's own refusal of the endpoint before any request byte.
+        c if c == crate::error::NoRouteReason::UntrustedEndpoint.as_str() => {
+            (ErrorCode::NoRoute, "untrusted_endpoint")
+        }
         _ => (ErrorCode::ControlFailed, "protocol"),
     };
     let mut details = e
@@ -119,6 +123,9 @@ pub fn to_glen_error(e: OpError, ctx: &ErrCtx<'_>) -> GlenError {
             ctx.handle
         )),
         ops::JOB_ENDED => Some("the glen job ended; retry on the session".into()),
+        "untrusted_endpoint" => Some(crate::live::route::hint(
+            crate::live::route::Unhealthy::Untrusted,
+        )),
         "protocol" => Some("check the omp and glen versions, then retry".into()),
         _ => None,
     };

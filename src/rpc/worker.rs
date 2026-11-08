@@ -1174,6 +1174,20 @@ fn endpoint_result(
     env: &Env,
 ) -> Result<(), Failure> {
     match endpoint {
+        crate::live::route::Endpoint::Unhealthy {
+            kind: crate::live::route::Unhealthy::Untrusted,
+            reason,
+            ..
+        } => {
+            let mut failure = Failure::no_route(
+                NoRouteReason::UntrustedEndpoint,
+                format!("session {handle} has a live endpoint glen does not trust ({reason})"),
+            );
+            failure.hint = Some(crate::live::route::hint(
+                crate::live::route::Unhealthy::Untrusted,
+            ));
+            Err(failure)
+        }
         crate::live::route::Endpoint::Unhealthy { kind, io, .. } => {
             if let Some(err) = crate::live::route::unhealthy_sandbox(env, "send", kind, io) {
                 let mut failure = Failure::no_route(NoRouteReason::Sandboxed, err.message);

@@ -678,7 +678,7 @@ fn endpoint_present(home: &GlenHome, session_id: &str) -> bool {
     match registry::read(home, session_id) {
         registry::Read::Missing => false,
         registry::Read::Unreadable(_) => true,
-        registry::Read::Ok(r) => !registry::pid_dead(r.pid),
+        registry::Read::Untrusted(r, _) | registry::Read::Ok(r) => !registry::pid_dead(r.pid),
     }
 }
 fn timestamp_after(d: Duration) -> String {

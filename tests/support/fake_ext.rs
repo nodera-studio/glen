@@ -42,6 +42,9 @@ impl Drop for Active {
 }
 #[derive(Clone)]
 struct Peer {
+    /// The pid the peer reports in `hello`/`state` and its registry: its own unless
+    /// `FAKE_EXT_PID` claims another process's (an S-18 forger).
+    pid: u32,
     home: GlenHome,
     id: String,
     file: Option<PathBuf>,
@@ -93,7 +96,7 @@ impl Peer {
     fn data(&self, hello: bool) -> Value {
         let busy = matches!(self.scenario.as_str(), "busy" | "queued")
             || self.active.load(Ordering::SeqCst) > 0;
-        let mut d = json!({"ext_version":self.version,"omp_version":"18.14.0","pid":std::process::id(),"session_id":if self.scenario=="mismatch"{moved(&self.id)}else{self.id.clone()},"session_file":self.file,"mode":self.mode,"state":if busy{"busy"}else{"idle"},"busy":busy,"queued":self.scenario=="queued","active_requests":0});
+        let mut d = json!({"ext_version":self.version,"omp_version":"18.14.0","pid":self.pid,"session_id":if self.scenario=="mismatch"{moved(&self.id)}else{self.id.clone()},"session_file":self.file,"mode":self.mode,"state":if busy{"busy"}else{"idle"},"busy":busy,"queued":self.scenario=="queued","active_requests":0});
         if hello {
             d["protocol"] = json!(1);
             d["protocols"] = json!([1]);
@@ -454,13 +457,31 @@ fn main() -> io::Result<()> {
         root: PathBuf::from(get("--home").ok_or_else(|| io::Error::other("--home required"))?),
     };
     let id = get("--session-id").ok_or_else(|| io::Error::other("--session-id required"))?;
-    let socket = glen::live::run_dir(&home).join(format!("{}.sock", std::process::id()));
+    // `--nnp`: confine this process (Linux no_new_privs) before it binds, as a sandboxed writer
+    // would be (S-18, R2).
+    #[cfg(target_os = "linux")]
+    if args.iter().any(|a| a == "--nnp") {
+        // SAFETY: prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) takes no pointers.
+        if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    // An S-18 forger: `FAKE_EXT_PID` claims another live process's pid, `FAKE_EXT_SOCKET` binds
+    // a socket outside `run/live/<pid>.sock`.
+    let pid = std::env::var("FAKE_EXT_PID")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(std::process::id);
+    let socket = std::env::var_os("FAKE_EXT_SOCKET")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| glen::live::run_dir(&home).join(format!("{pid}.sock")));
     let models: Vec<omp_rpc::ModelInfo> = serde_json::from_str(include_str!("fake_models.json"))?;
     let selected = models
         .first()
         .ok_or_else(|| io::Error::other("empty models fixture"))?
         .clone();
     let peer = Peer {
+        pid,
         old_ops: std::env::var("FAKE_EXT_OPS").as_deref() == Ok("w3"),
         models: Arc::new(models),
         selection: Arc::new(Mutex::new(Selection {
@@ -492,7 +513,7 @@ fn main() -> io::Result<()> {
     fs::set_permissions(&peer.socket, fs::Permissions::from_mode(0o600))?;
     let reg = Registry {
         v: 1,
-        pid: std::process::id(),
+        pid: peer.pid,
         session_id: peer.id.clone(),
         session_file: peer.file.clone(),
         socket: peer.socket.clone(),
@@ -539,6 +560,7 @@ mod tests {
         let models: Vec<omp_rpc::ModelInfo> =
             serde_json::from_str(include_str!("fake_models.json")).unwrap();
         Peer {
+            pid: std::process::id(),
             home: GlenHome {
                 root: temp.join("glen"),
             },

@@ -36,6 +36,8 @@ pub fn path(home: &GlenHome, id: &str) -> PathBuf {
 pub enum Read {
     Missing,
     Unreadable(String),
+    /// A well-formed registry whose socket glen will not connect to (S-18, [`check_socket`]).
+    Untrusted(Box<Registry>, String),
     Ok(Box<Registry>),
 }
 pub fn read(home: &GlenHome, id: &str) -> Read {
@@ -43,7 +45,10 @@ pub fn read(home: &GlenHome, id: &str) -> Read {
     match fs::read(&p) {
         Ok(b) => match serde_json::from_slice::<Registry>(&b) {
             Ok(r) if r.v == 1 && r.pid > 0 && r.session_id == id && r.socket.is_absolute() => {
-                Read::Ok(Box::new(r))
+                match check_socket(home, &r) {
+                    Ok(()) => Read::Ok(Box::new(r)),
+                    Err(reason) => Read::Untrusted(Box::new(r), reason),
+                }
             }
             Ok(_) => Read::Unreadable(format!("invalid registry {}", p.display())),
             Err(e) => Read::Unreadable(format!("{}: {e}", p.display())),
@@ -51,6 +56,47 @@ pub fn read(home: &GlenHome, id: &str) -> Read {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Read::Missing,
         Err(e) => Read::Unreadable(format!("{}: {e}", p.display())),
     }
+}
+/// S-18 hygiene, before any connection: the registry's socket is exactly
+/// `run/live/<pid>.sock` (the directory compared by its real path, as the extension may spell
+/// GLEN_HOME differently), and once it exists it is a socket owned by this user with no group or
+/// other permission bits. A socket not bound yet, or that glen cannot stat, passes: connecting
+/// reports it. The
+/// kernel peer check on every connection (`client`) is what binds the socket to `pid`.
+pub fn check_socket(home: &GlenHome, r: &Registry) -> Result<(), String> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let named = r
+        .socket
+        .file_name()
+        .is_some_and(|n| *n == *format!("{}.sock", r.pid))
+        && r.socket.parent().is_some_and(|dir| {
+            dir == super::run_dir(home)
+                || matches!(
+                    (fs::canonicalize(dir), fs::canonicalize(super::run_dir(home))),
+                    (Ok(a), Ok(b)) if a == b
+                )
+        });
+    if !named {
+        return Err(format!(
+            "registry socket {} is not {}/{}.sock",
+            r.socket.display(),
+            super::run_dir(home).display(),
+            r.pid
+        ));
+    }
+    // A socket glen cannot inspect is left to connect(2), which fails the same way or reaches
+    // the kernel peer check.
+    let Ok(meta) = fs::symlink_metadata(&r.socket) else {
+        return Ok(());
+    };
+    let euid = rustix::process::geteuid().as_raw();
+    if !meta.file_type().is_socket() || meta.uid() != euid || meta.mode() & 0o077 != 0 {
+        return Err(format!(
+            "{} is not a private socket owned by this user",
+            r.socket.display()
+        ));
+    }
+    Ok(())
 }
 pub fn files(home: &GlenHome) -> Vec<PathBuf> {
     fs::read_dir(super::run_dir(home))
@@ -73,7 +119,7 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
         })
-        .filter(|r| r.v == 1 && r.pid > 0)
+        .filter(|r| r.v == 1 && r.pid > 0 && check_socket(home, r).is_ok())
         .collect()
 }
 /// Only a pid proven gone (`liveness::observe`: never under S-04's hidden pids) is dead.
@@ -155,7 +201,12 @@ pub fn union(
         session::Session,
     };
     for r in registries {
-        if pid_dead(r.pid) || catalog.sessions.iter().any(|s| s.id == r.session_id) {
+        // AC-H109: a registry naming a process more confined than glen never lends a session
+        // its cwd or title (the confinement-ordering rule, without a connection).
+        if pid_dead(r.pid)
+            || catalog.sessions.iter().any(|s| s.id == r.session_id)
+            || crate::proc_ident::may_trust_pid(r.pid).is_err()
+        {
             continue;
         }
         let file = r.session_file.clone().unwrap_or_else(|| {
@@ -200,9 +251,9 @@ pub fn states(home: &GlenHome) -> std::collections::HashMap<String, super::clien
     for r in registries {
         let tx = tx.clone();
         std::thread::spawn(move || {
-            let result = super::client::state(&r.socket, super::STATE_LS)
+            let result = super::client::state(&r.socket, r.pid, super::STATE_LS)
                 .ok()
-                .filter(|s| s.session_id == r.session_id);
+                .filter(|s| s.session_id == r.session_id && s.pid == r.pid);
             let _ = tx.send(result);
         });
     }
@@ -235,7 +286,7 @@ mod tests {
         assert!(index(&home).is_empty());
         assert!(!home.root.exists());
         let dir = home.ensure_dir("run/live").unwrap();
-        let value = serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"socket":"/tmp/socket","started_at":"2026-10-30T00:00:00Z","future":true});
+        let value = serde_json::json!({"v":1,"pid":std::process::id(),"session_id":id,"socket":super::super::run_dir(&home).join(format!("{}.sock", std::process::id())),"started_at":"2026-10-30T00:00:00Z","future":true});
         std::fs::write(path(&home, id), value.to_string()).unwrap();
         let Read::Ok(reg) = read(&home, id) else {
             panic!("registry")

@@ -473,7 +473,7 @@ fn cwd_inbox_intersects_session_filters_and_leaves_foreign_and_orphan_replies_un
     };
     fs::create_dir_all(glen::live::run_dir(&home)).unwrap();
     for (id, cwd) in [(registry_alpha, Some(b.alpha())), (registry_unknown, None)] {
-        fs::write(glen::live::registry::path(&home, id), j!({"v":1,"pid":std::process::id(),"session_id":id,"socket":glen::live::run_dir(&home).join(format!("{id}.sock")),"cwd":cwd}).to_string()).unwrap();
+        fs::write(glen::live::registry::path(&home, id), j!({"v":1,"pid":std::process::id(),"session_id":id,"socket":glen::live::run_dir(&home).join(format!("{}.sock", std::process::id())),"cwd":cwd}).to_string()).unwrap();
     }
     let alpha = b.alpha();
     let flags = ["--cwd", alpha.to_str().unwrap()];
