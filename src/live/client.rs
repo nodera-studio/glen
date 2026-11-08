@@ -128,9 +128,10 @@ fn unix_socket() -> io::Result<std::os::fd::OwnedFd> {
 /// reported as timed out because glen itself ran late.
 ///
 /// S-18: before the stream is returned (so before any request byte), the socket's kernel peer
-/// must be `pid`, the registered endpoint process, and pass the confinement-ordering rule
-/// ([`crate::proc_ident::may_trust`]). A peer pid the kernel cannot map into this pid namespace
-/// is allowed only when glen itself is confined (sandboxed live delivery, §A13).
+/// must be `pid`, the registered endpoint process, in the generation that holds the listening
+/// socket, and pass the confinement-ordering rule ([`crate::proc_ident::trust_endpoint`]). A
+/// peer pid the kernel cannot map into this pid namespace is allowed only when glen itself is
+/// confined (sandboxed live delivery, §A13).
 fn bounded_connect(
     path: &Path,
     pid: u32,
@@ -164,17 +165,8 @@ fn bounded_connect(
             Err(e) => return Err(connect_error(e.into())),
         }
     }
-    let peer = crate::proc_ident::peer_of(&fd).map_err(|e| {
-        ClientError::Untrusted(format!("cannot read the endpoint's peer credentials: {e}"))
-    })?;
-    if let Some(got) = peer.pid
-        && got != pid
-    {
-        return Err(ClientError::Untrusted(format!(
-            "the socket is held by pid {got}, not by the registered pid {pid}"
-        )));
-    }
-    crate::proc_ident::may_trust(&peer).map_err(ClientError::Untrusted)?;
+    use std::os::fd::AsFd;
+    crate::proc_ident::trust_endpoint(fd.as_fd(), path, pid).map_err(ClientError::Untrusted)?;
     let stream = UnixStream::from(fd);
     stream
         .set_write_timeout(Some(super::WRITE))
