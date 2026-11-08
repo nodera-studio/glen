@@ -396,11 +396,27 @@ pub fn may_trust_pid(pid: u32) -> Result<(), String> {
 ///   one listening socket bound to `path`, before and after.
 /// - macOS: the `LOCAL_PEERTOKEN` audit token must name `pid` and fails once the listener has
 ///   exited, but after pid reuse it names the successor (spike), so `pid` must also hold a
-///   listening socket bound to `path` (`PROC_PIDFDSOCKETINFO`), and the confinement is judged
-///   by token (`sandbox_check_by_audit_token`), which answers "confined" for a token whose
-///   process is gone.
-pub fn trust_endpoint(fd: BorrowedFd<'_>, path: &Path, pid: u32) -> Result<(), String> {
-    trust_endpoint_with(fd, path, pid, true)
+///   listening socket bound to `path` and, once it has accepted, the server end of this very
+///   connection (F10: `PROC_PIDFDSOCKETINFO`, its `soi_so` equal to this socket's
+///   `unsi_conn_so`), waited for until `end`. The confinement is judged by token
+///   (`sandbox_check_by_audit_token`), which answers "confined" for a token whose process is
+///   gone.
+pub fn trust_endpoint(
+    fd: BorrowedFd<'_>,
+    path: &Path,
+    pid: u32,
+    end: std::time::Instant,
+) -> Result<(), Refusal> {
+    trust_endpoint_with(fd, path, pid, true, end)
+}
+/// Why [`trust_endpoint`] refused a connection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Refusal {
+    /// The endpoint is not the registered process, or may not receive work, and why.
+    Untrusted(String),
+    /// macOS: the registered process did not accept the connection by the deadline, so whether
+    /// it holds the connection is not known yet (F10).
+    NotAccepted,
 }
 /// [`trust_endpoint`]; `pidfd` false forces the Linux fallback (tests).
 fn trust_endpoint_with(
@@ -408,18 +424,34 @@ fn trust_endpoint_with(
     path: &Path,
     pid: u32,
     pidfd: bool,
-) -> Result<(), String> {
-    let peer =
-        peer_of(fd).map_err(|e| format!("cannot read the endpoint's peer credentials: {e}"))?;
+    end: std::time::Instant,
+) -> Result<(), Refusal> {
+    let peer = peer_of(fd).map_err(|e| {
+        Refusal::Untrusted(format!("cannot read the endpoint's peer credentials: {e}"))
+    })?;
     if let Some(got) = peer.pid
         && got != pid
     {
-        return Err(format!(
+        return Err(Refusal::Untrusted(format!(
             "the socket is held by pid {got}, not by the registered pid {pid}"
-        ));
+        )));
     }
+    let late = std::cell::Cell::new(false);
     may_trust_with(&peer, self_confinement(), RANKS, |pid| {
-        bound_confinement(fd, path, pid, pidfd)
+        bound_confinement(fd, path, pid, pidfd, end).map_err(|r| match r {
+            Refusal::Untrusted(why) => why,
+            Refusal::NotAccepted => {
+                late.set(true);
+                "the endpoint did not accept the connection in time".into()
+            }
+        })
+    })
+    .map_err(|why| {
+        if late.get() {
+            Refusal::NotAccepted
+        } else {
+            Refusal::Untrusted(why)
+        }
     })
 }
 
@@ -431,11 +463,12 @@ fn bound_confinement(
     path: &Path,
     pid: u32,
     pidfd: bool,
-) -> Result<Confinement, String> {
-    let held = holder(fd, path, pid, pidfd)?;
-    held()?;
+    _end: std::time::Instant,
+) -> Result<Confinement, Refusal> {
+    let held = holder(fd, path, pid, pidfd).map_err(Refusal::Untrusted)?;
+    held().map_err(Refusal::Untrusted)?;
     let confinement = confinement_of(pid);
-    held()?;
+    held().map_err(Refusal::Untrusted)?;
     Ok(confinement)
 }
 /// A check that `pid` is still the process holding the listener: through a pidfd when the
@@ -824,25 +857,64 @@ fn bound_confinement(
     path: &Path,
     pid: u32,
     _pidfd: bool,
-) -> Result<Confinement, String> {
+    end: std::time::Instant,
+) -> Result<Confinement, Refusal> {
     let token = peer_token(fd).map_err(|e| {
-        if e.raw_os_error() == Some(libc::EINVAL) {
+        Refusal::Untrusted(if e.raw_os_error() == Some(libc::EINVAL) {
             "the process that listened on the socket has exited".to_owned()
         } else {
             format!("cannot read the endpoint's audit token: {e}")
-        }
+        })
     })?;
     if token.val[5] != pid {
-        return Err(format!(
+        return Err(Refusal::Untrusted(format!(
             "the socket's audit token names pid {}, not the registered pid {pid}",
             token.val[5]
-        ));
+        )));
     }
-    holds_listener(pid, path)?;
-    Ok(sandbox_answer(
+    holds_listener(pid, path).map_err(Refusal::Untrusted)?;
+    // F10: a name proves nothing about which socket this connection reached (a listener kept
+    // by a departed process's child, renamed over the path of a TUI that reused that pid). The
+    // server end of this very connection must be in `pid`'s fd table, before and after the
+    // confinement is read.
+    let server = server_end(fd).map_err(Refusal::Untrusted)?;
+    accepted(pid, server, end)?;
+    let confinement = sandbox_answer(
         "sandbox_check_by_audit_token",
         sandbox_check_by_token(token),
-    ))
+    );
+    accepted(pid, server, end)?;
+    Ok(confinement)
+}
+/// The kernel's (hashed, stable) id of the server-side socket of the connected unix socket
+/// `fd` (`unsi_conn_so`). Before `accept` it is the socket queued on the listener; `accept`
+/// hands that same socket to the accepting process.
+#[cfg(target_os = "macos")]
+fn server_end(fd: BorrowedFd<'_>) -> Result<u64, String> {
+    use std::os::fd::AsRawFd;
+    let info = socket_info(std::process::id(), fd.as_raw_fd()).ok_or_else(|| {
+        format!(
+            "cannot read this connection: {}",
+            io::Error::last_os_error()
+        )
+    })?;
+    match (info.kind(), info.conn_so()) {
+        (SOCKINFO_UN, so) if so != 0 => Ok(so),
+        _ => Err("this connection has no unix peer socket".into()),
+    }
+}
+/// Waits until `pid` holds the socket `server` (it accepted this connection), or `end`.
+#[cfg(target_os = "macos")]
+fn accepted(pid: u32, server: u64, end: std::time::Instant) -> Result<(), Refusal> {
+    loop {
+        if any_socket(pid, |s| s.so() == server).map_err(Refusal::Untrusted)? {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= end {
+            return Err(Refusal::NotAccepted);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
 }
 /// `LOCAL_PEERTOKEN`: the audit token of the process that `listen()`ed.
 #[cfg(target_os = "macos")]
@@ -869,11 +941,69 @@ fn peer_token(fd: BorrowedFd<'_>) -> io::Result<AuditToken> {
 /// `PROC_PIDFDSOCKETINFO` on each socket fd).
 #[cfg(target_os = "macos")]
 fn holds_listener(pid: u32, path: &Path) -> Result<(), String> {
-    // <sys/proc_info.h>: struct socket_fdinfo is 792 bytes; psi.soi_options (short) at 188,
-    // psi.soi_kind (int) at 256, psi.soi_proto.pri_un.unsi_addr (sockaddr_un) at 280.
+    use std::os::unix::ffi::OsStrExt;
+    let found = any_socket(pid, |s| {
+        s.kind() == SOCKINFO_UN
+            && i32::from(s.options()) & libc::SO_ACCEPTCONN != 0
+            && same_socket_path(Path::new(std::ffi::OsStr::from_bytes(s.unix_path())), path)
+    })?;
+    if found {
+        Ok(())
+    } else {
+        Err(format!(
+            "process {pid} does not hold a listening socket bound to {}",
+            path.display()
+        ))
+    }
+}
+/// `soi_kind` of a unix socket.
+#[cfg(target_os = "macos")]
+const SOCKINFO_UN: i32 = 3;
+/// A `struct socket_fdinfo` (<sys/proc_info.h>, 792 bytes): `psi.soi_so` (u64) at 160,
+/// `psi.soi_options` (short) at 188, `psi.soi_kind` (int) at 256, then
+/// `psi.soi_proto.pri_un`: `unsi_conn_so` (u64) at 264 and `unsi_addr` (sockaddr_un) at 280.
+#[cfg(target_os = "macos")]
+struct SocketInfo([u8; 792]);
+#[cfg(target_os = "macos")]
+impl SocketInfo {
+    fn so(&self) -> u64 {
+        u64::from_ne_bytes(self.0[160..168].try_into().expect("8 bytes"))
+    }
+    fn options(&self) -> i16 {
+        i16::from_ne_bytes(self.0[188..190].try_into().expect("2 bytes"))
+    }
+    fn kind(&self) -> i32 {
+        i32::from_ne_bytes(self.0[256..260].try_into().expect("4 bytes"))
+    }
+    fn conn_so(&self) -> u64 {
+        u64::from_ne_bytes(self.0[264..272].try_into().expect("8 bytes"))
+    }
+    /// sockaddr_un: sun_len, sun_family, then sun_path[104], NUL-terminated.
+    fn unix_path(&self) -> &[u8] {
+        let sun_path = &self.0[282..282 + 104];
+        &sun_path[..sun_path.iter().position(|b| *b == 0).unwrap_or(104)]
+    }
+}
+/// `pid`'s socket fd `fd`, or `None` when it cannot be read (not a socket, gone).
+#[cfg(target_os = "macos")]
+fn socket_info(pid: u32, fd: i32) -> Option<SocketInfo> {
     const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
-    const SOCKINFO_UN: i32 = 3;
-    const SIZE: usize = 792;
+    let mut info = SocketInfo([0; 792]);
+    // SAFETY: info is writable for its full size.
+    let got = unsafe {
+        libc::proc_pidfdinfo(
+            i32::try_from(pid).ok()?,
+            fd,
+            PROC_PIDFDSOCKETINFO,
+            info.0.as_mut_ptr().cast(),
+            info.0.len() as i32,
+        )
+    };
+    (got == info.0.len() as i32).then_some(info)
+}
+/// Whether any socket in `pid`'s fd table (`PROC_PIDLISTFDS`) satisfies `want`.
+#[cfg(target_os = "macos")]
+fn any_socket(pid: u32, want: impl Fn(&SocketInfo) -> bool) -> Result<bool, String> {
     let raw = i32::try_from(pid).map_err(|_| format!("invalid pid {pid}"))?;
     let unreadable = || {
         format!(
@@ -909,44 +1039,11 @@ fn holds_listener(pid: u32, path: &Path) -> Result<(), String> {
         return Err(unreadable());
     }
     fds.truncate(n as usize / each);
-    let mut info = [0u8; SIZE];
-    for fd in fds
+    Ok(fds
         .iter()
         .filter(|f| f.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
-    {
-        // SAFETY: info is writable for SIZE bytes.
-        let got = unsafe {
-            libc::proc_pidfdinfo(
-                raw,
-                fd.proc_fd,
-                PROC_PIDFDSOCKETINFO,
-                info.as_mut_ptr().cast(),
-                SIZE as i32,
-            )
-        };
-        if got != SIZE as i32 {
-            continue;
-        }
-        let kind = i32::from_ne_bytes(info[256..260].try_into().expect("4 bytes"));
-        let options = i16::from_ne_bytes(info[188..190].try_into().expect("2 bytes"));
-        if kind != SOCKINFO_UN || i32::from(options) & libc::SO_ACCEPTCONN == 0 {
-            continue;
-        }
-        // sockaddr_un: sun_len, sun_family, then sun_path[104].
-        let sun_path = &info[282..282 + 104];
-        let end = sun_path.iter().position(|b| *b == 0).unwrap_or(104);
-        use std::os::unix::ffi::OsStrExt;
-        if same_socket_path(
-            Path::new(std::ffi::OsStr::from_bytes(&sun_path[..end])),
-            path,
-        ) {
-            return Ok(());
-        }
-    }
-    Err(format!(
-        "process {pid} does not hold a listening socket bound to {}",
-        path.display()
-    ))
+        .filter_map(|f| socket_info(pid, f.proc_fd))
+        .any(|s| want(&s)))
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -955,7 +1052,8 @@ fn bound_confinement(
     _path: &Path,
     _pid: u32,
     _pidfd: bool,
-) -> Result<Confinement, String> {
+    _end: std::time::Instant,
+) -> Result<Confinement, Refusal> {
     Ok(Confinement::Unknown(
         "socket ownership is not provable on this platform".into(),
     ))
@@ -1582,6 +1680,10 @@ mod tests {
     /// A listener bound to `path` by a forked child A, held by A's child B after A exits and is
     /// reaped. Returns (A, B); the caller kills B.
     fn orphaned_listener(path: &Path) -> (u32, u32) {
+        orphaned_listener_serving(path, false)
+    }
+    /// [`orphaned_listener`]; when `serve`, B accepts every connection and keeps it open.
+    fn orphaned_listener_serving(path: &Path, serve: bool) -> (u32, u32) {
         use std::os::unix::ffi::OsStrExt;
         // SAFETY: zeroed sockaddr_un is a valid value.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
@@ -1611,7 +1713,11 @@ mod tests {
                 let b = libc::fork();
                 if b == 0 {
                     loop {
-                        libc::pause();
+                        if serve {
+                            libc::accept(s, std::ptr::null_mut(), std::ptr::null_mut());
+                        } else {
+                            libc::pause();
+                        }
                     }
                 }
                 libc::write(
@@ -1666,9 +1772,9 @@ mod tests {
         );
         let me = std::process::id();
         for pidfd in [true, false] {
-            let got = trust_endpoint_with(stream.as_fd(), &path, a, pidfd);
+            let got = trust_endpoint_with(stream.as_fd(), &path, a, pidfd, soon());
             assert!(got.is_err(), "pidfd {pidfd}: {got:?}");
-            let got = trust_endpoint_with(stream.as_fd(), &path, me, pidfd);
+            let got = trust_endpoint_with(stream.as_fd(), &path, me, pidfd, soon());
             assert!(got.is_err(), "pidfd {pidfd}: {got:?}");
         }
         #[cfg(target_os = "linux")]
@@ -1868,7 +1974,7 @@ mod tests {
         );
         assert!(holds_socket(std::process::id(), theirs).is_err());
         let stream = UnixStream::connect(&path).unwrap();
-        let got = trust_endpoint_with(stream.as_fd(), &path, std::process::id(), false);
+        let got = trust_endpoint_with(stream.as_fd(), &path, std::process::id(), false, soon());
         assert!(got.is_err(), "{got:?}");
     }
 
@@ -1879,6 +1985,60 @@ mod tests {
         assert_eq!(vfs_dev(libc::makedev(8, 1)), (8 << 20) | 1);
         assert_eq!(vfs_dev(libc::makedev(0, 300)), 300);
         assert_eq!(vfs_dev(libc::makedev(259, 70_000)), (259 << 20) | 70_000);
+    }
+
+    /// A deadline for the macOS accepted-connection proof (F10).
+    fn soon() -> std::time::Instant {
+        std::time::Instant::now() + std::time::Duration::from_millis(200)
+    }
+
+    /// F10 (macOS): a listening socket bound under the endpoint's name proves nothing about the
+    /// connection. Here the registered endpoint (this process) still holds a listener bound to
+    /// `path`, so the name proof passes, but the socket at `path` is another process's (B, which
+    /// renamed its own over it) and B accepted the connection: the endpoint never holds the
+    /// connection's server end, so it is refused once the deadline passes. When the endpoint
+    /// itself accepts, it is found.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn f10_the_endpoint_must_hold_the_accepted_connection() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("l.sock");
+        let mine = UnixListener::bind(&path).unwrap();
+        let other = t.path().join("o.sock");
+        let (_a, b) = orphaned_listener_serving(&other, true);
+        let _kill = Kill(b);
+        std::fs::rename(&other, &path).unwrap();
+        let me = std::process::id();
+        assert_eq!(
+            holds_listener(me, &path),
+            Ok(()),
+            "the name proof is fooled"
+        );
+        let stream = UnixStream::connect(&path).unwrap();
+        let server = server_end(stream.as_fd()).unwrap();
+        wait_until("B never accepted", || {
+            any_socket(b, |s| s.so() == server) == Ok(true)
+        });
+        let start = std::time::Instant::now();
+        assert_eq!(accepted(me, server, soon()), Err(Refusal::NotAccepted));
+        assert!(start.elapsed() >= std::time::Duration::from_millis(150));
+        // The registered endpoint accepting its own connection is found at once.
+        std::fs::remove_file(&path).unwrap();
+        drop(mine);
+        let listener = UnixListener::bind(&path).unwrap();
+        let stream = UnixStream::connect(&path).unwrap();
+        let server = server_end(stream.as_fd()).unwrap();
+        assert_eq!(
+            accepted(me, server, std::time::Instant::now()),
+            Err(Refusal::NotAccepted),
+            "not accepted yet"
+        );
+        let _accepted = listener.accept().unwrap();
+        assert_eq!(accepted(me, server, std::time::Instant::now()), Ok(()));
+        assert_eq!(
+            trust_endpoint_with(stream.as_fd(), &path, me, true, soon()),
+            Ok(())
+        );
     }
 
     struct Kill(u32);
@@ -1895,15 +2055,17 @@ mod tests {
     fn f2_the_process_holding_the_listener_is_trusted() {
         let t = tempfile::tempdir().unwrap();
         let path = t.path().join("l.sock");
-        let _listener = UnixListener::bind(&path).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
         let stream = UnixStream::connect(&path).unwrap();
+        // macOS proves the connection by its accepted end in the endpoint's fd table (F10).
+        let _accepted = listener.accept().unwrap();
         let me = std::process::id();
         for pidfd in [true, false] {
             assert_eq!(
-                trust_endpoint_with(stream.as_fd(), &path, me, pidfd),
+                trust_endpoint_with(stream.as_fd(), &path, me, pidfd, soon()),
                 Ok(())
             );
-            assert!(trust_endpoint_with(stream.as_fd(), &path, me + 1, pidfd).is_err());
+            assert!(trust_endpoint_with(stream.as_fd(), &path, me + 1, pidfd, soon()).is_err());
         }
         #[cfg(target_os = "linux")]
         {

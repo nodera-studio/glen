@@ -166,7 +166,13 @@ fn bounded_connect(
         }
     }
     use std::os::fd::AsFd;
-    crate::proc_ident::trust_endpoint(fd.as_fd(), path, pid).map_err(ClientError::Untrusted)?;
+    // macOS waits for the endpoint to accept (F10) until the deadline, or a moment past one
+    // that had passed already (a glen that ran late still reaches an available endpoint).
+    let accept_by = end.max(Instant::now() + POLL_STEP);
+    crate::proc_ident::trust_endpoint(fd.as_fd(), path, pid, accept_by).map_err(|r| match r {
+        crate::proc_ident::Refusal::Untrusted(why) => ClientError::Untrusted(why),
+        crate::proc_ident::Refusal::NotAccepted => ClientError::Timeout,
+    })?;
     let stream = UnixStream::from(fd);
     stream
         .set_write_timeout(Some(super::WRITE))
@@ -1096,11 +1102,17 @@ mod unary_tests {
             .tempdir_in("/tmp")
             .unwrap();
         let path = tmp.path().join("s");
-        let _listener = UnixListener::bind(&path).unwrap();
+        let listener = UnixListener::bind(&path).unwrap();
         let end = Instant::now();
         std::thread::sleep(Duration::from_millis(5));
+        // An available endpoint accepts (macOS proves the connection by its accepted end, F10).
+        let acceptor = std::thread::spawn(move || {
+            let accepted = listener.accept().unwrap();
+            (listener, accepted)
+        });
         let stream = bounded_connect(&path, std::process::id(), end, &|| false).unwrap();
         assert!(stream.peer_addr().is_ok());
+        let (_listener, _accepted) = acceptor.join().unwrap();
         assert!(matches!(
             bounded_connect(
                 &tmp.path().join("missing"),
