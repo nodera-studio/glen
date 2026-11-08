@@ -1025,19 +1025,6 @@ thread_local! {
     static BETWEEN_BIND_AND_CHMOD: std::cell::Cell<Option<PathHook>> =
         const { std::cell::Cell::new(None) };
 }
-/// Waits up to `within` for a connection on `listener`.
-fn readable(listener: &std::os::unix::net::UnixListener, within: Duration) -> bool {
-    use std::os::fd::AsRawFd;
-    let mut fds = [libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    }];
-    let ms = within.as_millis().min(i32::MAX as u128) as libc::c_int;
-    // SAFETY: fds is a valid array of one pollfd for the duration of the call.
-    let n = unsafe { libc::poll(fds.as_mut_ptr(), 1, ms) };
-    n > 0
-}
 /// The peer of `stream` has closed it (an offerer that gave up waiting): nothing is pending.
 fn closed(stream: &std::os::unix::net::UnixStream) -> bool {
     use std::os::fd::AsRawFd;
@@ -1068,34 +1055,133 @@ impl Offer {
         );
     }
 }
-/// The offers that arrived within `within`: every connection pending then, each read by one
-/// shared deadline. A connection that sends no well-formed offer, or that its offerer already
-/// closed, is dropped unanswered.
-fn receive(listener: &std::os::unix::net::UnixListener, within: Duration) -> Vec<Offer> {
-    if !readable(listener, within) {
-        return vec![];
+/// The most connections the warm worker holds open while their offers arrive; later ones wait
+/// in the listen backlog.
+const MAX_PENDING: usize = 16;
+/// A connection whose offer line is still arriving.
+struct Pending {
+    stream: std::os::unix::net::UnixStream,
+    line: Vec<u8>,
+    /// [`OFFER_READ`] from its accept.
+    end: Instant,
+}
+/// The connections an idle warm worker is reading offers from (H2 G4). Each has its own
+/// deadline and they are read together, so a silent or slow connection delays no other offer;
+/// at most [`MAX_PENDING`] are held, and each line is capped at [`MAX_OFFER_BYTES`].
+#[derive(Default)]
+pub(crate) struct Inbox {
+    pending: Vec<Pending>,
+}
+impl Inbox {
+    /// Waits up to `within` for connections and offer bytes; returns the offers completed by
+    /// then (every one complete at that moment). A connection that sends no well-formed offer
+    /// by its deadline, sends too much, or that its offerer already closed, is dropped
+    /// unanswered.
+    fn receive(
+        &mut self,
+        listener: &std::os::unix::net::UnixListener,
+        within: Duration,
+    ) -> Vec<Offer> {
+        use std::{io::Read, os::fd::AsRawFd};
+        let end = Instant::now() + within;
+        let mut done = vec![];
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let now = Instant::now();
+            self.pending.retain(|p| now < p.end);
+            let mut fds: Vec<libc::pollfd> = self
+                .pending
+                .iter()
+                .map(|p| libc::pollfd {
+                    fd: p.stream.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                })
+                .collect();
+            let accepting = self.pending.len() < MAX_PENDING;
+            if accepting {
+                fds.push(libc::pollfd {
+                    fd: listener.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            if !done.is_empty() || now >= end {
+                break;
+            }
+            let wake = self.pending.iter().map(|p| p.end).fold(end, Instant::min);
+            let ms = wake
+                .saturating_duration_since(now)
+                .as_millis()
+                .clamp(1, i32::MAX as u128) as libc::c_int;
+            // SAFETY: fds is a valid array of `fds.len()` pollfds for the duration of the call.
+            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, ms) } <= 0 {
+                continue;
+            }
+            let polled = self.pending.len();
+            if accepting && fds.last().is_some_and(|f| f.revents != 0) {
+                while self.pending.len() < MAX_PENDING {
+                    let Ok((stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    if stream.set_nonblocking(true).is_ok() {
+                        self.pending.push(Pending {
+                            stream,
+                            line: Vec::new(),
+                            end: Instant::now() + OFFER_READ,
+                        });
+                    }
+                }
+            }
+            // Read every readable connection; finished or failed ones leave `pending`.
+            let mut keep = Vec::with_capacity(self.pending.len());
+            for (i, mut p) in std::mem::take(&mut self.pending).into_iter().enumerate() {
+                if i >= polled || fds[i].revents == 0 {
+                    keep.push(p);
+                    continue;
+                }
+                match (&p.stream).read(&mut buf) {
+                    Ok(0) => (),
+                    Ok(n) => {
+                        p.line.extend_from_slice(&buf[..n]);
+                        if let Some(at) = p.line.iter().position(|b| *b == b'\n') {
+                            p.line.truncate(at);
+                            done.extend(offer_of(p));
+                        } else if p.line.len() <= MAX_OFFER_BYTES {
+                            keep.push(p);
+                        }
+                    }
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        keep.push(p)
+                    }
+                    Err(_) => (),
+                }
+            }
+            self.pending = keep;
+        }
+        done
     }
-    let mut streams = vec![];
-    while let Ok((stream, _)) = listener.accept() {
-        streams.push(stream);
+}
+/// The offer a finished line carries, if it is well-formed, at most [`MAX_OFFER_BYTES`], and
+/// its offerer is still connected.
+fn offer_of(p: Pending) -> Option<Offer> {
+    if p.line.len() > MAX_OFFER_BYTES {
+        return None;
     }
-    let end = Instant::now() + OFFER_READ;
-    streams
-        .into_iter()
-        .filter_map(|stream| {
-            stream.set_nonblocking(false).ok()?;
-            let line = read_line(&stream, MAX_OFFER_BYTES, end).ok()?;
-            let o: OfferLine = serde_json::from_slice(&line).ok()?;
-            let id = JobId::parse(&o.job_id)?;
-            (o.v == 1 && o.op == "adopt" && JobId::parse(&o.job.id).as_ref() == Some(&id))
-                .then_some(())?;
-            (!closed(&stream)).then_some(Offer {
-                stream,
-                id,
-                job: o.job,
-            })
-        })
-        .collect()
+    p.stream.set_nonblocking(false).ok()?;
+    let o: OfferLine = serde_json::from_slice(&p.line).ok()?;
+    let id = JobId::parse(&o.job_id)?;
+    (o.v == 1 && o.op == "adopt" && JobId::parse(&o.job.id).as_ref() == Some(&id)).then_some(())?;
+    (!closed(&p.stream)).then_some(Offer {
+        stream: p.stream,
+        id,
+        job: o.job,
+    })
 }
 /// AC-H204: the offer comes from its job's own recorded worker (the job's `status.worker_pid`,
 /// the same process generation as `status.worker_start`), proven on the connection itself, and
@@ -1282,6 +1368,7 @@ impl Idler<'_> {
         };
         let mut beat = Instant::now();
         let mut defer = Defer::default();
+        let mut inbox = Inbox::default();
         loop {
             let tick = Tick {
                 cancelled: self.first.cancel.load(Ordering::SeqCst),
@@ -1302,7 +1389,7 @@ impl Idler<'_> {
                 touch(&self.home, &warm.session_id);
                 beat = Instant::now();
             }
-            let offers = receive(listener, CLAIM_TICK);
+            let offers = inbox.receive(listener, CLAIM_TICK);
             if offers.is_empty() {
                 continue;
             }
@@ -2698,6 +2785,9 @@ mod adopt_tests {
         let line = read_line(stream, 4096, Instant::now() + Duration::from_secs(2)).unwrap();
         serde_json::from_slice::<AnswerLine>(&line).unwrap().answer
     }
+    fn receive(listener: &std::os::unix::net::UnixListener, within: Duration) -> Vec<Offer> {
+        Inbox::default().receive(listener, within)
+    }
     fn setup() -> (
         tempfile::TempDir,
         JobStore,
@@ -2919,6 +3009,40 @@ mod adopt_tests {
         );
         other.kill().unwrap();
         other.wait().unwrap();
+    }
+    /// H2 G4: connections are read together, each by its own deadline: a silent one held
+    /// open delays no other offer, and stays pending (not dropped) for a later tick until its
+    /// own deadline.
+    #[test]
+    fn a_silent_connection_delays_no_other_offer() {
+        let (_t, store, listener, path) = setup();
+        let (id, job) = offered(&store, std::process::id(), |_| ());
+        let _silent = std::os::unix::net::UnixStream::connect(&path).unwrap();
+        let mut inbox = Inbox::default();
+        assert!(
+            inbox
+                .receive(&listener, Duration::from_millis(50))
+                .is_empty()
+        );
+        assert_eq!(inbox.pending.len(), 1);
+        let _good = connect_offer(&path, id.as_str(), &job);
+        let started = Instant::now();
+        let got = inbox.receive(&listener, Duration::from_secs(5));
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            started.elapsed()
+        );
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].id, id);
+        // The silent connection is dropped at its own deadline.
+        std::thread::sleep(OFFER_READ);
+        assert!(
+            inbox
+                .receive(&listener, Duration::from_millis(20))
+                .is_empty()
+        );
+        assert!(inbox.pending.is_empty());
     }
     /// A connection that sends nothing well-formed, an id that is not its job's, or that its
     /// offerer already closed, is dropped unanswered within the read bound.
