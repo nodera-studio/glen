@@ -375,12 +375,14 @@ fn ac202_the_worker_leads_its_own_session_with_null_stdin_and_a_private_log() {
     );
     let log = rb.job_dir(&id).join("worker.log");
     match fd_target(pid, 0) {
-        // H2 (S-13): stdin is the private pipe `send` wrote the job to, never a terminal or
-        // the caller's own input (Linux `pipe:[ino]`; lsof names a pipe by no path).
-        Some(p) => assert!(
-            p.starts_with("pipe:") || !p.starts_with('/'),
-            "worker stdin is the job pipe: {p}"
+        // H2 (S-13): stdin carries the job `send` wrote, never a terminal or the caller's own
+        // input: on Linux a sealed memfd (`/memfd:glen-job (deleted)`), on macOS a pipe (lsof
+        // names a pipe by no path).
+        Some(p) if cfg!(target_os = "linux") => assert!(
+            p.starts_with("/memfd:glen-job"),
+            "worker stdin is the sealed job memfd: {p}"
         ),
+        Some(p) => assert!(!p.starts_with('/'), "worker stdin is the job pipe: {p}"),
         None => eprintln!("note: cannot inspect fds of {pid}; stdin check skipped"),
     }
     for fd in [1, 2] {

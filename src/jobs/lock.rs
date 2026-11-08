@@ -53,13 +53,8 @@ pub fn mark(lock: &SessionLock, h: &Holder) -> io::Result<()> {
 }
 /// Read only. The caller must separately verify that the lock and identity are live.
 pub fn holder(home: &GlenHome, id: &str) -> Option<Holder> {
-    use std::io::Read;
-    let file = std::fs::File::open(lock_path(home, id)).ok()?;
-    let mut bytes = Vec::new();
-    file.take(16_385).read_to_end(&mut bytes).ok()?;
-    if bytes.len() > 16_384 {
-        return None;
-    }
+    // Never blocking or through a symlink: a writer can plant a FIFO at the lock path (H2).
+    let (bytes, _) = crate::glen_home::read_regular(&lock_path(home, id), 16_384).ok()?;
     let h: Holder = serde_json::from_slice(&bytes).ok()?;
     (h.v == 1 && h.pid > 0).then_some(h)
 }

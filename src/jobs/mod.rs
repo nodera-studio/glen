@@ -529,8 +529,13 @@ impl JobStore {
             .count()
     }
 }
+/// The most of a job record glen reads: a job carries at most 512 KiB of text (and a worker
+/// reads at most 8 MiB of job), a status far less.
+const MAX_RECORD: u64 = 16 * 1024 * 1024;
+/// A job record, read without blocking or following a symlink, regular files only and at most
+/// [`MAX_RECORD`] (H2: a writer can plant a FIFO where a record should be).
 fn read_json<T: DeserializeOwned>(path: &Path) -> Result<T, GlenError> {
-    let bytes = fs::read(path).map_err(|e| {
+    let (bytes, _) = crate::glen_home::read_regular(path, MAX_RECORD).map_err(|e| {
         GlenError::new(
             if e.kind() == io::ErrorKind::NotFound {
                 ErrorCode::NotFound

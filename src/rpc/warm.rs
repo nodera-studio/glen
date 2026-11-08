@@ -439,12 +439,10 @@ pub fn remove_if(home: &GlenHome, session_id: &str, ident: &str) -> io::Result<b
     }
     remove_file(&path(home, session_id)).map(|()| true)
 }
+/// A registry or release request: never blocking, never through a symlink, regular files only,
+/// at most 64 KiB (H2: a writer can plant a FIFO there).
 fn read_regular(path: &Path) -> Option<(Vec<u8>, SystemTime)> {
-    let meta = fs::symlink_metadata(path).ok()?;
-    if !meta.is_file() {
-        return None;
-    }
-    let bytes = fs::read(path).ok()?;
+    let (bytes, meta) = crate::glen_home::read_regular(path, 64 * 1024).ok()?;
     Some((bytes, meta.modified().ok()?))
 }
 pub fn read(home: &GlenHome, session_id: &str) -> Option<Indexed> {
@@ -3156,6 +3154,41 @@ mod adopt_tests {
         entry.state = EntryState::Busy;
         publish(&home, &entry).unwrap();
         drop(lock);
+    }
+    /// H2 fix 2 (H1): an older job directory whose `status.json` (or `job.json`) is a FIFO
+    /// with no writer never stalls the warm worker: the read does not block, and that job does
+    /// not defer the offer.
+    #[test]
+    fn a_fifo_status_in_an_older_job_never_stalls_the_warm_worker() {
+        let t = tempfile::tempdir().unwrap();
+        let store = crate::jobs::tests::store(t.path());
+        let mut live = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (older, _) = offered(&store, live.id(), |_| ());
+        let (oldish, _) = offered(&store, live.id(), |_| ());
+        let (newer, _) = offered(&store, std::process::id(), |_| ());
+        for (id, name) in [(&older, "status.json"), (&oldish, "job.json")] {
+            let path = store.dir(id).join(name);
+            fs::remove_file(&path).unwrap();
+            let c = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        }
+        let started = Instant::now();
+        assert_eq!(
+            Defer::default().blocker(&store, SESSION, &newer, Instant::now()),
+            None
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(store.read_status(&older).is_err());
+        live.kill().unwrap();
+        live.wait().unwrap();
     }
     /// A connection that sends nothing well-formed, an id that is not its job's, or that its
     /// offerer already closed, is dropped unanswered within the read bound.

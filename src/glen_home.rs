@@ -8,6 +8,45 @@ use std::{
     path::{Path, PathBuf},
     sync::atomic::{AtomicU64, Ordering},
 };
+/// Opens `path` for reading only if it is a regular file. The open never blocks (a path a writer
+/// swapped to a FIFO cannot hang it) and the type comes from the opened file, so no check-then-open
+/// race. With `follow` false a symlink is refused (`O_NOFOLLOW`).
+pub(crate) fn open_regular(path: &Path, follow: bool) -> io::Result<fs::File> {
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        let nofollow = if follow { 0 } else { libc::O_NOFOLLOW };
+        fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC | nofollow)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let file = fs::File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is not a regular file", path.display()),
+        ));
+    }
+    Ok(file)
+}
+/// [`open_regular`] without following a symlink, then at most `max` bytes: a longer file is an
+/// error, never truncated.
+pub(crate) fn read_regular(path: &Path, max: u64) -> io::Result<(Vec<u8>, fs::Metadata)> {
+    use std::io::Read;
+    let file = open_regular(path, false)?;
+    let meta = file.metadata()?;
+    let mut bytes = Vec::new();
+    file.take(max + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("{} is larger than {max} bytes", path.display()),
+        ));
+    }
+    Ok((bytes, meta))
+}
 #[derive(Clone, Debug)]
 pub struct GlenHome {
     pub root: PathBuf,
