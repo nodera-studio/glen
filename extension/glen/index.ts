@@ -345,8 +345,9 @@ function sweep(home: string, deps: Deps, place: Place) {
         if (!Number.isInteger(r.pid) || r.pid <= 0) return;
         const scope = scopeOf(r, place);
         // A pid numbered in another pid namespace protects its socket: from another boot too,
-        // unless that boot's record names our namespace (the initial one keeps its inode).
-        if (scope === "elsewhere" || (scope === "other_boot" && r.pidns !== place.pidns)) foreign.add(r.pid);
+        // unless that boot's record names our namespace (the initial one keeps its inode); an
+        // own namespace we cannot read never matches, or a forged `pidns: null` would.
+        if (scope === "elsewhere" || (scope === "other_boot" && (place.pidns === null || r.pidns !== place.pidns))) foreign.add(r.pid);
         if (scope !== "elsewhere") registries.push({ file, bytes, r });
     });
     const dead = (pid: number) => !foreign.has(pid) && !deps.isAlive(pid);

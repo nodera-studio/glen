@@ -39,6 +39,11 @@ pub struct Registry {
 pub fn path(home: &GlenHome, id: &str) -> PathBuf {
     super::run_dir(home).join(format!("{}.json", lock_key(id)))
 }
+/// A registry file's bytes: a regular file only, opened without blocking or following a link,
+/// at most 64 KiB (a writer can plant a FIFO under `run/live`, H2/H3).
+fn read_bytes(p: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    crate::glen_home::read_regular(p, 64 * 1024).map(|(b, _)| b)
+}
 pub enum Read {
     Missing,
     Unreadable(String),
@@ -48,7 +53,7 @@ pub enum Read {
 }
 pub fn read(home: &GlenHome, id: &str) -> Read {
     let p = path(home, id);
-    match fs::read(&p) {
+    match read_bytes(&p) {
         Ok(b) => match serde_json::from_slice::<Registry>(&b) {
             Ok(r) if r.v == 1 && r.pid > 0 && r.session_id == id && r.socket.is_absolute() => {
                 match check_socket(home, &r) {
@@ -121,7 +126,7 @@ pub fn index(home: &GlenHome) -> Vec<Registry> {
     files(home)
         .into_iter()
         .filter_map(|p| {
-            fs::read(p)
+            read_bytes(&p)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
         })
@@ -148,7 +153,7 @@ fn socket_dead(home: &GlenHome, reg: &Registry) -> bool {
     !numbered_elsewhere(reg)
         && matches!(liveness::observe(reg.pid), Probe::Gone)
         && !files(home).into_iter().any(|p| {
-            fs::read(p)
+            read_bytes(&p)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
                 .is_some_and(|r| r.pid == reg.pid && numbered_elsewhere(&r))
@@ -204,7 +209,7 @@ pub fn remove_if_unchanged(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(io(e)),
     }
-    let bytes = fs::read(&tombstone).map_err(io)?;
+    let bytes = read_bytes(&tombstone).map_err(io)?;
     let unchanged = serde_json::from_slice::<Registry>(&bytes).is_ok_and(|now| now == *reg);
     if !unchanged {
         // Restore without clobbering a concurrent atomic publisher. Keep an
@@ -300,7 +305,7 @@ pub fn probe(
     let all = files(home)
         .into_iter()
         .filter_map(|p| {
-            fs::read(p)
+            read_bytes(&p)
                 .ok()
                 .and_then(|b| serde_json::from_slice::<Registry>(&b).ok())
         })
@@ -560,6 +565,33 @@ mod h3_fix1_tests {
                 "this namespace's dead pid: the socket goes"
             );
         }
+    }
+    /// A writer can plant a FIFO where a registry should be: reading registries never blocks
+    /// on it (index, read and the cleanup scan all skip it at once).
+    #[test]
+    fn a_fifo_registry_never_blocks_a_reader() {
+        let t = tempfile::tempdir().unwrap();
+        let home = GlenHome {
+            root: t.path().join("g"),
+        };
+        home.ensure_dir("run/live").unwrap();
+        let fifo = path(&home, "planted");
+        let c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let r = reg(&home, "old", liveness::tests_dead_pid());
+        publish(&home, &r);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = home.clone();
+        std::thread::spawn(move || {
+            let n = index(&h).len();
+            let planted = matches!(read(&h, "planted"), Read::Unreadable(_));
+            let _ = remove_if_unchanged(&h, &r, true);
+            tx.send((n, planted)).unwrap();
+        });
+        let (_, planted) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO registry blocked a reader");
+        assert!(planted, "the FIFO reads as unreadable");
     }
     /// MEDIUM-001, as the extension's sweep does: a socket whose pid a current registry of
     /// another pid namespace names is never unlinked, whatever the stale registry says.

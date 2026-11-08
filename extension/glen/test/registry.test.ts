@@ -86,6 +86,18 @@ test("a registry write without a procfs records no place, and own cleanup skips 
         assert.equal(fs.readFileSync(e.registry, "utf8"), other);
     } finally { await f.close(); }
 });
+test("an other-boot registry never unlinks a socket while our own pid namespace is unknown", async () => {
+    // A forged record whose pidns is null must not match an unreadable own namespace (null === null).
+    const proc = fakeProc(null, "boot-a"), f = await fixture();
+    try {
+        const dir = path.join(f.home, "run/live"); fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(path.join(dir, "forged.json"), JSON.stringify({ pid: 92, pidns: null, boot_id: "boot-b" }));
+        fs.writeFileSync(path.join(dir, "92.sock"), "");
+        f.deps.proc = proc; f.deps.isAlive = (pid: number) => pid === f.deps.pid;
+        const e = await f.start(); assert.ok(e, f.notes.join("\n"));
+        assert.ok(fs.existsSync(path.join(dir, "92.sock")), "an unknown own namespace never proves the pid is numbered here");
+    } finally { await f.close(); fs.rmSync(proc, { recursive: true, force: true }); }
+});
 test("MEDIUM-001 an other-boot registry of another pid namespace keeps the socket its pid names", async () => {
     const proc = fakeProc(100, "boot-a"), f = await fixture();
     try {
