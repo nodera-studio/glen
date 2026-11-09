@@ -109,16 +109,30 @@ struct Written {
 struct Progress {
     frames: u64,
     failed: bool,
+    /// When each frame finished writing, so tests measure signal-to-write inside the client
+    /// rather than through a scheduler-dependent receiving thread.
+    #[cfg(test)]
+    at: Vec<Instant>,
 }
 impl Written {
     fn record(&self, ok: bool) {
         let mut progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
         if ok {
             progress.frames += 1;
+            #[cfg(test)]
+            progress.at.push(Instant::now());
         } else {
             progress.failed = true;
         }
         self.changed.notify_all();
+    }
+    #[cfg(test)]
+    fn written_at(&self, frame: u64) -> Option<Instant> {
+        let progress = self.progress.lock().unwrap_or_else(PoisonError::into_inner);
+        progress
+            .at
+            .get(usize::try_from(frame).ok()?.checked_sub(1)?)
+            .copied()
     }
     /// True once the `frame`th queued frame (from 1) is written; waits at most `wait` for a write
     /// still in flight.
@@ -191,6 +205,10 @@ impl Client {
     }
     pub fn events_dropped(&self) -> u64 {
         self.events_dropped
+    }
+    #[cfg(test)]
+    fn cancel_written_at(&self) -> Option<Instant> {
+        self.written.written_at(self.cancel_frame?)
     }
     pub fn cancel(&self) -> Option<&CancelState> {
         self.cancel.as_ref()
@@ -952,7 +970,6 @@ mod tests {
             let signalled = Instant::now();
             flag.store(true, Ordering::SeqCst);
             let cancel = inbox.recv_timeout(WAIT).unwrap();
-            let latency = signalled.elapsed();
             assert_eq!(cancel["method"], "session/cancel");
             assert_eq!(cancel["params"], json!({"sessionId":"s1"}));
             assert!(cancel.get("id").is_none());
@@ -973,10 +990,15 @@ mod tests {
                 .recv_timeout(Duration::from_millis(300))
                 .into_iter()
                 .count();
-            (latency, 1 + more, out)
+            (signalled, 1 + more, out)
         });
         let outcome = client.prompt("s1", "hi", &stop, far(), grace).unwrap();
-        let (latency, cancels, _out) = agent.join().unwrap();
+        let (signalled, cancels, _out) = agent.join().unwrap();
+        // Signal to the writer thread's flush, measured inside the client: the receiving test
+        // thread's wake-up under CPU load is not part of glen's latency.
+        let latency = client
+            .cancel_written_at()
+            .map_or(Duration::MAX, |at| at.saturating_duration_since(signalled));
         (outcome, latency, cancels, client)
     }
     #[test]
