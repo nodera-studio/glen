@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Isolated third review/debug engine. Policy/envcheck are internal smoke helpers.
 set -euo pipefail
+# The engine's provider is the model ladder's (owner decision 2026-11-09: openai-codex, not Cursor).
+# shellcheck source=.claude/omp/model-ladder.sh
+. "$(cd "$(dirname "$0")/../omp" && pwd -P)/model-ladder.sh"
+ENGINE_PROVIDER="${MODEL_LADDER[0]%%/*}"
 umask 077
 # A signal trap can run while dispatch_env's stdout is redirected to response.raw.
 # Keep the public result stream available even inside that redirected function.
@@ -390,10 +394,10 @@ capture() {
     USAGE="$(printf '%s' "$meta" | jq -c .usage)"
   fi
   # Preserve timeout status: its tree must stay available to a possibly live job.
-  if [ "$STATUS" != timeout ] && [ -n "$PROVIDER" ] && [ "$PROVIDER" != cursor ]; then
-    STATUS=failed REASON="ran on $PROVIDER, not cursor" EXIT_CODE=4
+  if [ "$STATUS" != timeout ] && [ -n "$PROVIDER" ] && [ "$PROVIDER" != "$ENGINE_PROVIDER" ]; then
+    STATUS=failed REASON="ran on $PROVIDER, not $ENGINE_PROVIDER" EXIT_CODE=4
   elif [ "$STATUS" = ok ] && [ -z "$PROVIDER" ]; then
-    STATUS=failed REASON='ran on unknown, not cursor' EXIT_CODE=4
+    STATUS=failed REASON="ran on unknown, not $ENGINE_PROVIDER" EXIT_CODE=4
   fi
   if [ "$STATUS" = ok ] && ! grep -q '[^[:space:]]' "$OUT"; then
     STATUS=failed REASON='omp returned no final answer' EXIT_CODE=4
@@ -586,12 +590,12 @@ probe_checks() {
   # file (fix cycle 5, LOW-3): no separate, unused copy into PROBE_DIR.
   resolve_launcher "$ENGINE_ROOT" "$(launcher_dir_for)" || stop skipped "$REASON" 3
   # Provisional login signal; Step 3 must confirm this after the owner's login.
-  if models="$(bounded_omp 9 models cursor --json)"; then rc=0; else rc="$?"; fi
+  if models="$(bounded_omp 9 models "$ENGINE_PROVIDER" --json)"; then rc=0; else rc="$?"; fi
   case "$rc" in
-    124 | 137 | 142) stop skipped 'Cursor login check timed out' 3 ;;
+    124 | 137 | 142) stop skipped "$ENGINE_PROVIDER login check timed out" 3 ;;
   esac
   if [ "$rc" -ne 0 ] || ! printf '%s' "$models" | jq -e '.models | type == "array" and length > 0' >/dev/null 2>&1; then
-    stop skipped 'omp --profile glen-harness not logged into Cursor (run: omp --profile glen-harness login cursor)' 3
+    stop skipped "omp --profile glen-harness not logged into $ENGINE_PROVIDER (run: omp --profile glen-harness login $ENGINE_PROVIDER)" 3
   fi
   if value="$(bounded_omp 4 config get modelRoles --json)"; then rc=0; else rc="$?"; fi
   case "$rc" in

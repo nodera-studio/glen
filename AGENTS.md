@@ -115,7 +115,7 @@ account".
 
 ## omp as a harness engine
 
-The third reviewer and optional debug investigator use profile `glen-harness` on Cursor.
+The third reviewer and optional debug investigator use profile `glen-harness` on openai-codex.
 Configure it with `.claude/scripts/omp-profile-setup.sh`.
 Engine sessions are read-only under omp's approval policy and read containment
 (`.claude/omp/glen-harness.yml`). Agents never write the owner's default `~/.omp/agent`

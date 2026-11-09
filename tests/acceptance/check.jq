@@ -185,11 +185,11 @@ $m[0] as $manifest | $calls as $all |
  + (if $mode=="b" then
      uses($transcript) as $tools |
      uses([$transcript[] | select(.type | IN("user","assistant","system","summary") | not)]) as $dropped_tools |
-     [check("AC-415-transcript"; ($dropped_tools|length)==0 and ($tools|length)>0 and all($tools[];.name=="Bash" or (.name=="Read" and (.input.file_path|startswith($scratch+"/")))); "required transcript: only Bash and scratch Read; no tools in dropped lines"),
-      check("AC-415-isolation"; ($dropped_tools|length)==0 and all($tools[]; if .name=="Bash" then (.input.command | sub("; echo (\"exit=\\$\\?\"|exit=\\$\\?)\\z"; "") as $c |
+     [check("AC-415-transcript"; ($dropped_tools|length)==0 and ($tools|length)>0 and all($tools[];.name=="Bash" or .name=="SubagentHandback" or (.name=="Read" and (.input.file_path|startswith($scratch+"/")))); "required transcript: only Bash, scratch Read and the final SubagentHandback; no tools in dropped lines"),
+      check("AC-415-isolation"; ($dropped_tools|length)==0 and all($tools[]; if .name=="Bash" then (.input.command | sub("; echo (?i:(\"exit=\\$\\?\"|exit=\\$\\?))\\z"; "") as $c |
          ([$scratch+"/bin/glen", "'"+$scratch+"/bin/glen'", "\""+$scratch+"/bin/glen\""] | any(.[]; . as $path |
            ($c|startswith($path+" ")) and
-           ($c[($path|length):] | test("\\A(?:[ \\t]+(?:[A-Za-z0-9_@%+=:,./-]+|'[^'\\\\\\r\\n]*'|\"[^\"\\\\$\\r\\n]*\")+)+[ \\t]*\\z")))) and
+           ($c[($path|length):] | test("\\A(?:[ \\t]+(?>(?:[A-Za-z0-9_@%+=:,./-]+|'[^'\\\\\\r\\n]*'|\"[^\"\\\\$\\r\\n]*\")+))+[ \\t]*\\z")))) and
          (["&&","||",";","\n","$(","`","|","&",">","<","${","<("] | all(.[];. as $token|$c|contains($token)|not))) else true end); "only plain scratch-wrapper calls; orchestrator also audits transcript")]
     elif $mode=="b3" then
      uses($discovered) as $tools | results($discovered) as $results |

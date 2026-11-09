@@ -56,7 +56,7 @@ Several agent prompts were written for a TypeScript web monorepo. Apply them to 
   `tests/conformance/`) and runs it with `cargo test --test conformance`.
 - There is no dev stack to start: skip "ensure Docker / the dev stack is running". Manual testing
   is `cargo run -- <args>`.
-- Review engines are Claude, Codex and omp (third engine: a Cursor model, read-only, via glen and
+- Review engines are Claude, Codex and omp (third engine: an openai-codex model, read-only, via glen and
   `.claude/scripts/omp-engine.sh`; skipped with a note when `omp-engine.sh probe` fails).
 - The `/implement` re-index step (Role 4) applies only if `code_index_status` with project `glen`
   shows an index; otherwise skip it and say so.
@@ -136,7 +136,7 @@ choice is configured outside the harness (see `AGENTS.md`).
 
 ## omp
 
-The third review/debug engine uses profile `glen-harness` on Cursor.
+The third review/debug engine uses profile `glen-harness` on openai-codex.
 Sessions are read-only under omp's approval policy plus read containment (`.claude/omp/glen-harness.yml`).
 Configure it with `.claude/scripts/omp-profile-setup.sh`; see `.claude/skills/omp/SKILL.md`.
 Claude Code's `permissions.deny` rules are best-effort typing guardrails, not a security boundary.

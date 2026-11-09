@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Set up the isolated omp reviewer/debugger profile; reruns sync only differences.
-# Usage: omp-profile-setup.sh [--model cursor/<id>] [--check] [--dry-run]
+# Usage: omp-profile-setup.sh [--model <provider>/<id>] [--check] [--dry-run]
 set -euo pipefail
 
 PROFILE=glen-harness
@@ -21,7 +21,7 @@ die() { say "ERROR: $*" >&2; exit 1; }
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --model)
-      [ "$#" -ge 2 ] || die '--model needs cursor/<id>'
+      [ "$#" -ge 2 ] || die '--model needs <provider>/<id>'
       MODEL="$2"
       EXPLICIT_MODEL=1
       shift 2
@@ -32,7 +32,8 @@ while [ "$#" -gt 0 ]; do
     *) die "Unknown arg: $1 (use --help)" ;;
   esac
 done
-case "$MODEL" in cursor/?*) ;; *) die '--model must be cursor/<id>' ;; esac
+PROVIDER="${DEFAULT_MODEL_PREFERENCE[0]%%/*}"
+case "$MODEL" in "$PROVIDER"/?*) ;; *) die "--model must be $PROVIDER/<id>" ;; esac
 
 # HOME's ancestry may contain system aliases such as macOS /var -> /private/var.
 # Anchor both our baseline and child directory resolution to the same physical HOME;
@@ -235,7 +236,7 @@ asset_guard "$SKILL_SOURCE" "$SKILL_TARGET" "$SKILL_MARKER"
 # --version returned without extraction on omp 18.14.0. commands/toks.ts imports
 # pi-natives and counts with embedded offline tokenizers; a tiny literal warms it.
 profile_omp profile toks glen-native-warmup --json >/dev/null
-MODELS="$(profile_omp sandbox models cursor --json)"
+MODELS="$(profile_omp sandbox models "$PROVIDER" --json)"
 MODEL_COUNT="$(printf '%s' "$MODELS" | jq -er '.models | length')"
 LOGIN=1
 [ "$MODEL_COUNT" -gt 0 ] || LOGIN=0
@@ -270,7 +271,7 @@ if [ "$LOGIN" -eq 1 ]; then
     [ "$CHECK" -eq 1 ] || say "model: $MODEL (explicit --model)"
   fi
 elif [ "$EXPLICIT_MODEL" -eq 0 ] && [ "$CHECK" -eq 0 ]; then
-  say "no live Cursor login yet; preference list unvalidated (using $MODEL)"
+  say "no live $PROVIDER login yet; preference list unvalidated (using $MODEL)"
 fi
 
 # Item 10 (fix cycle 4): omp 18.14.0 honours a "<id>:<level>" suffix on a
@@ -354,7 +355,7 @@ if [ "$CHECK" -eq 0 ]; then
 fi
 
 if [ "$LOGIN" -eq 0 ]; then
-  say "Owner action: run 'omp --profile glen-harness login cursor', then rerun"
+  say "Owner action: run 'omp --profile glen-harness login $PROVIDER', then rerun"
 fi
 
 if [ "$CHECK" -eq 1 ]; then
@@ -397,7 +398,7 @@ if [ "$CHECK" -eq 1 ]; then
     row 'extension status' unavailable
     FAILED=1
   fi
-  if [ "$LOGIN" -eq 1 ]; then row 'Cursor login' confirmed; else row 'Cursor login' 'missing/not confirmed'; fi
+  if [ "$LOGIN" -eq 1 ]; then row "$PROVIDER login" confirmed; else row "$PROVIDER login" 'missing/not confirmed'; fi
   [ "$DIFFERENCES" -eq 0 ] || FAILED=1
   [ "$MODEL_OK" -eq 1 ] || FAILED=1
   [ "$FAILED" -eq 0 ] || exit 1
