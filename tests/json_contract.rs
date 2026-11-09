@@ -1055,6 +1055,11 @@ fn evidence_shapes() {
                 Some(11) => "send.forked",
                 _ => continue,
             }
+        } else if command == "wait"
+            && args.windows(2).any(|w| w[0] == "--for" && w[1] == "reply")
+        {
+            // `wait --for reply` has its own contract (v0.2 W2), not the job's terminal `wait`.
+            "wait.reply"
         } else {
             command
         };

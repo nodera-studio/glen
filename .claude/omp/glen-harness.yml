@@ -1,7 +1,7 @@
 # Review gate: third review engine.
 # /deep-debug: optional third investigator.
 # Discovery id only (18.14.0 discovery/agents.ts); no model provider uses this id.
-# Native profile skills/MCP remain available. Never disable the cursor model provider.
+# Native profile skills/MCP remain available. Never disable the model ladder's provider (.claude/omp/model-ladder.sh).
 disabledProviders: [agents]
 tools:
   approvalMode: always-ask
