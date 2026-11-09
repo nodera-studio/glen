@@ -7,7 +7,7 @@ set plan {
   {glen show R => 0; Acceptance R}
   {glen tail R -n 2 => 0}
   {glen send R NONCE_A1 => 0; answer nonce}
-  {glen send R sleep-15 NONCE_A2 --wait 2s => 10; capture job}
+  {glen send R long-list NONCE_A2 --wait 2s => 10; capture job}
   {glen wait JOB --timeout 120s => 0; answer nonce}
   {glen jobs => 0}
   {glen send L glen_reply NONCE_A3 => 0; reply arrow and nonce}
@@ -17,7 +17,7 @@ set plan {
   {glen install-skill --project => 0; installed twice}
   {glen install-skill --project => 0; unchanged twice}
   {glen completions zsh | head -1 => 0; #compdef glen}
-  {if controls visible: models R => 0; send L sleep --no-wait => 10; abort L => 0}
+  {if controls visible: models R => 0; send L long-list --no-wait => 10; abort L => 0}
 }
 if {[info exists env(ACC_DRY)] && $env(ACC_DRY) eq "1"} {
   puts [join $plan "\n"]
@@ -68,12 +68,15 @@ set env(PATH) "$S/glen-bin:$env(PATH)"
 cd $P
 log_file -noappend "$S/a-person.typescript"
 spawn bash --norc --noprofile -i
+# expect keeps only the last 2000 bytes by default; doctor's output is longer (v0.2).
+match_max 1000000
 set timeout 10
 expect -re {[$#] }
 send -- "PS1='acc> '\r"
 expect -re {\r?\n}
 expect -exact "acc> "
 # Every plan step runs omp under profile glen-harness, never the owner's default agent dir.
+# That profile denies bash (.claude/omp/glen-harness.yml), so long turns come from long output, not tools.
 send -- {glen() { command glen --profile glen-harness "$@"; }}
 send -- "\r"
 expect -re {\r?\n}
@@ -86,7 +89,7 @@ foreach h [list $R $L $X] {if {![string match *$h* $listing]} {fail "ls missing 
 step "glen show $R" 0 {Acceptance R}
 step "glen tail $R -n 2" 0
 step "glen send $R [quote "Reply with exactly $n1"]" 0 $n1
-set running [step "glen send $R [quote "Use the bash tool to run sleep 15, then reply with exactly $n2"] --wait 2s" 10 {glen wait j[0-9a-f]{7}}]
+set running [step "glen send $R [quote "Write the numbers 1 to 400, one per line, then reply with exactly $n2"] --wait 2s" 10 {glen wait j[0-9a-f]{7}}]
 if {![regexp {glen wait (j[0-9a-f]{7})} $running -> job]} {fail "missing running job"}
 step "glen wait $job --timeout 120s" 0 $n2
 step {glen jobs} 0
@@ -101,9 +104,10 @@ set unchanged [step {glen install-skill --project} 0 {unchanged}]
 if {[regexp -all {unchanged} $unchanged] < 2} {fail "expected two unchanged skills"}
 step {glen completions zsh | head -1} 0 {#compdef glen} 0
 set help [step {glen --help} 0]
-if {[regexp {\n +abort +} $help]} {
+# --help styles command names, so allow ANSI codes around "abort".
+if {[regexp {\n +(\x1b\[[0-9;]*m)*abort} $help]} {
   step "glen models $R" 0
-  step "glen send $L [quote {Use the bash tool to run sleep 30, then answer late.}] --no-wait" 10
+  step "glen send $L [quote {Write the numbers 1 to 3000, one per line, then answer late.}] --no-wait" 10
   step "glen abort $L" 0
 }
 send -- "exit\r"

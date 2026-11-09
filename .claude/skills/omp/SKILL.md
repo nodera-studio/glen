@@ -11,7 +11,7 @@ allowed-tools: Bash
 
 ## Role
 
-omp is a third reviewer and an optional third investigator only, read-only, on Cursor in
+omp is a third reviewer and an optional third investigator only, read-only, on openai-codex in
 the `glen-harness` profile. It has no supervisor or plan-judge role. It reviews as the third
 pass of `/code-review` (so of every `/implement` Role 2 gate) and of `/review-implementation`,
 and investigates optionally in `/deep-debug`. In `/code-review` an omp-only finding is
@@ -19,20 +19,20 @@ advisory until a verifier confirms it against the code; omp plus one other engin
 
 ## One-time setup
 
-The owner runs `omp --profile glen-harness login cursor`, then
+The owner runs `omp --profile glen-harness login openai-codex`, then
 `.claude/scripts/omp-profile-setup.sh`, then `.claude/scripts/omp-profile-setup.sh --check`.
 The live Mnemosyne tool names (`mcp__mnemosyne_memory_*`, including the write tools
 `memory_store`, `memory_update` and `memory_delete` the policy denies) were confirmed in the
-Step 11 acceptance run. Setup picks the first id present in the live Cursor model list from
+Step 11 acceptance run. Setup picks the first id present in the live openai-codex model list from
 an ordered ladder, each entry with its own startup thinking level. The ladder has one entry,
-`cursor/grok-4.7` at high (owner decision 2026-11-01; Cursor dropped Gemini). It
+`openai-codex/gpt-6.1-sol` at high (owner decision 2026-11-09: Cursor is retired as an agent, Bugbot only). It
 writes `modelRoles.default` as `<id>:<level>` (omp 18.14.0 honours this suffix itself,
 `config/model-resolver.ts` `splitThinkingSuffix`; host-verified against the session
 transcript's own `thinkingLevel` field, not the model's self-reported, unreliable answer).
 The engine repeats exactly that persisted suffix as a per-dispatch `--thinking <level>` on
 each `glen send`, as belt and braces on top of the persisted default, and passes no
 `--thinking` when the persisted value has no suffix. If that id is not present, omp is unavailable, with a reason
-naming it. `--model cursor/<id>` selects another model and requires that exact id; it
+naming it. `--model openai-codex/<id>` selects another model and requires that exact id; it
 does not use the ladder, and setup never appends a thinking-level suffix for it.
 
 ## How to invoke

@@ -1056,10 +1056,16 @@ fn evidence_shapes() {
                 _ => continue,
             }
         } else if command == "wait"
+            && call["exit"].as_i64() == Some(10)
             && args.windows(2).any(|w| w[0] == "--for" && w[1] == "reply")
         {
-            // `wait --for reply` has its own contract (v0.2 W2), not the job's terminal `wait`.
-            "wait.reply"
+            // `wait --for reply` exit 10 has its own contracts (v0.2 W2); once the job ends
+            // (exit 0) it returns the job's terminal `wait` document.
+            if call["stdout"]["data"].get("woke").is_some() {
+                "wait.reply"
+            } else {
+                "wait.reply.expired"
+            }
         } else {
             command
         };
